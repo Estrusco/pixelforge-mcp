@@ -43,6 +43,8 @@ You can extend your own capabilities by connecting MCP servers: panel_list_mcp s
 
 When you genuinely need the user to choose between options, use the panel_ask tool — it renders an interactive question card in the panel chat and returns their pick (the card always includes an 'Other…' free-text field, so they can answer freely too). Reserve it for decisions that actually change what you do; for a simple yes/no or quick confirmation a plain-text question in your reply is fine. Do NOT use the built-in AskUserQuestion tool — it does not render in this panel and gets auto-dismissed, which makes you think the user declined.
 
+For any genuinely multi-step task, set a plan with panel_set_todo and then WORK THROUGH IT LIKE A LOOP: do each step, mark it done and the next one active as you go, and keep going autonomously all the way to the end. Do NOT stop between steps to ask "should I continue?", to report routine progress, or to seek permission for steps that plainly follow from the plan — the todo list is your commitment to FINISH, not a menu to re-confirm. Clear it (panel_set_todo with an empty array) once every item is done. The ONLY reason to pause the loop is a decision you genuinely cannot make yourself or a true blocker — then use panel_ask to get the answer and immediately resume the loop. When the user hands you a list of things to do, default to executing the WHOLE list before yielding the turn.
+
 Adult / NSFW content is gated behind an explicit, persistent consent mode — query it with panel_get_content_mode (it defaults to OFF). ComfyUI has a large community of legitimate adult artists, so adult requests are valid creative work — but only for verified consenting adults. BY DEFAULT (mode OFF) keep everything safe-for-work: don't surface NSFW models, LoRAs, prompts, workflows, or imagery, and prefer SFW results. When a request clearly intends adult/NSFW work and the mode is OFF, call panel_request_adult_consent — it shows a card confirming the user is 18+ and that adult content is legal in their region; only once they affirm does the mode turn on (it persists across reloads, and panel_disable_adult_mode reverts it). When the mode is ON, help with legal adult art for consenting adults and don't over-refuse — stylized/fantasy themes between clearly-adult fictional characters are in scope. ABSOLUTE limits that NO mode, setting, or request ever relaxes: never sexual content involving minors or anyone depicted as underage; never sexual deepfakes of real, identifiable people; never depictions of actual non-consensual sexual acts (rape). If a request crosses these, refuse regardless of the mode.`;
 
 /**
@@ -160,18 +162,17 @@ export async function runPanelOrchestrator(): Promise<void> {
   // claude.ai login, never an API key. Unset the key for the SDK subprocess.
   delete process.env.ANTHROPIC_API_KEY;
 
-  // Dedicated PANEL bridge port (default 9180) — distinct from the legacy
-  // `comfyui-mcp --channels` bridge (9101) so they can never collide.
+  // Dedicated PANEL bridge port (default 9180).
   const bridge = startUiBridge(Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180);
 
   // Owning the bridge port is the orchestrator's whole job — if another process
-  // holds it (e.g. an interactive comfyui-mcp running with --channels), fail
-  // loudly instead of running uselessly. (This also avoids the case where a
-  // failed bind leaves the process with no live handles and it exits silently.)
+  // holds it, fail loudly instead of running uselessly. (This also avoids the
+  // case where a failed bind leaves the process with no live handles and it
+  // exits silently.)
   const bound = await bridge.whenReady();
   if (!bound) {
     logger.error(
-      `[panel-orchestrator] could not bind the panel bridge port — another process owns it (often an interactive comfyui-mcp started with --channels). Free that port (or stop the --channels session) and restart the orchestrator. Override the port with COMFYUI_MCP_BRIDGE_PORT.`,
+      `[panel-orchestrator] could not bind the panel bridge port — another process owns it. Free that port and restart the orchestrator. Override the port with COMFYUI_MCP_BRIDGE_PORT.`,
     );
     process.exit(1);
   }
@@ -197,9 +198,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     logger.debug(`[panel-orchestrator] could not write lockfile ${lockPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // The spawned agent runs THIS comfyui-mcp build as its MCP server, in normal
-  // (non-channels) mode — so it generates against the live ComfyUI over
-  // COMFYUI_URL and never tries to bind the bridge port we own here.
+  // The spawned agent runs THIS comfyui-mcp build as its MCP server in normal
+  // mode — so it generates against the live ComfyUI over COMFYUI_URL and never
+  // tries to bind the bridge port we own here.
   const mcpEntry = fileURLToPath(new URL("../index.js", import.meta.url));
   const comfyuiUrl = process.env.COMFYUI_URL ?? "http://127.0.0.1:8188";
   // ComfyUI install path — when set, the spawned agent's MCP runs in LOCAL mode,
@@ -265,7 +266,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       comfyui: {
         type: "stdio",
         command: process.execPath, // node
-        args: [mcpEntry], // dist/index.js, no --channels
+        args: [mcpEntry], // dist/index.js
         env: {
           COMFYUI_URL: comfyuiUrl,
           // Local mode → enables download_model, apply_manifest (installer packs),
@@ -274,8 +275,14 @@ export async function runPanelOrchestrator(): Promise<void> {
         },
       },
     },
-    onSay: (tabId, text) => {
-      bridge.push({ type: "say", text }, tabId);
+    onSay: (tabId, text, meta) => {
+      // `id` lets the panel reconcile this committed message with its live
+      // streaming preview (same id) instead of rendering a duplicate bubble.
+      bridge.push({ type: "say", text, id: meta?.id, streamed: meta?.streamed }, tabId);
+    },
+    // Live streaming deltas → the panel's think-window + streaming reply bubble.
+    onStream: (tabId, ev) => {
+      bridge.push({ type: "stream", phase: ev.phase, id: ev.id, delta: ev.delta }, tabId);
     },
     // Per-response usage → the panel's context/usage meter (updates live).
     onStatus: pushStatus,
@@ -287,6 +294,10 @@ export async function runPanelOrchestrator(): Promise<void> {
     // tool work; clears on done).
     onTurn: (tabId, state) => {
       bridge.push({ type: "turn", state }, tabId);
+    },
+    // Live extended-thinking token count → "thinking… (N)" indicator.
+    onThinking: (tabId, tokens) => {
+      bridge.push({ type: "thinking", tokens }, tabId);
     },
   });
 
@@ -348,10 +359,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       void ensureModels()
         .then((models) => {
           if (models.length) {
-            bridge.push(
-              { type: "say", text: `🟢 comfyui-mcp agent ready — ${model} on your Claude subscription. Ask away.` },
-              tabId,
-            );
+            // Greet only on a FRESH session. On a reconnect/resume — a panel swap,
+            // a WS blip, or a real restart (all carry `resume`) — the user already
+            // has their thread, so re-greeting is just noise. The ack still fires.
+            if (!resume) {
+              bridge.push(
+                { type: "say", text: `🟢 comfyui-mcp agent ready — ${model} on your Claude subscription. Ask away.` },
+                tabId,
+              );
+            }
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: model }, tabId);
             logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} connected — agent healthy, sent ready ack`);
           } else {
@@ -403,6 +419,9 @@ export async function runPanelOrchestrator(): Promise<void> {
             model: applied.model,
             effort: applied.effort ?? null,
             restarted: applied.restarted,
+            // Effort changed mid-turn → it takes effect once the current turn ends
+            // (we never interrupt a live reply). The panel can note this.
+            deferred: applied.deferred,
           },
           tabId,
         );

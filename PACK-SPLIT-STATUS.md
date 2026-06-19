@@ -49,18 +49,18 @@ group-toggling.
 | `z-image-base-img2img` | z-image-base | img→image | ✅ | |
 | `z-image-base-combo` | z-image-base | combo | ✅ | |
 | `z-image-base-inpaint` | z-image-base | inpaint | ✅ | |
-| `ltx-2.3-txt2vid` | LTX ULTRA | text→video | 🟡 | weights downloaded; render pending |
-| `ltx-2.3-img2vid` | LTX ULTRA | img→video | 🟡 | " |
-| `ltx-2.3-flf` | LTX ULTRA | first/mid/last-frame | 🟡 | " |
+| `ltx-2.3-txt2vid` | Comfy-Org LTX-2.3 template | text→video | ✅ | **Rebuilt on the official two-stage template** (T2V mode: bypass_i2v + EmptyImage). Render-verified sharp. LTXAVTextEncoderLoader (gemma+ckpt) + gemma abliterated LoRA + dynamic distilled LoRA + ×2 spatial upscale. All-core nodes. See the ltxv2-video skill |
+| `ltx-2.3-img2vid` | Comfy-Org LTX-2.3 template | img→video | ✅ | **Rebuilt on the official two-stage template** (I2V). Render-verified sharp at 1280×704 + 48kHz stereo audio (the sample_woman_video). Same model stack as txt2vid |
+| `ltx-2.3-flf` | LTX ULTRA | first/mid/last-frame | 🟡 | needs rebuild on the official template (old DualCLIPLoader stack = mush) |
 | `ltx-2.3-extender` | LTX ULTRA | video extend (audio) | 🟡 | " |
 | `ltx-2.3-extender-no-audio` | LTX EXTENDER | video extend (no audio) | 🟡 | " |
-| `ltx-2.3-xy-plot` | LTX XY-PLOT | LoRA xy-plot grid | 🟡 | user LoRAs allow-listed |
-| `ideogram-txt2img` | ideogram | text→image | 🟡 | converts clean; live render not yet captured |
-| `ideogram-img2img` | ideogram | img→image | 🟡 | " |
+| `ltx-2.3-xy-plot` | LTX XY-PLOT | LoRA xy-plot grid | 🟡 | " |
+| `ideogram-txt2img` | ideogram | text→image | 🔴 | converts clean, but KJNodes **V3 dynamic-combo** nodes (Ideogram4PromptBuilderKJ, ImageSharpenKJ) reject the flat API form at /prompt validation — needs the V3 structured serialization. Converter now maps the values + prunes dangling subgraph refs (groundwork committed); full V3 execution still pending |
+| `ideogram-img2img` | ideogram | img→image | 🔴 | same V3 dynamic-combo blocker |
 | `anima-txt2img` | anima | text→image | 🟡 | needs ttN seed (tinyterraNodes) + SDXL/detector weights |
 | `anima-img2img` | anima | img→image (controlnet) | 🟡 | + DWPose/DepthAnything (controlnet_aux), AnimaLLLite |
 | `anima-inpaint` | anima | inpaint (controlnet) | 🟡 | + AnimaLLLite |
-| `qwen-image-edit-edit` | qwen-image-edit | instruction edit | 🟡 | needs Crystools + Qwen-Image-Edit GGUF |
+| `qwen-image-edit-edit` | qwen-image-edit | instruction edit | ✅ | render-verified — two sample-woman inputs hugged in a rainy forest per the shipped instruction. Installed Crystools + downloaded Qwen-Image-Edit Q8 GGUF + Qwen2.5-VL encoders + VAE + Lightning-4step LoRA |
 | `wan-longer-videos-t2v` | wan-longer-videos | text→video | 🟡 | needs WanVideoWrapper + VHS + Wan 14B |
 | `wan-longer-videos-i2v` | wan-longer-videos | img→video | 🟡 | " |
 | `wan-longer-videos-v2v` | wan-longer-videos | video→video | 🟡 | " |

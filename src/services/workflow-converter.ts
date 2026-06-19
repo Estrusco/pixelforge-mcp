@@ -49,6 +49,10 @@ function isWidgetInput(
   const typeSpec = spec[0];
   // If the type is an array of choices like ["option1", "option2"], it's a widget
   if (Array.isArray(typeSpec)) return true;
+  // V3 dynamic combo: a string type carrying an `options` list (e.g.
+  // COMFY_DYNAMICCOMBO_V3) — the selected option's key is a widget value.
+  const cfg = spec[1] as { options?: unknown } | undefined;
+  if (Array.isArray(cfg?.options)) return true;
   // Standard widget types
   const WIDGET_TYPES = new Set([
     "INT",
@@ -392,14 +396,14 @@ function expandSingleComponent(
     }
   }
 
-  // ── 9. Resolve PrimitiveNode-type nodes inside the subgraph ─────────────
-  // PrimitiveNode/PrimitiveInt/PrimitiveFloat/PrimitiveBoolean/PrimitiveStringMultiline
-  // produce widget values but get skipped by the main converter. Resolve them
-  // by pushing their value onto the target node's widgets_values.
-  const PRIMITIVE_TYPES = new Set([
-    "PrimitiveNode", "PrimitiveInt", "PrimitiveFloat",
-    "PrimitiveBoolean", "PrimitiveStringMultiline", "CustomCombo",
-  ]);
+  // ── 9. Resolve virtual PrimitiveNode nodes inside the subgraph ──────────
+  // The legacy virtual "PrimitiveNode" produces a widget value but isn't a real
+  // executable node, so bake its value onto the target's widgets_values. The
+  // typed primitives (PrimitiveInt/Float/Boolean/String) ARE real nodes that
+  // output a value — leave them as link sources so the main converter maps them
+  // by name (baking them by widget index mis-positions V3 nested inputs like
+  // "resize_type.width", which aren't 1:1 with the inputs[] widget order).
+  const PRIMITIVE_TYPES = new Set(["PrimitiveNode", "CustomCombo"]);
   const primitiveNodeIds = new Set(
     newNodes.filter((n) => PRIMITIVE_TYPES.has(n.type)).map((n) => n.id),
   );
@@ -563,6 +567,12 @@ export function convertUiToApi(
       const inp = (src.inputs ?? []).find((i) => i.link != null);
       return inp?.link != null ? resolveSource(inp.link, depth + 1) : null;
     }
+    // Reroute passthrough: a virtual node that just forwards its single input to
+    // all outputs — follow its input link to the real source.
+    if (src.type === "Reroute") {
+      const inp = (src.inputs ?? []).find((i) => i.link != null);
+      return inp?.link != null ? resolveSource(inp.link, depth + 1) : null;
+    }
     const mode = src.mode ?? 0;
     if (mode === 0) {
       return { id: String(link.sourceNodeId), slot: link.sourceSlot };
@@ -624,31 +634,75 @@ export function convertUiToApi(
     // a phantom widget value in widgets_values ("fixed"/"randomize"/"increment"/"decrement")
     // that doesn't correspond to any named input — we must skip those.
     const widgetValues = node.widgets_values ?? [];
+
+    // Some nodes (e.g. VHS_VideoCombine) store widgets_values as a name->value
+    // object instead of a positional array. Map those by name directly.
+    if (!Array.isArray(widgetValues)) {
+      const wv = widgetValues as Record<string, unknown>;
+      for (const name of widgetNames) {
+        if (name in wv) inputs[name] = wv[name];
+      }
+    } else {
     let widgetIdx = 0;
     for (const name of widgetNames) {
       if (widgetIdx >= widgetValues.length) break;
-      inputs[name] = widgetValues[widgetIdx];
+      const value = widgetValues[widgetIdx];
+      inputs[name] = value;
       widgetIdx++;
 
       // If this input has control_after_generate, skip the next widgets_values entry
       if (hasControlAfterGenerate(name, def) && widgetIdx < widgetValues.length) {
         widgetIdx++;
       }
-    }
 
-    // Fill widget inputs not covered by widgets_values (e.g. a node version added
-    // a required widget the saved graph predates) with their object_info default,
-    // so /prompt validation doesn't reject on a missing required input.
-    for (const name of widgetNames) {
-      if (name in inputs) continue;
+      // V3 dynamic combo: the selected option adds nested required inputs whose
+      // values follow in widgets_values (e.g. method="rcas" -> strength=0.55).
       const spec =
         (def.input?.required as Record<string, unknown>)?.[name] ??
         (def.input?.optional as Record<string, unknown>)?.[name];
+      const opts = (
+        Array.isArray(spec)
+          ? (spec[1] as { options?: Array<{ key?: unknown; inputs?: { required?: Record<string, unknown> } }> })
+          : undefined
+      )?.options;
+      const nested = Array.isArray(opts)
+        ? opts.find((o) => o?.key === value)?.inputs?.required
+        : undefined;
+      if (nested) {
+        // V3 dynamic-combo nested inputs are keyed with the combo's id as a
+        // "<combo>.<nested>" prefix (ComfyUI rebuilds the nested dict from these
+        // via dynamic_paths). A flat "<nested>" key is rejected as missing.
+        for (const nName of Object.keys(nested)) {
+          if (widgetIdx >= widgetValues.length) break;
+          inputs[`${name}.${nName}`] = widgetValues[widgetIdx];
+          widgetIdx++;
+        }
+      }
+    }
+    }
+
+    // Fill any required input not covered by widgets_values or a link with its
+    // object_info default, so /prompt validation doesn't reject on a missing
+    // required input (e.g. a node version added a required widget the saved graph
+    // predates, or a special widget type the widget-index mapping skipped). Link
+    // inputs (IMAGE/LATENT/etc.) have no default, so they're left alone.
+    for (const name of orderedNames) {
+      if (name in inputs) continue;
+      const spec = (def.input?.required as Record<string, unknown>)?.[name];
       if (!Array.isArray(spec)) continue;
-      const [type, config] = spec as [unknown, { default?: unknown }?];
-      const dflt = Array.isArray(type)
-        ? (config?.default ?? type[0]) // combo: default or first option
-        : config?.default;
+      const [type, config] = spec as [
+        unknown,
+        { default?: unknown; options?: Array<{ key?: unknown }> }?,
+      ];
+      let dflt: unknown;
+      if (Array.isArray(type)) {
+        dflt = config?.default ?? type[0]; // combo list: default or first option
+      } else if (Array.isArray(config?.options) && config.options.length) {
+        // dynamic combo (e.g. COMFY_DYNAMICCOMBO_V3): default or first option key
+        dflt = config.default ?? config.options[0]?.key ?? config.options[0];
+      } else {
+        dflt = config?.default;
+      }
       if (dflt !== undefined) inputs[name] = dflt;
     }
 
@@ -675,6 +729,30 @@ export function convertUiToApi(
     if (Object.keys(meta).length > 0) {
       workflow[nodeId]._meta = meta as { title?: string };
     }
+  }
+
+  // Prune dangling input references — a connection to a node id that isn't in
+  // the prompt (e.g. a consumer of an expanded-away subgraph instance that the
+  // component expansion didn't remap). ComfyUI errors hard ("Node X not found")
+  // on these, so drop the connection like an unresolved link.
+  const validIds = new Set(Object.keys(workflow));
+  let prunedRefs = 0;
+  for (const node of Object.values(workflow)) {
+    const ins = node.inputs as Record<string, unknown>;
+    for (const [name, val] of Object.entries(ins)) {
+      if (
+        Array.isArray(val) &&
+        val.length === 2 &&
+        typeof val[0] === "string" &&
+        !validIds.has(val[0])
+      ) {
+        delete ins[name];
+        prunedRefs++;
+      }
+    }
+  }
+  if (prunedRefs > 0) {
+    warnings.push(`Pruned ${prunedRefs} dangling input reference(s) to nodes not in the prompt.`);
   }
 
   const nodeCount = Object.keys(workflow).length;

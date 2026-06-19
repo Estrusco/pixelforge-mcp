@@ -2,9 +2,9 @@
 // control of the workflow the user is actually looking at.
 //
 // The panel pack already implements a fixed allowlist of graph executors
-// (graph_get_state, graph_add_node, graph_set_widget, graph_run, …) for the
-// interactive --channels path. This server exposes those same operations to the
-// background agent as MCP tools, each forwarding to the panel over the bridge
+// (graph_get_state, graph_add_node, graph_set_widget, graph_run, …). This
+// server exposes those operations to the background agent as MCP tools, each
+// forwarding to the panel over the bridge
 // the orchestrator owns (bridge.send → rid-correlated reply). Because it runs
 // IN the orchestrator process (createSdkMcpServer, not a stdio subprocess), the
 // tools can reach the live UiBridge directly.
@@ -386,6 +386,24 @@ export function createPanelMcpServer(
         },
       ),
       tool(
+        "panel_set_todo",
+        "Show/update a live TODO checklist in the panel's footer tray — a running view of your plan that the user watches as you work a multi-step task. Pass the FULL ordered list each call (it replaces the tray); update each step's status as you progress (pending → active → done). Pass an empty array to clear it. Use for genuinely multi-step work (3+ steps); skip it for quick one-shot replies. Mark exactly one step 'active' at a time.",
+        {
+          items: z
+            .array(
+              z.object({
+                text: z.string().describe("Short step description (a few words)."),
+                status: z
+                  .enum(["pending", "active", "done"])
+                  .optional()
+                  .describe("Step state (default 'pending'). Mark the one you're on 'active'."),
+              }),
+            )
+            .describe("The full ordered checklist (replaces the current one). Empty array clears the tray."),
+        },
+        async (args) => call({ cmd: "set_todo", items: args.items }, 5000),
+      ),
+      tool(
         "panel_ask",
         "Ask the user to choose between options — renders an interactive question card in the panel chat and BLOCKS until they pick, returning their choice as text. Use this (NOT the AskUserQuestion tool, which never renders here) whenever you need the user to decide between options. Each option may carry a short description. The card always includes an 'Other…' free-text field, so the returned string may be a listed label or whatever the user typed (comma-joined for multi_select). Ask only when the answer genuinely changes what you do.",
         {
@@ -492,6 +510,17 @@ export function createPanelMcpServer(
         "Leave the current subgraph and return to the root graph (undo a panel_enter_subgraph). After this, panel_* tools target the root graph again.",
         {},
         async () => call({ cmd: "graph_exit_subgraph" }, 15000),
+      ),
+      tool(
+        "panel_promote_widget",
+        "Expose (promote) an INNER subgraph widget on the PARENT subgraph node, so it can be set from outside without opening the subgraph — e.g. surface an inner KSampler's `seed`/`steps` on the subgraph node. You MUST be inside the subgraph first (call panel_enter_subgraph): `node_id` is an inner node (from panel_get_graph while inside) and `widget` is one of its widget names. Pass demote:true to un-promote. Undoable with Ctrl+Z.",
+        {
+          node_id: z.number().int().describe("Inner node id (from panel_get_graph while inside the subgraph)."),
+          widget: z.string().describe("Name of the widget on that node to promote (e.g. 'seed', 'steps', 'text')."),
+          demote: z.boolean().optional().describe("Set true to UN-promote (remove the widget from the parent node)."),
+        },
+        async (args) =>
+          call({ cmd: "graph_promote_widget", node_id: args.node_id, widget: args.widget, demote: args.demote }, 15000),
       ),
       tool(
         "panel_search_nodes",

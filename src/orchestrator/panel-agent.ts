@@ -13,8 +13,8 @@
 // (verified: the session reports apiKeySource=none on this machine).
 //
 // The spawned agent runs THIS comfyui-mcp build as its MCP server in normal
-// (non-channels) mode, so it talks to the live ComfyUI over COMFYUI_URL and
-// never contends for the bridge port the orchestrator owns.
+// mode, so it talks to the live ComfyUI over COMFYUI_URL and never contends for
+// the bridge port the orchestrator owns.
 
 import type {
   Query,
@@ -144,6 +144,28 @@ export interface UsageStatus {
   costUsd?: number;
 }
 
+/** A live streaming delta for the panel — incremental thinking/reply text as the
+ *  model produces it (from SDKPartialAssistantMessage stream events). `id` is the
+ *  SDK message id, so the frontend groups deltas into one bubble and the final
+ *  authoritative `say` (carrying the same id) replaces the streamed preview. */
+export interface StreamDelta {
+  /** "think" = extended-thinking text, "text" = reply text, "end" = message done. */
+  phase: "think" | "text" | "end";
+  /** SDK message id grouping all deltas of one assistant message. */
+  id: string;
+  /** The incremental text chunk (absent for phase "end"). */
+  delta?: string;
+}
+
+/** Optional metadata attached to a committed `onSay` so the frontend can reconcile
+ *  it with a live streaming bubble (same `id`) instead of duplicating it. */
+export interface SayMeta {
+  /** SDK message id — matches the StreamDelta.id of the live preview, if any. */
+  id?: string;
+  /** True when this text was already streamed via onStream (so the bubble exists). */
+  streamed?: boolean;
+}
+
 /** A ComfyUI image reference the panel sends so the orchestrator can fetch the
  *  bytes from /view and deliver them to the agent as an inline image block —
  *  saving the agent a fetch round-trip. */
@@ -154,7 +176,7 @@ export interface ImageRef {
 }
 
 export interface PanelAgentDeps {
-  /** mcpServers config for the spawned agent (the comfyui MCP, non-channels). */
+  /** mcpServers config for the spawned agent (the comfyui MCP). */
   mcpServers: Options["mcpServers"];
   /** Base URL of the ComfyUI instance, for fetching image bytes (/view). */
   comfyuiUrl?: string;
@@ -164,8 +186,11 @@ export interface PanelAgentDeps {
   model: string;
   /** Reasoning effort for the session (low..max). Omitted = SDK default. */
   effort?: Effort;
-  /** Route the agent's words into the panel chat for this tab. */
-  onSay: (tabId: string, text: string) => void;
+  /** Route the agent's words into the panel chat for this tab. `meta.id` lets the
+   *  frontend reconcile a committed message with its live streaming preview. */
+  onSay: (tabId: string, text: string, meta?: SayMeta) => void;
+  /** Live incremental thinking/reply text as the model streams (optional). */
+  onStream?: (tabId: string, ev: StreamDelta) => void;
   /** Report per-turn usage (context meter) for this tab. */
   onStatus?: (tabId: string, status: UsageStatus) => void;
   /** Report the SDK session id once known, so the panel can persist/resume it. */
@@ -173,6 +198,8 @@ export interface PanelAgentDeps {
   /** Report turn lifecycle so the panel shows a "working" indicator that stays
    *  up through silent tool work and clears when the turn ends. */
   onTurn?: (tabId: string, state: "working" | "done") => void;
+  /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
+  onThinking?: (tabId: string, tokens: number) => void;
   /** In-process MCP server giving the agent LIVE control of this tab's graph. */
   panelServer?: McpSdkServerConfigWithInstance;
   /**
@@ -195,11 +222,18 @@ export class PanelAgent {
   private queue: Array<{ text: string; images?: ImageRef[] }> = [];
   private waiting: (() => void) | null = null;
   private closed = false;
+  /** True while a turn is in flight (working→done). Lets the manager defer a
+   *  session-restarting option change (effort) until the turn finishes, instead
+   *  of interrupting and silently dropping the in-flight reply. */
+  private busy = false;
   /** Mutable so the model/effort picker can change them at runtime. */
   private model: string;
   private effort?: Effort;
   /** Captured from the session's init message; enables resume across restarts. */
   sessionId: string | null = null;
+  /** Id of the assistant message currently streaming (from message_start), so
+   *  stream deltas and the final committed `say` share one bubble id. */
+  private streamMsgId: string | null = null;
   title: string | undefined;
   /** Usage from the most recent assistant API response — the CURRENT context
    *  size (input + cache), as opposed to result.usage which sums every internal
@@ -255,6 +289,7 @@ export class PanelAgent {
         `If it relates to what you were doing, diagnose it (panel_get_errors has the details) and offer a fix.`;
     }
     if (!text) return;
+    this.busy = true;
     this.deps.onTurn?.(this.tabId, "working"); // event triggers a turn — show working
     this.queue.push({ text, images });
     const wake = this.waiting;
@@ -314,6 +349,23 @@ export class PanelAgent {
    *  an SDK session that ended on its own (so the manager can self-heal). */
   get isStopped(): boolean {
     return this.closed;
+  }
+
+  /** True while a turn is actively running (between working and done). */
+  get isBusy(): boolean {
+    return this.busy;
+  }
+  /** True when messages are queued but not yet consumed (a turn is about to
+   *  start). The manager waits for both !busy and !hasPending before a restart. */
+  get hasPending(): boolean {
+    return this.queue.length > 0;
+  }
+  /** Remove and return any unsent queued messages — so a session restart can hand
+   *  them to the replacement agent instead of dropping them. */
+  takePending(): Array<{ text: string; images?: ImageRef[] }> {
+    const items = this.queue;
+    this.queue = [];
+    return items;
   }
 
   get currentModel(): string {
@@ -384,6 +436,11 @@ export class PanelAgent {
       permissionMode: "bypassPermissions",
       // Required alongside bypassPermissions (intentional, isolated background agent).
       allowDangerouslySkipPermissions: true,
+      // Stream partial assistant messages so the panel can show thinking + reply
+      // text live (token-by-token) instead of only the final block. route() turns
+      // these into onStream deltas; the final assistant message still commits the
+      // authoritative text via onSay (reconciled by message id).
+      includePartialMessages: true,
       mcpServers: {
         ...this.deps.mcpServers,
         // Live-graph control of THIS tab's open workflow (in-process; talks to
@@ -391,7 +448,7 @@ export class PanelAgent {
         ...(this.deps.panelServer ? { panel: this.deps.panelServer } : {}),
       },
       // Only our comfyui MCP — never inherit the user's project/user MCP config
-      // (which may run a second comfyui in --channels mode that grabs the port).
+      // (which may run a second comfyui that grabs the bridge port).
       strictMcpConfig: true,
       systemPrompt: {
         type: "preset",
@@ -466,10 +523,47 @@ export class PanelAgent {
           logger.info(
             `[panel-agent ${this.short()}] init model=${message.model} session=${message.session_id.slice(0, 8)} apiKeySource=${message.apiKeySource} effort=${this.effort ?? "default"} skills=${message.skills?.length ?? 0}`,
           );
+        } else if (message.subtype === "thinking_tokens") {
+          // Live extended-thinking token count → drives a "thinking… (N)" meter
+          // so the user can see the agent reasoning (not stuck) before any text.
+          const t = (message as unknown as { estimated_tokens?: number }).estimated_tokens;
+          if (typeof t === "number") {
+            this.busy = true;
+            this.deps.onTurn?.(this.tabId, "working");
+            this.deps.onThinking?.(this.tabId, t);
+          }
         }
         break;
+      case "stream_event": {
+        // Live partial output (includePartialMessages). Turn the raw Anthropic
+        // stream events into thinking/reply deltas the panel renders token-by-
+        // token. The authoritative text still commits via the `assistant` case.
+        const ev = (message as unknown as { event?: Record<string, unknown> }).event;
+        if (!ev || !this.deps.onStream) break;
+        const evType = ev.type as string | undefined;
+        if (evType === "message_start") {
+          const mid = (ev.message as { id?: string } | undefined)?.id;
+          this.streamMsgId = typeof mid === "string" ? mid : null;
+        } else if (evType === "content_block_delta") {
+          const d = ev.delta as { type?: string; text?: string; thinking?: string } | undefined;
+          const id = this.streamMsgId;
+          if (!d || !id) break;
+          if (d.type === "thinking_delta" && typeof d.thinking === "string" && d.thinking) {
+            this.deps.onTurn?.(this.tabId, "working");
+            this.deps.onStream(this.tabId, { phase: "think", id, delta: d.thinking });
+          } else if (d.type === "text_delta" && typeof d.text === "string" && d.text) {
+            this.deps.onTurn?.(this.tabId, "working");
+            this.deps.onStream(this.tabId, { phase: "text", id, delta: d.text });
+          }
+        } else if (evType === "message_stop") {
+          if (this.streamMsgId) this.deps.onStream(this.tabId, { phase: "end", id: this.streamMsgId });
+          this.streamMsgId = null;
+        }
+        break;
+      }
       case "assistant": {
         // Still working — keep the panel's indicator alive through the turn.
+        this.busy = true;
         this.deps.onTurn?.(this.tabId, "working");
         // Each assistant API response carries the CURRENT context size — report
         // it live so the meter updates throughout the turn, not just at the end.
@@ -478,16 +572,22 @@ export class PanelAgent {
           this.lastUsage = u;
           this.reportStatus(u);
         }
-        // Relay each text block into the panel chat — progress and final reply.
+        // Commit the authoritative reply text as ONE message. With streaming on,
+        // the panel already showed a live preview (matched by this message id);
+        // the commit replaces it with the final text. Without streaming (or for
+        // injected events), it just renders a normal bubble.
         const content = (message.message?.content ?? []) as Array<{
           type: string;
           text?: string;
         }>;
-        for (const block of content) {
-          if (block.type === "text" && typeof block.text === "string") {
-            const text = block.text.trim();
-            if (text) this.deps.onSay(this.tabId, text);
-          }
+        const text = content
+          .filter((b) => b.type === "text" && typeof b.text === "string")
+          .map((b) => b.text as string)
+          .join("\n\n")
+          .trim();
+        if (text) {
+          const id = (message.message as unknown as { id?: string })?.id;
+          this.deps.onSay(this.tabId, text, { id, streamed: true });
         }
         break;
       }
@@ -504,6 +604,7 @@ export class PanelAgent {
           }
         }
         if (this.lastUsage) this.reportStatus(this.lastUsage, m.total_cost_usd);
+        this.busy = false;
         this.deps.onTurn?.(this.tabId, "done");
         logger.info(
           `[panel-agent ${this.short()}] turn done (subtype=${message.subtype})`,
@@ -548,10 +649,14 @@ export interface PanelAgentManagerOptions {
   effort?: Effort;
   /** ComfyUI base URL, for fetching image bytes to inline into agent turns. */
   comfyuiUrl?: string;
-  onSay: (tabId: string, text: string) => void;
+  onSay: (tabId: string, text: string, meta?: SayMeta) => void;
+  /** Live incremental thinking/reply deltas (streaming). */
+  onStream?: (tabId: string, ev: StreamDelta) => void;
   onStatus?: (tabId: string, status: UsageStatus) => void;
   onSession?: (tabId: string, sessionId: string) => void;
   onTurn?: (tabId: string, state: "working" | "done") => void;
+  /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
+  onThinking?: (tabId: string, tokens: number) => void;
   /** Build the per-tab live-graph MCP server (bound to the tab id). */
   makePanelServer?: (tabId: string) => McpSdkServerConfigWithInstance;
   /** Bundled plugin dir whose skills make the agent an expert (optional). */
@@ -564,6 +669,9 @@ export class PanelAgentManager {
   private opts: PanelAgentManagerOptions;
   /** Per-tab session id to resume on the next spawn (reload restore). */
   private pendingResume = new Map<string, string>();
+  /** Tabs whose effort changed mid-turn — the session restart is deferred to the
+   *  next idle moment so we never interrupt (and silently drop) a live reply. */
+  private pendingEffortRestart = new Set<string>();
   /** Default model/effort for newly-spawned agents (mutated by the picker). */
   private model: string;
   private effort?: Effort;
@@ -582,12 +690,51 @@ export class PanelAgentManager {
       model: this.model,
       effort: this.effort,
       onSay: this.opts.onSay,
+      onStream: this.opts.onStream,
       onStatus: this.opts.onStatus,
       onSession: this.opts.onSession,
-      onTurn: this.opts.onTurn,
+      // Wrap onTurn so the manager learns when a turn ends — the safe point to
+      // apply a deferred, session-restarting effort change.
+      onTurn: (id, state) => {
+        this.opts.onTurn?.(id, state);
+        if (state === "done") this.applyDeferredRestart(id);
+      },
+      onThinking: this.opts.onThinking,
       panelServer: this.opts.makePanelServer?.(tabId),
       pluginPath: this.opts.pluginPath,
     });
+  }
+
+  /** Effort is a session-construction option (no live setter), so changing it
+   *  needs a fresh resumed session. Do it ONLY when the tab is idle — restart
+   *  with resume, and hand any queued-but-unsent messages to the new agent so
+   *  nothing is lost. Called on every turn-done; a no-op unless a restart is
+   *  pending and the agent has fully settled. */
+  private applyDeferredRestart(tabId: string): void {
+    if (!this.pendingEffortRestart.has(tabId)) return;
+    const agent = this.agents.get(tabId);
+    if (!agent || agent.isStopped) {
+      this.pendingEffortRestart.delete(tabId);
+      return;
+    }
+    // Still mid-work (a queued message will start the next turn) — wait for the
+    // next idle so we don't restart between back-to-back turns.
+    if (agent.isBusy || agent.hasPending) return;
+    this.pendingEffortRestart.delete(tabId);
+    this.restartForEffort(tabId, agent);
+  }
+
+  /** Replace a tab's agent with a fresh one (new model/effort), resuming the
+   *  conversation and carrying over any unsent queued messages. */
+  private restartForEffort(tabId: string, oldAgent: PanelAgent): void {
+    const resume = oldAgent.sessionId ?? undefined;
+    const pending = oldAgent.takePending();
+    const fresh = this.spawn(tabId, resume); // new agent (updated this.effort) owns the tab
+    for (const item of pending) fresh.send(item.text, { images: item.images });
+    void oldAgent.stop(); // retire the old one; it's no longer mapped
+    logger.info(
+      `[panel-orchestrator] tab ${tabId.slice(0, 8)} effort restart applied (idle, ${pending.length} queued carried over)`,
+    );
   }
 
   /** Last usage snapshot for a tab's agent (for re-pushing the meter on connect). */
@@ -655,16 +802,21 @@ export class PanelAgentManager {
   }
 
   /**
-   * Apply a model/effort change for a tab. Model switches live; effort requires
-   * a session restart, so we recreate the agent with resume to continue the
-   * conversation seamlessly. Returns a human summary of what changed.
+   * Apply a model/effort change for a tab. Model switches live (SDK setModel).
+   * Effort has no live setter, so it needs a fresh resumed session — but we NEVER
+   * do that mid-turn (it would interrupt and silently drop the in-flight reply,
+   * which read as "the agent stopped responding"). If a turn is running, the
+   * restart is deferred to the next idle moment (applyDeferredRestart); if idle,
+   * it happens now. Either way the model change is applied live immediately.
+   * `restarted` is true only when the session was actually recreated in this call.
    */
   async setOptions(
     tabId: string,
     next: { model?: string; effort?: Effort | null },
-  ): Promise<{ model: string; effort?: Effort; restarted: boolean }> {
+  ): Promise<{ model: string; effort?: Effort; restarted: boolean; deferred: boolean }> {
     const changes: string[] = [];
     let restarted = false;
+    let deferred = false;
 
     if (typeof next.model === "string" && next.model && next.model !== this.model) {
       this.model = next.model;
@@ -684,25 +836,31 @@ export class PanelAgentManager {
 
     const agent = this.agents.get(tabId);
     if (agent) {
-      if (effortChanged) {
-        // Effort is a session option → recreate the agent (new effort + model),
-        // resuming so the conversation carries over. Swap the map SYNCHRONOUSLY
-        // (spawn before the async stop) so a concurrent send() can't interleave
-        // and spawn a competing agent in the gap.
-        const resume = agent.sessionId ?? undefined;
-        this.spawn(tabId, resume); // new agent (uses updated this.model/effort) owns the tab
-        void agent.stop(); // retire the old one; it's no longer mapped
-        restarted = true;
-      } else if (typeof next.model === "string" && next.model) {
-        // Model-only change applies live to the existing session.
+      // Apply a model change live regardless of the effort path (so a deferred
+      // effort restart doesn't hold up the model switch).
+      if (typeof next.model === "string" && next.model) {
         await agent.setModel(next.model);
+      }
+      if (effortChanged) {
+        if (agent.isBusy || agent.hasPending) {
+          // Mid-turn → defer; applyDeferredRestart fires on the next turn-done.
+          this.pendingEffortRestart.add(tabId);
+          deferred = true;
+        } else {
+          // Idle → restart now (resume + carry over any queued messages).
+          this.pendingEffortRestart.delete(tabId);
+          this.restartForEffort(tabId, agent);
+          restarted = true;
+        }
       }
     }
 
     if (changes.length) {
-      logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} options: ${changes.join(" ")}`);
+      logger.info(
+        `[panel-orchestrator] tab ${tabId.slice(0, 8)} options: ${changes.join(" ")}${deferred ? " (effort restart deferred to idle)" : ""}`,
+      );
     }
-    return { model: this.model, effort: this.effort, restarted };
+    return { model: this.model, effort: this.effort, restarted, deferred };
   }
 
   /** Forget a tab's agent so the next message starts a brand-new session. The
@@ -713,6 +871,7 @@ export class PanelAgentManager {
     const agent = this.agents.get(tabId);
     this.agents.delete(tabId);
     this.pendingResume.delete(tabId);
+    this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     if (agent) {
       logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} reset — new session next message`);
       void agent.stop();
@@ -724,6 +883,7 @@ export class PanelAgentManager {
   }
 
   async stopAll(): Promise<void> {
+    this.pendingEffortRestart.clear();
     await Promise.all([...this.agents.values()].map((a) => a.stop()));
     this.agents.clear();
   }
