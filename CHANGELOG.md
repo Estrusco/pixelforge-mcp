@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.30.0] - 2026-07-09
+
+### MCP
+
+#### Added
+- render mailbox — never lose a render while the phone is away (#182)
+
+#### Docs
+- LLM Arena results for the gemma4-comfyui-mcp fine-tune ladder — `:e4b` 14/20
+  (best local model tested), `:12b` 13/20, `:e2b` honestly flagged at 4/20
+  pending the v2 training fix (#183); leaderboard SVGs + sizing guidance
+  updated across docs, the local-llm-free skill, and the Ollama ack copy (#184)
+- "try the knowledge first": skills documented as standalone-readable plain
+  markdown, with a direct link to prompt-engineering/SKILL.md (#181, #185)
+
+
 ## [0.29.0] - 2026-07-09
 
 ### MCP
