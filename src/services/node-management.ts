@@ -5,6 +5,7 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
+import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -85,7 +86,7 @@ export interface InstalledNode {
 
 export interface NodeOpResult {
   /** Which mechanism handled the request. */
-  mechanism: "manager-http" | "cm-cli" | "git-clone";
+  mechanism: "manager-http" | "comfy-cli" | "git-clone";
   /** Human-readable summary. */
   message: string;
   /** Raw queue status (HTTP path) or subprocess output (cm-cli path). */
@@ -419,7 +420,7 @@ async function queueManagerTask(
 // cm-cli subprocess helper
 // ---------------------------------------------------------------------------
 
-const CM_CLI_TIMEOUT = 600_000;
+const COMFY_CLI_TIMEOUT = 600_000;
 // A real custom-node repo clones well under this; with prompts disabled a
 // missing/private repo fails in ~1s rather than blocking the whole timeout.
 const GIT_CLONE_TIMEOUT = 180_000;
@@ -469,35 +470,32 @@ function resolveCmCliPath(): string {
  * Throws ProcessControlError if comfyuiPath is undefined (remote mode).
  */
 function runCmCli(args: string[]): string {
-  const cmCli = resolveCmCliPath();
-  const pythonExe = process.env.COMFYUI_PYTHON || "python";
-  logger.info("Running cm-cli", { args: [cmCli, ...args].join(" ") });
-
+  if (!config.comfyuiPath) {
+    throw new ProcessControlError(
+      "This operation requires a local ComfyUI install. Set COMFYUI_PATH or use the Manager HTTP API.",
+    );
+  }
+  logger.info("Running comfy-cli", { args: ["node", ...args].join(" ") });
   try {
-    const out = execFileSync(pythonExe, [cmCli, ...args], {
-      cwd: config.comfyuiPath,
-      encoding: "utf-8",
-      timeout: CM_CLI_TIMEOUT,
-      env: {
-        ...process.env,
-        ...(config.githubToken ? { GITHUB_TOKEN: config.githubToken } : {}),
-      },
-    });
-    return out;
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
-    const stdout = e.stdout ? e.stdout.toString() : "";
-    const stderr = e.stderr ? e.stderr.toString() : "";
-    if (e.code === "ENOENT") {
+    const envelope = assertComfyCliOk(
+      runComfyCliSync(["node", ...args], {
+        workspace: config.comfyuiPath,
+        timeoutMs: COMFY_CLI_TIMEOUT,
+        env: config.githubToken ? { GITHUB_TOKEN: config.githubToken } : undefined,
+      }),
+    );
+    return JSON.stringify(envelope.data ?? {}, null, 2);
+  } catch (error) {
+    const processError = error as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
+    if (processError.code === "ENOENT") {
       throw new ProcessControlError(
-        `Python executable "${pythonExe}" not found. Set COMFYUI_PYTHON to the ` +
-          `python interpreter for your ComfyUI install.`,
+        "The comfy-cli executable could not be started. Check COMFY_CLI_PATH and PATH.",
       );
     }
-    throw new NodeManagementError(
-      `cm-cli ${args[0]} failed: ${e.message}`,
-      { stdout, stderr },
-    );
+    throw new NodeManagementError(`comfy-cli node ${args[0]} failed: ${processError.message}`, {
+      stdout: processError.stdout?.toString() ?? "",
+      stderr: processError.stderr?.toString() ?? "",
+    });
   }
 }
 
@@ -877,7 +875,7 @@ function cloneCustomNodeFallback(
         execFileSync(python, ["-m", "pip", "install", "-r", requirements], {
           cwd: nodeDir,
           encoding: "utf-8",
-          timeout: CM_CLI_TIMEOUT,
+          timeout: COMFY_CLI_TIMEOUT,
         });
       } catch (err) {
         const e = err as Error;
@@ -891,7 +889,7 @@ function cloneCustomNodeFallback(
         execFileSync(python, [installScript], {
           cwd: nodeDir,
           encoding: "utf-8",
-          timeout: CM_CLI_TIMEOUT,
+          timeout: COMFY_CLI_TIMEOUT,
         });
       } catch (err) {
         const e = err as Error;
@@ -962,7 +960,7 @@ export async function installCustomNode(
       runGitCheckout(gitId, gitRef);
     }
     return {
-      mechanism: "cm-cli",
+      mechanism: "comfy-cli",
       message: `Installed "${id}" via cm-cli.`,
       details: out.trim(),
     };
@@ -1070,7 +1068,7 @@ export async function updateCustomNode(
   if (opts.useCmCli) {
     const out = runCmCli(["update", id, "--mode", mode, "--channel", channel]);
     return {
-      mechanism: "cm-cli",
+      mechanism: "comfy-cli",
       message: all
         ? "Updated all installed node packs via cm-cli."
         : `Updated "${id}" via cm-cli.`,
@@ -1135,7 +1133,7 @@ export async function reinstallCustomNode(
   if (opts.useCmCli) {
     const out = runCmCli(["reinstall", id, "--mode", mode, "--channel", channel]);
     return {
-      mechanism: "cm-cli",
+      mechanism: "comfy-cli",
       message: `Reinstalled "${id}" via cm-cli.`,
       details: out.trim(),
     };
@@ -1178,7 +1176,7 @@ export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
   if (opts.useCmCli || all) {
     const out = runCmCli(["fix", id, "--mode", mode, "--channel", channel]);
     return {
-      mechanism: "cm-cli",
+      mechanism: "comfy-cli",
       message: all
         ? "Repaired all installed node packs via cm-cli."
         : `Repaired "${id}" via cm-cli.`,
@@ -1237,7 +1235,7 @@ export async function listInstalledNodes(
 // ---------------------------------------------------------------------------
 
 export interface SyncDepsResult {
-  mechanism: "cm-cli";
+  mechanism: "comfy-cli";
   message: string;
   details?: unknown;
 }
@@ -1251,7 +1249,7 @@ export interface SyncDepsResult {
 export async function syncNodeDependencies(): Promise<SyncDepsResult> {
   const out = runCmCli(["restore-dependencies"]);
   return {
-    mechanism: "cm-cli",
+    mechanism: "comfy-cli",
     message:
       "Reconciled installed-node Python dependencies via cm-cli restore-dependencies.",
     details: out.trim(),

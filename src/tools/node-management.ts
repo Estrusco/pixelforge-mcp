@@ -29,7 +29,7 @@ const useCmCliSchema = z
   .boolean()
   .optional()
   .describe(
-    "Force the cm-cli.py subprocess instead of the ComfyUI-Manager HTTP API. Requires a local ComfyUI install (COMFYUI_PATH); errors in remote --comfyui-url mode.",
+    "Force the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install.",
   );
 
 const channelSchema = z
@@ -86,7 +86,7 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const result = await installCustomNode(args);
+        const result = await installCustomNode({ ...args, useCmCli: args.useCmCli ?? isLocalMode() });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -109,7 +109,7 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const result = await updateCustomNode(args);
+        const result = await updateCustomNode({ ...args, useCmCli: args.useCmCli ?? isLocalMode() });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -134,7 +134,7 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const result = await reinstallCustomNode(args);
+        const result = await reinstallCustomNode({ ...args, useCmCli: args.useCmCli ?? isLocalMode() });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -168,7 +168,7 @@ export function registerNodeManagementTools(server: McpServer): void {
         );
       }
       try {
-        const result = await fixCustomNode(args);
+        const result = await fixCustomNode({ ...args, useCmCli: args.useCmCli ?? isLocalMode() });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
