@@ -9,7 +9,17 @@
 
 import type { ImageRef } from "./panel-agent.js";
 
-export type BackendId = "claude" | "codex" | "gemini" | "ollama" | "openrouter";
+export type BackendId =
+  | "claude"
+  | "codex"
+  | "chatgpt"
+  | "gemini"
+  | "grok"
+  | "glm"
+  | "kimi"
+  | "ollama"
+  | "openrouter"
+  | "copilot";
 
 /**
  * A user turn in PROVIDER-NEUTRAL form. PanelAgent owns the queue/turn-gate and
@@ -222,6 +232,21 @@ export const GEMINI_CAPABILITIES: AgentCapabilities = {
   vision: true, // gemini-2.5 sees images; delivered as inline base64 image ContentBlocks
 };
 
+/** Capability descriptor for the Grok CLI ACP backend (xAI / Grok Build).
+ *  Same ACP posture as Gemini: persistent session, streaming deltas, interrupt,
+ *  config-declared MCP servers, static model catalog at spawn. */
+export const GROK_CAPABILITIES: AgentCapabilities = {
+  persistentChannel: true,
+  streamingDeltas: true,
+  interruptMidTurn: true,
+  forkAtAnchor: false,
+  inProcessMcp: false,
+  modelEnumeration: true, // grok-composer-2.5-fast / grok-build — ACP exposes no catalog
+  slashCommands: false,
+  hooks: false,
+  vision: true,
+};
+
 /** Capability descriptor for the Ollama local-LLM backend (issue #97's panel
  *  phase). Ollama is a stateless HTTP daemon, so the backend owns the whole
  *  agentic loop itself (stream /api/chat, dispatch tool calls, repeat) and
@@ -239,4 +264,36 @@ export const OLLAMA_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: false,
+};
+
+/** ChatGPT subscription via direct Codex OAuth (~/.codex/auth.json) — Codex Responses
+ *  HTTP backend (not the codex app-server CLI). Same 6-tool router as Ollama. */
+export const CHATGPT_CAPABILITIES: AgentCapabilities = {
+  persistentChannel: true,
+  streamingDeltas: true,
+  interruptMidTurn: true,
+  forkAtAnchor: false,
+  inProcessMcp: false,
+  modelEnumeration: true, // ~/.codex/models_cache.json + configured default
+  slashCommands: false,
+  hooks: false,
+  vision: false,
+};
+
+/** Z.AI GLM Coding Plan — OpenAI-compatible /v1/chat/completions. */
+export const GLM_CAPABILITIES: AgentCapabilities = {
+  ...OLLAMA_CAPABILITIES,
+};
+
+/** Kimi Code subscription OAuth or KIMI_API_KEY — OpenAI-compatible coding API. */
+export const KIMI_CAPABILITIES: AgentCapabilities = {
+  ...OLLAMA_CAPABILITIES,
+};
+
+/** GitHub Copilot chat via in-panel device-code OAuth — EXPERIMENTAL (ToS risk,
+ *  see OAUTH_PROVIDERS.copilot). OpenAI-compatible chat/completions + the same
+ *  6-tool router as Ollama/GLM/Kimi. The exact contract (endpoints, headers) is
+ *  UNVERIFIED offline — see copilot-backend.ts's module doc. */
+export const COPILOT_CAPABILITIES: AgentCapabilities = {
+  ...OLLAMA_CAPABILITIES,
 };

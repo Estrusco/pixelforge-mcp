@@ -51,8 +51,15 @@ import {
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
+import { GrokBackend, GROK_DEFAULT_MODEL } from "./grok-backend.js";
 import { OllamaBackend } from "./ollama-backend.js";
+import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL } from "./chatgpt-oauth-backend.js";
+import { GlmBackend, GLM_DEFAULT_MODEL } from "./glm-backend.js";
+import { KimiBackend, KIMI_DEFAULT_MODEL } from "./kimi-backend.js";
+import { CopilotBackend, COPILOT_DEFAULT_MODEL } from "./copilot-backend.js";
 import { allBackendReadiness } from "./backend-readiness.js";
+import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth-bridge.js";
+import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
 import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
@@ -956,6 +963,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // COMFYUI_MCP_GEMINI_MODEL (default gemini-2.5-pro). The model is applied at spawn
   // via the CLI `--model` flag (ACP exposes no per-session model setter).
   const geminiModel = process.env.COMFYUI_MCP_GEMINI_MODEL ?? GEMINI_DEFAULT_MODEL;
+  const grokModel = process.env.COMFYUI_MCP_GROK_MODEL ?? GROK_DEFAULT_MODEL;
   // Ollama (local LLMs, issue #97): the model is a local tag applied PER
   // REQUEST — switching live is free. Default = OUR FINE-TUNE,
   // artokun/gemma4-comfyui-mcp:e4b — gemma4 QLoRA-trained on 1055
@@ -977,6 +985,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   const persistedAgent = getAgentSettings();
   let ollamaModel =
     process.env.COMFYUI_MCP_OLLAMA_MODEL ?? persistedAgent.ollama?.model ?? "artokun/gemma4-comfyui-mcp:e4b";
+  const chatgptModel = process.env.COMFYUI_MCP_CHATGPT_MODEL ?? CHATGPT_DEFAULT_MODEL;
+  const glmModel = process.env.COMFYUI_MCP_GLM_MODEL ?? GLM_DEFAULT_MODEL;
+  const kimiModel = process.env.COMFYUI_MCP_KIMI_MODEL ?? KIMI_DEFAULT_MODEL;
+  // EXPERIMENTAL (ToS risk) — off by default, only reachable once the user has
+  // signed in via the panel's experimental row (oauth-bridge.ts's
+  // allow_experimental gate); never the defaultBackend/auto-pick.
+  const copilotModel = process.env.COMFYUI_MCP_COPILOT_MODEL ?? COPILOT_DEFAULT_MODEL;
   // The same backend also speaks any OpenAI-compatible endpoint (OpenRouter,
   // DeepSeek, vLLM, LM Studio): COMFYUI_MCP_OLLAMA_API=openai +
   // COMFYUI_MCP_OLLAMA_BASE_URL (incl. /v1) + COMFYUI_MCP_OLLAMA_API_KEY
@@ -1064,7 +1079,21 @@ export async function runPanelOrchestrator(): Promise<void> {
   // provider (the panel replays the transcript to seed it) while a same-provider
   // reconnect RESUMES. `backendId`/`codexModel`/`geminiModel` above are the
   // DEFAULT + per-provider model config; the process is no longer pinned to one.
-  const KNOWN_BACKENDS = new Set(["claude", "codex", "gemini", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]);
+  const KNOWN_BACKENDS = new Set([
+    "claude",
+    "codex",
+    "chatgpt",
+    "gemini",
+    "grok",
+    "glm",
+    "kimi",
+    "ollama",
+    "openrouter",
+    "lmstudio",
+    "llamacpp",
+    "custom",
+    "copilot", // EXPERIMENTAL — see copilotModel's comment above
+  ]);
   const defaultBackend = KNOWN_BACKENDS.has(backendId) ? backendId : "claude";
   const AGENT_KEY_SEP = "::";
   const tabBackends = new Map<string, string>(); // panel tabId -> selected backend
@@ -1232,6 +1261,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         mcpServers: makeHttpBackendMcpServers(panelTabId),
       });
     }
+    if (backend === "grok") {
+      return new GrokBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: grokModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
     if (backend === "ollama") {
       return new OllamaBackend({
         cwd: comfyuiPath ?? process.cwd(),
@@ -1282,11 +1320,51 @@ export async function runPanelOrchestrator(): Promise<void> {
         ...customDeps(),
       });
     }
+    if (backend === "chatgpt") {
+      return new ChatGptOAuthBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: chatgptModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "glm") {
+      return new GlmBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: glmModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "kimi") {
+      return new KimiBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: kimiModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "copilot") {
+      // EXPERIMENTAL (ToS risk) — prepare() throws a clear re-sign-in error if
+      // no ~/.comfyui-mcp/copilot-auth.json exists yet (resolveCopilotOAuth),
+      // so simply being selectable here does not make it USABLE without the
+      // panel's experimental opt-in sign-in flow having already run.
+      return new CopilotBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: copilotModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
     return undefined; // claude → built-in ClaudeBackend
   };
   logger.info(
     `[panel-orchestrator] single-port multi-provider: default backend=${defaultBackend}; ` +
-      `codex/gemini panel_* live-graph tools via loopback HTTP MCP${panelMcpHttp ? ` on :${panelMcpHttp.port}` : " UNAVAILABLE"} + headless comfyui MCP`,
+      `codex/gemini/grok panel_* live-graph tools via loopback HTTP MCP${panelMcpHttp ? ` on :${panelMcpHttp.port}` : " UNAVAILABLE"} + headless comfyui MCP`,
   );
   // Readiness/model probing routes through the SELECTED backend PER TAB — a
   // codex/gemini tab's "ready" must NOT depend on Claude SDK/login health. Claude
@@ -1301,17 +1379,27 @@ export async function runPanelOrchestrator(): Promise<void> {
       pb =
         backend === "codex"
           ? new CodexBackend({ cwd: comfyuiPath ?? process.cwd(), model: codexModel })
+          : backend === "chatgpt"
+            ? new ChatGptOAuthBackend({ cwd: comfyuiPath ?? process.cwd(), model: chatgptModel })
+          : backend === "glm"
+            ? new GlmBackend({ cwd: comfyuiPath ?? process.cwd(), model: glmModel })
+          : backend === "kimi"
+            ? new KimiBackend({ cwd: comfyuiPath ?? process.cwd(), model: kimiModel })
           : backend === "ollama"
             ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: ollamaModel, ...ollamaDeps() })
-            : backend === "openrouter"
-              ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: openrouterModel, ...openrouterDeps() })
-              : backend === "lmstudio"
-                ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: lmstudioModel, ...lmstudioDeps() })
-                : backend === "llamacpp"
-                  ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: llamacppModel, ...llamacppDeps() })
-                  : backend === "custom"
-                    ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: customModel, ...customDeps() })
-                    : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
+            : backend === "grok"
+              ? new GrokBackend({ cwd: comfyuiPath ?? process.cwd(), model: grokModel })
+              : backend === "openrouter"
+                ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: openrouterModel, ...openrouterDeps() })
+                : backend === "lmstudio"
+                  ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: lmstudioModel, ...lmstudioDeps() })
+                  : backend === "llamacpp"
+                    ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: llamacppModel, ...llamacppDeps() })
+                    : backend === "custom"
+                      ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: customModel, ...customDeps() })
+                      : backend === "copilot"
+                        ? new CopilotBackend({ cwd: comfyuiPath ?? process.cwd(), model: copilotModel })
+                        : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
       probeBackends.set(backend, pb);
     }
     return pb;
@@ -1649,11 +1737,16 @@ export async function runPanelOrchestrator(): Promise<void> {
   function currentModelFor(backend: string): string | undefined {
     if (backend === "codex") return codexModel;
     if (backend === "gemini") return geminiModel;
+    if (backend === "grok") return grokModel;
     if (backend === "ollama") return ollamaModel;
     if (backend === "openrouter") return openrouterModel;
     if (backend === "lmstudio") return lmstudioModel || undefined;
     if (backend === "llamacpp") return llamacppModel || undefined;
     if (backend === "custom") return customModel || undefined;
+    if (backend === "chatgpt") return chatgptModel;
+    if (backend === "glm") return glmModel;
+    if (backend === "kimi") return kimiModel;
+    if (backend === "copilot") return copilotModel;
     return model;
   }
   function pushModels(panelTabId: string): void {
@@ -1798,12 +1891,17 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (now - (lastAckAt.get(panelTab) ?? 0) < ACK_DEBOUNCE_MS) return;
       lastAckAt.set(panelTab, now);
       const isCx = backend === "codex";
+      const isCg = backend === "chatgpt";
       const isGm = backend === "gemini";
+      const isGk = backend === "grok";
+      const isGl = backend === "glm";
+      const isKm = backend === "kimi";
       const isOl = backend === "ollama";
       const isOr = backend === "openrouter";
       const isLs = backend === "lmstudio";
       const isLc = backend === "llamacpp";
       const isCu = backend === "custom";
+      const isCp = backend === "copilot";
       // TRUTHFUL "connected": only claim ready after PROVING the SELECTED backend
       // can run, by probing its model list. If the probe fails — the "connected
       // but dead" wedge — send a degraded ack so the panel shows the real state.
@@ -1849,8 +1947,16 @@ export async function runPanelOrchestrator(): Promise<void> {
           if (models.length) {
             const agentLabel = isCx
               ? (codexModel ?? (models[0] as { value?: string }).value ?? "Codex")
+              : isCg
+                ? (chatgptModel ?? (models[0] as { value?: string }).value ?? "ChatGPT")
               : isGm
                 ? (geminiModel ?? (models[0] as { value?: string }).value ?? "Gemini")
+                : isGk
+                  ? (grokModel ?? (models[0] as { value?: string }).value ?? "Grok")
+                : isGl
+                  ? (glmModel ?? (models[0] as { value?: string }).value ?? "GLM")
+                : isKm
+                  ? (kimiModel ?? (models[0] as { value?: string }).value ?? "Kimi")
                 : isOl
                   ? (ollamaModel ?? (models[0] as { value?: string }).value ?? "Ollama")
                   : isLs
@@ -1861,7 +1967,9 @@ export async function runPanelOrchestrator(): Promise<void> {
                         ? (customModel || ((models[0] as { value?: string }).value ?? "Custom endpoint"))
                         : isOr
                       ? (openrouterModel ?? (models[0] as { value?: string }).value ?? "OpenRouter")
-                      : model;
+                      : isCp
+                        ? (copilotModel ?? (models[0] as { value?: string }).value ?? "Copilot")
+                        : model;
             // llama.cpp launch gotchas (issue #161): a reachable server can still
             // be useless for us — tool calling needs --jinja (rejected requests),
             // and a launch-time -c under ~16K silently truncates the tool payload.
@@ -1899,8 +2007,16 @@ export async function runPanelOrchestrator(): Promise<void> {
             if (!resume) {
               const readyText = isCx
                 ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Codex (ChatGPT) account. Ask away.`
+                : isCg
+                  ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your ChatGPT subscription (direct OAuth). Ask away.`
                 : isGm
                   ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Google account (Gemini Code Assist). Ask away.`
+                  : isGk
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Grok (xAI) account. Ask away.`
+                  : isGl
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Z.AI GLM Coding Plan. Ask away.`
+                  : isKm
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Kimi Code subscription. Ask away.`
                   : isOl
                     ? `🟢 comfyui-mcp agent ready — ${agentLabel} running locally via Ollama (no account, no API key). Small local models are slower and simpler than frontier ones — expect fewer frills. Ask away.`
                     : isLs
@@ -1911,6 +2027,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                           ? `🟢 comfyui-mcp agent ready — ${agentLabel} via your custom endpoint (${customBaseUrl}). Ask away.`
                           : isOr
                       ? `🟢 comfyui-mcp agent ready — ${agentLabel} via OpenRouter (hosted API, your OPENROUTER_API_KEY). Ask away.`
+                      : isCp
+                        ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your GitHub Copilot subscription (⚠️ experimental, ToS risk — you opted in). Ask away.`
                       : `🟢 comfyui-mcp agent ready — ${agentLabel} on your Claude subscription. Ask away.`;
               bridge.push({ type: "say", text: readyText }, panelTab);
             }
@@ -1919,8 +2037,16 @@ export async function runPanelOrchestrator(): Promise<void> {
           } else {
             const degradedText = isCx
               ? "⚠️ The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry."
+              : isCg
+                ? "⚠️ The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry."
               : isGm
                 ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
+                : isGk
+                  ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
+                : isGl
+                  ? "⚠️ The background agent isn't responding — GLM Code API couldn't start. Set ZAI_API_KEY (Z.AI Coding Plan), then Disconnect → Connect to retry."
+                : isKm
+                  ? "⚠️ The background agent isn't responding — Kimi Code couldn't start. Run Kimi Code login (~/.kimi/credentials/kimi-code.json) or set KIMI_API_KEY, then Disconnect → Connect to retry."
                 : isOl
                   ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite — arena-best local model; `:12b` for ~8 GB VRAM), then Disconnect → Connect to retry."
                   : isLs
@@ -1929,6 +2055,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                       ? `⚠️ The background agent isn't responding — llama-server isn't reachable at ${LLAMACPP_BASE_URL}. Start it with \`llama-server -m <model>.gguf -c 16384\` (our gemma4-comfyui-mcp GGUFs work great; add --jinja on older builds — required there for tool calling), or set COMFYUI_MCP_LLAMACPP_HOST — then Disconnect → Connect to retry.`
                       : isCu
                         ? `⚠️ The background agent isn't responding — your custom endpoint isn't answering at ${customBaseUrl}. Check the base URL in Settings → Custom endpoint (it must be OpenAI-compatible and include the /v1) and the API key if the server requires one — then Connect to retry.`
+                        : isCp
+                          ? "⚠️ The background agent isn't responding — GitHub Copilot (experimental) couldn't start. Sign in from the panel's experimental row, then Disconnect → Connect to retry."
                         : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
             bridge.push({ type: "say", text: degradedText }, panelTab);
             bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
@@ -2208,6 +2336,78 @@ export async function runPanelOrchestrator(): Promise<void> {
           tabId,
         );
       });
+      return;
+    }
+
+    // In-panel OAuth sign-in: kick a loopback (codex/grok) or device-code
+    // (copilot, experimental) flow. Reply comes back FAST (loopback: just
+    // "browser opened"; device: the user_code to show) — the actual sign-in
+    // completes in the background and pushes a refreshed `{type:"backends"}`
+    // frame via pushReadiness when it lands. STATUS ONLY ever crosses the
+    // bridge here — no token material (see oauth-bridge.ts).
+    if (event.type === "oauth_begin" && event.tab_id) {
+      const tabId = event.tab_id;
+      const provider = typeof (event as { provider?: unknown }).provider === "string"
+        ? (event as { provider?: string }).provider
+        : undefined;
+      const allowExperimental = (event as { allow_experimental?: unknown }).allow_experimental === true;
+      handleOAuthBegin(
+        { provider, allow_experimental: allowExperimental },
+        {
+          onAuthChanged: () => pushReadiness(tabId),
+          onBackgroundError: (providerId, message) => {
+            const label = OAUTH_PROVIDERS[providerId]?.label ?? providerId;
+            bridge.push({ type: "say", text: `⚠️ ${label} sign-in failed: ${message}` }, tabId);
+          },
+        },
+      )
+        .then((result) => {
+          bridge.push({ type: "ack", ok: true, kind: "oauth_begin", ...result }, tabId);
+          logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} oauth_begin ${provider} → ${result.mode}`);
+        })
+        .catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          // Echo the requested provider on the failure ack too, so the panel
+          // routes the error to the row that asked (correlation) rather than
+          // guessing "last-clicked". provider may be undefined for a malformed
+          // request; the panel falls back to single-pending in that case.
+          bridge.push({ type: "ack", ok: false, kind: "oauth_begin", ...(provider ? { provider } : {}), message }, tabId);
+          logger.warn(`[panel-orchestrator] tab ${tabId.slice(0, 8)} oauth_begin ${provider ?? "?"} refused: ${message}`);
+        });
+      return;
+    }
+
+    // In-panel OAuth status: the panel's Connections tab polls this to show
+    // "signed in as …" per provider. Status-only mirror — never tokens.
+    if (event.type === "oauth_status" && event.tab_id) {
+      const tabId = event.tab_id;
+      try {
+        const result = handleOAuthStatus({});
+        bridge.push({ type: "ack", ok: true, kind: "oauth_status", ...result }, tabId);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        bridge.push({ type: "ack", ok: false, kind: "oauth_status", message }, tabId);
+      }
+      return;
+    }
+
+    // In-panel OAuth sign-out: clears the native token file + status mirror,
+    // then pushes refreshed readiness so the provider picker reflects it live.
+    if (event.type === "oauth_signout" && event.tab_id) {
+      const tabId = event.tab_id;
+      const provider = typeof (event as { provider?: unknown }).provider === "string"
+        ? (event as { provider?: string }).provider
+        : undefined;
+      try {
+        const result = handleOAuthSignout({ provider });
+        pushReadiness(tabId);
+        bridge.push({ type: "ack", kind: "oauth_signout", ...result }, tabId);
+        logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} oauth_signout ${provider}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Echo provider on failure too (correlation) — see oauth_begin above.
+        bridge.push({ type: "ack", ok: false, kind: "oauth_signout", ...(provider ? { provider } : {}), message }, tabId);
+      }
       return;
     }
 
