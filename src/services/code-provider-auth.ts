@@ -671,13 +671,14 @@ function nativeCliStatus(providerId: string, home = homedir()): OAuthStatusRecor
 
 /** All in-panel OAuth sign-ins' status (for the UI) — status only, never tokens.
  *  Merges the panel mirror with DETECTED native CLI auth (mirror wins) so a
- *  CLI-authenticated provider never asks the user to sign in a second time. */
-export function readOAuthStatus(): OAuthStatusRecord[] {
+ *  CLI-authenticated provider never asks the user to sign in a second time.
+ *  `home` is injectable so tests never read the developer's real logins. */
+export function readOAuthStatus(home = homedir()): OAuthStatusRecord[] {
   const mirror = listOAuthStatus();
   const seen = new Set(mirror.map((r) => r.provider));
   for (const providerId of ["codex", "grok", "copilot"]) {
     if (seen.has(providerId)) continue;
-    const detected = nativeCliStatus(providerId);
+    const detected = nativeCliStatus(providerId, home);
     if (detected) mirror.push(detected);
   }
   return mirror;

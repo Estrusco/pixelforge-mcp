@@ -105,10 +105,13 @@ function fileExists(...parts: string[]): boolean {
  *  never has to touch the real ~/.comfyui-mcp/panel-secrets.json), defaulting
  *  to the real store. Never throws — a corrupt/missing store just means "no
  *  panel sign-ins known", not a readiness crash. */
-function panelOAuthRecords(opts?: { oauthStatus?: OAuthStatusRecord[] }): OAuthStatusRecord[] {
+function panelOAuthRecords(opts?: { oauthStatus?: OAuthStatusRecord[]; home?: string }): OAuthStatusRecord[] {
   if (opts?.oauthStatus) return opts.oauthStatus;
   try {
-    return readOAuthStatus();
+    // Thread the (test-injectable) home through — readOAuthStatus also detects
+    // native CLI auth files under it, and reading the REAL home from inside a
+    // test-scoped readiness probe would leak the developer's own logins.
+    return readOAuthStatus(opts?.home);
   } catch {
     return [];
   }
