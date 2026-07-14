@@ -149,11 +149,13 @@ describe("OllamaBackend", () => {
     expect((chatRequests.at(-1) as { options?: unknown }).options).toEqual({ num_ctx: 16384 });
 
     // Our fine-tune → num_ctx omitted so the Modelfile's 65536 governs (a
-    // blanket 16384 here silently truncated conversations mid-flight).
+    // blanket 16384 here silently truncated conversations mid-flight) — but
+    // Gemma-recommended sampling IS sent, un-baking the Modelfile's greedy
+    // temperature 0 (the "goes in circles" loop machine).
     backend = new OllamaBackend({ model: "artokun/gemma4-comfyui-mcp:e4b", connectToolClients: async () => ({ comfyui: client }) });
     chatScript.push(oneTurn);
     await collect(backend, turnsOf({ text: "hi" }));
-    expect((chatRequests.at(-1) as { options?: unknown }).options).toEqual({});
+    expect((chatRequests.at(-1) as { options?: unknown }).options).toEqual({ temperature: 1.0, top_k: 64, top_p: 0.95 });
 
     // COMFYUI_MCP_OLLAMA_NUM_CTX beats everything (e.g. 128K on big VRAM).
     process.env.COMFYUI_MCP_OLLAMA_NUM_CTX = "131072";
@@ -161,10 +163,28 @@ describe("OllamaBackend", () => {
       backend = new OllamaBackend({ model: "artokun/gemma4-comfyui-mcp:e4b", connectToolClients: async () => ({ comfyui: client }) });
       chatScript.push(oneTurn);
       await collect(backend, turnsOf({ text: "hi" }));
-      expect((chatRequests.at(-1) as { options?: unknown }).options).toEqual({ num_ctx: 131072 });
+      expect((chatRequests.at(-1) as { options?: unknown }).options).toEqual({ num_ctx: 131072, temperature: 1.0, top_k: 64, top_p: 0.95 });
     } finally {
       delete process.env.COMFYUI_MCP_OLLAMA_NUM_CTX;
     }
+
+    // Sampling env overrides replace the fine-tune defaults wholesale — an
+    // explicit experiment (even temp 0) must win over our recommended trio.
+    process.env.COMFYUI_MCP_OLLAMA_TEMPERATURE = "0";
+    try {
+      backend = new OllamaBackend({ model: "artokun/gemma4-comfyui-mcp:e4b", connectToolClients: async () => ({ comfyui: client }) });
+      chatScript.push(oneTurn);
+      await collect(backend, turnsOf({ text: "hi" }));
+      expect((chatRequests.at(-1) as { options?: unknown }).options).toEqual({ temperature: 0 });
+    } finally {
+      delete process.env.COMFYUI_MCP_OLLAMA_TEMPERATURE;
+    }
+
+    // Stock models get NO sampling injection — their tags' own tuning governs.
+    backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    chatScript.push(oneTurn);
+    await collect(backend, turnsOf({ text: "hi" }));
+    expect((chatRequests.at(-1) as { options?: unknown }).options).toEqual({ num_ctx: 16384 });
   });
 
   it("breaks a tool loop: identical repeat calls are blocked, 4th repeat ends the turn", async () => {

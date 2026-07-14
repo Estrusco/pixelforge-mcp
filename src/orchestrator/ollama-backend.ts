@@ -260,6 +260,32 @@ export class OllamaBackend implements AgentBackend {
     return this.effectiveNumCtx() || 65536;
   }
 
+  /** Sampling options for /api/chat. The fine-tune tags bake `temperature 0`
+   *  into their Modelfile — fully greedy decoding, which on a small model is
+   *  the classic repetition-loop trap ("goes in circles" — Discord #help), and
+   *  contradicts the Gemma team's recommended sampling (temp 1.0, top_k 64,
+   *  top_p 0.95). Request options override the Modelfile, so we send explicit
+   *  sampling for the fine-tune (env-overridable for experiments); stock
+   *  models keep their own tuned defaults unless the env says otherwise. */
+  private samplingOptions(): Record<string, number> {
+    const envNum = (name: string): number | null => {
+      const raw = process.env[name];
+      if (raw === undefined || raw === "") return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
+    const t = envNum("COMFYUI_MCP_OLLAMA_TEMPERATURE");
+    const k = envNum("COMFYUI_MCP_OLLAMA_TOP_K");
+    const p = envNum("COMFYUI_MCP_OLLAMA_TOP_P");
+    const out: Record<string, number> = {};
+    if (t !== null) out.temperature = t;
+    if (k !== null) out.top_k = k;
+    if (p !== null) out.top_p = p;
+    if (Object.keys(out).length) return out;
+    // Fine-tune default: un-bake the Modelfile's temperature 0.
+    return this.isFinetune() ? { temperature: 1.0, top_k: 64, top_p: 0.95 } : {};
+  }
+
   async prepare(): Promise<void> {
     if (this.disposed) throw new Error("ollama backend is closed.");
     if (this.prepared) return;
@@ -528,7 +554,11 @@ export class OllamaBackend implements AgentBackend {
                 stream: true,
                 // See OllamaBackendDeps.numCtx: omit for our fine-tune so the
                 // tag's baked 65536 window governs instead of clamping it.
-                options: this.effectiveNumCtx() ? { num_ctx: this.effectiveNumCtx() } : {},
+                // samplingOptions un-bakes the fine-tune's Modelfile temp 0.
+                options: {
+                  ...(this.effectiveNumCtx() ? { num_ctx: this.effectiveNumCtx() } : {}),
+                  ...this.samplingOptions(),
+                },
               }),
               signal,
             });
