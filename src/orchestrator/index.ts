@@ -1949,6 +1949,36 @@ export async function runPanelOrchestrator(): Promise<void> {
           ? ((event as { backend?: string }).backend as string).toLowerCase()
           : undefined;
       const backend = reqBackend && KNOWN_BACKENDS.has(reqBackend) ? reqBackend : defaultBackend;
+      // Tab-id migration (issue #210): the BRIDGE stamps `migrated_from` on a
+      // hello when the SAME socket re-helloed under a new tab id (panel update
+      // changed the id scheme, e.g. random UUID → tmp:/wf:). That same-socket
+      // signal is the only safe rebind trigger — a workflow-title heuristic
+      // would steal agents across identically-titled tabs (two "Unsaved
+      // Workflow" tabs are routine). Rebind the old id's agent so the
+      // conversation survives instead of orphaning on a dead tab id.
+      const migratedFrom =
+        typeof (event as { migrated_from?: unknown }).migrated_from === "string"
+          ? ((event as { migrated_from?: string }).migrated_from as string)
+          : undefined;
+      if (migratedFrom && migratedFrom !== panelTab) {
+        const prevBackend = tabBackends.get(migratedFrom) ?? backend;
+        const prevKey = migratedFrom + AGENT_KEY_SEP + prevBackend;
+        const newKey = panelTab + AGENT_KEY_SEP + prevBackend;
+        if (manager.rebindAgent(prevKey, newKey)) {
+          logger.info(
+            `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — agent rebound, conversation preserved`,
+          );
+        }
+        // Carry the old tab's runtime prefs to the new id regardless of whether
+        // an agent was live (backend pick, headless flag), then retire the old id.
+        if (!tabBackends.has(panelTab) && tabBackends.has(migratedFrom)) {
+          tabBackends.set(panelTab, tabBackends.get(migratedFrom)!);
+        }
+        if (headlessTabs.has(migratedFrom)) headlessTabs.add(panelTab);
+        tabBackends.delete(migratedFrom);
+        headlessTabs.delete(migratedFrom);
+        workflowTargets.clear(migratedFrom);
+      }
       const prev = tabBackends.get(panelTab);
       if (prev && prev !== backend) {
         // Provider switch: retire the previous provider's agent for this tab so it

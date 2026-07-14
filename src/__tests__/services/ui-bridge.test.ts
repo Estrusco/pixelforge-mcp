@@ -362,6 +362,111 @@ describe("UiBridge (multi-tab)", () => {
     a.close();
   });
 
+  it("resolves via tab-id migration when a socket re-hellos under a new scheme (tmp:→wf:)", async () => {
+    // Simulate the bug scenario: a tab first connects with a random-UUID tab id
+    // (the old scheme), an agent binds to it, then the SAME socket re-hellos
+    // under a deterministic tmp:/wf: scheme (the new scheme). bridge.send() with
+    // the OLD id must still resolve to the new connection.
+    const sock = await connectPanel(); // open socket, no hello yet
+    autoReply(sock, "old-tab");
+    await vi.waitFor(() => expect(bridge.connected()).toBe(false));
+
+    // 1) First hello: old-style random-UUID tab id.
+    const oldId = "6eccc826-592e-4abb-b280-35434e00ddd1";
+    sock.send(JSON.stringify({ type: "hello", tab_id: oldId, title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    // Verify the old id works.
+    const oldResult = await bridge.send({ cmd: "graph_outline" }, { tabId: oldId });
+    expect(oldResult).toMatchObject({ from: "old-tab" });
+
+    // 2) Same socket re-hellos under a new deterministic tab id (the migration).
+    const newId = "wf:workf";
+    sock.send(JSON.stringify({ type: "hello", tab_id: newId, title: "image_flux2_fp8" }));
+    await vi.waitFor(() => {
+      expect(bridge.tabs()).toHaveLength(1);
+      expect(bridge.tabs()[0].tab_id).toBe(newId);
+    });
+
+    // 3) The old agent (still holding the old tabId) sends a command via the
+    //    bridge — this MUST resolve via the migration map instead of throwing.
+    const migratedResult = await bridge.send({ cmd: "graph_get_state" }, { tabId: oldId });
+    expect(migratedResult).toMatchObject({ from: "old-tab", cmd: "graph_get_state" });
+
+    // 4) An UNKNOWN id (no migration, no connection) still fails with the
+    //    expected error — plus a prefix mismatch for the old id should work too.
+    await expect(
+      bridge.send({ cmd: "x" }, { tabId: "completely-unknown" }),
+    ).rejects.toThrow(/no connected tab/);
+
+    sock.close();
+  });
+
+  it("migrates tab id when socket re-hellos to a different scheme and rejects absent tab_id", async () => {
+    // Same scenario but with TWO tabs to ensure the migration is per-socket and
+    // doesn't cross-contaminate.
+    const sockA = await connectPanel();
+    const sockB = await connectPanel();
+    autoReply(sockA, "A");
+    autoReply(sockB, "B");
+
+    const oldA = "legacy-a-1111";
+    const oldB = "legacy-b-2222";
+    sockA.send(JSON.stringify({ type: "hello", tab_id: oldA, title: "flux-workflow" }));
+    sockB.send(JSON.stringify({ type: "hello", tab_id: oldB, title: "video-workflow" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+    // Migrate tab A's socket to a new id, leave tab B unchanged.
+    const newA = "wf:flux123";
+    sockA.send(JSON.stringify({ type: "hello", tab_id: newA, title: "flux-workflow" }));
+    await vi.waitFor(() => {
+      expect(bridge.tabs()).toHaveLength(2);
+      expect(bridge.tabs().find((t) => t.tab_id === newA)).toBeTruthy();
+      expect(bridge.tabs().find((t) => t.tab_id === oldA)).toBeFalsy();
+    });
+
+    // Old id A still routes to the migrated tab.
+    const fromA = await bridge.send({ cmd: "x" }, { tabId: oldA });
+    expect(fromA).toMatchObject({ from: "A" });
+
+    // Old id B (never migrated) still works normally.
+    const fromB = await bridge.send({ cmd: "x" }, { tabId: oldB });
+    expect(fromB).toMatchObject({ from: "B" });
+
+    // New id works directly too.
+    const fromNewA = await bridge.send({ cmd: "x" }, { tabId: newA });
+    expect(fromNewA).toMatchObject({ from: "A" });
+
+    sockA.close();
+    sockB.close();
+  });
+
+  it("follows MIGRATION CHAINS: uuid → tmp: → wf: (the exact #210 field sequence)", async () => {
+    // The reported failure re-helloed TWICE: legacy random UUID, then the
+    // unsaved-tab tmp:<uuid> id, then the saved wf:<hash> id. The ORIGINAL id
+    // must still resolve after both hops (single-hop lookup lands on the dead
+    // tmp: id) — the map path-compresses so every historical id points at the
+    // live tab.
+    const sock = await connectPanel();
+    autoReply(sock, "chained");
+    const uuid = "6eccc826-592e-4abb-b280-35434e00ddd1";
+    sock.send(JSON.stringify({ type: "hello", tab_id: uuid, title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    sock.send(JSON.stringify({ type: "hello", tab_id: "tmp:7eab1234", title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("tmp:7eab1234"));
+
+    sock.send(JSON.stringify({ type: "hello", tab_id: "wf:workf", title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("wf:workf"));
+
+    // Every id along the chain resolves to the live tab.
+    for (const id of [uuid, "tmp:7eab1234", "wf:workf"]) {
+      const r = await bridge.send({ cmd: "ping" }, { tabId: id });
+      expect(r).toMatchObject({ from: "chained" });
+    }
+    sock.close();
+  });
+
   it("retries binding when the port is briefly held, then self-heals", async () => {
     // Simulate a fast /mcp reconnect: a previous session still owns the port
     // when the new bridge starts. It should back off, retry, and bind once the
