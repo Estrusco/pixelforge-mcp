@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.31.1] - 2026-07-14
+
+### MCP
+
+#### Fixed
+- codex-review hardening of the tab-id migration (#212 follow-up) (#213)
+- current DeepSeek in curated picks; sort + widen the overflow list
+- live account-aware model catalog + clamp; error turns are never silent
+- tab-id migration self-heal — #211 hardened (chains, safe rebind, resume survival) (#212)
+
+#### Docs
+- connection guide for the five new providers (Grok / Kimi / GLM /
+  ChatGPT-direct-OAuth / Copilot) — sign-in paths, picker roster, honest
+  degraded-ack behavior (#214)
+
+#### Changed
+- `npx github:artokun/comfyui-mcp` now works as a nightly channel (prepare script)
+
+
 ## [0.31.0] - 2026-07-12
 
 ### MCP
