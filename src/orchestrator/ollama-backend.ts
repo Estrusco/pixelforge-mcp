@@ -168,7 +168,7 @@ export const RECOMMENDED_OPENROUTER_MODELS: readonly RecommendedModel[] = [
   { id: "minimax/minimax-m3", label: "MiniMax M3 (1M · SOTA · open)", context1m: true },
   { id: "moonshotai/kimi-k2.5", label: "Kimi K2.5 (SOTA · open)" },
   { id: "z-ai/glm-5.1", label: "GLM 5.1 (SOTA · open)" },
-  { id: "deepseek/deepseek-v3.2", label: "DeepSeek v3.2 (open)" },
+  { id: "deepseek/deepseek-v4-pro", label: "DeepSeek v4 Pro (open)" },
 ];
 
 function msgOf(err: unknown): string {
@@ -947,7 +947,15 @@ export class OllamaBackend implements AgentBackend {
         // bounded slice of the rest — OpenRouter's 300+ catalog isn't a browser.
         const recommended = RECOMMENDED_OPENROUTER_MODELS.filter((m) => available.has(m.id));
         const recIds = new Set(recommended.map((m) => m.id));
-        const rest = ids.filter((id) => id !== this.model && !recIds.has(id)).slice(0, 40);
+        // Sort the overflow alphabetically so a vendor's models CLUSTER (all
+        // deepseek/* together, findable), and widen the cap — the old unsorted
+        // 40-slice made newer models effectively invisible ("the list is very
+        // old" — Discord #help: deepseek-v4-pro existed upstream but never
+        // showed because it sat past the cut in OpenRouter's arrival order).
+        const rest = ids
+          .filter((id) => id !== this.model && !recIds.has(id))
+          .sort((a, b) => a.localeCompare(b))
+          .slice(0, 150);
         // llama-server reports its single model as the GGUF's FILE PATH —
         // keep the id verbatim (the server echoes it) but label by basename
         // so the picker isn't a wall of C:\...\model.gguf.
