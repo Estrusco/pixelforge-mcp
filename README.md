@@ -563,9 +563,11 @@ Generates a comprehensive skill file documenting every node, its inputs/outputs,
 
 The server auto-detects your ComfyUI installation and port. Override with environment variables if needed.
 
-You can set any variable below in your shell/system environment, or put it in **`~/.comfyui-mcp/.env`** (same path on Windows, macOS, and Linux — next to the rest of your comfyui-mcp files). Real environment variables win over `.env` values. See `.env.example` for a starting point.
+Where to put keys and overrides:
 
-Keys pasted into the panel's **API Keys** card are stored separately in `~/.comfyui-mcp/panel-secrets.json` and only fill in what the environment didn't provide — if the same key exists in both, the environment/`.env` value wins.
+- **Panel users**: the **API Keys** card (▾ menu next to "connected") — stored in `~/.comfyui-mcp/panel-secrets.json`, applied immediately, no restart.
+- **MCP-only setups** (Claude Desktop, Claude Code, etc.): the `env` block of your MCP client config, as shown in the setup examples above.
+- Real environment variables always take precedence over stored keys. (For development, `~/.comfyui-mcp/.env` is also loaded as an override file — regular installs shouldn't need it.)
 
 ### Deployment modes
 
