@@ -47,7 +47,8 @@
     "release:minor": "npm version minor && git push --follow-tags",
     "release:major": "npm version major && git push --follow-tags",
     "changelog": "node scripts/gen-changelog.mjs",
-    "version": "node scripts/gen-changelog.mjs --from-pkg && git add CHANGELOG.md"
+    "version": "node scripts/gen-changelog.mjs --from-pkg && git add CHANGELOG.md",
+    "prepare": "tsc"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
