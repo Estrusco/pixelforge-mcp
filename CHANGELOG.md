@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.34.0] - 2026-07-14
+
 ### MCP
 
 #### Fixed
@@ -40,6 +42,16 @@ All notable changes to this project are documented here. This project adheres to
 - chatgpt backend delivers attached images via Responses-API `input_image`
   data URLs, with the same one-shot strip-and-retry + honest 📎 note on
   rejection as the Ollama family (#218)
+
+### MCP
+
+#### Added
+- self-updater + self-restarter — a running orchestrator never goes stale (#223)
+- strip/slice read the live canvas by default — no save-to-disk round trip
+
+#### Fixed
+- the Discord invite link was expired — use the permanent one (#220)
+
 
 ## [0.33.0] - 2026-07-14
 
