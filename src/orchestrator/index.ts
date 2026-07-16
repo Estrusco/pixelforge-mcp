@@ -961,10 +961,10 @@ export async function runPanelOrchestrator(): Promise<void> {
   const model = process.env.COMFYUI_MCP_PANEL_MODEL ?? "claude-opus-4-8";
   const envEffort = process.env.COMFYUI_MCP_PANEL_EFFORT;
   const effort: Effort | undefined = isEffort(envEffort) ? envEffort : undefined;
-  // Each backend runs its OWN orchestrator on its OWN loopback bridge port so the
-  // providers never share a session or fight for a port. The launcher (panel pack)
-  // sets COMFYUI_MCP_BRIDGE_PORT per the selected backend; the convention is
-  // 9180 = claude (default), 9181 = codex, 9182 = gemini.
+  // Single-port multi-provider: ONE orchestrator on ONE bridge port (default
+  // 9180) serves ALL providers — the panel picks a provider per tab via the
+  // hello/set_backend handshake (see "Per-tab backend" below). +1 is the panel_*
+  // HTTP-MCP port, +2 the phone-pairing listener. COMFYUI_MCP_BRIDGE_PORT overrides.
   const bridgePort = Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180;
 
   // Open the cloudflared tunnel and advertise the wss URL to the pod so its
