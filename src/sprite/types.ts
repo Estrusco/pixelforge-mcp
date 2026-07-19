@@ -15,9 +15,7 @@ export interface RawImage {
 }
 
 // Palettes verified against a reachable source at implementation time.
-// "resurrect-64" is intentionally omitted until its hex list can be verified
-// (lospec.com is unreachable from this environment) — see follow-up issue.
-export type LospecPresetSlug = "pico-8" | "sweetie-16" | "endesga-32";
+export type LospecPresetSlug = "pico-8" | "sweetie-16" | "endesga-32" | "resurrect-64";
 
 export type PaletteSource =
   | { readonly mode: "auto_kmeans"; readonly paletteSize: number }

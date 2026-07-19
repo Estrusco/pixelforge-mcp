@@ -61,6 +61,12 @@ async function run() {
       palette: { mode: "lospec", slug: "pico-8" },
     },
     {
+      name: "synthetic-lospec-resurrect64",
+      input: synthetic,
+      target: { width: 24, height: 24 },
+      palette: { mode: "lospec", slug: "resurrect-64" },
+    },
+    {
       name: "synthetic-custom",
       input: synthetic,
       target: { width: 24, height: 24 },

@@ -50,6 +50,7 @@ import { registerSelfUpdateTools } from "./self-update.js";
 import { registerCalculateTools } from "./calculate.js";
 import { registerComfyUISettingsTools } from "./comfyui-settings.js";
 import { registerNodeDevTools } from "./node-dev.js";
+import { registerPixelateImageTool } from "../sprite/tools/index.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 import { ToolCatalog } from "./catalog.js";
 
@@ -109,6 +110,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["diagnostics", registerCalculateTools],
   ["server", registerComfyUISettingsTools],
   ["custom-nodes", registerNodeDevTools],
+  ["images-assets", registerPixelateImageTool],
 ];
 
 export async function registerAllTools(server: McpServer): Promise<void> {
