@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.41.0] - 2026-07-20
+
 ### MCP
 
 #### Changed
@@ -17,6 +19,12 @@ All notable changes to this project are documented here. This project adheres to
   (accounts without 5.6 keep their catalog). ChatGPT-direct default is now
   `gpt-5.6-luna` (successor to the retired `gpt-5.4-mini`); Claude-max→xhigh
   effort downmapping removed (`max` is native now)
+
+### MCP
+
+#### Added
+- GPT-5.6 family (Sol/Terra/Luna) + max/ultra efforts; deprecate pre-5.6 models (fixes #241) (#244)
+
 
 ## [0.40.0] - 2026-07-19
 
