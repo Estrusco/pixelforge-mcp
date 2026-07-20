@@ -22,8 +22,10 @@ const CHATGPT_SYSTEM_PROMPT = [
   "Describe a tool before its first call. Finish tasks by running tools, not inventing results.",
 ].join("\n");
 
+// GPT-5.6-only policy (2026-07-20): Luna is the family's cost-conscious
+// variant — the successor default to the retired gpt-5.4-mini.
 export const CHATGPT_DEFAULT_MODEL =
-  process.env.COMFYUI_MCP_CHATGPT_MODEL?.trim() || "gpt-5.4-mini";
+  process.env.COMFYUI_MCP_CHATGPT_MODEL?.trim() || "gpt-5.6-luna";
 
 const MAX_TOOL_ROUNDS = 32;
 
@@ -446,9 +448,24 @@ export class ChatGptOAuthBackend extends OllamaBackend {
 
   override async listModels(): Promise<ModelChoice[]> {
     const cached = await loadCodexModelIds();
-    const ids = cached.length
-      ? cached
-      : [CHATGPT_DEFAULT_MODEL, "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"];
+    // GPT-5.6-only policy: hide deprecated pre-5.6 ids when the cache carries
+    // the 5.6 family; a cache without any 5.6 keeps its full list.
+    const fam = cached.filter((id) => id.startsWith("gpt-5.6"));
+    const ids = fam.length
+      ? fam
+      : cached.length
+        ? cached
+        : ["gpt-5.6-sol", "gpt-5.6-terra", CHATGPT_DEFAULT_MODEL];
+    // A deprecated ACTIVE model (e.g. a tab that saved the old gpt-5.4-mini
+    // default) must not be re-inserted at the head of the filtered list — that
+    // kept it selected and 400ing every turn (codex review). Migrate the
+    // instance to the family default instead so the next turn works.
+    if (fam.length && this.model && !this.model.startsWith("gpt-5.6")) {
+      logger.info(
+        `[chatgpt-oauth-backend] active model ${this.model} is deprecated — migrating to ${CHATGPT_DEFAULT_MODEL}`,
+      );
+      this.model = ids.includes(CHATGPT_DEFAULT_MODEL) ? CHATGPT_DEFAULT_MODEL : ids[0];
+    }
     const rest = ids.filter((id) => id !== this.model).slice(0, 40);
     return [this.model, ...rest].map((id) => ({ id, label: id }));
   }
