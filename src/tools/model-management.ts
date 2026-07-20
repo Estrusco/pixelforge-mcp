@@ -56,7 +56,7 @@ const downloadAuthSchema = z.discriminatedUnion("type", [
 export function registerModelManagementTools(server: McpServer): void {
   server.tool(
     "search_models",
-    "Search HuggingFace Hub for models usable in ComfyUI (checkpoints, LoRAs, VAEs, ControlNets, etc.). Read-only and network-only: queries HuggingFace over HTTP, does NOT require a running ComfyUI or COMFYUI_PATH and does not download anything. Returns a ranked list with modelId, author, downloads, likes, and tags. Pick a result's download URL and pass it to download_model to install it locally. For packs of custom nodes (not models) use search_custom_nodes.",
+    "Search HuggingFace Hub for models usable in ComfyUI (checkpoints, LoRAs, VAEs, ControlNets, etc.). Read-only and network-only: queries HuggingFace over HTTP, does NOT require a running ComfyUI or COMFYUI_PATH and does not download anything. Returns a ranked list with modelId, author, downloads, likes, and tags. Pick a result's download URL and pass it to download_model to install it locally. For CIVITAI searches ('find a Flux LoRA on Civitai') use search_civitai_models instead — it filters by type + base model and returns ids for download_civitai_model. For packs of custom nodes (not models) use search_custom_nodes.",
     {
       query: z.string().describe("Search query (e.g. 'SDXL', 'flux', 'controlnet')"),
       filter: z
@@ -138,7 +138,7 @@ export function registerModelManagementTools(server: McpServer): void {
 
   server.tool(
     "list_local_models",
-    "List model files available to the connected ComfyUI, grouped by type. Read-only. Queries ComfyUI's /models REST endpoint first (works with remote ComfyUI and respects extra_model_paths.yaml — symlinked / mounted dirs the install-path filesystem scan would miss), then falls back to a filesystem scan of COMFYUI_PATH/models/ when the REST endpoint is unavailable. Size and modified time are only available on the filesystem fallback path. Use to see which models are already available before generating or downloading; use search_models to discover new models on HuggingFace, then download_model to fetch them.",
+    "List model files available to the connected ComfyUI, grouped by type. Read-only. Queries ComfyUI's /models REST endpoint first (works with remote ComfyUI and respects extra_model_paths.yaml — symlinked / mounted dirs the install-path filesystem scan would miss), then falls back to a filesystem scan of COMFYUI_PATH/models/ when the REST endpoint is unavailable. Size and modified time are only available on the filesystem fallback path. Use to see which models are already available before generating or downloading; use search_models to discover new models on HuggingFace, then download_model to fetch them. For models fetched via download_civitai_model, any CivitAI trigger/activation words and base model are shown inline (read from the `<file>.civitai.json` sidecar) — apply those trigger words in your prompt when generating with that model. A `civitai:` line under an entry is that model's CivitAI page URL (modelId + INSTALLED modelVersionId, from the same sidecar) — use it to reference the source or check for newer versions.",
     {
       model_type: modelTypeEnum
         .optional()
@@ -177,6 +177,22 @@ export function registerModelManagementTools(server: McpServer): void {
               lines.push(`- ${m.name} (${sizeMB} MB) — modified ${m.modified}`);
             } else {
               lines.push(`- ${m.name}`);
+            }
+            // Surface CivitAI sidecar hints so the agent applies the trigger
+            // words (and picks the right base model) when it builds a workflow.
+            if (m.triggerWords && m.triggerWords.length > 0) {
+              lines.push(
+                `    trigger words: ${m.triggerWords.join(", ")}` +
+                  (m.baseModel ? `  ·  base: ${m.baseModel}` : ""),
+              );
+            } else if (m.baseModel) {
+              lines.push(`    base: ${m.baseModel}`);
+            }
+            // Provenance: the sidecar's CivitAI page URL carries the modelId
+            // and the INSTALLED modelVersionId — link back to the source, and
+            // let clients check whether a newer version exists on CivitAI.
+            if (m.civitaiUrl) {
+              lines.push(`    civitai: ${m.civitaiUrl}`);
             }
           }
           lines.push("");

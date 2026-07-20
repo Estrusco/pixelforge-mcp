@@ -114,7 +114,9 @@ over a loopback HTTP MCP for ChatGPT/Codex), so [parity](/backends) is automatic
 |---|---|
 | `panel_query_graph` | Query the graph being viewed — filter/traverse/aggregate, token-bounded |
 | `panel_get_subgraph` | Read inside a subgraph node's inner graph |
-| `panel_get_errors` | Read the last execution error + per-node validation errors |
+| `panel_view_selected` | Read the node(s) the user has **selected** — answers "this node" in one call |
+| `panel_view_nodes_in_viewport` | Read only what's **on screen** (viewport rect + zoom) — scopes work on a big graph |
+| `panel_get_errors` | **Why** a node is red — each errored node joined to its cause (missing model + download URL, missing media, validation, runtime `exception_type`) |
 | `panel_list_workflows` | List open workflow tabs and which is active |
 | `panel_list_nodes` | List installed custom-node packs |
 | `panel_list_mcp` | List connected MCP servers |
@@ -317,6 +319,7 @@ hide and resumes the typewriter on return. Foreground animation is unchanged.
 
 ## See also
 
+- [Mobile app (beta)](/mobile) — pair your phone with the panel and chat with the agent on the go
 - [Backends / providers](/backends) — Claude vs ChatGPT, the picker, capability parity
 - [Skills, Packs & Runtime Cost](/tools/skills-knowledge) — knowledge parity + the cost guardrail
 - [Bridge configuration](/configuration)

@@ -456,6 +456,7 @@ export class ClaudeBackend implements AgentBackend {
         const content = (message.message?.content ?? []) as Array<{
           type: string;
           text?: string;
+          name?: string;
         }>;
         const text = content
           .filter((b) => b.type === "text" && typeof b.text === "string")
@@ -470,6 +471,14 @@ export class ClaudeBackend implements AgentBackend {
           ...(id ? { id } : {}),
           ...(u ? { usage: u } : {}),
         };
+        // TOOL VISIBILITY: surface each tool the agent invoked as a tool_call
+        // event, so a canvas-less mobile client can show the agent's actions
+        // (not just a spinner). The panel infers these from its live canvas.
+        for (const b of content) {
+          if (b.type === "tool_use" && typeof b.name === "string") {
+            yield { type: "tool_call", name: b.name, phase: "start" };
+          }
+        }
         break;
       }
       case "result": {

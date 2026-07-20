@@ -19,12 +19,15 @@ import { logger } from "../utils/logger.js";
 import type {
   AgentBackend,
   AgentEvent,
+  BackendId,
   BackendStartOptions,
   ModelChoice,
   NeutralTurn,
 } from "./agent-backend.js";
+import type { ImageRef } from "./panel-agent.js";
 import { OLLAMA_CAPABILITIES } from "./agent-backend.js";
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
+import { resolvePrompt } from "../services/prompt-overrides.js";
 
 type McpToolInfo = { name: string; description?: string; inputSchema?: unknown };
 type McpCallResult = { isError?: boolean; content?: Array<{ type: string; text?: string }> };
@@ -67,6 +70,8 @@ export interface OllamaBackendDeps {
   numCtx?: number;
   /** Test seam: replaces the MCP client construction from mcpServers specs. */
   connectToolClients?: () => Promise<{ comfyui?: McpToolClient; panel?: McpToolClient }>;
+  /** Panel backend id when reusing this driver for GLM/Kimi/Ollama (default ollama). */
+  backendId?: BackendId;
 }
 
 type ChatMessage = {
@@ -77,6 +82,14 @@ type ChatMessage = {
   tool_name?: string;
   /** OpenAI-dialect tool-result pairing (by call id). */
   tool_call_id?: string;
+  /** Inline image payloads (raw base64, no data: prefix) — Ollama's native
+   *  message shape; toOpenAiMessages re-wraps them as image_url content parts.
+   *  Whether the MODEL understands them is per-model, not per-provider: we
+   *  always attempt delivery, and a rejecting endpoint triggers one images-
+   *  stripped retry (see runTurn). */
+  images?: string[];
+  /** Mime types parallel to `images` (for the openai-dialect data: URLs). */
+  imageMimes?: string[];
 };
 
 type OllamaToolCall = {
@@ -110,6 +123,18 @@ function toOpenAiMessages(messages: ChatMessage[]): Array<Record<string, unknown
     if (m.role === "tool") {
       return { role: "tool", tool_call_id: m.tool_call_id ?? "call_0", content: m.content };
     }
+    if (m.role === "user" && m.images?.length) {
+      return {
+        role: "user",
+        content: [
+          { type: "text", text: m.content },
+          ...m.images.map((b64, i) => ({
+            type: "image_url",
+            image_url: { url: `data:${m.imageMimes?.[i] ?? "image/png"};base64,${b64}` },
+          })),
+        ],
+      };
+    }
     return { role: m.role, content: m.content };
   });
 }
@@ -130,7 +155,7 @@ const MAX_TOOL_ROUNDS = 32;
  * is short, router-shaped, and (deliberately, for local models) does NOT carry
  * the NSFW consent-gate flow — only the absolute hard limits.
  */
-const OLLAMA_SYSTEM_PROMPT = [
+export const OLLAMA_SYSTEM_PROMPT = [
   "You are the ComfyUI agent in a sidebar panel, driving the user's live ComfyUI graph and server. Answer in normal Markdown.",
   "",
   "You have exactly six tools:",
@@ -141,6 +166,7 @@ const OLLAMA_SYSTEM_PROMPT = [
   "- Catalog entries are tool NAMES, not data. Finish every task by actually running tools; never invent results.",
   "- Describe a tool before its first call so you use the right parameters. If a call errors, read the error — it includes the expected schema — fix the args and retry.",
   "- To read the user's graph, ALWAYS start with panel_graph_outline (a compact text map) via panel_call_tool. For specifics use panel_query_graph — filter by types/where ('cfg>7'), traverse upstream_of/downstream_of, or read ONE node's exact detail with {ids:[id], fields:'detail'}. Its output is token-bounded, so it can never flood your context.",
+  "- To EDIT the graph — add a node (e.g. a LoraLoader after a download), wire slots, set widgets, run — those are PANEL tools too: panel_call_tool with panel_add_node / panel_connect / panel_set_widget / panel_run. Do NOT search the headless list_tools catalog for graph editing; it is not there.",
   "- To see or show any generated image/video, run the panel_show_media tool via panel_call_tool.",
   "- Workflows with API nodes cost the user PAID credits; local-GPU workflows are free. Ask before anything that might spend credits.",
 ].join("\n");
@@ -163,7 +189,7 @@ export const RECOMMENDED_OPENROUTER_MODELS: readonly RecommendedModel[] = [
   { id: "minimax/minimax-m3", label: "MiniMax M3 (1M · SOTA · open)", context1m: true },
   { id: "moonshotai/kimi-k2.5", label: "Kimi K2.5 (SOTA · open)" },
   { id: "z-ai/glm-5.1", label: "GLM 5.1 (SOTA · open)" },
-  { id: "deepseek/deepseek-v3.2", label: "DeepSeek v3.2 (open)" },
+  { id: "deepseek/deepseek-v4-pro", label: "DeepSeek v4 Pro (open)" },
 ];
 
 function msgOf(err: unknown): string {
@@ -193,38 +219,45 @@ export function isOllamaModel(id: string): boolean {
 }
 
 export class OllamaBackend implements AgentBackend {
-  readonly id = "ollama" as const;
+  readonly id: BackendId;
   readonly capabilities = OLLAMA_CAPABILITIES;
-  private deps: OllamaBackendDeps;
-  private host: string;
-  private model: string;
-  private disposed = false;
-  private prepared = false;
+  protected deps: OllamaBackendDeps;
+  protected host: string;
+  protected model: string;
+  protected disposed = false;
+  protected prepared = false;
   /** In-flight turn abort — interrupt() aborts the current fetch/loop. */
-  private turnAbort: AbortController | null = null;
-  private comfy: McpToolClient | null = null;
-  private panel: McpToolClient | null = null;
+  protected turnAbort: AbortController | null = null;
+  protected comfy: McpToolClient | null = null;
+  protected panel: McpToolClient | null = null;
   /** comfyui compact meta-tool defs (from tools/list) — handed to the model verbatim. */
-  private comfyTools: McpToolInfo[] = [];
+  protected comfyTools: McpToolInfo[] = [];
   /** panel_* tool list (full defs stay HERE; the model gets 3 meta-tools). */
-  private panelTools: McpToolInfo[] = [];
+  protected panelTools: McpToolInfo[] = [];
   /** Conversation history for the live session (Ollama is stateless per request). */
   private history: ChatMessage[] = [];
   private sessionId: string | null = null;
 
   /** Wire dialect (see OllamaBackendDeps.api). */
-  private api: "ollama" | "openai";
-  private apiKey: string | undefined;
+  protected api: "ollama" | "openai";
+  protected apiKey: string | undefined;
 
   constructor(deps: OllamaBackendDeps = {}) {
     this.deps = deps;
+    this.id = deps.backendId ?? "ollama";
     this.api = deps.api ?? "ollama";
     this.apiKey = deps.apiKey;
     this.host = (deps.host ?? process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434").replace(/\/$/, "");
     this.model = deps.model ?? DEFAULT_MODEL;
   }
 
-  private authHeaders(): Record<string, string> {
+  protected setOpenAiAuth(host: string, apiKey: string): void {
+    this.api = "openai";
+    this.host = host.replace(/\/$/, "");
+    this.apiKey = apiKey;
+  }
+
+  protected authHeaders(): Record<string, string> {
     return this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {};
   }
 
@@ -246,6 +279,32 @@ export class OllamaBackend implements AgentBackend {
    *  num_ctx, or the fine-tune's baked 65536 when we omit it. */
   private contextWindow(): number {
     return this.effectiveNumCtx() || 65536;
+  }
+
+  /** Sampling options for /api/chat. The fine-tune tags bake `temperature 0`
+   *  into their Modelfile — fully greedy decoding, which on a small model is
+   *  the classic repetition-loop trap ("goes in circles" — Discord #help), and
+   *  contradicts the Gemma team's recommended sampling (temp 1.0, top_k 64,
+   *  top_p 0.95). Request options override the Modelfile, so we send explicit
+   *  sampling for the fine-tune (env-overridable for experiments); stock
+   *  models keep their own tuned defaults unless the env says otherwise. */
+  private samplingOptions(): Record<string, number> {
+    const envNum = (name: string): number | null => {
+      const raw = process.env[name];
+      if (raw === undefined || raw === "") return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
+    const t = envNum("COMFYUI_MCP_OLLAMA_TEMPERATURE");
+    const k = envNum("COMFYUI_MCP_OLLAMA_TOP_K");
+    const p = envNum("COMFYUI_MCP_OLLAMA_TOP_P");
+    const out: Record<string, number> = {};
+    if (t !== null) out.temperature = t;
+    if (k !== null) out.top_k = k;
+    if (p !== null) out.top_p = p;
+    if (Object.keys(out).length) return out;
+    // Fine-tune default: un-bake the Modelfile's temperature 0.
+    return this.isFinetune() ? { temperature: 1.0, top_k: 64, top_p: 0.95 } : {};
   }
 
   async prepare(): Promise<void> {
@@ -279,7 +338,7 @@ export class OllamaBackend implements AgentBackend {
     );
   }
 
-  private async connectTools(): Promise<void> {
+  protected async connectTools(): Promise<void> {
     if (this.deps.connectToolClients) {
       const { comfyui, panel } = await this.deps.connectToolClients();
       this.comfy = comfyui ?? null;
@@ -317,7 +376,7 @@ export class OllamaBackend implements AgentBackend {
   }
 
   /** The six OpenAI-style tool defs the model sees. */
-  private buildModelTools(): Array<Record<string, unknown>> {
+  protected buildModelTools(): Array<Record<string, unknown>> {
     const defs: Array<Record<string, unknown>> = [];
     for (const t of this.comfyTools) {
       defs.push({
@@ -372,7 +431,7 @@ export class OllamaBackend implements AgentBackend {
   }
 
   /** Dispatch one model tool call; returns display text (never throws). */
-  private async dispatch(name: string, rawArgs: Record<string, unknown> | string): Promise<{ text: string; isError: boolean }> {
+  protected async dispatch(name: string, rawArgs: Record<string, unknown> | string): Promise<{ text: string; isError: boolean }> {
     let args: Record<string, unknown> = {};
     if (typeof rawArgs === "string") {
       try {
@@ -516,7 +575,11 @@ export class OllamaBackend implements AgentBackend {
                 stream: true,
                 // See OllamaBackendDeps.numCtx: omit for our fine-tune so the
                 // tag's baked 65536 window governs instead of clamping it.
-                options: this.effectiveNumCtx() ? { num_ctx: this.effectiveNumCtx() } : {},
+                // samplingOptions un-bakes the fine-tune's Modelfile temp 0.
+                options: {
+                  ...(this.effectiveNumCtx() ? { num_ctx: this.effectiveNumCtx() } : {}),
+                  ...this.samplingOptions(),
+                },
               }),
               signal,
             });
@@ -704,7 +767,7 @@ export class OllamaBackend implements AgentBackend {
     if (fresh) {
       // deps.systemAppend (the frontier panel prompt) is intentionally NOT
       // used — see OLLAMA_SYSTEM_PROMPT.
-      this.history = [{ role: "system", content: OLLAMA_SYSTEM_PROMPT }];
+      this.history = [{ role: "system", content: resolvePrompt("backend.ollama", OLLAMA_SYSTEM_PROMPT) }];
     }
     yield { type: "session", sessionId: this.sessionId, model: this.model };
 
@@ -713,11 +776,68 @@ export class OllamaBackend implements AgentBackend {
     }
   }
 
+  /** Fetch a ComfyUI image ref as raw base64 + mime, or null on any failure
+   *  (mirrors ClaudeBackend.fetchImageBlock; the text reference still names the
+   *  file as a fallback). */
+  protected async fetchImageB64(ref: ImageRef): Promise<{ b64: string; mime: string } | null> {
+    if (!this.deps.comfyuiUrl || !ref?.filename) return null;
+    try {
+      const u = new URL("/view", this.deps.comfyuiUrl);
+      u.searchParams.set("filename", ref.filename);
+      u.searchParams.set("type", ref.type || "input");
+      if (ref.subfolder) u.searchParams.set("subfolder", ref.subfolder);
+      const res = await fetch(u, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) {
+        logger.warn(`[ollama-backend] image ref fetch failed (${ref.filename}): http ${res.status}`);
+        return null;
+      }
+      let mime = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)) mime = "image/png";
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length > 12 * 1024 * 1024) {
+        logger.warn(`[ollama-backend] image ref too large to inline (${ref.filename}: ${buf.length} bytes)`);
+        return null;
+      }
+      return { b64: buf.toString("base64"), mime };
+    } catch (err) {
+      logger.warn(`[ollama-backend] image ref fetch failed (${ref?.filename ?? "?"}): ${msgOf(err)}`);
+      return null;
+    }
+  }
+
+  /** Remove every inline image from history after an endpoint rejected image
+   *  input, leaving an honest note in the affected user messages so the model
+   *  never pretends it saw them. One-shot per turn (see runTurn). */
+  private stripImagesFromHistory(): void {
+    for (const m of this.history) {
+      if (m.images?.length) {
+        delete m.images;
+        delete m.imageMimes;
+        m.content +=
+          "\n[note: the attached image(s) were removed — this model/endpoint rejected image input. You did NOT see them; tell the user so if it matters.]";
+      }
+    }
+  }
+
   private async *runTurn(turn: NeutralTurn, opts: BackendStartOptions): AsyncIterable<AgentEvent> {
     const abort = new AbortController();
     this.turnAbort = abort;
     const tools = this.buildModelTools();
-    this.history.push({ role: "user", content: turn.text });
+    // Vision is a per-MODEL property (gemma4 sees images, qwen3 doesn't;
+    // DeepSeek's API rejects image parts outright), so ALWAYS attempt delivery:
+    // resolve the ComfyUI refs inline and let the strip-and-retry below handle
+    // endpoints that reject them.
+    const userMsg: ChatMessage = { role: "user", content: turn.text };
+    if (turn.images?.length) {
+      const resolved = (await Promise.all(turn.images.slice(0, 4).map((r) => this.fetchImageB64(r)))).filter(
+        (r): r is { b64: string; mime: string } => r !== null,
+      );
+      if (resolved.length) {
+        userMsg.images = resolved.map((r) => r.b64);
+        userMsg.imageMimes = resolved.map((r) => r.mime);
+      }
+    }
+    this.history.push(userMsg);
 
     let resultEmitted = false;
     // Loop-breaker: small models (especially stock ones) can wedge into
@@ -728,6 +848,18 @@ export class OllamaBackend implements AgentBackend {
     // ended outright.
     const seenCalls = new Map<string, number>();
     let maxRepeats = 0;
+    // Second wedge shape (field: Discord "circles" report): the model spams a
+    // DISCOVERY meta-tool with a DIFFERENT search each round (list_tools
+    // {"search":"lora"} → {"search":"civitai"} → {"search":"flux"} …), hunting a
+    // capability that isn't in the catalog — every call is unique so the
+    // exact-repeat breaker above never fires. Count calls per discovery tool
+    // (ignoring args); past a threshold, stop searching and tell it the truth
+    // (some capabilities live in OPTIONAL companion servers). describe_tool is
+    // NOT here — describing many distinct tools is legitimate exploration.
+    const DISCOVERY_TOOLS = new Set(["list_tools", "panel_list_tools", "search_models", "search_custom_nodes"]);
+    const discoveryCounts = new Map<string, number>();
+    let emptyFinalRetried = false;
+    let imagesStripped = false;
     try {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         // Drain the chat stream manually: yield each delta event as it arrives,
@@ -737,21 +869,63 @@ export class OllamaBackend implements AgentBackend {
         let toolCalls: OllamaToolCall[] = [];
         let usage: Record<string, number> | undefined;
         let streamId: string | null = null;
-        for (;;) {
-          const r = await stream.next();
-          if (r.done) {
-            ({ content, toolCalls, usage, streamId } = r.value);
-            break;
+        try {
+          for (;;) {
+            const r = await stream.next();
+            if (r.done) {
+              ({ content, toolCalls, usage, streamId } = r.value);
+              break;
+            }
+            yield r.value;
           }
-          yield r.value;
+        } catch (err) {
+          // GRACEFUL IMAGE DEGRADATION: if the request carried inline images
+          // and the endpoint rejected it (text-only model — e.g. DeepSeek 400s
+          // on image parts; a non-vision Ollama model can error at prompt
+          // build), retry ONCE with the images stripped and an honest note in
+          // both directions. Any other failure re-throws to the normal handler.
+          if (!abort.signal.aborted && !imagesStripped && this.history.some((m) => m.images?.length)) {
+            imagesStripped = true;
+            logger.warn(`[ollama-backend] image input rejected (${msgOf(err).slice(0, 200)}) — retrying without images`);
+            this.stripImagesFromHistory();
+            yield {
+              type: "assistant",
+              text: `📎 ${this.model} rejected image input, so I'm continuing without the attachment — I can't see the image. Describe it in words, or switch to a vision-capable model.`,
+            };
+            round--; // the rejected request didn't count as a tool round
+            continue;
+          }
+          throw err;
         }
 
         if (!toolCalls.length) {
+          // EMPTY-FINAL recovery (live E2E, native dialect, temp 0): after a
+          // run of tool rounds the model sometimes emits a final message with
+          // NO content — the turn would "complete" in total silence. Nudge it
+          // ONCE to summarize; a second empty reply falls through (never loop).
+          if (!content.trim() && round > 0 && !emptyFinalRetried) {
+            emptyFinalRetried = true;
+            this.history.push({ role: "assistant", content });
+            this.history.push({
+              role: "user",
+              content:
+                "(system: your reply was EMPTY. In 1-3 sentences, tell the user what you found or did with the tools above, and what you recommend next. Do not call any more tools.)",
+            });
+            continue;
+          }
           // Record the final answer in history too — without this, the NEXT
           // turn's context is missing the model's own previous replies (and
           // the transcript dump ends mid-conversation on a tool message).
           this.history.push({ role: "assistant", content });
-          yield { type: "assistant", text: content, id: streamId ?? undefined, usage };
+          // NEVER end a tool-using turn in total silence (live panel test: a
+          // Civitai 503 → empty final → empty retry → the user stared at a raw
+          // tool error with no explanation). History keeps the raw empty
+          // content; only the USER-FACING text gets the fallback.
+          const finalText =
+            content.trim() || (round === 0
+              ? content
+              : "(I ran the tools above but couldn't compose a reply — check the last tool result. Say “continue” to have me try again, or rephrase the request.)");
+          yield { type: "assistant", text: finalText, id: streamId ?? undefined, usage };
           yield { type: "result", ok: true, usage };
           resultEmitted = true;
           return;
@@ -766,6 +940,9 @@ export class OllamaBackend implements AgentBackend {
           const repeats = (seenCalls.get(callKey) ?? 0) + 1;
           seenCalls.set(callKey, repeats);
           maxRepeats = Math.max(maxRepeats, repeats);
+          const discoveryHits = DISCOVERY_TOOLS.has(name)
+            ? (discoveryCounts.set(name, (discoveryCounts.get(name) ?? 0) + 1), discoveryCounts.get(name)!)
+            : 0;
           yield { type: "tool_call", name, phase: "start", detail: tc.function?.arguments };
           const { text, isError } =
             repeats >= 2
@@ -780,7 +957,20 @@ export class OllamaBackend implements AgentBackend {
                     `If you are stuck, tell the user what you found and ask how to proceed.`,
                   isError: true,
                 }
-              : await this.dispatch(name, args);
+              : discoveryHits >= 4
+                ? {
+                    // Searched the catalog 4+ times with no hit — the capability
+                    // isn't here. Stop, and name the most common trap (Civitai
+                    // search lives in the OPTIONAL companion server, not here).
+                    text:
+                      `SEARCH LIMIT: you have called ${name} ${discoveryHits} times without finding a matching tool — it is very likely NOT in this catalog. STOP searching. ` +
+                      `Common misses: GRAPH/CANVAS actions (add a node, connect slots, set a widget, run the workflow) are PANEL tools — panel_call_tool {"name":"panel_add_node"} / panel_connect / panel_set_widget / panel_run, listed by panel_list_tools, NOT here. ` +
+                      `Civitai keyword search is the search_civitai_models tool (filter by types + base_models, then download_civitai_model); ` +
+                      `model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS — call_tool {"name":"list_packs"}. ` +
+                      `Otherwise, tell the user plainly what IS available and ask how they want to proceed. Do not call ${name} again.`,
+                    isError: true,
+                  }
+                : await this.dispatch(name, args);
           opts.onActivity?.();
           yield { type: "tool_call", name, phase: "end", detail: { isError } };
           this.history.push({
@@ -790,11 +980,23 @@ export class OllamaBackend implements AgentBackend {
             content: text.slice(0, 16000),
           });
         }
-        if (maxRepeats >= 4) {
-          logger.warn(`[ollama-backend] tool loop broken: a call repeated ${maxRepeats}x this turn (${this.model})`);
+        const maxDiscovery = Math.max(0, ...discoveryCounts.values());
+        if (maxRepeats >= 4 || maxDiscovery >= 8) {
+          logger.warn(
+            `[ollama-backend] tool loop broken: repeats=${maxRepeats} discovery=${maxDiscovery} this turn (${this.model})`,
+          );
+          // Honest, breaker-specific stop copy (live E2E caught the old one
+          // recommending the fine-tune TO the fine-tune). Discovery wedge →
+          // the capability likely isn't here; repeat wedge → the model stalled.
+          const switchTip = this.isFinetune()
+            ? ""
+            : " If you're on a stock model, `artokun/gemma4-comfyui-mcp:e4b` knows this tool suite and gets stuck far less.";
           yield {
             type: "assistant",
-            text: "(stopped: I kept repeating the same tool call without progress. Try rephrasing the request — and if you're on a stock model, switch to `artokun/gemma4-comfyui-mcp:e4b`, which knows this tool suite.)",
+            text:
+              maxDiscovery >= 8
+                ? `(stopped: I searched the tool catalog ${maxDiscovery} times without finding what I was looking for — that capability probably isn't available here. Tell me how you'd like to proceed.${switchTip})`
+                : `(stopped: I kept repeating the same tool call without progress. Try rephrasing the request, or break it into smaller steps.${switchTip})`,
           };
           yield { type: "result", ok: false, subtype: "tool_loop" };
           resultEmitted = true;
@@ -842,7 +1044,18 @@ export class OllamaBackend implements AgentBackend {
       mkdirSync(dir, { recursive: true });
       writeFileSync(
         join(dir, `${this.sessionId ?? "session"}.json`),
-        JSON.stringify({ model: this.model, messages: this.history }, null, 2),
+        JSON.stringify(
+          {
+            model: this.model,
+            // Inline image payloads are elided — a single screenshot would
+            // dwarf the whole conversation in the datagen transcript.
+            messages: this.history.map((m) =>
+              m.images?.length ? { ...m, images: m.images.map(() => "[inline image omitted]") } : m,
+            ),
+          },
+          null,
+          2,
+        ),
       );
     } catch (err) {
       logger.warn(`[ollama-backend] transcript dump failed: ${msgOf(err)}`);
@@ -874,7 +1087,15 @@ export class OllamaBackend implements AgentBackend {
         // bounded slice of the rest — OpenRouter's 300+ catalog isn't a browser.
         const recommended = RECOMMENDED_OPENROUTER_MODELS.filter((m) => available.has(m.id));
         const recIds = new Set(recommended.map((m) => m.id));
-        const rest = ids.filter((id) => id !== this.model && !recIds.has(id)).slice(0, 40);
+        // Sort the overflow alphabetically so a vendor's models CLUSTER (all
+        // deepseek/* together, findable), and widen the cap — the old unsorted
+        // 40-slice made newer models effectively invisible ("the list is very
+        // old" — Discord #help: deepseek-v4-pro existed upstream but never
+        // showed because it sat past the cut in OpenRouter's arrival order).
+        const rest = ids
+          .filter((id) => id !== this.model && !recIds.has(id))
+          .sort((a, b) => a.localeCompare(b))
+          .slice(0, 150);
         // llama-server reports its single model as the GGUF's FILE PATH —
         // keep the id verbatim (the server echoes it) but label by basename
         // so the picker isn't a wall of C:\...\model.gguf.

@@ -12,6 +12,8 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readOAuthStatus } from "../services/code-provider-auth.js";
+import type { OAuthStatusRecord } from "../services/panel-secrets.js";
 
 export type BackendReadiness = {
   backend: string;
@@ -21,6 +23,11 @@ export type BackendReadiness = {
   auth: boolean | null;
   /** cli && auth-not-false. */
   ready: boolean;
+  /** True only for providers the panel must label/gate as experimental (ToS
+   *  risk, unverified contract) — currently just copilot. Omitted (not merely
+   *  false) for every other backend so this frame stays a pure ADDITION for
+   *  existing consumers/tests. */
+  experimental?: boolean;
 };
 
 // CLI binary names per provider (Windows resolves .cmd/.exe via PATHEXT, but we
@@ -28,6 +35,7 @@ export type BackendReadiness = {
 const CLI_NAMES: Record<string, string[]> = {
   codex: ["codex", "codex.cmd", "codex.exe"],
   gemini: ["gemini", "gemini.cmd", "gemini.exe"],
+  grok: ["grok", "grok.cmd", "grok.exe"],
   ollama: ["ollama", "ollama.exe"],
   lmstudio: ["lms", "lms.exe"],
   llamacpp: ["llama-server", "llama-server.exe"],
@@ -93,6 +101,34 @@ function fileExists(...parts: string[]): boolean {
   }
 }
 
+/** The panel's in-panel-OAuth status records — injectable for tests (so a test
+ *  never has to touch the real ~/.comfyui-mcp/panel-secrets.json), defaulting
+ *  to the real store. Never throws — a corrupt/missing store just means "no
+ *  panel sign-ins known", not a readiness crash. */
+function panelOAuthRecords(opts?: { oauthStatus?: OAuthStatusRecord[]; home?: string }): OAuthStatusRecord[] {
+  if (opts?.oauthStatus) return opts.oauthStatus;
+  try {
+    // Thread the (test-injectable) home through — readOAuthStatus also detects
+    // native CLI auth files under it, and reading the REAL home from inside a
+    // test-scoped readiness probe would leak the developer's own logins.
+    return readOAuthStatus(opts?.home);
+  } catch {
+    return [];
+  }
+}
+
+/** True if `providerId` has an in-panel OAuth status entry that isn't expired.
+ *  A record with no `expires_at` (copilot's device-code tokens, e.g.) is
+ *  treated as "no known expiry" — mirrors the resolvers' own tokenExpiring()
+ *  semantics in code-provider-auth.ts, which likewise never expires a token
+ *  it has no expiry info for. */
+function hasValidPanelOAuth(providerId: string, records: OAuthStatusRecord[], nowMs: number): boolean {
+  const rec = records.find((r) => r.provider === providerId);
+  if (!rec) return false;
+  if (typeof rec.expires_at !== "number") return true;
+  return rec.expires_at * 1000 > nowMs;
+}
+
 /**
  * Readiness for one backend, evaluated locally.
  *
@@ -104,17 +140,58 @@ function fileExists(...parts: string[]): boolean {
  */
 export function backendReadiness(
   backend: string,
-  opts?: { home?: string; customEndpointConfigured?: boolean },
+  opts?: {
+    home?: string;
+    customEndpointConfigured?: boolean;
+    oauthStatus?: OAuthStatusRecord[];
+    now?: number;
+  },
 ): BackendReadiness {
   const b = (backend || "").toLowerCase();
   const home = opts?.home ?? homedir();
+  const nowMs = opts?.now ?? Date.now();
   if (b === "claude") {
     return { backend: "claude", cli: true, auth: true, ready: true };
   }
   if (b === "codex") {
     const cli = onPath(CLI_NAMES.codex);
-    const auth = fileExists(home, ".codex", "auth.json");
+    // The panel's in-panel OAuth for codex writes the SAME ~/.codex/auth.json
+    // an external `codex login` would (see persistOAuthResult), so the native
+    // file check below already picks it up in practice — the OAuth-status
+    // check is kept as an explicit, independent signal (belt-and-suspenders,
+    // and the only signal at all for a provider with no dedicated file check).
+    const auth =
+      fileExists(home, ".codex", "auth.json") ||
+      hasValidPanelOAuth("codex", panelOAuthRecords(opts), nowMs);
     return { backend: "codex", cli, auth, ready: cli && auth };
+  }
+  if (b === "chatgpt") {
+    // Direct Codex OAuth — no CLI; ~/.codex/auth.json from `codex login`.
+    const auth = fileExists(home, ".codex", "auth.json");
+    return { backend: "chatgpt", cli: true, auth, ready: !!auth };
+  }
+  if (b === "glm") {
+    const apiKey =
+      process.env.ZAI_API_KEY?.trim() ||
+      process.env.GLM_API_KEY?.trim() ||
+      process.env.ZHIPUAI_API_KEY?.trim() ||
+      process.env.ZHIPU_API_KEY?.trim();
+    const auth = !!apiKey;
+    return { backend: "glm", cli: true, auth, ready: auth };
+  }
+  if (b === "kimi") {
+    const apiKey = process.env.KIMI_API_KEY?.trim();
+    const kimiShare = process.env.KIMI_SHARE_DIR || join(home, ".kimi");
+    const oauth = fileExists(kimiShare, "credentials", "kimi-code.json");
+    const auth = !!apiKey || oauth;
+    return { backend: "kimi", cli: true, auth, ready: auth };
+  }
+  if (b === "moonshot") {
+    // Moonshot platform (Kimi K3) — hosted, no CLI. Readiness = MOONSHOT_API_KEY
+    // in the orchestrator's env (a bad key still surfaces via the connect ack's
+    // model probe → degraded). Distinct from `kimi` (Kimi Code subscription).
+    const auth = !!process.env.MOONSHOT_API_KEY?.trim();
+    return { backend: "moonshot", cli: true, auth, ready: auth };
   }
   if (b === "gemini") {
     const cli = onPath(CLI_NAMES.gemini);
@@ -123,6 +200,25 @@ export function backendReadiness(
     const geminiHome = process.env.GEMINI_CLI_HOME || home;
     const auth = fileExists(geminiHome, ".gemini", "oauth_creds.json");
     return { backend: "gemini", cli, auth, ready: cli && auth };
+  }
+  if (b === "grok") {
+    const cli = onPath(CLI_NAMES.grok);
+    // Same reasoning as codex above: the panel's in-panel OAuth writes the
+    // same ~/.grok/auth.json an external `grok` login would.
+    const auth =
+      fileExists(home, ".grok", "auth.json") ||
+      hasValidPanelOAuth("grok", panelOAuthRecords(opts), nowMs);
+    return { backend: "grok", cli, auth, ready: cli && auth };
+  }
+  if (b === "copilot") {
+    // No external CLI/native-file concept for Copilot — the in-panel device-
+    // code OAuth (experimental, gated behind allow_experimental in
+    // oauth-bridge.ts) is the ONLY sign-in path, so it's the only signal here.
+    // `experimental: true` lets the panel (Task 7) label/gate this row even
+    // once signed in — this backend is opt-in ToS-risk territory, never a
+    // default or auto-pick.
+    const auth = hasValidPanelOAuth("copilot", panelOAuthRecords(opts), nowMs);
+    return { backend: "copilot", cli: true, auth, ready: auth, experimental: true };
   }
   if (b === "ollama") {
     // No login concept — a local daemon. Binary presence is the readiness
@@ -171,7 +267,12 @@ export function backendReadiness(
 /** Readiness for every known backend, plus a rolled-up any_ready. */
 export function allBackendReadiness(
   backends: Iterable<string>,
-  opts?: { home?: string; customEndpointConfigured?: boolean },
+  opts?: {
+    home?: string;
+    customEndpointConfigured?: boolean;
+    oauthStatus?: OAuthStatusRecord[];
+    now?: number;
+  },
 ): {
   backends: BackendReadiness[];
   any_ready: boolean;

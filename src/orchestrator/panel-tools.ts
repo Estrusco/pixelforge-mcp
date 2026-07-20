@@ -33,17 +33,23 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import {
+  type WorkflowTargetStore,
+  withWorkflowTarget,
+} from "../services/workflow-target-store.js";
+import {
   addUserMcpServer,
   readUserMcpServers,
   removeUserMcpServer,
   setUserMcpServerSecret,
 } from "../services/user-mcp-config.js";
 import { setComfyuiSecret, setAgentSecret, isAllowedAgentSecretKey } from "../services/panel-secrets.js";
+import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
 import { QueueMonitor } from "../services/queue-monitor.js";
 import { getObjectInfo, backfillObjectInfo } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
+import { validateA2UISpecServer } from "../services/a2ui-spec.js";
 import type { UiWorkflow } from "../comfyui/types.js";
 
 /** Treat these as an affirmative answer to the adult-content consent card. */
@@ -233,13 +239,21 @@ export interface PanelToolCtx {
    *  (image screenshots, secret collection). */
   bridge: UiBridge;
   tabId: string;
+  /** Per-tab workflow pin store (optional for tests). */
+  workflowTarget?: WorkflowTargetStore;
 }
 
 /** Build a tab-bound execution context shared by both transports. */
-export function makePanelToolCtx(bridge: UiBridge, tabId: string): PanelToolCtx {
+export function makePanelToolCtx(
+  bridge: UiBridge,
+  tabId: string,
+  workflowTargets?: WorkflowTargetStore,
+): PanelToolCtx {
   const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
     try {
-      return ok(await bridge.send(cmd as { cmd: string }, { tabId, timeoutMs }));
+      const target = workflowTargets?.get(tabId);
+      const routed = target ? withWorkflowTarget(cmd, target) : cmd;
+      return ok(await bridge.send(routed as { cmd: string }, { tabId, timeoutMs }));
     } catch (err) {
       return fail(err);
     }
@@ -269,7 +283,44 @@ export function makePanelToolCtx(bridge: UiBridge, tabId: string): PanelToolCtx 
       return false;
     }
   };
-  return { call, confirm, bridge, tabId };
+  return { call, confirm, bridge, tabId, workflowTarget: workflowTargets };
+}
+
+/**
+ * Resolve a workflow source for the strip/slice tools: an explicit `pack`,
+ * `path`, or inline `graph` — or, when none is given, the LIVE CANVAS via the
+ * panel's graph_serialize command. The canvas default exists because "flatten
+ * what I have open" is the common ask, and requiring a save-to-disk round trip
+ * first derailed real sessions (deleted placeholder files, 404 tabs).
+ */
+async function resolveWorkflowInput(
+  args: Record<string, unknown>,
+  ctx: PanelToolCtx,
+): Promise<Record<string, unknown>> {
+  if (args.pack) return readPackWorkflow(args.pack as string);
+  if (args.path) return readWorkflowFromPath(args.path as string);
+  if (args.graph != null) {
+    return (typeof args.graph === "string"
+      ? JSON.parse(args.graph as string)
+      : args.graph) as Record<string, unknown>;
+  }
+  let reply: unknown;
+  try {
+    reply = await ctx.bridge.send({ cmd: "graph_serialize" } as { cmd: string }, {
+      tabId: ctx.tabId,
+      timeoutMs: 30000,
+    });
+  } catch (err) {
+    throw new Error(
+      `Couldn't capture the live canvas (${err instanceof Error ? err.message : String(err)}). ` +
+        `An older panel version may not support graph_serialize — pass pack, path, or graph instead.`,
+    );
+  }
+  const wf = (reply as { workflow?: unknown } | null)?.workflow;
+  if (!wf || typeof wf !== "object") {
+    throw new Error("The live canvas returned no graph — pass pack, path, or graph explicitly.");
+  }
+  return wf as Record<string, unknown>;
 }
 
 /** One shared tool definition: name, description, zod raw-shape schema, and a
@@ -365,6 +416,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "Read a COMPACT, dependency-ordered TEXT MAP of the workflow the user is viewing — the FASTEST way to UNDERSTAND a graph (especially a big loaded pack/template) before you touch it. Returns one `outline` string built for you to read top→down: nodes are topologically sorted (sources first, sinks last), each shown on its own block as `id Type \"title\" [bypass/mute] [OUTPUT] · group:X  widget=value …` with `← inputs` (as source_node.output_name) and `→ outputs` (as target_node.input_name), preceded by a GROUPS index (title → member node ids). It shows the WIRING you'd otherwise have to reconstruct. Use this FIRST to get oriented; then panel_query_graph to filter/traverse/inspect (e.g. {ids:[42], fields:'detail'} for one node's exact slot/widget detail), or panel_find_nodes for free-text search. Read-only.",
       {},
       async (_args, ctx) => ctx.call({ cmd: "graph_outline" }),
+    ),
+    def(
+      "panel_view_selected",
+      "What the user has SELECTED on the canvas right now. Call this FIRST whenever they say \"this node\", \"the selected one\", \"the highlighted node\", \"where did I get this from\", or otherwise point at something without giving an id — the selection IS the answer, and reading it costs one call instead of scanning the graph. Returns the full detail summary (id, type, title, widgets, inputs with sources, outputs, mode) for each selected node, plus `selected_count` and any selected groups/reroutes. If `selected_count` is 0, nothing is selected — ask the user to click the node rather than guessing. NEVER dump the whole graph to work out which node they mean. Read-only.",
+      {},
+      async (_args, ctx) => ctx.call({ cmd: "graph_view_selected" }),
+    ),
+    def(
+      "panel_view_nodes_in_viewport",
+      "The nodes the user can actually SEE — everything intersecting the current viewport (pan+zoom) of the canvas they're looking at. Use this to SCOPE your work to what's on their screen instead of reading a whole graph: when they say \"these nodes\", \"the ones here\", \"what am I looking at\", or when a graph is large and you only need the region in front of them. Returns the viewport rect in graph coordinates (x, y, width, height, zoom), `node_count` (whole graph) vs `in_view_count`, and the detail summary of each visible node. A node counts as visible if any part of it overlaps the viewport. On a big canvas this is dramatically cheaper than panel_graph_outline / panel_query_graph — prefer it when the user's framing is visual. Read-only.",
+      {},
+      async (_args, ctx) => ctx.call({ cmd: "graph_view_nodes_in_viewport" }),
+    ),
+    def(
+      "panel_audit_prompt_director",
+      "Audit Prompt Director on the LIVE canvas without changing it. Correlates Prompt Director/Producer/Auto/Context/Reference/Critic widget values and wiring with detected model-loader filenames, every LoRA loader's actual model/CLIP strengths, and Prompt Director's latest sanitized runtime edit plan, resolved Model Explorer metadata, warnings, exact final prompt, and critic verdict. Returns observations plus proposed panel_set_widget changes with requires_confirmation=true. Call this when Prompt Director nodes are present, before saying the model/LoRA setup is correct, or when an edit prompt is ignored. READ-ONLY: present useful findings to the user and ask before applying any recommendation unless they already explicitly asked you to fix it.",
+      {},
+      async (_args, ctx) => ctx.call({ cmd: "graph_prompt_director_audit" }),
     ),
     def(
       "panel_get_subgraph",
@@ -475,12 +544,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_strip_workflow",
       "Strip a workflow to a clean, flat, RESOLVED graph — Get/Set buses, Reroutes, subgraph " +
         "definitions, and bypassed/muted nodes all collapsed into real connections (the " +
-        "'de-getter-setter' pass). Takes the same input as panel_load_workflow — a `pack`, a server-side " +
-        "`path` (absolute or relative to the ComfyUI workflows folder), or an inline `graph` — but RETURNS " +
-        "the de-virtualized graph plus a node-type summary for INSPECTION / REBUILD instead of loading it " +
-        "onto the canvas. Use this to understand or rebuild an expert workflow's real wiring without the " +
-        "virtual nodes (e.g. a staged 150KB graph full of GetNode/SetNode/Reroute). The resolved graph is " +
-        "much smaller than the raw UI JSON and is read SERVER-SIDE.",
+        "'de-getter-setter' pass). With NO arguments it reads the LIVE CANVAS directly (no need to save " +
+        "to a file first); or pass a `pack`, a server-side `path` (absolute or relative to the ComfyUI " +
+        "workflows folder), or an inline `graph`. RETURNS the de-virtualized graph (API/prompt format) " +
+        "plus a node-type summary for INSPECTION / EXECUTION / REBUILD — it does NOT and CANNOT load the " +
+        "result back onto the canvas (the canvas only loads UI-format graphs). Use it to understand an " +
+        "expert workflow's real wiring, run the resolved graph headless, or rebuild connections with the " +
+        "graph edit tools. The resolved graph is much smaller than the raw UI JSON.",
       {
         pack: z
           .string()
@@ -497,20 +567,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .optional()
           .describe("Inline UI workflow (object or JSON string) to strip instead of a pack/path."),
       },
-      async (args: A) => {
-        let raw: Record<string, unknown>;
-        if (args.pack) {
-          raw = readPackWorkflow(args.pack as string);
-        } else if (args.path) {
-          raw = readWorkflowFromPath(args.path as string);
-        } else if (args.graph != null) {
-          raw = (typeof args.graph === "string"
-            ? JSON.parse(args.graph as string)
-            : args.graph) as Record<string, unknown>;
-        } else {
-          throw new Error("Provide exactly one of: pack, path, or graph.");
-        }
-
+      async (args: A, ctx) => {
+        const raw = await resolveWorkflowInput(args, ctx);
         const ui = raw as unknown as UiWorkflow;
         const bulk = await getObjectInfo();
         const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(ui));
@@ -538,15 +596,66 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       },
     ),
     def(
+      "panel_flatten_workflow",
+      "Flatten the user's workflow IN PLACE, preserving their layout: every Get/Set bus, Reroute, and " +
+        "cg-use-everywhere (UE) broadcast is resolved into a direct real link, and the virtual nodes are " +
+        "deleted — kept nodes never move, so groups/positions/colors/titles survive exactly (unlike " +
+        "panel_strip_workflow, whose API-format output can't go back on the canvas). With no source it " +
+        "flattens the LIVE CANVAS and reloads the result onto it (one undo restores); pass a `pack`, " +
+        "server-side `path`, or inline `graph` to flatten that instead (still loads onto the canvas " +
+        "unless `apply:false`). UE broadcasts materialize from the pack's own computed extra.ue_links; " +
+        "if senders exist without it, they're left in place with a warning (save/queue once, retry). " +
+        "Real executable nodes (rgthree Context/Context Switch, Seed Everywhere) are KEPT — they run.",
+      {
+        pack: z.string().optional().describe("Bundled pack name — its UI workflow.json is read server-side."),
+        path: z
+          .string()
+          .optional()
+          .describe("Workflow .json on the ComfyUI machine's disk — absolute or relative to user/default/workflows."),
+        graph: z
+          .union([z.string(), z.record(z.string(), z.unknown())])
+          .optional()
+          .describe("Inline UI workflow (object or JSON string) to flatten instead of the live canvas."),
+        include_ue: z.boolean().optional().describe("Materialize Use-Everywhere broadcasts (default true)."),
+        include_getset: z.boolean().optional().describe("Resolve Get/Set buses + Reroutes (default true)."),
+        apply: z
+          .boolean()
+          .optional()
+          .describe("Load the flattened graph onto the canvas (default true). false = return the graph JSON only."),
+      },
+      async (args: A, ctx) => {
+        const raw = await resolveWorkflowInput(args, ctx);
+        const { graph, report } = flattenUiWorkflow(raw as never, {
+          includeUe: args.include_ue !== false,
+          includeGetSet: args.include_getset !== false,
+        });
+        const summary =
+          `Flattened: removed ${report.removed.getset} Get/Set, ${report.removed.reroute} Reroute, ` +
+          `${report.removed.ue} UE sender(s); added ${report.added_links} direct link(s) ` +
+          `(${report.rewired_inputs} inputs rewired); ${report.kept_nodes} nodes kept in place.` +
+          (report.warnings.length
+            ? `\nWarnings:\n${report.warnings.map((w) => `- ${w}`).join("\n")}`
+            : "");
+        if (args.apply === false) {
+          return ok(`${summary}\n\n${JSON.stringify(graph)}`);
+        }
+        const loaded = await ctx.call({ cmd: "graph_load", graph: graph as never }, 30000);
+        const loadText = (loaded as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "";
+        return ok(`${summary}\nLoaded onto the canvas (one undo restores the original). ${loadText.slice(0, 120)}`);
+      },
+    ),
+    def(
       "panel_slice_workflow",
       "Slice ONE pipeline out of a toggle-template workflow (built with rgthree 'Fast Groups " +
         "Bypasser/Muter' — one graph holding many pipelines, only one active at a time). Seeds from the " +
         "output nodes in the named `groups`, takes their backward closure (real links + virtual Set/Get " +
         "buses), un-bypasses the kept nodes and their subgraph internals, and RETURNS a standalone, " +
-        "activated UI graph (only the subgraph defs it uses). Reads a `pack`, server-side `path`, or " +
-        "inline `graph`. Pair with panel_strip_workflow to then flatten the Set/Get buses. This returns " +
+        "activated UI graph (only the subgraph defs it uses). With NO source argument it reads the LIVE " +
+        "CANVAS directly; or pass a `pack`, server-side `path`, or inline `graph`. Pair with " +
+        "panel_strip_workflow to then flatten the Set/Get buses. This returns " +
         "the sliced graph for inspection — it does NOT load it onto the canvas (feed the result to " +
-        "panel_load_workflow if you want that).",
+        "panel_load_workflow if you want that; unlike the strip tool's API-format output, the slice IS a " +
+        "loadable UI graph).",
       {
         pack: z.string().optional().describe("Bundled pack name (its UI workflow.json is read server-side)."),
         path: z
@@ -563,20 +672,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             "Group-title substrings (case-insensitive) whose output nodes seed the slice — CSV string or array, e.g. 'TEXT TO IMAGE' or ['extend','sampler'].",
           ),
       },
-      async (args: A) => {
-        let raw: Record<string, unknown>;
-        if (args.pack) {
-          raw = readPackWorkflow(args.pack as string);
-        } else if (args.path) {
-          raw = readWorkflowFromPath(args.path as string);
-        } else if (args.graph != null) {
-          raw = (typeof args.graph === "string"
-            ? JSON.parse(args.graph as string)
-            : args.graph) as Record<string, unknown>;
-        } else {
-          throw new Error("Provide exactly one of: pack, path, or graph.");
-        }
-
+      async (args: A, ctx) => {
+        const raw = await resolveWorkflowInput(args, ctx);
         const groupList = Array.isArray(args.groups)
           ? (args.groups as string[])
           : String(args.groups ?? "").split(",");
@@ -648,14 +745,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .boolean()
           .optional()
           .describe("Default true. Set false to force legacy exact resolution (omitted slot = index 0)."),
+        // ALIASES small models actually emit (live panel finding): zod silently
+        // STRIPPED from_slot_name/to_slot_name, both slots fell to "auto", and
+        // auto-match wired something the model never asked for — reported as
+        // success, scrambling the graph. Accept the aliases so intent survives.
+        from_slot_name: slotRef.optional().describe("Alias for from_output."),
+        to_slot_name: slotRef.optional().describe("Alias for to_input."),
+        from_slot: slotRef.optional().describe("Alias for from_output."),
+        to_slot: slotRef.optional().describe("Alias for to_input."),
+        output: slotRef.optional().describe("Alias for from_output."),
+        input: slotRef.optional().describe("Alias for to_input."),
       },
       async (args: A, ctx) =>
         ctx.call({
           cmd: "graph_connect",
           from_node_id: args.from_node_id,
-          from_output: args.from_output,
+          from_output: args.from_output ?? args.from_slot_name ?? args.from_slot ?? args.output,
           to_node_id: args.to_node_id,
-          to_input: args.to_input,
+          to_input: args.to_input ?? args.to_slot_name ?? args.to_slot ?? args.input,
           auto_match: args.auto_match,
         }),
     ),
@@ -798,7 +905,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_get_errors",
-      "Read ComfyUI's pre-run VALIDATION errors (missing models, value_not_in_list / invalid widget values, broken links — the SAME 'N ERRORS' the user sees in the frontend's error panel) plus the most recent runtime execution error, from the user's open tab. The validation errors are populated by ComfyUI's own validator on ANY queue attempt — the user's OR yours — so this reflects what the user is looking at. A ⚠️ GRAPH VALIDATION block is also auto-injected at your turn start when this state changes; call this to re-check on demand (e.g. after you edit widgets/links). Read-only.",
+      "WHY IS THAT NODE RED / WHY DID THE RUN FAIL? The single error surface for the user's open tab: every errored node JOINED TO ITS CAUSE, which ComfyUI itself does not show — LiteGraph only paints a red outline and stores no reason, which is why users report \"red node, no error message\". Call this whenever the user mentions a red/highlighted/erroring node, a failed run, or \"required models are missing\" — instead of guessing from widget values. Each entry in `nodes[]` is the node's full detail summary plus `red_outline` and `reasons[]`, drawn from every source: `missing_model` (exact file, its models directory, the widget holding it, and a download URL when known), `missing_media` (a referenced input image/video that isn't on disk — the usual cause of a red LoadImage), `validation` (per-input errors from the last queue attempt: message, details, offending input), and `execution` (runtime failure with `exception_type`, e.g. PIL.UnidentifiedImageError). TWO THINGS THAT MAKE THIS ESSENTIAL: (1) missing model/media assets paint nodes red AS SOON AS THE WORKFLOW LOADS, long before any queue attempt — so the raw validation map is still EMPTY while the user is staring at red nodes; (2) a node that throws AT RUNTIME is never painted red at all, so it can't be spotted on the canvas — it appears here with red_outline:false. Also returns graph-level `missing_models`, `missing_media`, `missing_node_types` (or `missing_node_count`), plus the raw `node_errors` map and `last_execution_error` for reference. A ⚠️ GRAPH VALIDATION block is auto-injected at your turn start when this state changes; call this to re-check on demand (e.g. after you edit widgets/links). Read-only.",
       {},
       async (_args, ctx) => ctx.call({ cmd: "graph_get_errors" }),
     ),
@@ -1041,6 +1148,44 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       async (args: A, ctx) => ctx.call({ cmd: "set_todo", items: args.items }, 5000),
     ),
     def(
+      "panel_open_civitai",
+      "Open the in-panel CivitAI browser for the user, pre-seeded with a search term and suggested filters, so they can VISUALLY browse and pick a model / LoRA / checkpoint / workflow / image. Use this whenever the user wants to find or choose a resource on CivitAI: set a helpful query + filters matched to their goal (including the browsing level), and they pick. Their selection comes back to you as a normal chat message — UNLESS the panel is muted, in which case they download it directly themselves. Prefer this over guessing a specific model or asking them to paste a URL.",
+      {
+        query: z
+          .string()
+          .optional()
+          .describe("Search term to pre-fill (e.g. 'anime lineart', 'Flux photoreal'). Omit for a plain browse."),
+        tab: z
+          .enum(["images", "videos", "checkpoints", "loras", "workflows", "favorites"])
+          .optional()
+          .describe("Which tab to open. Default 'images'. Use 'loras'/'checkpoints'/'workflows' when they want a downloadable resource."),
+        browsingLevels: z
+          .array(z.number())
+          .optional()
+          .describe("Content levels to show, as a set of bitmask values: PG=1, PG-13=2, R=4, X=8, XXX=16. e.g. [1,2] for SFW only, [1,2,4,8,16] for everything. Default [1]. Match the user's stated comfort."),
+        filters: z
+          .object({
+            period: z.string().optional(),
+            modelSort: z.string().optional(),
+            imageSort: z.string().optional(),
+            baseModels: z.array(z.string()).optional(),
+          })
+          .optional()
+          .describe("Optional filter hints: period, a sort, and base-model names (e.g. ['Flux.1 D'])."),
+      },
+      async (args: A, ctx) =>
+        ctx.call(
+          {
+            cmd: "open_civitai",
+            query: args.query,
+            tab: args.tab,
+            browsingLevels: args.browsingLevels,
+            filters: args.filters,
+          },
+          10000,
+        ),
+    ),
+    def(
       "panel_ask",
       "Ask the user to choose between options — renders an interactive question card in the panel chat and BLOCKS until they pick, returning their choice as text. Use this (NOT the AskUserQuestion tool, which never renders here) whenever you need the user to decide between options. Each option may carry a short description. The card always includes an 'Other…' free-text field, so the returned string may be a listed label or whatever the user typed (comma-joined for multi_select). Ask only when the answer genuinely changes what you do.",
       {
@@ -1084,6 +1229,47 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "List the user's OPEN workflow tabs and which one is active (path, filename, modified, persisted). Use this to know what's open before switching/renaming/closing. Read-only.",
       {},
       async (_args, ctx) => ctx.call({ cmd: "workflow_list" }),
+    ),
+    def(
+      "panel_get_workflow_target",
+      "Read which workflow this agent is bound to edit. mode 'current' means graph tools follow whatever tab the user is viewing; mode 'pinned' means edits go to the pinned workflow even if the user switched to another tab. Call this when unsure which workflow your panel_* edits will affect.",
+      {},
+      async (_args, ctx) => {
+        const target = ctx.workflowTarget?.get(ctx.tabId) ?? { mode: "current" as const };
+        return ok(target);
+      },
+    ),
+    def(
+      "panel_set_workflow_target",
+      "Pin the agent to a specific open workflow tab, or release the pin to follow the user's current tab. Use pinned when the user asks you to work on workflow A while they browse workflow B — set mode:'pinned' and path from panel_list_workflows. Set mode:'current' (or omit path) to follow the active tab again. Does NOT switch what the user sees; it only routes your panel_* graph edits.",
+      {
+        mode: z
+          .enum(["current", "pinned"])
+          .describe("'current' = follow the user's active workflow tab; 'pinned' = always edit the given path."),
+        path: z
+          .string()
+          .optional()
+          .describe("Workflow path/filename/key from panel_list_workflows — required when mode is 'pinned'."),
+        filename: z.string().optional().describe("Optional display label for the pinned workflow."),
+      },
+      async (args: A, ctx) => {
+        if (!ctx.workflowTarget) {
+          return fail("Workflow targeting is not available in this session.");
+        }
+        const mode = args.mode === "pinned" ? "pinned" : "current";
+        const path = typeof args.path === "string" ? args.path : undefined;
+        const filename = typeof args.filename === "string" ? args.filename : undefined;
+        if (mode === "pinned" && !(path ?? "").trim()) {
+          return fail("Provide path when pinning — use panel_list_workflows to list open workflows.");
+        }
+        const target = ctx.workflowTarget.set(ctx.tabId, { mode, path, filename });
+        ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
+        const hint =
+          target.mode === "pinned"
+            ? `Pinned to "${target.filename ?? target.path}". Graph tools will target that workflow without switching the user's view.`
+            : "Following the user's current workflow tab.";
+        return ok({ ...target, note: hint });
+      },
     ),
     def(
       "panel_new_workflow",
@@ -1605,6 +1791,33 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         return ctx.call({ cmd: "show_media", items: resolved }, 60000);
       },
     ),
+    def(
+      "panel_ui_render",
+      "Render an INTERACTIVE UI CARD in the panel chat from an A2UI-subset JSON spec — choice buttons, forms (TextField/Select/Checkbox + a submit Button), node-wiring diagrams (comfy:graph), and bar/line charts (comfy:chart). Use a card whenever the user must pick between options, confirm a plan, fill in parameters, or would understand a wiring explanation better as a diagram. The card is non-blocking: this returns { card_id } immediately; when the user clicks a button (or submits a form) their choice arrives as a NORMAL chat message (the button's `reply` text; submit buttons append 'name: value' lines) — so after rendering a card that asks a question, END YOUR TURN and wait. Set surface:'wide' for diagram-heavy cards (the panel widens and restores automatically). Spec shape: { surface?, title?, root: '<id>', components: [ {id, type, ...} ] } with children referenced by id. Types: Text{text}, Heading{text,level?}, Button{label,reply?,submit?,style?:'primary'|'secondary'}, Row/Column/Card{children:[ids]}, Divider, Image{src:/view-URL,caption?}, TextField{label,name,value?,placeholder?}, Select{label,name,options:[{label,value?}],value?}, Checkbox{label,name,checked?}, 'comfy:graph'{nodes:[{id,label,color?}],edges:[{from,to,label?}],direction?:'lr'|'tb'}, 'comfy:chart'{kind:'bar'|'line',series:[{label,values:[num]}],x?:[labels]}. Caps: ≤64 components, ≤30 graph nodes, ≤8×256 chart points. On a validation error, FIX the spec and retry.",
+      {
+        spec: z
+          .record(z.string(), z.unknown())
+          .describe("The A2UI-subset card spec object (see tool description for the exact shape)."),
+      },
+      async (args: A, ctx) => {
+        const v = validateA2UISpecServer(args.spec);
+        if (!v.ok) return fail(`invalid a2ui spec: ${v.errors.join("; ")}`);
+        return ctx.call({ cmd: "ui_render", spec: v.spec }, 15000);
+      },
+    ),
+    def(
+      "panel_ui_update",
+      "Re-render a LIVE card previously created with panel_ui_render, in place (progress updates, revised options, reactive forms). Pass the card_id you received and a complete NEW spec (same shape/caps as panel_ui_render — this replaces the card's content, it does not merge). Fails once the user has already clicked/resolved or dismissed the card, or after the view was switched away — on 'no live card', just render a fresh card instead.",
+      {
+        card_id: z.string().describe("The card_id returned by panel_ui_render."),
+        spec: z.record(z.string(), z.unknown()).describe("The complete replacement spec."),
+      },
+      async (args: A, ctx) => {
+        const v = validateA2UISpecServer(args.spec);
+        if (!v.ok) return fail(`invalid a2ui spec: ${v.errors.join("; ")}`);
+        return ctx.call({ cmd: "ui_update", card_id: args.card_id, spec: v.spec }, 15000);
+      },
+    ),
   ];
 }
 
@@ -1619,8 +1832,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
 export function createPanelMcpServer(
   bridge: UiBridge,
   tabId: string,
+  workflowTargets?: WorkflowTargetStore,
 ): McpSdkServerConfigWithInstance {
-  const ctx = makePanelToolCtx(bridge, tabId);
+  const ctx = makePanelToolCtx(bridge, tabId, workflowTargets);
   const defs = buildPanelToolDefs();
   // The Anthropic SDK's tool() accepts (name, description, zodRawShape, cb). The
   // shared handler is transport-agnostic — bind it to this tab's ctx. Each def's

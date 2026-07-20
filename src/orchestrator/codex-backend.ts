@@ -363,7 +363,9 @@ class AppServerClient {
 // present) AND toCodexEffort() further down (the validity check), to avoid drift.
 // The backend ALREADY applies effort to every turn via toCodexEffort regardless
 // of model, so advertising it for all Codex models matches current behavior.
-const CODEX_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+// GPT-5.6 extends the scale with `max` and `ultra` (verified live per model:
+// sol/terra accept through ultra, luna through max — issue #241's catalog).
+const CODEX_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 // ---- model fallback ----
 // config/read does not enumerate a model CATALOG (it reports the active provider
@@ -371,9 +373,18 @@ const CODEX_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"
 // model family. The panel picker degrades gracefully on an empty list. Each entry
 // advertises the Codex effort scale so the panel enables the reasoning-effort
 // dropdown for these models (the backend applies effort to every turn anyway).
+// GPT-5.6 family ONLY (product decision 2026-07-20): older GPT-5.x are
+// deprecated — the live catalog is filtered to the 5.6 family and these
+// fallbacks match it. Per-variant effort ceilings from the live model/list.
 const CODEX_FALLBACK_MODELS: ModelChoice[] = [
-  { id: "gpt-5.5", label: "GPT-5.5", supportsEffort: true, supportedEffortLevels: [...CODEX_EFFORT_LEVELS] },
-  { id: "gpt-5.5-codex", label: "GPT-5.5 Codex", supportsEffort: true, supportedEffortLevels: [...CODEX_EFFORT_LEVELS] },
+  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+  { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+  { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+  // This static list only surfaces when model/list is UNAVAILABLE — i.e. an
+  // older CLI resolved from PATH (bundled-install failure), which cannot run
+  // any 5.6 model. Keep one runnable pre-5.6 escape hatch there (codex
+  // review); accounts on the pinned bundled CLI never see this list.
+  { id: "gpt-5.5", label: "GPT-5.5 (legacy CLI fallback)", supportsEffort: true, supportedEffortLevels: ["none", "minimal", "low", "medium", "high", "xhigh"] },
 ];
 
 /** Does this id look like an OpenAI/Codex model (vs. a Claude panel model)? Used
@@ -394,12 +405,27 @@ function isCodexModel(id: string): boolean {
 // off-scale source value is Claude "max", which has no Codex equivalent and maps
 // to the nearest valid level (xhigh). Unknown/empty → null (app-server default).
 const CODEX_EFFORTS = CODEX_EFFORT_LEVELS; // single source of truth (advertised == accepted)
-function toCodexEffort(effort: string | undefined): string | null {
+// Low→high rank for ceiling-snapping in toCodexEffort.
+const EFFORT_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+function toCodexEffort(effort: string | undefined, allowed?: string[]): string | null {
   if (!effort) return null;
   const e = effort.toLowerCase();
-  if ((CODEX_EFFORTS as readonly string[]).includes(e)) return e;
-  if (e === "max") return "xhigh"; // Claude's top level → Codex's nearest valid
-  return null; // unknown level → let the app-server pick its default
+  if (!(CODEX_EFFORTS as readonly string[]).includes(e)) {
+    return null; // unknown level → let the app-server pick its default
+  }
+  // Snap to the active model's supported list when we know it: "max"/"ultra"
+  // are native on GPT-5.6 but REJECTED by pre-5.6 models and older CLIs —
+  // the old blanket max→xhigh downmap was removed, so the ceiling must be
+  // enforced here (codex review). No list known → conservative xhigh cap.
+  if (allowed && allowed.length) {
+    if (allowed.includes(e)) return e;
+    for (let i = EFFORT_RANK.indexOf(e); i >= 0; i--) {
+      if (allowed.includes(EFFORT_RANK[i])) return EFFORT_RANK[i];
+    }
+    return allowed[allowed.length - 1] ?? null;
+  }
+  if (e === "max" || e === "ultra") return "xhigh";
+  return e;
 }
 
 /**
@@ -541,6 +567,9 @@ export class CodexBackend implements AgentBackend {
   private disposed = false;
   /** Cached resolved path to the codex binary/launcher (set in prepare()). */
   private bin: string | null = null;
+  /** Account-aware model catalog from the app-server's model/list (set by
+   *  listModels()); resolveTurnModel() clamps every thread's model to it. */
+  private liveCatalog: ModelChoice[] | null = null;
   /** Sandbox posture for the app-server + every thread (COMFYUI_MCP_CODEX_SANDBOX,
    *  default danger-full-access — mirrors Claude's bypassPermissions). Read once at
    *  construction so it's stable for this backend instance. */
@@ -552,6 +581,9 @@ export class CodexBackend implements AgentBackend {
   private model: string | undefined;
   /** The Codex reasoning effort for new turns, already mapped to a valid Codex
    *  level (null = let the app-server choose). Captured from run(opts.effort). */
+  /** RAW panel effort for this session — snapped per-turn against the
+   *  RESOLVED model's supported list (the catalog isn't loaded yet when run()
+   *  captures it, and the active model can change via the clamp). */
   private effort: string | null = null;
   /** True until the panel system prompt has been prepended to a turn. The
    *  app-server's thread/start has no instructions field, so the persona rides on
@@ -750,23 +782,29 @@ export class CodexBackend implements AgentBackend {
     // otherwise ignore it and keep the configured Codex model (or the account
     // default when neither is set — model:null lets the app-server choose).
     if (opts.model && isCodexModel(opts.model)) this.model = opts.model;
-    // Map the panel/Claude effort scale onto Codex's and apply it to every turn in
-    // this session (the panel restarts run() on an effort change, so capturing it
-    // here is enough — each new turn reads this.effort). Without this the session
-    // ran at the app-server default regardless of the picker (the effort was
-    // previously hardcoded to null on turn/start).
-    this.effort = toCodexEffort(opts.effort);
+    // Capture the RAW panel effort; each turn maps+snaps it against the model
+    // it actually runs (toCodexEffort with the model's supported list — the
+    // catalog isn't loaded yet here, and max/ultra are only valid on models
+    // that advertise them). The panel restarts run() on an effort change, so
+    // capturing once per session is enough.
+    this.effort = opts.effort ?? null;
 
     // forkAtAnchor is false (CODEX_CAPABILITIES) → ignore opts.rewindAnchor; we
     // only do whole-thread resume.
     const resumeId = opts.resume ?? opts.sessionId ?? null;
+    // Make sure THIS instance knows the account's live model catalog before the
+    // thread opens — each tab's agent gets its own backend instance, so the
+    // catalog fetched by the connect-time advertisement lives elsewhere. Without
+    // this, resolveTurnModel() has nothing to clamp against and defers to the
+    // ~/.codex config default, which can be unrunnable (see resolveTurnModel).
+    if (!this.liveCatalog) await this.listModels().catch(() => {});
     let threadModel: string | undefined;
     if (resumeId) {
       // thread/resume continues an existing conversation by id.
       const res = await client.request<{ thread: { id: string }; model?: string }>("thread/resume", {
         threadId: resumeId,
         cwd,
-        model: this.model ?? null,
+        model: this.resolveTurnModel(),
         approvalPolicy: "never",
         sandbox: this.sandbox,
       });
@@ -779,7 +817,7 @@ export class CodexBackend implements AgentBackend {
       // thread/start opens a fresh conversation.
       const res = await client.request<{ thread: { id: string }; model?: string }>("thread/start", {
         cwd,
-        model: this.model ?? null,
+        model: this.resolveTurnModel(),
         approvalPolicy: "never",
         sandbox: this.sandbox,
         ephemeral: false,
@@ -1065,13 +1103,22 @@ export class CodexBackend implements AgentBackend {
 
     try {
       // turn/start delivers the user text plus any resolved image input items.
+      const turnModel = this.resolveTurnModel();
       client
         .request<{ turn?: { id?: string } }>("turn/start", {
           threadId,
           input: turnInput,
-          model: this.model ?? null,
-          // Forward the session's mapped Codex effort (null = app-server default).
-          effort: this.effort,
+          // Same clamp as thread/start|resume — sending the raw pin here let
+          // a deprecated/unrunnable model bypass the thread-level clamp on
+          // every turn (codex review on this branch).
+          model: turnModel,
+          // Map+snap the session effort against the model THIS turn runs:
+          // known catalog → the model's own supported list caps it (5.6 keeps
+          // max/ultra; pre-5.6 snaps down); unknown catalog → xhigh cap.
+          effort: toCodexEffort(
+            this.effort ?? undefined,
+            this.liveCatalog?.find((m) => m.id === turnModel)?.supportedEffortLevels,
+          ),
           outputSchema: null,
         })
         .then((res) => {
@@ -1146,16 +1193,87 @@ export class CodexBackend implements AgentBackend {
   }
 
   /**
-   * Codex model enumeration. config/read reports the active provider/model rather
-   * than a catalog, so we surface a sensible static set (the current Codex model
-   * family). Returns [] only if even that can't be determined.
+   * Codex model enumeration — LIVE via the app-server's `model/list` (codex-cli
+   * ≥ ~0.14x), which is ACCOUNT-AWARE: a ChatGPT-plan login only sees models that
+   * plan can actually run. The old static list advertised ids the account
+   * couldn't use (e.g. "gpt-5.5-codex" on a ChatGPT account), so picking one
+   * 400'd every turn ("The 'gpt-5.5-codex' model is not supported when using
+   * Codex with a ChatGPT account" — Discord #help). Falls back to the static
+   * family only when the RPC is unavailable (older CLI) or errors.
    */
   async listModels(): Promise<ModelChoice[]> {
-    // Every Codex ModelChoice MUST carry CODEX_EFFORT_LEVELS so the panel enables
-    // the reasoning-effort dropdown (the backend applies effort to every turn).
-    // The fallback already does; if a future live config/read path builds its own
-    // ModelChoice(s) here, attach `supportedEffortLevels: [...CODEX_EFFORT_LEVELS]`.
+    try {
+      await this.prepare();
+      const client = this.client;
+      if (client) {
+        const res = await client.request<{
+          data?: Array<{
+            id?: string;
+            model?: string;
+            displayName?: string;
+            description?: string;
+            hidden?: boolean;
+            supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
+          }>;
+        }>("model/list", {});
+        const live = (res?.data ?? [])
+          .filter((m) => (m.id || m.model) && m.hidden !== true)
+          .map((m): ModelChoice => {
+            const efforts = (m.supportedReasoningEfforts ?? [])
+              .map((e) => e.reasoningEffort)
+              .filter((e): e is string => typeof e === "string" && (CODEX_EFFORT_LEVELS as readonly string[]).includes(e));
+            return {
+              id: (m.id ?? m.model) as string,
+              ...(m.displayName ? { label: m.displayName } : {}),
+              // Every Codex ModelChoice MUST advertise effort support so the
+              // panel enables the reasoning dropdown (the backend applies
+              // effort to every turn regardless). Prefer the model's own list.
+              supportsEffort: true,
+              supportedEffortLevels: efforts.length ? efforts : [...CODEX_EFFORT_LEVELS],
+            };
+          });
+        if (live.length) {
+          // liveCatalog keeps the FULL account catalog: it answers "can this
+          // account run model X" for resolveTurnModel's clamp. The PICKER gets
+          // the deprecation-filtered view below — hiding a model from new
+          // picks must not force-switch an existing pin/resume that the
+          // account can still legally run (codex review on this branch).
+          this.liveCatalog = live;
+          // GPT-5.6-only policy: hide deprecated 5.x/codex ids from the picker
+          // when the account has the 5.6 family. Accounts WITHOUT any 5.6
+          // model keep their full catalog (never brick an older plan).
+          const fam = live.filter((m) => m.id.startsWith("gpt-5.6"));
+          if (fam.length && fam.length < live.length) {
+            logger.debug(
+              `[codex-backend] hiding ${live.length - fam.length} deprecated pre-5.6 model(s) from the picker`,
+            );
+          }
+          return fam.length ? fam : live;
+        }
+      }
+    } catch (err) {
+      logger.debug(`[codex-backend] model/list unavailable (older CLI?): ${msgOf(err)} — using static fallback`);
+    }
     return CODEX_FALLBACK_MODELS;
+  }
+
+  /** The model to pass to thread/start|resume, CLAMPED to the live catalog.
+   *  Passing null defers to the user's ~/.codex config default — which can name
+   *  a model the RESOLVED binary or the account can't run (e.g. a newer CLI
+   *  wrote `gpt-5.6-sol` into config, our optional-dep binary is older → every
+   *  turn 400s "requires a newer version of Codex"). If we know the catalog and
+   *  the requested/configured model isn't in it, use the catalog's first entry
+   *  and say so in the log. Without a catalog, behave as before. */
+  private resolveTurnModel(): string | null {
+    const cat = this.liveCatalog;
+    if (!cat || !cat.length) return this.model ?? null;
+    const wanted = this.model;
+    if (wanted && cat.some((m) => m.id === wanted)) return wanted;
+    const fallback = cat[0].id;
+    logger.warn(
+      `[codex-backend] model ${wanted ?? "(config default)"} is not in the account's live catalog — using ${fallback}`,
+    );
+    return fallback;
   }
 
   /** Permanently dispose of the backend (AgentBackend.close): kill the app-server

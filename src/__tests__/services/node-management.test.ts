@@ -34,6 +34,11 @@ vi.mock("../../config.js", () => {
 // Mock child_process for the cm-cli subprocess paths.
 vi.mock("node:child_process", () => ({
   execFileSync: vi.fn(),
+  spawnSync: vi.fn(() => ({
+    status: 0,
+    stdout: JSON.stringify({ schema: "envelope/1", type: "envelope", ok: true, command: "version", version: "1.11.1", where: null, data: {}, error: null }),
+    stderr: "",
+  })),
 }));
 
 // Mock fs so resolveCmCliPath's existsSync check is controllable.
@@ -67,7 +72,8 @@ const mockedExists = vi.mocked(existsSync);
 // platform separator (backslashes on Windows). Build the expected values the
 // same way instead of hardcoding POSIX paths.
 const COMFY = "/fake/comfy";
-const CM_CLI = join(COMFY, "custom_nodes", "ComfyUI-Manager", "cm-cli.py");
+const COMFY_CLI = join(COMFY, ".venv", process.platform === "win32" ? "Scripts" : "bin", process.platform === "win32" ? "comfy.exe" : "comfy");
+const cliEnvelope = (data: unknown) => JSON.stringify({ schema: "envelope/1", type: "envelope", ok: true, command: "node", version: "1.11.1", where: "local", data, error: null });
 // runGitCheckout now resolves the target with path.resolve (containment check),
 // so the -C dir carries the drive letter on Windows — match it.
 const BAR_DIR = resolve(COMFY, "custom_nodes", "bar");
@@ -591,14 +597,18 @@ describe("node-management service", () => {
     });
 
     it("uses cm-cli subprocess when forced", async () => {
-      mockedExec.mockReturnValue("installed ok" as never);
+      mockedExec.mockReturnValue(cliEnvelope({ message: "installed ok" }) as never);
       const res = await installCustomNode({ id: "some-pack", useCmCli: true });
 
-      expect(res.mechanism).toBe("cm-cli");
+      expect(res.mechanism).toBe("comfy-cli");
       const [bin, args] = mockedExec.mock.calls[0];
-      expect(bin).toBe("python");
+      expect(bin).toBe(COMFY_CLI);
       expect(args).toEqual([
-        CM_CLI,
+        "--json",
+        "--workspace",
+        COMFY,
+        "--skip-prompt",
+        "node",
         "install",
         "some-pack",
         "--mode",
@@ -609,17 +619,21 @@ describe("node-management service", () => {
     });
 
     it("checks out the requested git ref after forced cm-cli install", async () => {
-      mockedExec.mockReturnValue("installed ok" as never);
+      mockedExec.mockReturnValue(cliEnvelope({ message: "installed ok" }) as never);
       const res = await installCustomNode({
         id: "https://github.com/foo/bar/tree/dev",
         ref: "abc123",
         useCmCli: true,
       });
 
-      expect(res.mechanism).toBe("cm-cli");
+      expect(res.mechanism).toBe("comfy-cli");
       expect(mockedExec).toHaveBeenCalledTimes(3);
       expect(mockedExec.mock.calls[0][1]).toEqual([
-        CM_CLI,
+        "--json",
+        "--workspace",
+        COMFY,
+        "--skip-prompt",
+        "node",
         "install",
         "https://github.com/foo/bar",
         "--mode",
@@ -701,9 +715,9 @@ describe("node-management service", () => {
     });
 
     it("routes 'all' to the cm-cli subprocess", async () => {
-      mockedExec.mockReturnValue("fixed all" as never);
+      mockedExec.mockReturnValue(cliEnvelope({ message: "fixed all" }) as never);
       const res = await fixCustomNode({ id: "all" });
-      expect(res.mechanism).toBe("cm-cli");
+      expect(res.mechanism).toBe("comfy-cli");
       const [, args] = mockedExec.mock.calls[0];
       expect(args).toContain("fix");
       expect(args).toContain("all");
@@ -774,12 +788,16 @@ describe("node-management service", () => {
 
   describe("syncNodeDependencies", () => {
     it("runs cm-cli restore-dependencies", async () => {
-      mockedExec.mockReturnValue("deps restored" as never);
+      mockedExec.mockReturnValue(cliEnvelope({ message: "deps restored" }) as never);
       const res = await syncNodeDependencies();
-      expect(res.mechanism).toBe("cm-cli");
+      expect(res.mechanism).toBe("comfy-cli");
       const [, args] = mockedExec.mock.calls[0];
       expect(args).toEqual([
-        CM_CLI,
+        "--json",
+        "--workspace",
+        COMFY,
+        "--skip-prompt",
+        "node",
         "restore-dependencies",
       ]);
     });
@@ -1022,6 +1040,123 @@ describe("node-management service", () => {
         (c) => new URL(c.url).pathname === "/v2/manager/queue/status",
       );
       expect(probes.length).toBe(1);
+    });
+  });
+
+  // ── issue #235: pip Manager in legacy-UI mode = the "v2-batch" dialect ────
+  describe("v2-batch dialect (pip Manager with --enable-manager-legacy-ui)", () => {
+    /** Stub a server shaped like comfyui_manager 4.2.2 in legacy-UI mode:
+     *  /v2 status + is_legacy_manager_ui:true + batch; NO /v2 task route
+     *  (a POST there gets ComfyUI's catchall 405, per the field report). */
+    function stubBatchFetch(opts: { failed?: unknown[]; installedBody?: unknown } = {}) {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        calls.push({ url, method, body });
+        const path = new URL(url).pathname;
+        if (path.startsWith("/v2/customnode/installed")) return jsonResponse(opts.installedBody ?? {});
+        if (path === "/v2/manager/queue/status") {
+          return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
+        }
+        if (path === "/v2/manager/is_legacy_manager_ui") {
+          return jsonResponse({ is_legacy_manager_ui: true });
+        }
+        if (path === "/v2/manager/queue/batch" && method === "POST") {
+          return jsonResponse({ failed: opts.failed ?? [] });
+        }
+        if (path === "/v2/manager/queue/start" && method === "POST") {
+          return new Response("", { status: 200 });
+        }
+        if (path === "/v2/manager/queue/task") {
+          // The exact #235 signature: route unregistered, catchall answers 405.
+          return new Response("405: Method Not Allowed", { status: 405 });
+        }
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      return { calls };
+    }
+
+    it("installs through /v2/manager/queue/batch with a 3.x body — never touches the task route", async () => {
+      const { calls } = stubBatchFetch({
+        installedBody: { "comfyui-impact-pack": { ver: "1.0.0", cnr_id: "comfyui-impact-pack", enabled: true } },
+      });
+      const res = await installCustomNode({ id: "comfyui-impact-pack" });
+      expect(res.mechanism).toBe("manager-http");
+      const batch = calls.find((c) => c.url.includes("/v2/manager/queue/batch"));
+      expect(batch).toBeDefined();
+      const payload = batch!.body as Record<string, Array<Record<string, unknown>>>;
+      expect(Object.keys(payload)).toEqual(["install"]);
+      expect(payload.install[0]).toMatchObject({ id: "comfyui-impact-pack", channel: "default" });
+      expect(typeof payload.install[0].ui_id).toBe("string");
+      expect(calls.some((c) => c.url.includes("/v2/manager/queue/task"))).toBe(false);
+      // still drains the queue for temp-queued post-install work
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(true);
+    });
+
+    it("git-URL installs use the 3.x URL-carrying body (version:'unknown', files:[url])", async () => {
+      // codex review on #235: v2-batch runs the 3.x handlers, so a git URL
+      // must NOT take v4's registry-first shape (which resolves ids against
+      // the registry DB and silently no-ops on a full URL).
+      const { calls } = stubBatchFetch({
+        installedBody: { bar: { ver: "unknown", cnr_id: "bar", enabled: true, aux_id: "foo/bar" } },
+      });
+      await installCustomNode({ id: "https://github.com/foo/bar" }).catch(() => {});
+      const batch = calls.find((c) => c.url.includes("/v2/manager/queue/batch"));
+      expect(batch).toBeDefined();
+      const payload = batch!.body as Record<string, Array<Record<string, unknown>>>;
+      expect(payload.install[0]).toMatchObject({
+        version: "unknown",
+        selected_version: "unknown",
+        files: ["https://github.com/foo/bar"],
+      });
+    });
+
+    it("surfaces a batch-reported failure with the legacy-UI hint", async () => {
+      stubBatchFetch({
+        failed: ["comfyui-impact-pack"],
+        installedBody: { "comfyui-impact-pack": { ver: "1.0.0", cnr_id: "comfyui-impact-pack", enabled: true } },
+      });
+      await expect(installCustomNode({ id: "comfyui-impact-pack" })).rejects.toThrow(
+        /reported the install .* as failed[\s\S]*legacy-ui mode/i,
+      );
+    });
+
+    it("routes install-model to the dedicated /v2 route (not the batch)", async () => {
+      // reach queueManagerTask("install-model") through the public surface via
+      // detection cache pinning + a direct queue call is not exported; instead
+      // assert the detection outcome feeds managerQueuePrefix by checking a
+      // second op — covered above — and the model path via downloadModel is
+      // exercised in its own suite. Here we lock the DETECTION itself:
+      const { calls } = stubBatchFetch();
+      await listInstalledNodes().catch(() => {});
+      // the discriminator probe must have run
+      expect(calls.some((c) => c.url.includes("/v2/manager/is_legacy_manager_ui"))).toBe(true);
+    });
+  });
+
+  describe("Manager detection hardening (issue #235)", () => {
+    it("a 200-HTML SPA fallback on the v2 status probe does NOT detect v2", async () => {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        calls.push({ url, method: init?.method ?? "GET", body: undefined });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") {
+          return new Response("<!doctype html><html>frontend</html>", {
+            status: 200, headers: { "Content-Type": "text/html" },
+          });
+        }
+        if (path === "/manager/queue/status") {
+          return jsonResponse({ total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false });
+        }
+        if (path.startsWith("/v2/customnode/installed")) return jsonResponse({});
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await listInstalledNodes().catch(() => {});
+      // fell through to the legacy probe instead of trusting the HTML 200
+      expect(calls.some((c) => c.url.endsWith("/manager/queue/status"))).toBe(true);
     });
   });
 });

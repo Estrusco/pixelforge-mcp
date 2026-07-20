@@ -287,7 +287,8 @@ async function main() {
         process.exit(1);
       }
       process.env.COMFYUI_URL = cli.comfyuiUrl;
-      // Default panel bridge port is 9180 (claude); COMFYUI_MCP_BRIDGE_PORT overrides.
+      // Default panel bridge port is 9180 (one port shared by all providers);
+      // COMFYUI_MCP_BRIDGE_PORT overrides.
       const bridgePort = Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180;
       // Remote https pod → secure wss:// tunnel (auto); local/http or
       // --insecure-bridge → plain loopback ws://. Informational only here.
