@@ -14,9 +14,11 @@ import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   buildPanelToolDefs,
+  makePanelToolCtx,
   registerPanelTools,
   type PanelToolCtx,
 } from "../../orchestrator/panel-tools.js";
+import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 
 type Forwarded = Record<string, unknown>;
 
@@ -437,6 +439,18 @@ describe("panel-tools: panel_graph_outline (compact text map)", () => {
   });
 });
 
+describe("panel-tools: panel_audit_prompt_director", () => {
+  it("is read-only, takes no args, and forwards the dedicated graph audit command", async () => {
+    const def = defByName("panel_audit_prompt_director");
+    expect(Object.keys(def.schema)).toEqual([]);
+    expect(def.description).toContain("READ-ONLY");
+
+    const { ctx, calls } = makeFakeCtx();
+    await def.handler({}, ctx);
+    expect(calls[0]).toMatchObject({ cmd: "graph_prompt_director_audit" });
+  });
+});
+
 describe("panel-tools: panel_subgraph_group (wrap a group into a subgraph)", () => {
   it("is registered and takes a string|number group ref", () => {
     expect(buildPanelToolDefs().map((d) => d.name)).toContain("panel_subgraph_group");
@@ -454,5 +468,147 @@ describe("panel-tools: panel_subgraph_group (wrap a group into a subgraph)", () 
     expect(calls[0]).toMatchObject({ cmd: "graph_subgraph_group", group: "REPLACEMENT MODE" });
     await defByName("panel_subgraph_group").handler({ group: 2 }, ctx);
     expect(calls[1]).toMatchObject({ cmd: "graph_subgraph_group", group: 2 });
+  });
+});
+
+describe("panel-tools: workflow target (per-workflow agent)", () => {
+  it("registers get/set workflow target tools", () => {
+    const names = buildPanelToolDefs().map((d) => d.name);
+    expect(names).toContain("panel_get_workflow_target");
+    expect(names).toContain("panel_set_workflow_target");
+  });
+
+  it("injects workflow_path on graph commands when pinned", async () => {
+    const store = new WorkflowTargetStore();
+    store.set("test-tab", { mode: "pinned", path: "workflows/pinned.json" });
+    const calls: Forwarded[] = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        calls.push(cmd);
+        return { ok: true };
+      },
+      push: () => 1,
+    } as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    // Upstream replaced panel_get_graph (graph_get_state) with panel_query_graph
+    // (graph_query) — same injection path: any graph_* command gets the pin.
+    await defByName("panel_query_graph").handler({}, ctx);
+    expect(calls[0]).toMatchObject({
+      cmd: "graph_query",
+      workflow_path: "workflows/pinned.json",
+    });
+  });
+
+  it("panel_set_workflow_target pins and returns note", async () => {
+    const store = new WorkflowTargetStore();
+    const pushes: unknown[] = [];
+    const bridge = {
+      send: async () => ({}),
+      push: (frame: unknown) => {
+        pushes.push(frame);
+        return 1;
+      },
+    } as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/a.json", filename: "a.json" },
+      ctx,
+    );
+    expect(store.get("test-tab")).toMatchObject({
+      mode: "pinned",
+      path: "workflows/a.json",
+    });
+    expect(pushes[0]).toMatchObject({
+      type: "workflow_target",
+      target: { mode: "pinned", path: "workflows/a.json", filename: "a.json" },
+    });
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toContain("Pinned");
+  });
+});
+
+describe("panel_connect slot aliases (live panel finding: stripped aliases → auto-match scramble)", () => {
+  it("maps from_slot_name/to_slot_name onto from_output/to_input on the wire", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    const def = defByName("panel_connect");
+    await def.handler(
+      { from_node_id: 10, from_slot_name: "MODEL", to_node_id: 3, to_slot_name: "model" },
+      ctx,
+    );
+    expect(calls[0]).toMatchObject({
+      cmd: "graph_connect",
+      from_node_id: 10,
+      from_output: "MODEL",
+      to_node_id: 3,
+      to_input: "model",
+    });
+  });
+
+  it("canonical names win over aliases; bare aliases output/input also map", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    const def = defByName("panel_connect");
+    await def.handler(
+      { from_node_id: 1, from_output: "LATENT", from_slot: "WRONG", to_node_id: 2, input: "samples" },
+      ctx,
+    );
+    expect(calls[0]).toMatchObject({ from_output: "LATENT", to_input: "samples" });
+  });
+});
+
+describe("panel-tools: strip/slice read the live canvas by default", () => {
+  const CANVAS_GRAPH = {
+    nodes: [
+      {
+        id: 1,
+        type: "SaveImage",
+        pos: [10, 10],
+        size: [100, 50],
+        inputs: [],
+        outputs: [],
+        widgets_values: [],
+      },
+    ],
+    links: [],
+    groups: [{ id: 1, title: "OUT", bounding: [0, 0, 200, 200] }],
+  };
+
+  function ctxWithCanvas(sendImpl?: () => Promise<unknown>) {
+    const send = vi.fn(sendImpl ?? (async () => ({ workflow: CANVAS_GRAPH, node_count: 1 })));
+    const ctx: PanelToolCtx = {
+      call: async (cmd) => ({ content: [{ type: "text", text: JSON.stringify(cmd) }] }),
+      confirm: async () => true,
+      bridge: { send } as unknown as PanelToolCtx["bridge"],
+      tabId: "test-tab",
+    };
+    return { ctx, send };
+  }
+
+  it("panel_slice_workflow with no source captures the canvas via graph_serialize", async () => {
+    const { ctx, send } = ctxWithCanvas();
+    const res = await defByName("panel_slice_workflow").handler({ groups: "OUT" }, ctx);
+    expect(send).toHaveBeenCalledWith({ cmd: "graph_serialize" }, { tabId: "test-tab", timeoutMs: 30000 });
+    const text = (res as { content: Array<{ text: string }> }).content[0].text;
+    expect(text).toContain("Sliced");
+  });
+
+  it("panel_strip_workflow with no source surfaces a clear error when the canvas capture fails", async () => {
+    const { ctx, send } = ctxWithCanvas(async () => {
+      throw new Error("no panel tab");
+    });
+    await expect(defByName("panel_strip_workflow").handler({}, ctx)).rejects.toThrow(
+      /Couldn't capture the live canvas/,
+    );
+    expect(send).toHaveBeenCalled();
+  });
+
+  it("explicit inline graph still wins over the canvas (no bridge call)", async () => {
+    const { ctx, send } = ctxWithCanvas();
+    const res = await defByName("panel_slice_workflow").handler(
+      { graph: CANVAS_GRAPH, groups: "OUT" },
+      ctx,
+    );
+    expect(send).not.toHaveBeenCalled();
+    const text = (res as { content: Array<{ text: string }> }).content[0].text;
+    expect(text).toContain("Sliced");
   });
 });

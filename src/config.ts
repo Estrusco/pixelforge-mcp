@@ -2,15 +2,37 @@ import { z } from "zod";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, resolve, join } from "path";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
 
-// Resolve .env from the package root, not process.cwd()
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageRoot = resolve(__dirname, "..");
-dotenv.config({ path: resolve(packageRoot, ".env") });
+// Env-file config lives in the user's config dir — ~/.comfyui-mcp/.env — next
+// to panel-secrets.json and the token files, so the same path works for
+// npx/npm installs and git checkouts on Windows/mac/Linux alike. A package-root
+// .env (only reachable in dev checkouts; npm installs resolve into the package
+// cache) is legacy: migrate it once, then stop reading it. Real environment
+// variables always win — dotenv never overrides values that are already set.
+const homeEnvPath = join(homedir(), ".comfyui-mcp", ".env");
+const legacyEnvPath = resolve(packageRoot, ".env");
+try {
+  if (!existsSync(homeEnvPath) && existsSync(legacyEnvPath)) {
+    mkdirSync(dirname(homeEnvPath), { recursive: true });
+    copyFileSync(legacyEnvPath, homeEnvPath);
+    // owner-only, matching panel-secrets.json (no-op on Windows ACLs)
+    try {
+      chmodSync(homeEnvPath, 0o600);
+    } catch {
+      /* ignore */
+    }
+    process.stderr.write(`[comfyui-mcp] migrated ${legacyEnvPath} -> ${homeEnvPath} (the package .env is no longer read)\n`);
+  }
+} catch {
+  // best-effort migration; real env vars and an existing home .env still work
+}
+dotenv.config({ path: homeEnvPath });
 
 /**
  * Does `p` look like a real ComfyUI install root? A ComfyUI Desktop-installer
@@ -364,7 +386,9 @@ const urlOverride = resolveUrlOverride();
 const cloudApiKey = process.env.COMFYUI_API_KEY?.trim() || undefined;
 const cloudActive = Boolean(cloudApiKey);
 const forceRemote = resolveForceRemote();
-const remoteUrlActive =
+// Mutable: setComfyuiTarget() re-classifies this on a runtime retarget so
+// isRemoteMode()/isLocalMode() track the new host instead of the startup one.
+let remoteUrlActive =
   Boolean(urlOverride) && (forceRemote || !isLoopbackHost(urlOverride?.host));
 
 if (cloudActive) {
@@ -378,6 +402,30 @@ if (forceRemote && !urlOverride) {
     `[comfyui-mcp] WARNING: --force-remote/COMFYUI_MCP_FORCE_REMOTE set but no ` +
       `--comfyui-url/COMFYUI_URL given — there's no target to force remote, so this has no effect.`,
   );
+}
+
+/**
+ * Comfy.org API key for partner/API-node auth (extra_data.api_key_comfy_org).
+ * Precedence: COMFY_API_KEY env var, then ~/.comfy-api-key (trimmed file
+ * contents) — the file fallback lets headless setups keep the key out of env/
+ * process listings (chmod 600 recommended). Best-effort: unreadable/empty file
+ * just means no key. Never log the key value.
+ * File fallback originally contributed by @joaolvivas in
+ * `joaolvivas/comfyui-mcp-byjlucas@4b989e4` and reimplemented here with thanks.
+ */
+function resolveComfyApiKey(): string | undefined {
+  const env = process.env.COMFY_API_KEY;
+  if (env && env.trim()) return env.trim();
+  try {
+    const keyFile = join(homedir(), ".comfy-api-key");
+    if (existsSync(keyFile)) {
+      const key = readFileSync(keyFile, "utf-8").trim();
+      if (key) return key;
+    }
+  } catch {
+    // Unreadable file — behave as if no key is configured.
+  }
+  return undefined;
 }
 
 const parsedConfig = configSchema.parse({
@@ -398,7 +446,7 @@ const parsedConfig = configSchema.parse({
   huggingfaceToken: process.env.HUGGINGFACE_TOKEN,
   githubToken: process.env.GITHUB_TOKEN,
   civitaiApiToken: process.env.CIVITAI_API_TOKEN,
-  comfyApiKey: process.env.COMFY_API_KEY,
+  comfyApiKey: resolveComfyApiKey(),
 });
 
 // Resolve port:
@@ -461,6 +509,43 @@ export function getApiKey(): string {
     throw new Error("Comfy Cloud API key not configured (COMFYUI_API_KEY).");
   }
   return config.comfyuiApiKey;
+}
+
+/**
+ * Retarget the shared `config` (and thus getComfyUIApiHost()/getClient()) to a new
+ * ComfyUI URL at runtime. The panel orchestrator calls this from applyComfyuiUrl when
+ * the desktop `hello` points at a different ComfyUI, so the orchestrator's OWN
+ * in-process client — the direct call_tool path used by the mobile app (list_workflows,
+ * get_image, …) — follows the retarget instead of staying pinned to the process-start
+ * ComfyUI. Callers MUST resetClient() afterwards so the cached client rebuilds against
+ * the new host. Returns false on a malformed URL (target left unchanged).
+ */
+export function setComfyuiTarget(url: string): boolean {
+  let t: ComfyUITarget;
+  try {
+    t = parseComfyUIUrl(url);
+  } catch {
+    return false;
+  }
+  config.comfyuiHost = t.host;
+  config.comfyuiPort = t.port;
+  config.resolvedPort = t.port;
+  config.comfyuiSsl = t.ssl;
+  config.comfyuiBasePath = t.basePath;
+  // Re-classify local vs remote so isRemoteMode()/isLocalMode() follow the new
+  // target — they read this module-level flag, not the host on each call, so a
+  // retarget that crosses the loopback boundary would otherwise stay misclassed.
+  remoteUrlActive = forceRemote || !isLoopbackHost(t.host);
+  // Keep comfyuiPath consistent with the mode: a remote target has no local FS
+  // (local-FS tools must throw), a loopback target re-resolves the local path
+  // (honoring COMFYUI_PATH). Without this, remote→local leaves path undefined and
+  // local→remote leaves a stale local path that FS tools would wrongly trust.
+  config.comfyuiPath = resolveComfyUIPath(process.env.COMFYUI_PATH, {
+    remoteUrl: remoteUrlActive,
+    cloud: isCloudMode(),
+    remoteHost: t.host,
+  });
+  return true;
 }
 
 export function getComfyUIApiHost(): string {

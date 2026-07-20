@@ -5,6 +5,7 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
+import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -85,7 +86,7 @@ export interface InstalledNode {
 
 export interface NodeOpResult {
   /** Which mechanism handled the request. */
-  mechanism: "manager-http" | "cm-cli" | "git-clone";
+  mechanism: "manager-http" | "comfy-cli" | "git-clone";
   /** Human-readable summary. */
   message: string;
   /** Raw queue status (HTTP path) or subprocess output (cm-cli path). */
@@ -191,7 +192,20 @@ function sleep(ms: number): Promise<void> {
 // routes and different body shapes. Probe once per target and adapt.
 // ---------------------------------------------------------------------------
 
-type ManagerApi = "v2" | "legacy";
+// Three dialects in the wild (issue #116 found the second; #235 the third):
+//   "v2"       pip comfyui_manager (Manager v4) in its NORMAL mode — the
+//              unified POST /v2/manager/queue/task envelope.
+//   "v2-batch" pip comfyui_manager started with --enable-manager-legacy-ui
+//              (what e.g. the yanwk/comfyui-boot images hardcode): the pip
+//              package loads its BUNDLED 3.x server under the /v2 prefix.
+//              GET /v2/manager/queue/status exists, but POST .../task does NOT
+//              — mutations go through POST /v2/manager/queue/batch with 3.x
+//              body shapes ({install:[body], uninstall:[body], ...}). And
+//              because ComfyUI's frontend catchall matches every path for GET,
+//              an unregistered POST returns 405 (never 404) — the exact
+//              symptom of #235.
+//   "legacy"   the 3.x custom-node Manager: per-operation /manager/queue/*.
+type ManagerApi = "v2" | "v2-batch" | "legacy";
 
 let managerApiCache: { base: string; api: ManagerApi } | null = null;
 
@@ -200,29 +214,54 @@ export function resetManagerApiCacheForTests(api?: ManagerApi): void {
   managerApiCache = api ? { base: managerBaseUrl(), api } : null;
 }
 
+/** A real queue/status payload — guards detection against servers that answer
+ *  200 with HTML/junk for unknown GETs (SPA fallbacks, index catchalls). */
+function looksLikeQueueStatus(s: unknown): boolean {
+  return (
+    !!s &&
+    typeof s === "object" &&
+    (typeof (s as QueueStatus).total_count === "number" ||
+      typeof (s as QueueStatus).is_processing === "boolean")
+  );
+}
+
 async function detectManagerApi(): Promise<ManagerApi> {
   const base = managerBaseUrl();
   if (managerApiCache?.base === base) return managerApiCache.api;
   const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", { soft: true });
-  if (v2 !== undefined) {
-    managerApiCache = { base, api: "v2" };
-    return "v2";
+  if (looksLikeQueueStatus(v2)) {
+    // Same /v2 surface, two servers: the pip package in legacy-UI mode swaps
+    // in its bundled 3.x server (no task route). Both register
+    // GET /v2/manager/is_legacy_manager_ui and answer truthfully; a missing
+    // route (older pip) means the normal v4 server → task dialect.
+    const legacyUi = await managerFetch<{ is_legacy_manager_ui?: boolean }>(
+      "/v2/manager/is_legacy_manager_ui",
+      { soft: true },
+    );
+    const api: ManagerApi =
+      legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
+        ? "v2-batch"
+        : "v2";
+    managerApiCache = { base, api };
+    return api;
   }
   const legacy = await managerFetch<QueueStatus>("/manager/queue/status", { soft: true });
-  if (legacy !== undefined) {
+  if (looksLikeQueueStatus(legacy)) {
     managerApiCache = { base, api: "legacy" };
     return "legacy";
   }
   throw new NodeManagementError(
     "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
-      "nor /manager/queue/status answered). Is ComfyUI-Manager installed and enabled " +
-      "on the connected ComfyUI?",
+      "nor /manager/queue/status answered with a queue status). Is ComfyUI-Manager " +
+      "installed and enabled on the connected ComfyUI? The pip comfyui_manager " +
+      "package only activates when ComfyUI is started with --enable-manager.",
   );
 }
 
-/** Queue route prefix for the detected generation. */
+/** Queue route prefix for the detected generation ("v2-batch" serves
+ *  status/start under the /v2 prefix too — only the mutation routes differ). */
 async function managerQueuePrefix(): Promise<string> {
-  return (await detectManagerApi()) === "v2" ? "/v2/manager/queue" : "/manager/queue";
+  return (await detectManagerApi()) === "legacy" ? "/manager/queue" : "/v2/manager/queue";
 }
 
 /** Appended to every legacy-Manager operation failure so users know they're on
@@ -235,15 +274,28 @@ const MANAGER_UPGRADE_HINT =
   "custom_nodes/ComfyUI-Manager clone and restart. " +
   "See https://comfyui-mcp.artokun.io/docs/troubleshooting";
 
+/** Appended to v2-batch (pip Manager in legacy-UI mode) failures. */
+const MANAGER_LEGACY_UI_HINT =
+  "NOTE: this ComfyUI runs Manager v4 (pip comfyui_manager) in LEGACY-UI mode " +
+  "(--enable-manager-legacy-ui), which serves the older 3.x API — some operations " +
+  "degrade (notably arbitrary-URL model downloads, which the 3.x code whitelist-gates). " +
+  "For the full v4 API, start ComfyUI without --enable-manager-legacy-ui (for " +
+  "yanwk/comfyui-boot images that flag is hardcoded in the entrypoint). " +
+  "See https://comfyui-mcp.artokun.io/docs/troubleshooting";
+
 /** Wrap a legacy-Manager failure with the upgrade guidance (keeps details). */
-function annotateLegacyError(err: unknown, kind: ManagerTaskKind): NodeManagementError {
+function annotateLegacyError(
+  err: unknown,
+  kind: ManagerTaskKind,
+  hint: string = MANAGER_UPGRADE_HINT,
+): NodeManagementError {
   const base = err instanceof Error ? err.message : String(err);
   const extra =
     kind === "install-model"
       ? " Arbitrary-URL model installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models)."
       : "";
   return new NodeManagementError(
-    `${base}${extra}\n${MANAGER_UPGRADE_HINT}`,
+    `${base}${extra}\n${hint}`,
     err instanceof NodeManagementError ? err.details : undefined,
   );
 }
@@ -392,7 +444,8 @@ async function queueManagerTask(
   params: Record<string, unknown>,
 ): Promise<QueueStatus> {
   const uiId = randomUUID();
-  if ((await detectManagerApi()) === "legacy") {
+  const api = await detectManagerApi();
+  if (api === "legacy") {
     // Released Manager 3.x: per-operation routes + different body shapes
     // (issue #116 — the unified /v2 task route 405s there).
     const { path, body } = legacyTaskRequest(kind, params, uiId);
@@ -400,6 +453,39 @@ async function queueManagerTask(
       await managerFetch(path, { method: "POST", body });
     } catch (err) {
       throw annotateLegacyError(err, kind);
+    }
+    return runManagerQueue();
+  }
+  if (api === "v2-batch") {
+    // pip Manager in legacy-UI mode (issue #235): the /v2 prefix serves the
+    // BUNDLED 3.x server — no task route (POST there 405s via the frontend
+    // catchall). Mutations take 3.x body shapes, wrapped in the batch
+    // envelope {<op>: [body, ...]}; the batch runs its items synchronously
+    // and reports failures as {failed: [id, ...]}. install-model keeps its
+    // dedicated route (same path as v4, 3.x whitelist semantics).
+    const { path, body } = legacyTaskRequest(kind, params, uiId);
+    try {
+      if (kind === "install-model") {
+        await managerFetch("/v2/manager/queue/install_model", { method: "POST", body });
+      } else {
+        // legacyTaskRequest's path is "/manager/queue/<op>"; the batch key is
+        // that trailing op ("enable" maps to an install body → key "install").
+        const op = path.split("/").pop() as string;
+        const res = await managerFetch<{ failed?: unknown[] }>("/v2/manager/queue/batch", {
+          method: "POST",
+          body: { [op]: [body] },
+        });
+        const failed = Array.isArray(res?.failed) ? res.failed : [];
+        if (failed.length && (body.id === undefined || failed.includes(body.id))) {
+          throw new NodeManagementError(
+            `ComfyUI-Manager batch reported the ${op} of "${String(body.id ?? "?")}" as failed ` +
+              "(check the ComfyUI server log for the underlying error — security_level " +
+              "gating is a common cause).",
+          );
+        }
+      }
+    } catch (err) {
+      throw annotateLegacyError(err, kind, MANAGER_LEGACY_UI_HINT);
     }
     return runManagerQueue();
   }
@@ -416,10 +502,10 @@ async function queueManagerTask(
 }
 
 // ---------------------------------------------------------------------------
-// cm-cli subprocess helper
+// Official comfy-cli subprocess helper
 // ---------------------------------------------------------------------------
 
-const CM_CLI_TIMEOUT = 600_000;
+const COMFY_CLI_TIMEOUT = 600_000;
 // A real custom-node repo clones well under this; with prompts disabled a
 // missing/private repo fails in ~1s rather than blocking the whole timeout.
 const GIT_CLONE_TIMEOUT = 180_000;
@@ -439,65 +525,37 @@ export function nonInteractiveGitEnv(): NodeJS.ProcessEnv {
   };
 }
 
-function resolveCmCliPath(): string {
-  if (!config.comfyuiPath) {
-    throw new ProcessControlError(
-      "This operation requires a local ComfyUI install, but config.comfyuiPath " +
-        "is not set (running in remote --comfyui-url mode). Set COMFYUI_PATH or " +
-        "use the ComfyUI-Manager HTTP API instead.",
-    );
-  }
-  const cmCli = join(
-    config.comfyuiPath,
-    "custom_nodes",
-    "ComfyUI-Manager",
-    "cm-cli.py",
-  );
-  if (!existsSync(cmCli)) {
-    throw new NodeManagementError(
-      `cm-cli.py not found at ${cmCli}. Modern ComfyUI-Manager ships as the pip ` +
-        `package 'comfyui_manager' (no cm-cli.py), so the subprocess fallback is ` +
-        `unavailable on this install. Retry without useCmCli — the HTTP API covers ` +
-        `install/update/fix/uninstall/enable/disable.`,
-    );
-  }
-  return cmCli;
-}
-
 /**
- * Run a cm-cli.py subcommand. Returns combined stdout.
+ * Run an official `comfy node` subcommand. Returns normalized JSON data.
  * Throws ProcessControlError if comfyuiPath is undefined (remote mode).
  */
 function runCmCli(args: string[]): string {
-  const cmCli = resolveCmCliPath();
-  const pythonExe = process.env.COMFYUI_PYTHON || "python";
-  logger.info("Running cm-cli", { args: [cmCli, ...args].join(" ") });
-
+  if (!config.comfyuiPath) {
+    throw new ProcessControlError(
+      "This operation requires a local ComfyUI install. Set COMFYUI_PATH or use the Manager HTTP API.",
+    );
+  }
+  logger.info("Running comfy-cli", { args: ["node", ...args].join(" ") });
   try {
-    const out = execFileSync(pythonExe, [cmCli, ...args], {
-      cwd: config.comfyuiPath,
-      encoding: "utf-8",
-      timeout: CM_CLI_TIMEOUT,
-      env: {
-        ...process.env,
-        ...(config.githubToken ? { GITHUB_TOKEN: config.githubToken } : {}),
-      },
-    });
-    return out;
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
-    const stdout = e.stdout ? e.stdout.toString() : "";
-    const stderr = e.stderr ? e.stderr.toString() : "";
-    if (e.code === "ENOENT") {
+    const envelope = assertComfyCliOk(
+      runComfyCliSync(["node", ...args], {
+        workspace: config.comfyuiPath,
+        timeoutMs: COMFY_CLI_TIMEOUT,
+        env: config.githubToken ? { GITHUB_TOKEN: config.githubToken } : undefined,
+      }),
+    );
+    return JSON.stringify(envelope.data ?? {}, null, 2);
+  } catch (error) {
+    const processError = error as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
+    if (processError.code === "ENOENT") {
       throw new ProcessControlError(
-        `Python executable "${pythonExe}" not found. Set COMFYUI_PYTHON to the ` +
-          `python interpreter for your ComfyUI install.`,
+        "The comfy-cli executable could not be started. Check COMFY_CLI_PATH and PATH.",
       );
     }
-    throw new NodeManagementError(
-      `cm-cli ${args[0]} failed: ${e.message}`,
-      { stdout, stderr },
-    );
+    throw new NodeManagementError(`comfy-cli node ${args[0]} failed: ${processError.message}`, {
+      stdout: processError.stdout?.toString() ?? "",
+      stderr: processError.stderr?.toString() ?? "",
+    });
   }
 }
 
@@ -877,7 +935,7 @@ function cloneCustomNodeFallback(
         execFileSync(python, ["-m", "pip", "install", "-r", requirements], {
           cwd: nodeDir,
           encoding: "utf-8",
-          timeout: CM_CLI_TIMEOUT,
+          timeout: COMFY_CLI_TIMEOUT,
         });
       } catch (err) {
         const e = err as Error;
@@ -891,7 +949,7 @@ function cloneCustomNodeFallback(
         execFileSync(python, [installScript], {
           cwd: nodeDir,
           encoding: "utf-8",
-          timeout: CM_CLI_TIMEOUT,
+          timeout: COMFY_CLI_TIMEOUT,
         });
       } catch (err) {
         const e = err as Error;
@@ -925,7 +983,7 @@ export interface InstallOptions {
   ref?: string;
   mode?: ManagerMode;
   channel?: string;
-  /** Force the cm-cli subprocess instead of the HTTP API. */
+  /** Force the official comfy-cli subprocess instead of the HTTP API. */
   useCmCli?: boolean;
 }
 
@@ -962,8 +1020,8 @@ export async function installCustomNode(
       runGitCheckout(gitId, gitRef);
     }
     return {
-      mechanism: "cm-cli",
-      message: `Installed "${id}" via cm-cli.`,
+      mechanism: "comfy-cli",
+      message: `Installed "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -971,10 +1029,12 @@ export async function installCustomNode(
   if (source === "git") {
     const repoName = gitCheckoutDir(gitId);
     let status: QueueStatus;
-    if ((await detectManagerApi()) === "legacy") {
-      // Released Manager 3.x accepts a REAL git URL natively:
-      // { version:'unknown', files:[url] } clones it as an unregistered pack.
-      // (Gated server-side by security_level + the allow_git_url_install
+    if ((await detectManagerApi()) !== "v2") {
+      // 3.x SEMANTICS (both the custom-node Manager AND pip Manager in
+      // legacy-UI mode, whose /v2 batch runs the same 3.x handlers — codex
+      // review on #235): a REAL git URL installs natively via
+      // { version:'unknown', files:[url] }, cloning it as an unregistered
+      // pack. (Gated server-side by security_level + allow_git_url_install
       // config — a rejection surfaces as a 403/404 from the queue route.)
       status = await queueManagerTask("install", {
         id: repoName,
@@ -1070,10 +1130,10 @@ export async function updateCustomNode(
   if (opts.useCmCli) {
     const out = runCmCli(["update", id, "--mode", mode, "--channel", channel]);
     return {
-      mechanism: "cm-cli",
+      mechanism: "comfy-cli",
       message: all
-        ? "Updated all installed node packs via cm-cli."
-        : `Updated "${id}" via cm-cli.`,
+        ? "Updated all installed node packs via official comfy-cli."
+        : `Updated "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -1135,8 +1195,8 @@ export async function reinstallCustomNode(
   if (opts.useCmCli) {
     const out = runCmCli(["reinstall", id, "--mode", mode, "--channel", channel]);
     return {
-      mechanism: "cm-cli",
-      message: `Reinstalled "${id}" via cm-cli.`,
+      mechanism: "comfy-cli",
+      message: `Reinstalled "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -1178,10 +1238,10 @@ export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
   if (opts.useCmCli || all) {
     const out = runCmCli(["fix", id, "--mode", mode, "--channel", channel]);
     return {
-      mechanism: "cm-cli",
+      mechanism: "comfy-cli",
       message: all
-        ? "Repaired all installed node packs via cm-cli."
-        : `Repaired "${id}" via cm-cli.`,
+        ? "Repaired all installed node packs via official comfy-cli."
+        : `Repaired "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -1225,7 +1285,9 @@ export async function listInstalledNodes(
     }));
   }
 
-  const prefix = (await detectManagerApi()) === "v2" ? "/v2" : "";
+  // Both pip-Manager modes serve /v2/customnode/installed (the legacy-UI
+  // module registers it too); only the 3.x custom-node Manager lacks /v2.
+  const prefix = (await detectManagerApi()) === "legacy" ? "" : "/v2";
   const raw = await managerFetch<unknown>(
     `${prefix}/customnode/installed?mode=${encodeURIComponent(mode)}`,
   );
@@ -1237,7 +1299,7 @@ export async function listInstalledNodes(
 // ---------------------------------------------------------------------------
 
 export interface SyncDepsResult {
-  mechanism: "cm-cli";
+  mechanism: "comfy-cli";
   message: string;
   details?: unknown;
 }
@@ -1251,9 +1313,9 @@ export interface SyncDepsResult {
 export async function syncNodeDependencies(): Promise<SyncDepsResult> {
   const out = runCmCli(["restore-dependencies"]);
   return {
-    mechanism: "cm-cli",
+    mechanism: "comfy-cli",
     message:
-      "Reconciled installed-node Python dependencies via cm-cli restore-dependencies.",
+      "Reconciled installed-node Python dependencies via official comfy-cli node restore-dependencies.",
     details: out.trim(),
   };
 }

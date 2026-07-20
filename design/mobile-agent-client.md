@@ -124,6 +124,43 @@ built in:
   finds it on CivitAI/HuggingFace, downloads it, wires it, and retries — no "node's
   red, good luck." (This already works in the panel today; mobile inherits it.)
 
+## Pairing QR — one code, three behaviors
+
+The pairing QR (the panel's "Remote control" button already mints one) becomes
+**multi-purpose**: it encodes a single HTTPS URL on our own domain —
+`https://pair.artokun.io/#v=1&host=<lan-or-tunnel>&token=<pairing-token>` —
+and every scan path does the right thing:
+
+1. **In-app scanner** — parses the URL string directly, pulls `host` + `token`
+   from the fragment, connects. Works regardless of OS routing.
+2. **Regular camera, app installed** — iOS Universal Links / Android App Links
+   route the URL into the app, which auto-fills the login from the same
+   fragment. Needs `/.well-known/apple-app-site-association` +
+   `/.well-known/assetlinks.json` served on that domain (with the
+   Firebase-distributed **release** cert fingerprint in assetlinks, not just
+   debug, or Android falls through to the browser).
+3. **Regular camera, no app** — the URL opens in the browser: a tiny static
+   lander does user-agent detection and shows the **TestFlight** button (iOS)
+   or **Firebase App Distribution** button (Android), both when it can't tell.
+   Custom-scheme fallback (`comfyui-mcp://pair?...`) for edge cases.
+
+Design rules:
+- **Secrets ride the fragment (`#`), never the query string** — fragments are
+  not sent to the server, so host+token can't land in anyone's request logs.
+  JS on the lander still reads it; universal links deliver it to the app.
+- **The install gap**: no deferred deep linking without Branch-style infra
+  (Firebase Dynamic Links is dead). The lander offers "Copy pairing code"
+  (app checks clipboard on first launch) and says "or re-scan with the in-app
+  scanner" — with short-TTL tokens, re-scan is the realistic path anyway.
+- **Hosting: Cloudflare on `artokun.io`** (already on brand — the docs live at
+  comfyui-mcp.artokun.io). A Pages/Worker project serves the lander + both
+  association files with correct content-types (this fixes the classic
+  GitHub-Pages AASA `octet-stream` ambiguity). Universal/App Links bind to the
+  domain, so owning it means printed/cached QRs never break.
+- The QR **content** is minted panel/orchestrator-side (the #180 pairing
+  listener); the app funnels all three entry points (in-app scan, universal
+  link, custom scheme) into one `parsePairingUrl()`.
+
 ## What it feels like on the phone
 
 - **Swipe between trees like a Trello board.** Each workflow (or branch) is a

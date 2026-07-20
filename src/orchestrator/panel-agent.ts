@@ -143,6 +143,8 @@ export interface PanelAgentDeps {
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
   onThinking?: (tabId: string, tokens: number) => void;
+  /** A tool the agent invoked — for a compact "activity" line (tool visibility). */
+  onToolCall?: (tabId: string, name: string) => void;
   /** Fired when the agent DEQUEUES a message and starts processing it (the true
    *  "read" moment) — carries the client mid so the panel can flip that bubble
    *  from queued/muted to read. */
@@ -182,6 +184,18 @@ export class PanelAgent {
    *  session-restarting option change (effort) until the turn finishes, instead
    *  of interrupting and silently dropping the in-flight reply. */
   private busy = false;
+  /** True once THIS turn's failure has been surfaced to the user — set by the
+   *  `error` event case so an error-subtype `result` right behind it doesn't
+   *  paint a second failure line. Reset when a turn starts (busy = true). */
+  private errorSurfaced = false;
+  /** True between a USER-initiated interrupt (Stop / send-now) and the aborted
+   *  turn's terminal result. The Claude SDK reports an interrupted turn as an
+   *  error-subtype result (error_during_execution), which the never-end-in-
+   *  silence guard below would otherwise paint as "⚠️ That turn failed" — a
+   *  scary failure line for something the user did on purpose. Cleared on the
+   *  next result and at the next turn dispatch, so a REAL later failure still
+   *  surfaces. */
+  private interruptRequested = false;
   // ---- turn idle watchdog (freeze safety net) ----
   // A stalled turn (the backend stops emitting ANY events — e.g. a wedged Codex
   // app-server) would otherwise leave the panel "working" forever. This is an
@@ -338,11 +352,19 @@ export class PanelAgent {
           ? `${note} `
           : `A run on the user's canvas just finished and produced ${imgs.length} output image(s): ${names}. `) +
         // Only claim images are attached when some actually are (a note-only event —
-        // e.g. a video that produced no storyboard — has none).
-        (imgs.length ? `The image(s) are attached below and already shown to the user in the panel. ` : ``) +
+        // e.g. a video that produced no storyboard — has none), and only when this
+        // backend can actually see them — a text-only backend told "attached below"
+        // would confabulate having viewed the render.
+        (imgs.length
+          ? this.backend.capabilities.vision
+            ? `The image(s) are attached below and already shown to the user in the panel. `
+            : `You cannot view images on this provider, but they are already shown to the user in the panel. `
+          : ``) +
         `Reply with ONE short sentence acknowledging the result and suggesting a sensible next step — you do NOT need to call any tools. Don't repeat an earlier comment.`;
       // Attach the outputs inline so the agent SEES the render (no fetch needed).
-      images = imgs.filter((i) => i.filename).map((i) => ({ ...i, type: i.type ?? "output" }));
+      if (this.backend.capabilities.vision) {
+        images = imgs.filter((i) => i.filename).map((i) => ({ ...i, type: i.type ?? "output" }));
+      }
     } else if (ev.kind === "run_error") {
       text =
         `[panel event] The user's workflow run just ERRORED: ${ev.error ?? "unknown error"}. ` +
@@ -453,6 +475,9 @@ export class PanelAgent {
     // both clear it and have us re-queue a stale copy.
     const interrupted = this.inFlight;
     this.inFlight = null;
+    // The aborted turn's result is EXPECTED (and error-subtyped on the Claude
+    // SDK) — don't let the result case report it as a turn failure.
+    this.interruptRequested = true;
     // The turn that's in flight RIGHT NOW — the one we're aborting. Captured
     // before the await so the release fallback below targets exactly this turn's
     // gate (not a later one the channel may legitimately advance to if the
@@ -592,8 +617,22 @@ export class PanelAgent {
       for (const it of batch) {
         if (it.mid) this.deps.onSeen?.(this.tabId, it.mid);
       }
-      const text = batch.map((it) => it.text).join("\n\n");
-      const images = batch.flatMap((it) => it.images ?? []);
+      let text = batch.map((it) => it.text).join("\n\n");
+      let images = batch.flatMap((it) => it.images ?? []);
+      if (images.length && !this.backend.capabilities.vision) {
+        // Text-only backend: every non-vision adapter silently ignores image
+        // refs, which reads to the user as "it ignored my screenshot". Say so
+        // visibly, and tell the MODEL too so it can't pretend it saw them.
+        this.deps.onSay(
+          this.tabId,
+          `📎 This provider is text-only, so I can't see the ${images.length > 1 ? "images" : "image"} you attached. ` +
+            `Describe what's in it, or switch to a vision-capable provider (Claude, Codex, or Gemini) and re-send.`,
+        );
+        text +=
+          `\n\n[panel note: the user attached ${images.length} image(s), but this provider is text-only and you CANNOT see them. ` +
+          `Do not claim or imply you saw them — if the content matters, ask the user to describe it or switch to a vision-capable provider.]`;
+        images = [];
+      }
       if (this.closed) return;
       // Remember the in-flight turn's user text so an interrupt mid-reply can
       // re-queue it (send-now must address BOTH the interrupted and new message).
@@ -603,6 +642,8 @@ export class PanelAgent {
       // the watchdog's `busy` guard would be false for the exact zero-event freeze
       // it's meant to catch, so onTurnStalled() would no-op. (handleEvent's later
       // `busy = true` becomes a harmless no-op.) Also shows "working" immediately.
+      this.errorSurfaced = false; // fresh turn → its failure (if any) is unreported
+      this.interruptRequested = false; // a stale interrupt can't mute THIS turn's failure
       this.busy = true;
       this.deps.onTurn?.(this.tabId, "working");
       // Arm the freeze watchdog AT DISPATCH: a turn that produces NO events at all
@@ -704,6 +745,21 @@ export class PanelAgent {
           this.sessionId = null;
           resumeSessionId = undefined;
           resumeMiss = true;
+        }
+        // SELF-HEAL: a crash mid-turn (the SDK process dying, e.g. code
+        // 4294967295) leaves the triggering message unprocessed. Resuming the
+        // session finds the turn already recorded as ended, so it produces empty
+        // "success" turns and the user's request is silently EATEN. Re-queue the
+        // in-flight message so the restarted/fresh session actually re-runs it.
+        // Idempotent enough: a duplicate render beats a lost request, and the
+        // quickRestarts give-up guard still bounds a message that crash-loops.
+        if (this.inFlight) {
+          const interrupted = this.inFlight;
+          this.inFlight = null;
+          this.queue.unshift(interrupted);
+          logger.warn(
+            `[panel-agent ${this.short()}] crash mid-turn — re-queued the interrupted message so it isn't lost`,
+          );
         }
       }
       // Session ended (cleanly or via error) — disarm any armed watchdog AND the
@@ -855,6 +911,33 @@ export class PanelAgent {
         }
         break;
       }
+      case "tool_call": {
+        // Tool visibility — surface the agent's actions (a canvas-less mobile
+        // client otherwise sees only a spinner between reply bubbles). Only the
+        // START phase is forwarded as a compact activity line.
+        this.busy = true;
+        this.deps.onTurn?.(this.tabId, "working");
+        if (ev.phase === "start") {
+          this.deps.onToolCall?.(this.tabId, ev.name);
+        }
+        break;
+      }
+      case "error": {
+        // A backend-reported turn error (codex/gemini/grok emit these before
+        // their error result). Without this case the message fell through
+        // `default` and the user watched a turn end in TOTAL silence — the
+        // exact "three Hellos into the void" failure from the support thread.
+        // Surface it as a visible chat line; the follow-up `result` event still
+        // advances the turn gate normally.
+        const detail = typeof ev.message === "string" && ev.message.trim() ? ev.message.trim() : "unknown error";
+        this.errorSurfaced = true;
+        this.deps.onSay(
+          this.tabId,
+          `⚠️ The ${this.model} turn failed: ${detail}\n\nNothing was lost — try again, switch models from the composer picker, or check the terminal running the orchestrator for more detail.`,
+        );
+        logger.warn(`[panel-agent ${this.short()}] backend error: ${detail}`);
+        break;
+      }
       case "result": {
         // Cache the context window + cost from the result, then re-report using
         // the last assistant usage (the true current context).
@@ -874,6 +957,22 @@ export class PanelAgent {
         // fork the conversation here for a rewind.
         if (this.lastAssistantUuid) this.deps.onTurnAnchor?.(this.tabId, this.lastAssistantUuid);
         this.deps.onTurn?.(this.tabId, "done");
+        // Failed turn that never produced a visible error (the claude SDK path
+        // reports failures only via the result subtype; the `error` event case
+        // covers codex/gemini/grok) → say SOMETHING. A turn must never end in
+        // silence, error turns included. EXCEPT a turn the user just interrupted
+        // (Stop / send-now): its error-subtype result is the interrupt landing,
+        // not a failure.
+        const wasInterrupted = this.interruptRequested;
+        this.interruptRequested = false; // one result consumes the flag
+        if ((ev.ok === false || /error/i.test(ev.subtype ?? "")) && !this.errorSurfaced && !wasInterrupted) {
+          this.errorSurfaced = true;
+          this.deps.onSay(
+            this.tabId,
+            `⚠️ That turn failed (${ev.subtype ?? "error"}) without a reply. ` +
+              `Nothing was lost — try again, switch models from the composer picker, or check the orchestrator terminal for detail.`,
+          );
+        }
         logger.info(
           `[panel-agent ${this.short()}] turn done (subtype=${ev.subtype})`,
         );
@@ -926,6 +1025,8 @@ export interface PanelAgentManagerOptions {
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
   onThinking?: (tabId: string, tokens: number) => void;
+  /** A tool the agent invoked — for a compact "activity" line (tool visibility). */
+  onToolCall?: (tabId: string, name: string) => void;
   /** Fired when the agent dequeues a message (read moment) — carries the mid. */
   onSeen?: (tabId: string, mid: string) => void;
   /** Build the per-tab live-graph MCP server (bound to the tab id). May return
@@ -1004,6 +1105,14 @@ export class PanelAgentManager {
     return this.effortByKey.has(tabId) ? this.effortByKey.get(tabId) : this.effort;
   }
 
+  /** The picker's model OVERRIDE for this composite key (`tabId::backend`), if
+   *  any — undefined when the key runs the shared default. Lets the models
+   *  push report the model this tab will ACTUALLY spawn with as `current`,
+   *  instead of the backend default the override supersedes. */
+  modelOverrideFor(tabId: string): string | undefined {
+    return this.modelByKey.get(tabId);
+  }
+
   private makeAgent(tabId: string): PanelAgent {
     // Inject the toggle-selected backend (Codex) when provided; otherwise the
     // PanelAgent constructor defaults to ClaudeBackend (existing behavior).
@@ -1035,6 +1144,7 @@ export class PanelAgentManager {
         if (state === "done") this.applyPendingRestarts(id);
       },
       onThinking: this.opts.onThinking,
+      onToolCall: this.opts.onToolCall,
       onSeen: this.opts.onSeen,
       panelServer: this.opts.makePanelServer?.(tabId),
       pluginPath: this.opts.pluginPath,
@@ -1064,6 +1174,12 @@ export class PanelAgentManager {
    *  restartAllForMcpEnv() after this points every provider at the new target. */
   setComfyuiUrl(comfyuiUrl: string): void {
     this.opts.comfyuiUrl = comfyuiUrl;
+  }
+
+  /** Whether a live agent (session) exists for this composite key — used to flag
+   *  the mobile mirror picker's "session attached" dot. */
+  hasLiveAgent(key: string): boolean {
+    return this.agents.has(key);
   }
 
   /** Respawn every active tab's agent (resume + carry-over) so the live comfyui
@@ -1223,6 +1339,59 @@ export class PanelAgentManager {
     this.pendingResume.set(tabId, sessionId);
   }
 
+  /**
+   * Rebind an agent from its current (stale) tabId to a new tabId — recovers
+   * from a panel tab-id scheme migration (e.g. random UUID → deterministic
+   * tmp:/wf: prefixed ids) without losing the conversation. The agent's panel
+   * tools still carry the old tabId; the UiBridge's tabMigrations map (see
+   * ui-bridge.ts resolveTarget) redirects those calls to the new connection.
+   * Returns true if an agent was rebound.
+   */
+  rebindAgent(oldKey: string, newKey: string): boolean {
+    if (oldKey === newKey) return false;
+    if (this.agents.has(newKey)) return false;
+    // DURABLE state migrates even when no live agent exists (codex review:
+    // the agent may have been reaped while its persisted session survives —
+    // skipping this meant the rebound tab started a fresh conversation).
+    const moveDurable = () => {
+      if (this.pendingResume.has(oldKey)) {
+        this.pendingResume.set(newKey, this.pendingResume.get(oldKey)!);
+        this.pendingResume.delete(oldKey);
+      }
+      const persisted = this.opts.sessionStore?.get(oldKey);
+      if (persisted) this.opts.sessionStore?.set(newKey, persisted);
+      this.opts.sessionStore?.clear(oldKey);
+    };
+    const agent = this.agents.get(oldKey);
+    if (!agent || agent.isStopped) {
+      moveDurable();
+      return false;
+    }
+    this.agents.delete(oldKey);
+    this.agents.set(newKey, agent);
+    // has()-based moves throughout (codex review): truthy checks dropped
+    // legitimate null/undefined sentinels (e.g. restart-without-nudge, an
+    // explicit effort-override clear).
+    if (this.pendingEffortRestart.has(oldKey)) {
+      this.pendingEffortRestart.delete(oldKey);
+      this.pendingEffortRestart.add(newKey);
+    }
+    if (this.pendingMcpRestart.has(oldKey)) {
+      this.pendingMcpRestart.set(newKey, this.pendingMcpRestart.get(oldKey)!);
+      this.pendingMcpRestart.delete(oldKey);
+    }
+    if (this.modelByKey.has(oldKey)) {
+      this.modelByKey.set(newKey, this.modelByKey.get(oldKey)!);
+      this.modelByKey.delete(oldKey);
+    }
+    if (this.effortByKey.has(oldKey)) {
+      this.effortByKey.set(newKey, this.effortByKey.get(oldKey)!);
+      this.effortByKey.delete(oldKey);
+    }
+    moveDurable();
+    return true;
+  }
+
   /** Route a panel message to its tab's agent, creating the agent if needed.
    *  Never routes into a stopped agent (whose channel is closed) — respawns so
    *  the message reaches a live session. */
@@ -1354,6 +1523,15 @@ export class PanelAgentManager {
 
   count(): number {
     return this.agents.size;
+  }
+
+  /** True when NO agent is mid-turn or holding queued messages — the only
+   *  moment a self-restart may replace the process without eating a reply. */
+  allIdle(): boolean {
+    for (const a of this.agents.values()) {
+      if (a.isBusy || a.hasPending) return false;
+    }
+    return true;
   }
 
   get defaults(): { model: string; effort?: Effort } {

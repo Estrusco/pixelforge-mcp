@@ -6,6 +6,339 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.41.0] - 2026-07-20
+
+### MCP
+
+#### Changed
+- **GPT-5.6 family (Sol / Terra / Luna) with the extended effort scale
+  (`max`, `ultra`)** — the bundled Codex SDK is now 0.145.0-alpha.24 (the
+  stable 0.144.6 crashes renewing a Codex-Desktop 0.145 models cache; the
+  alpha is the field-verified pairing — #241), and pre-5.6 models are
+  DEPRECATED: the picker hides them whenever the account has the 5.6 family
+  (accounts without 5.6 keep their catalog). ChatGPT-direct default is now
+  `gpt-5.6-luna` (successor to the retired `gpt-5.4-mini`); Claude-max→xhigh
+  effort downmapping removed (`max` is native now)
+
+### MCP
+
+#### Added
+- GPT-5.6 family (Sol/Terra/Luna) + max/ultra efforts; deprecate pre-5.6 models (fixes #241) (#244)
+
+
+## [0.40.0] - 2026-07-19
+
+### MCP
+
+#### Removed
+- `panel_view_errored_nodes` — merged into `panel_get_errors` rather than
+  shipping two overlapping error tools. Requires panel ≥ 0.9.6 (the panel
+  executor moves with it); a 0.39.0 server paired with a newer panel would
+  otherwise call a command that no longer exists.
+
+#### Changed
+- `panel_get_errors` is now the single error surface and returns every errored
+  node JOINED TO ITS CAUSE — `nodes[]` with the node's detail summary,
+  `red_outline`, and `reasons[]` (`missing_model` with file/folder/download URL,
+  `missing_media`, `validation`, `execution` with `exception_type`) — plus
+  graph-level `missing_models`, `missing_media`, `missing_node_types` /
+  `missing_node_count`. The raw `node_errors` map and `last_execution_error`
+  are still returned unchanged for existing consumers.
+- This closes a real gap behind "red node, no error message": missing
+  model/media assets paint nodes red AS SOON AS THE WORKFLOW LOADS, but the raw
+  validation map only populates on a queue attempt — so the old tool answered
+  "no errors recorded since the last execution start" while the user was
+  looking at red nodes (reproduced live, then fixed). Likewise a node that
+  throws AT RUNTIME is never painted red, so it can only be found here
+  (`red_outline: false`).
+- docs: the panel's Read-tools table now lists `panel_view_selected` and
+  `panel_view_nodes_in_viewport`, and describes the merged `panel_get_errors`.
+
+### MCP
+
+#### Changed
+- merge panel_view_errored_nodes into panel_get_errors (#240)
+
+
+## [0.39.0] - 2026-07-19
+
+### MCP
+
+#### Added
+- expose view_selected / viewport / errored-node tools (#238)
+
+
+## [0.38.1] - 2026-07-18
+
+### MCP
+
+#### Fixed
+- custom-node/model operations no longer 405 against pip ComfyUI-Manager
+  running in legacy-UI mode (`--enable-manager-legacy-ui` — hardcoded by e.g.
+  yanwk/comfyui-boot images): that mode swaps in Manager's bundled 3.x server
+  under the /v2 prefix, which has no `queue/task` route — comfyui-mcp now
+  detects the mode (`/v2/manager/is_legacy_manager_ui`) and speaks its
+  `queue/batch` dialect; Manager detection also validates the probe payload so
+  an SPA 200 can't masquerade as a Manager API (#235)
+
+### MCP
+
+#### Fixed
+- speak pip Manager's legacy-UI dialect — queue/batch, not queue/task (fixes #235) (#236)
+
+
+## [0.38.0] - 2026-07-17
+
+### MCP
+
+#### Added
+- add Moonshot (Kimi K3) as a first-class provider (#233)
+
+
+## [0.37.0] - 2026-07-16
+
+### MCP
+
+#### Added
+- **`list_local_models` CivitAI provenance line** — entries whose
+  `<file>.civitai.json` sidecar (written by `download_civitai_model`) carries
+  ids now render a `civitai: <page URL>` line (the sidecar's `sourceUrl`, or
+  reconstructed from `modelId`/`versionId` for older sidecars). The URL
+  carries the modelId + INSTALLED modelVersionId, so agents and clients (the
+  mobile LoRA hub) can link back to the source and check CivitAI for newer
+  versions. Purely additive; no whitelist change — `list_local_models` is
+  already mobile-callable.
+- **live `queue_status` bridge frame** — the orchestrator now broadcasts
+  ComfyUI's live render/queue state (running, queue depth, current node,
+  sampler progress, prompt_id) to every connected tab, riding the existing
+  QueueMonitor watchdog so browser-queued jobs are covered too. Change-only
+  and capped at 1 frame/sec: an idle rig broadcasts nothing. Each tab is also
+  seeded with the current state on `hello`, so a client connecting mid-render
+  sees the running job immediately. Powers the mobile app's live queue monitor
+- **`cancel_job` on the mobile call_tool whitelist** — one-tap cancel of the
+  running render from the phone's queue monitor. Narrowly scoped: the client
+  passes the `prompt_id` it observed, cancel_job only interrupts a still-matching
+  running job, and pending jobs are never touched
+
+#### Fixed
+- **QueueMonitor stayed disconnected after a ComfyUI retarget** — the watchdog
+  WS never reconnected once the orchestrator retargeted ComfyUI (e.g. the
+  `127.0.0.1`→`localhost` swap on a local panel `hello`), because `start()`
+  early-returned on the stale URL after the retarget's `stop()`. That left
+  `queue_status` permanently `connected:false` (so the mobile queue bar never
+  appeared) and silently disabled the local-Ollama VRAM pause. `start()` now
+  reconnects on a URL change or after `stop()`, and the WS handlers are guarded
+  against a superseded socket so the retarget's async close can't null the new
+  connection. Latent since the watchdog landed (2026-06-27); surfaced by the
+  `queue_status` broadcast above
+
+#### Docs
+- mobile app (beta) page — Android (Firebase App Distribution) + iOS
+  (TestFlight) beta-tester links, pairing walkthrough, wired into the docs nav
+
+### MCP
+
+#### Added
+- live queue_status broadcast + mobile one-tap render cancel (#229)
+- surface CivitAI provenance (page URL w/ model+version ids) in list_local_models (#231)
+
+#### Fixed
+- reconnect watchdog WS after ComfyUI retarget (#232)
+
+
+## [0.36.0] - 2026-07-15
+
+### MCP
+
+#### Added
+- **cid-correlated `set_options` acks** — clients may stamp `set_options`
+  with an opaque `cid`; the options ack echoes it verbatim plus
+  `requested_model`, making model-switch acks exactly attributable (acks are
+  not FIFO — each handler is an independent async task). Failure now also
+  sends an `ok:false` ack for cid-stamped requests. Fully backward
+  compatible: cid-less requests get the byte-identical legacy ack. Note:
+  `cid`, not `rid` — the bridge consumes any frame carrying `rid` as a
+  canvas-command reply. The models frame's `current` now reports the per-tab
+  model override instead of the backend default (#228)
+
+
+## [0.35.0] - 2026-07-15
+
+### MCP
+
+#### Added
+- **search_civitai_creators** — CivitAI creator discovery: with no query it
+  returns the site's creator leaderboard (rank, score, downloads, likes;
+  boards: `overall`, `overall_90`, `overall_nsfw`, `new_creators`), with a
+  query it searches usernames via the public `/api/v1/creators`. Each hit
+  feeds `search_civitai_models {creator}` directly, so "show me top creators
+  → their models → download" works end-to-end (Discord mobile-beta request)
+- **search_civitai_models `creator` filter** — list one creator's models by
+  exact username, with or without a keyword (the keyword is applied
+  client-side because CivitAI returns an empty page when `query` and
+  `username` are combined). Both CivitAI search tools are now whitelisted on
+  the mobile `call_tool` channel (read-only)
+- **panel_flatten_workflow** — one-call, formatting-preserving flatten of the
+  live canvas: Get/Set buses, Reroutes, and cg-use-everywhere broadcasts
+  resolve to direct real links and the virtual nodes are deleted, while kept
+  nodes never move (groups/positions/colors/titles survive exactly; one undo
+  restores). UE broadcasts materialize from the pack's own computed
+  `extra.ue_links`; real executable nodes (rgthree Context, Seed Everywhere)
+  are kept
+
+### MCP
+
+#### Added
+- mobile workflows-over-tunnel fix + desktop-tab mirror (remote control) (#227)
+- creator search — search_civitai_creators + search_civitai_models creator filter (#226)
+- panel_open_civitai tool — agent opens the CivitAI browser pre-seeded (#225)
+- panel_flatten_workflow — in-place UE + Get/Set flatten that preserves the author's layout (#224)
+
+
+## [0.34.0] - 2026-07-14
+
+### MCP
+
+#### Fixed
+- a user interrupt (panel Stop or a pending-tray **Send now**) no longer paints
+  the "⚠️ That turn failed (error_during_execution)" banner — the Claude SDK
+  reports an interrupted turn with an error-subtype result, which the
+  never-end-in-silence guard mistook for a real failure; genuine failed turns
+  still surface (#221)
+- UI→API conversion no longer scrambles widget values on nodes with a custom
+  serialized-widget layout (`properties.has_serialized_properties` — LTXDirector,
+  LTXSequencer, PromptRelay): authoritative named values in `node.properties`
+  now win over the shifted positional mapping (#222)
+
+#### Added
+- **orchestrator self-updater + self-restarter** (default ON) — the panel
+  orchestrator re-checks npm hourly, updates the installed package
+  (global/local via npm; npx respawns pinned to the new version), and restarts
+  itself once every agent is idle with nothing queued, held, or rendering —
+  the panel announces the restart, sessions resume from the durable store, and
+  the panel reconnects on its own. Dev installs (npm link / checkout) are
+  never modified on disk; instead the orchestrator restarts itself when a
+  rebuilt `dist` lands, so `npm run build` is all a developer needs (no more
+  days-old processes serving a fresh checkout). MCP stdio mode never
+  self-restarts (the MCP client owns that process). Opt out with
+  `COMFYUI_MCP_AUTO_UPDATE_DISABLE=1` (or keep checks but never restart with
+  `COMFYUI_MCP_AUTORESTART=0`); tune the period with
+  `COMFYUI_MCP_UPDATE_CHECK_MS`
+- panel_strip_workflow / panel_slice_workflow read the LIVE CANVAS when called
+  with no source (new panel graph_serialize command) — no more save-to-disk
+  round trip; strip's description now states its API-format output cannot be
+  loaded back onto the canvas
+- chatgpt backend delivers attached images via Responses-API `input_image`
+  data URLs, with the same one-shot strip-and-retry + honest 📎 note on
+  rejection as the Ollama family (#218)
+
+### MCP
+
+#### Added
+- self-updater + self-restarter — a running orchestrator never goes stale (#223)
+- strip/slice read the live canvas by default — no save-to-disk round trip
+
+#### Fixed
+- the Discord invite link was expired — use the permanent one (#220)
+
+
+## [0.33.0] - 2026-07-14
+
+### MCP
+
+#### Added
+- **stable phone-pairing token** — set `COMFYUI_MCP_PAIR_TOKEN` to pin the mobile
+  bridge's pairing token so a paired phone reconnects across orchestrator restarts
+  instead of dying on a per-session token. When set, the LAN pairing listener also
+  auto-starts at boot and prints the ready-to-paste `ws://<lan-ip>:<port>/?token=…`
+  URL; leaving it unset keeps the previous on-demand, per-session behavior (and its
+  default "nothing exposed until you ask" posture) unchanged (#219)
+
+
+## [0.32.0] - 2026-07-14
+
+### MCP
+
+#### Added
+- inline image delivery for every Ollama-family backend (ollama / OpenRouter /
+  LM Studio / llama.cpp / custom / GLM / Kimi / Copilot) — vision is per-MODEL,
+  always attempted (native `images` base64 or OpenAI `image_url` parts), with a
+  graceful one-shot strip-and-retry + honest 📎 note when the endpoint rejects
+  image input; live-verified against local ComfyUI and a cloudflared tunnel
+- boot diagnostic logging which keyed providers have a key and its source
+  (env / store / none — never values)
+
+#### Fixed
+- the gemma4 fine-tune tags' baked `temperature 0` caused greedy repetition
+  loops — the backend now sends the Gemma-recommended sampling (temp 1.0 /
+  top_k 64 / top_p 0.95) for the fine-tune tags; `COMFYUI_MCP_OLLAMA_TEMPERATURE`
+  / `TOP_K` / `TOP_P` override wholesale
+- render-completed events no longer tell a text-only model the image is
+  "attached below" (confabulation guard)
+
+#### Changed
+- `~/.comfyui-mcp/.env` is the only dotenv location (dev override; a legacy
+  package-root `.env` is auto-migrated once, then ignored) — panel users manage
+  keys via the API Keys card, MCP-only setups via the client config env block
+- docker build context whitelisted to exactly what the Dockerfile COPYs (#217)
+
+## [0.31.1] - 2026-07-14
+
+### MCP
+
+#### Fixed
+- codex-review hardening of the tab-id migration (#212 follow-up) (#213)
+- current DeepSeek in curated picks; sort + widen the overflow list
+- live account-aware model catalog + clamp; error turns are never silent
+- tab-id migration self-heal — #211 hardened (chains, safe rebind, resume survival) (#212)
+
+#### Docs
+- connection guide for the five new providers (Grok / Kimi / GLM /
+  ChatGPT-direct-OAuth / Copilot) — sign-in paths, picker roster, honest
+  degraded-ack behavior (#214)
+
+#### Changed
+- `npx github:artokun/comfyui-mcp` now works as a nightly channel (prepare script)
+
+
+## [0.31.0] - 2026-07-12
+
+### MCP
+
+#### Added
+- clear/revoke path for credential slots — POST {slot, clear:true} (#203)
+- forward tool_call as an 'action' frame for mobile tool visibility
+- A2UI chat cards — panel_ui_render/panel_ui_update with server-side spec wall — ported from MichaelDanCurtis fork (#194)
+- per-workflow agent sessions + prompt registry — ported from MichaelDanCurtis fork (#199)
+- OAuth engine + Grok/Kimi/GLM/ChatGPT/Copilot provider backends — ported from MichaelDanCurtis fork (#201)
+- upload_media bridge frame — stage phone media as ComfyUI input
+- loopback MCP console + credential slots — ported from MichaelDanCurtis fork (#197)
+- ltx23-distill-3stage — 3-stage LTX 2.3 distill I2V/T2V pack — from jcd315 fork (#195)
+- native search_civitai_models — kill the bundled MCP, own the loop (#198)
+- chat-history bridge frames (list_history / load_history)
+- integrate official comfy-cli JSON tools
+- download metadata sidecars + agent-visible trigger words
+- call_tool — direct, whitelisted tool channel for the mobile app
+
+#### Fixed
+- a throwing backend constructor can never kill the process (#209)
+- pick the real LAN IP, not a VPN/virtual adapter
+- forward onToolCall to spawned agents (action lines were dropped)
+- move MCP console to bridge+3 — bridge+2 is the phone-pairing listener's port
+- thread injectable home through readOAuthStatus — CLI-auth detection leaked the real homedir into readiness tests
+- loud not-a-model warning on download (Workflows-zip trap) (#206)
+- report existing CLI logins in oauth_status — no more double sign-in prompt
+- signpost graph editing to the panel router (live panel wedge #3) (#205)
+- CORS for the ComfyUI origin — the panel's credentials card couldn't fetch /api/secrets
+- panel_connect slot aliases — stop silent auto-match on stripped params (#204)
+- re-queue the in-flight message when the agent crashes mid-turn
+- a tool-using turn can never end in silence (#202)
+- community fixes — get_node_info summary, comfy-api-key fallback, save_workflow doc clarity (from community forks) (#196)
+- live-E2E follow-ups — honest stop copy + empty-final recovery (#193)
+- harden comfy-cli integration
+- stop the 'circles' loop on unsatisfiable searches (Discord report) (#191)
+
+
 ## [0.30.0] - 2026-07-09
 
 ### MCP

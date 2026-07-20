@@ -362,6 +362,148 @@ describe("UiBridge (multi-tab)", () => {
     a.close();
   });
 
+  it("resolves via tab-id migration when a socket re-hellos under a new scheme (tmp:→wf:)", async () => {
+    // Simulate the bug scenario: a tab first connects with a random-UUID tab id
+    // (the old scheme), an agent binds to it, then the SAME socket re-hellos
+    // under a deterministic tmp:/wf: scheme (the new scheme). bridge.send() with
+    // the OLD id must still resolve to the new connection.
+    const sock = await connectPanel(); // open socket, no hello yet
+    autoReply(sock, "old-tab");
+    await vi.waitFor(() => expect(bridge.connected()).toBe(false));
+
+    // 1) First hello: old-style random-UUID tab id.
+    const oldId = "6eccc826-592e-4abb-b280-35434e00ddd1";
+    sock.send(JSON.stringify({ type: "hello", tab_id: oldId, title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    // Verify the old id works.
+    const oldResult = await bridge.send({ cmd: "graph_outline" }, { tabId: oldId });
+    expect(oldResult).toMatchObject({ from: "old-tab" });
+
+    // 2) Same socket re-hellos under a new deterministic tab id (the migration).
+    const newId = "wf:workf";
+    sock.send(JSON.stringify({ type: "hello", tab_id: newId, title: "image_flux2_fp8" }));
+    await vi.waitFor(() => {
+      expect(bridge.tabs()).toHaveLength(1);
+      expect(bridge.tabs()[0].tab_id).toBe(newId);
+    });
+
+    // 3) The old agent (still holding the old tabId) sends a command via the
+    //    bridge — this MUST resolve via the migration map instead of throwing.
+    const migratedResult = await bridge.send({ cmd: "graph_get_state" }, { tabId: oldId });
+    expect(migratedResult).toMatchObject({ from: "old-tab", cmd: "graph_get_state" });
+
+    // 4) An UNKNOWN id (no migration, no connection) still fails with the
+    //    expected error — plus a prefix mismatch for the old id should work too.
+    await expect(
+      bridge.send({ cmd: "x" }, { tabId: "completely-unknown" }),
+    ).rejects.toThrow(/no connected tab/);
+
+    sock.close();
+  });
+
+  it("migrates tab id when socket re-hellos to a different scheme and rejects absent tab_id", async () => {
+    // Same scenario but with TWO tabs to ensure the migration is per-socket and
+    // doesn't cross-contaminate.
+    const sockA = await connectPanel();
+    const sockB = await connectPanel();
+    autoReply(sockA, "A");
+    autoReply(sockB, "B");
+
+    const oldA = "legacy-a-1111";
+    const oldB = "legacy-b-2222";
+    sockA.send(JSON.stringify({ type: "hello", tab_id: oldA, title: "flux-workflow" }));
+    sockB.send(JSON.stringify({ type: "hello", tab_id: oldB, title: "video-workflow" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+    // Migrate tab A's socket to a new id, leave tab B unchanged.
+    const newA = "wf:flux123";
+    sockA.send(JSON.stringify({ type: "hello", tab_id: newA, title: "flux-workflow" }));
+    await vi.waitFor(() => {
+      expect(bridge.tabs()).toHaveLength(2);
+      expect(bridge.tabs().find((t) => t.tab_id === newA)).toBeTruthy();
+      expect(bridge.tabs().find((t) => t.tab_id === oldA)).toBeFalsy();
+    });
+
+    // Old id A still routes to the migrated tab.
+    const fromA = await bridge.send({ cmd: "x" }, { tabId: oldA });
+    expect(fromA).toMatchObject({ from: "A" });
+
+    // Old id B (never migrated) still works normally.
+    const fromB = await bridge.send({ cmd: "x" }, { tabId: oldB });
+    expect(fromB).toMatchObject({ from: "B" });
+
+    // New id works directly too.
+    const fromNewA = await bridge.send({ cmd: "x" }, { tabId: newA });
+    expect(fromNewA).toMatchObject({ from: "A" });
+
+    sockA.close();
+    sockB.close();
+  });
+
+  it("SCRUBS a client-forged migrated_from (codex review: rebind hijack)", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    bridge.onPanelMessage = (ev) => void seen.push(ev as unknown as Record<string, unknown>);
+    const sock = await connectPanel();
+    autoReply(sock, "attacker");
+    // Fresh socket, FIRST hello — no migration happened, but the client claims one.
+    sock.send(JSON.stringify({ type: "hello", tab_id: "attacker-tab", migrated_from: "victim-tab" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    const hello = seen.find((e) => e.type === "hello" && e.tab_id === "attacker-tab");
+    expect(hello).toBeTruthy();
+    expect(hello!.migrated_from).toBeUndefined();
+    bridge.onPanelMessage = null;
+    sock.close();
+  });
+
+  it("a DEAD socket's migration alias never routes to an unrelated tab reusing the id (deterministic wf: reuse)", async () => {
+    // sockA: legacy id → wf:reused (migration created), then DIES.
+    const sockA = await connectPanel();
+    autoReply(sockA, "A");
+    sockA.send(JSON.stringify({ type: "hello", tab_id: "legacy-old-id" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:reused" }));
+    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("wf:reused"));
+    sockA.close();
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+
+    // sockB: an UNRELATED tab that happens to get the same deterministic wf: id.
+    const sockB = await connectPanel();
+    autoReply(sockB, "B");
+    sockB.send(JSON.stringify({ type: "hello", tab_id: "wf:reused" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    // The old legacy id must NOT resolve to sockB's tab via the stale alias.
+    await expect(bridge.send({ cmd: "x" }, { tabId: "legacy-old-id" })).rejects.toThrow(/no connected tab/);
+    sockB.close();
+  });
+
+  it("follows MIGRATION CHAINS: uuid → tmp: → wf: (the exact #210 field sequence)", async () => {
+    // The reported failure re-helloed TWICE: legacy random UUID, then the
+    // unsaved-tab tmp:<uuid> id, then the saved wf:<hash> id. The ORIGINAL id
+    // must still resolve after both hops (single-hop lookup lands on the dead
+    // tmp: id) — the map path-compresses so every historical id points at the
+    // live tab.
+    const sock = await connectPanel();
+    autoReply(sock, "chained");
+    const uuid = "6eccc826-592e-4abb-b280-35434e00ddd1";
+    sock.send(JSON.stringify({ type: "hello", tab_id: uuid, title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    sock.send(JSON.stringify({ type: "hello", tab_id: "tmp:7eab1234", title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("tmp:7eab1234"));
+
+    sock.send(JSON.stringify({ type: "hello", tab_id: "wf:workf", title: "image_flux2_fp8" }));
+    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("wf:workf"));
+
+    // Every id along the chain resolves to the live tab.
+    for (const id of [uuid, "tmp:7eab1234", "wf:workf"]) {
+      const r = await bridge.send({ cmd: "ping" }, { tabId: id });
+      expect(r).toMatchObject({ from: "chained" });
+    }
+    sock.close();
+  });
+
   it("retries binding when the port is briefly held, then self-heals", async () => {
     // Simulate a fast /mcp reconnect: a previous session still owns the port
     // when the new bridge starts. It should back off, retry, and bind once the
@@ -411,5 +553,282 @@ describe("UiBridge (multi-tab)", () => {
     } finally {
       await reconnecting.stop();
     }
+  });
+});
+
+// ── Desktop-tab mirror: multi-viewer fanout (mobile remote control) ───────────
+function connectHeadless(tabId: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const sock = new WebSocket(`ws://127.0.0.1:${port}`);
+    sock.on("open", () => {
+      sock.send(JSON.stringify({ type: "hello", tab_id: tabId, title: "phone", headless: true }));
+      resolve(sock);
+    });
+    sock.on("error", reject);
+  });
+}
+
+function nextFrame(
+  sock: WebSocket,
+  match: (m: Record<string, unknown>) => boolean,
+  timeoutMs = 1500,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      sock.off("message", h);
+      reject(new Error("timeout waiting for frame"));
+    }, timeoutMs);
+    function h(buf: WebSocket.RawData) {
+      const m = JSON.parse(buf.toString());
+      if (match(m)) {
+        clearTimeout(t);
+        sock.off("message", h);
+        resolve(m);
+      }
+    }
+    sock.on("message", h);
+  });
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 60));
+
+describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
+  it("lists desktop tabs (excluding headless viewers), attaches, and fans push out to primary + viewer", async () => {
+    const desktop = await connectPanel("desktop-1", "My Graph");
+    const phone = await connectHeadless("phone-1");
+    await settle();
+
+    phone.send(JSON.stringify({ type: "list_tabs", cid: "c1" }));
+    const list = await nextFrame(phone, (m) => m.type === "tab_list" && m.cid === "c1");
+    const tabs = list.tabs as Array<{ tab_id: string; title: string }>;
+    expect(tabs.map((t) => t.tab_id)).toContain("desktop-1");
+    expect(tabs.find((t) => t.tab_id === "desktop-1")?.title).toBe("My Graph");
+    expect(tabs.some((t) => t.tab_id === "phone-1")).toBe(false); // headless not listed
+
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "c2", target_tab_id: "desktop-1" }));
+    const att = await nextFrame(phone, (m) => m.type === "tab_attached" && m.cid === "c2");
+    expect(att.ok).toBe(true);
+    expect(bridge.connected()).toBe(true); // attach did NOT evict the primary
+
+    const onDesktop = nextFrame(desktop, (m) => m.type === "say" && m.text === "hello");
+    const onPhone = nextFrame(phone, (m) => m.type === "say" && m.text === "hello");
+    bridge.push({ type: "say", text: "hello" }, "desktop-1");
+    await Promise.all([onDesktop, onPhone]); // both receive, or the test times out
+  });
+
+  it("canvas send() targets the primary only, never a mirror viewer", async () => {
+    const desktop = await connectPanel("desktop-2", "G");
+    autoReply(desktop, "desktop");
+    const phone = await connectHeadless("phone-2");
+    await settle();
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "desktop-2" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    let phoneGotCmd = false;
+    phone.on("message", (buf) => {
+      if (JSON.parse(buf.toString()).cmd) phoneGotCmd = true;
+    });
+    const res = (await bridge.send({ cmd: "graph_state" } as { cmd: string }, {
+      tabId: "desktop-2",
+    })) as { from?: string };
+    expect(res.from).toBe("desktop");
+    await settle();
+    expect(phoneGotCmd).toBe(false);
+  });
+
+  it("detach_tab stops the fanout", async () => {
+    await connectPanel("desktop-3", "G");
+    const phone = await connectHeadless("phone-3");
+    await settle();
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "desktop-3" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+    phone.send(JSON.stringify({ type: "detach_tab" }));
+    await settle();
+
+    let phoneGotSay = false;
+    phone.on("message", (buf) => {
+      if (JSON.parse(buf.toString()).type === "say") phoneGotSay = true;
+    });
+    bridge.push({ type: "say", text: "after-detach" }, "desktop-3");
+    await settle();
+    expect(phoneGotSay).toBe(false);
+  });
+
+  it("never fans out a correlated reply (cid-bearing) to mirror viewers", async () => {
+    await connectPanel("desktop-4", "G");
+    const phone = await connectHeadless("phone-4");
+    await settle();
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "desktop-4" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    let phoneGotResult = false;
+    phone.on("message", (buf) => {
+      if (JSON.parse(buf.toString()).type === "tool_result") phoneGotResult = true;
+    });
+    // A tool_result for the desktop tab must NOT leak to the mirror viewer.
+    bridge.push(
+      { type: "tool_result", cid: "x", tool: "list_workflows", ok: true, result: [] },
+      "desktop-4",
+    );
+    await settle();
+    expect(phoneGotResult).toBe(false);
+  });
+
+  it("mirrors only allowlisted activity frames — never secret/correlated ones (cid-less too)", async () => {
+    await connectPanel("desktop-8", "G");
+    const phone = await connectHeadless("phone-8");
+    await settle();
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "desktop-8" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    const leaked: string[] = [];
+    phone.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.type && m.type !== "tab_attached" && m.type !== "tab_list") leaked.push(m.type);
+    });
+    // cid-LESS correlated/secret frames that a denylist-by-cid would have leaked.
+    bridge.push({ type: "pair_url", url: "https://pair.example/secret" }, "desktop-8");
+    bridge.push({ type: "secret_saved", key: "CIVITAI_API_TOKEN" }, "desktop-8");
+    bridge.push({ type: "ack", ok: true, kind: "new_session" }, "desktop-8");
+    bridge.push({ type: "backends", backends: [] }, "desktop-8");
+    // history_list reply to a NO-cid request → cid:undefined, would slip a cid guard.
+    bridge.push({ type: "history_list", cid: undefined, sessions: [] }, "desktop-8");
+    await settle();
+    expect(leaked).toEqual([]); // nothing off the allowlist reached the viewer
+
+    // …but a genuine activity frame still mirrors.
+    const onPhone = nextFrame(phone, (m) => m.type === "say" && m.text === "hi");
+    bridge.push({ type: "say", text: "hi" }, "desktop-8");
+    await onPhone;
+  });
+
+  it("routes an attached viewer's input to the mirrored tab's session (remote control)", async () => {
+    await connectPanel("desktop-9", "G");
+    const phone = await connectHeadless("phone-9");
+    await settle();
+    const seen: Array<{ type?: string; tab_id?: string; text?: string }> = [];
+    bridge.onPanelMessage = (e) => seen.push(e as { type?: string; tab_id?: string; text?: string });
+
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "desktop-9" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    // The phone sends a chat message (no tab_id — the server stamps it). While
+    // attached it must drive desktop-9's session, NOT the phone's own tab.
+    phone.send(JSON.stringify({ type: "user_message", text: "drive it", context: {} }));
+    await settle();
+    const drove = seen.find((e) => e.type === "user_message" && e.text === "drive it");
+    expect(drove?.tab_id).toBe("desktop-9");
+
+    // After detach, the phone's input reverts to its own tab.
+    phone.send(JSON.stringify({ type: "detach_tab" }));
+    await settle();
+    phone.send(JSON.stringify({ type: "user_message", text: "my own", context: {} }));
+    await settle();
+    const own = seen.find((e) => e.type === "user_message" && e.text === "my own");
+    expect(own?.tab_id).toBe("phone-9");
+  });
+
+  it("rejects attach to a non-existent desktop tab", async () => {
+    const phone = await connectHeadless("phone-5");
+    await settle();
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "ghost" }));
+    const att = await nextFrame(phone, (m) => m.type === "tab_attached");
+    expect(att.ok).toBe(false);
+  });
+
+  it("keeps mirroring across a same-socket tab-id migration", async () => {
+    const desktop = await connectPanel("old-id", "G");
+    const phone = await connectHeadless("phone-6");
+    await settle();
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "old-id" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    // Desktop re-hellos under a NEW id on the SAME socket (the migration path).
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "new-id", title: "G" }));
+    await settle();
+
+    // The real scenario: the tab's AGENT keeps pushing under the ORIGINAL id
+    // ("old-id") after the migration — the fan-out must resolve that through the
+    // migration map to the moved subscriber set (keyed under the canonical id).
+    // Pushing under the new id would mask the bug (codex review).
+    const onPhone = nextFrame(phone, (m) => m.type === "say" && m.text === "post-migrate");
+    bridge.push({ type: "say", text: "post-migrate" }, "old-id");
+    await onPhone; // resolves, or the test times out (fan-out broke)
+  });
+
+  it("refuses a headless hello takeover of a desktop tab id (no drive-path hijack)", async () => {
+    const desktop = await connectPanel("desktop-h", "G");
+    autoReply(desktop, "desktop");
+    const phone = await connectHeadless("phone-h");
+    await settle();
+
+    // Malicious: the phone re-hellos under the DESKTOP's id to seize it without
+    // going through attach_tab. This must be refused — the desktop stays primary.
+    phone.send(JSON.stringify({ type: "hello", tab_id: "desktop-h", title: "evil", headless: true }));
+    await settle();
+
+    const res = (await bridge.send({ cmd: "graph_state" } as { cmd: string }, {
+      tabId: "desktop-h",
+    })) as { from?: string };
+    expect(res.from).toBe("desktop"); // desktop not evicted; the takeover was refused
+  });
+
+  it("refuses a hello takeover even when the viewer FORGES headless:false (kind is pinned)", async () => {
+    const desktop = await connectPanel("desktop-hf", "G");
+    autoReply(desktop, "desktop");
+    // The phone's FIRST hello pins it as headless; connectHeadless sends headless:true.
+    const phone = await connectHeadless("phone-hf");
+    await settle();
+
+    // The bypass: forge headless:false to match the desktop's kind. The pinned
+    // socket kind must win, so this is still refused and the desktop stays primary.
+    phone.send(JSON.stringify({ type: "hello", tab_id: "desktop-hf", title: "evil", headless: false }));
+    await settle();
+
+    const res = (await bridge.send({ cmd: "graph_state" } as { cmd: string }, {
+      tabId: "desktop-hf",
+    })) as { from?: string };
+    expect(res.from).toBe("desktop"); // forged flag ignored — takeover refused
+  });
+
+  it("re-attaching to another tab stops the first tab's fanout", async () => {
+    await connectPanel("desktop-A", "A");
+    await connectPanel("desktop-B", "B");
+    const phone = await connectHeadless("phone-ab");
+    await settle();
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "1", target_tab_id: "desktop-A" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached" && m.cid === "1");
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "2", target_tab_id: "desktop-B" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached" && m.cid === "2");
+
+    let gotA = false;
+    phone.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.type === "say" && m.text === "from-A") gotA = true;
+    });
+    bridge.push({ type: "say", text: "from-A" }, "desktop-A"); // old tab — must NOT arrive
+    const onB = nextFrame(phone, (m) => m.type === "say" && m.text === "from-B");
+    bridge.push({ type: "say", text: "from-B" }, "desktop-B"); // new tab — must arrive
+    await onB;
+    expect(gotA).toBe(false);
+  });
+
+  it("reverts a viewer's drive to its own tab when the mirrored desktop closes", async () => {
+    const desktop = await connectPanel("desktop-c", "G");
+    const phone = await connectHeadless("phone-c");
+    await settle();
+    const seen: Array<{ type?: string; tab_id?: string; text?: string }> = [];
+    bridge.onPanelMessage = (e) => seen.push(e as { type?: string; tab_id?: string; text?: string });
+
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "desktop-c" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    desktop.close(); // the mirrored desktop goes away
+    await settle();
+
+    phone.send(JSON.stringify({ type: "user_message", text: "after-close", context: {} }));
+    await settle();
+    const msg = seen.find((e) => e.type === "user_message" && e.text === "after-close");
+    expect(msg?.tab_id).toBe("phone-c"); // reverted to own tab, not routed into the dead id
   });
 });

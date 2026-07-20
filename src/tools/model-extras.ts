@@ -1,7 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { unlink } from "node:fs/promises";
-import { isLocalMode } from "../config.js";
+import { unlink, writeFile } from "node:fs/promises";
+import { isLocalMode, config } from "../config.js";
+import { logger } from "../utils/logger.js";
 import {
   downloadModel,
   resolveExistingModelFile,
@@ -10,8 +11,38 @@ import {
 import {
   resolveCivitaiModel,
   resolveCivitaiModelVersion,
+  buildCivitaiMarkdown,
+  searchCivitaiModels,
+  searchCivitaiCreators,
+  fetchCivitaiTopCreators,
+  type CivitaiMetadata,
 } from "../services/civitai-resolver.js";
 import { ValidationError, errorToToolResult } from "../utils/errors.js";
+
+/**
+ * Write the CivitAI metadata sidecars next to a freshly downloaded model:
+ * `<file>.civitai.json` (structured, incl. example generation params) and
+ * `<file>.civitai.md` (agent-readable usage docs + example recipes). Best-effort
+ * — a sidecar failure never fails the download. Returns the sidecar paths written.
+ */
+async function writeCivitaiSidecar(
+  savedPath: string,
+  metadata: CivitaiMetadata,
+): Promise<{ json: string; md: string } | null> {
+  try {
+    const jsonPath = `${savedPath}.civitai.json`;
+    const mdPath = `${savedPath}.civitai.md`;
+    await writeFile(jsonPath, JSON.stringify(metadata, null, 2), "utf8");
+    await writeFile(mdPath, buildCivitaiMarkdown(metadata), "utf8");
+    return { json: jsonPath, md: mdPath };
+  } catch (err) {
+    logger.warn("Failed to write CivitAI metadata sidecar", {
+      savedPath,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
 
 /** Graceful "not supported remotely" tool result (no isError), matching the
  *  degrade-don't-throw pattern list_local_models uses. */
@@ -65,6 +96,235 @@ export function registerModelExtrasTools(server: McpServer): void {
             {
               type: "text" as const,
               text: `Removed model:\n  ${target}\n  (${sizeMB} MB freed)`,
+            },
+          ],
+        };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "search_civitai_models",
+    "Search CivitAI by keyword for checkpoints, LoRAs, embeddings, VAEs, and ControlNets — THE tool for " +
+      "'find me a <base model> LoRA on Civitai'. Read-only and network-only (public CivitAI REST API; no " +
+      "token or running ComfyUI required; CIVITAI_API_TOKEN unlocks gated results). Filter by `types` " +
+      "(LORA, Checkpoint, TextualInversion, VAE, Controlnet, …) and `base_models` (CivitAI labels: " +
+      "'Flux.1 D', 'SDXL 1.0', 'SD 1.5', 'Pony', 'Illustrious', 'Wan Video') — ALWAYS pass base_models when " +
+      "the user's checkpoint family is known, so results actually fit their setup. Each hit returns the " +
+      "model_id and version_id that download_civitai_model takes directly, plus trigger words to use in the " +
+      "prompt after installing. Flow: search_civitai_models → pick a hit → download_civitai_model " +
+      "{model_version_id, target_subfolder} → wire/prompt with the trained words. Pass `creator` (exact " +
+      "username, e.g. from search_civitai_creators) to list ONE creator's models — with or without a query. " +
+      "SFW-only by default. For HuggingFace search use search_models.",
+    {
+      query: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Keyword search (e.g. 'detail enhancer', 'anime style', a character name). " +
+            "Optional when creator is given (then it narrows that creator's models).",
+        ),
+      creator: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Only models by this CivitAI creator (EXACT username — find it with " +
+            "search_civitai_creators). At least one of query/creator is required.",
+        ),
+      types: z
+        .array(z.enum(["Checkpoint", "LORA", "LoCon", "DoRA", "TextualInversion", "VAE", "Controlnet", "Upscaler", "MotionModule", "Workflows"]))
+        .optional()
+        .describe("Only these model types (e.g. ['LORA'])."),
+      base_models: z
+        .array(z.string())
+        .optional()
+        .describe("Only these base-model families, CivitAI labels: 'Flux.1 D', 'SDXL 1.0', 'SD 1.5', 'Pony', 'Illustrious', 'Wan Video', …"),
+      sort: z
+        .enum(["Highest Rated", "Most Downloaded", "Newest"])
+        .optional()
+        .describe("Ranking (default 'Highest Rated')."),
+      nsfw: z.boolean().optional().describe("Include NSFW results (default false)."),
+      limit: z.number().int().min(1).max(25).optional().describe("Max results (default 10)."),
+    },
+    async (args) => {
+      try {
+        if (!args.query?.trim() && !args.creator?.trim()) {
+          throw new ValidationError(
+            "Provide a query, a creator (exact username), or both.",
+          );
+        }
+        const { hits, scanned, scanCapped } = await searchCivitaiModels(args.query ?? "", {
+          types: args.types,
+          baseModels: args.base_models,
+          sort: args.sort,
+          nsfw: args.nsfw,
+          limit: args.limit,
+          creator: args.creator,
+        });
+        // Creator+keyword scans are bounded (client-side keyword filter over
+        // paged results) — never present a capped miss as definitive.
+        const capNote = scanCapped
+          ? `\nNOTE: the keyword was matched client-side over only this creator's first ${scanned} models (scan cap) — matching models past that may exist. Narrow with types/base_models, or drop the query to list everything.`
+          : "";
+        const what = [
+          args.query?.trim() && `"${args.query}"`,
+          args.creator?.trim() && `creator ${args.creator}`,
+        ]
+          .filter(Boolean)
+          .join(" by ");
+        if (hits.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `No CivitAI models matched ${what}` +
+                  (args.base_models?.length ? ` for base ${args.base_models.join("/")}` : "") +
+                  `. Try a broader query, drop the filters` +
+                  (args.creator
+                    ? `, check the exact username with search_civitai_creators (creators with only NSFW models need nsfw:true)`
+                    : "") +
+                  `, or search HuggingFace with search_models.` +
+                  capNote,
+              },
+            ],
+          };
+        }
+        const lines = hits.map((h, i) => {
+          const stats = [
+            h.base_model && `base ${h.base_model}`,
+            h.downloads != null && `${h.downloads.toLocaleString()} downloads`,
+            h.thumbs_up != null && `${h.thumbs_up} 👍`,
+            h.size_mb && `~${h.size_mb} MB`,
+            h.nsfw && "NSFW",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          const words = h.trained_words?.length ? `\n   trigger words: ${h.trained_words.join(", ")}` : "";
+          return (
+            `${i + 1}. **${h.name}** (${h.type ?? "?"}) by ${h.creator ?? "unknown"} — ${stats}\n` +
+            `   model_id: ${h.model_id} · model_version_id: ${h.version_id ?? "?"} (${h.version_name ?? "latest"})${words}`
+          );
+        });
+        // Civitai downloads are token-gated even though search is open — warn
+        // BEFORE the model burns rounds on 401s (live E2E failure shape).
+        const tokenNote = config.civitaiApiToken
+          ? ""
+          : `\nNOTE: no CIVITAI_API_TOKEN is configured — downloads WILL fail with 401 until the user sets one (panel Settings › “Set CivitAI token…”, or the CIVITAI_API_TOKEN env var; created at civitai.com/user/account). Ask them to set it before attempting a download.`;
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${hits.length} CivitAI result(s) for ${what}:\n\n${lines.join("\n\n")}\n\n` +
+                `Next: download_civitai_model {"model_version_id": <id>, "target_subfolder": "<loras|checkpoints|...>"} — then use the trigger words in the prompt.` +
+                capNote +
+                tokenNote,
+            },
+          ],
+        };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "search_civitai_creators",
+    "Find CivitAI CREATORS — THE tool for 'who are the top creators on Civitai' and 'find creator <name>'. " +
+      "Read-only and network-only (no token or running ComfyUI required). Two modes: with NO query it returns " +
+      "the site's creator LEADERBOARD (civitai.com/leaderboard — rank, score, downloads, likes; pick a `board`: " +
+      "'overall' [default], 'overall_90' [last 90 days], 'overall_nsfw' [mature], 'new_creators' [first model " +
+      "<30 days ago]); with a `query` it searches usernames (public /api/v1/creators; partial match, returns " +
+      "model counts, NOT ranked). Each hit's username feeds search_civitai_models {creator: <username>} " +
+      "directly. Flow: search_civitai_creators → pick a creator → search_civitai_models {creator, types?} → " +
+      "download_civitai_model.",
+    {
+      query: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Username search (partial match, e.g. 'alcait'). Omit to get the top-creators leaderboard instead.",
+        ),
+      board: z
+        .enum(["overall", "overall_90", "overall_nsfw", "new_creators"])
+        .optional()
+        .describe(
+          "Leaderboard to rank by when no query is given (default 'overall'). Ignored with a query.",
+        ),
+      limit: z.number().int().min(1).max(50).optional().describe("Max results (default 10)."),
+    },
+    async (args) => {
+      try {
+        if (args.query?.trim()) {
+          const { hits, total } = await searchCivitaiCreators(args.query, {
+            limit: args.limit,
+          });
+          if (hits.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `No CivitAI creators matched "${args.query}". Usernames match on substrings — ` +
+                    `try a shorter fragment, or omit the query for the top-creators leaderboard.`,
+                },
+              ],
+            };
+          }
+          const lines = hits.map(
+            (h, i) =>
+              `${i + 1}. **${h.username}** — ${h.model_count ?? 0} model(s) · ${h.profile_url}`,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `${hits.length} CivitAI creator(s) for "${args.query}"` +
+                  (total != null ? ` (${total.toLocaleString()} total match${total === 1 ? "" : "es"})` : "") +
+                  `:\n\n${lines.join("\n")}\n\n` +
+                  `Next: search_civitai_models {"creator": "<username>"} to list a creator's models.`,
+              },
+            ],
+          };
+        }
+
+        const board = args.board ?? "overall";
+        const hits = await fetchCivitaiTopCreators({ board, limit: args.limit });
+        if (hits.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `CivitAI returned an empty "${board}" leaderboard. Try again later or search by name with a query.`,
+              },
+            ],
+          };
+        }
+        const lines = hits.map((h) => {
+          const stats = [
+            h.score != null && `score ${h.score.toLocaleString()}`,
+            h.downloads != null && `${h.downloads.toLocaleString()} downloads`,
+            h.thumbs_up != null && `${h.thumbs_up.toLocaleString()} 👍`,
+            h.entries != null && `${h.entries} model(s) counted`,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          return `${h.position ?? "?"}. **${h.username}** — ${stats}\n   ${h.profile_url}`;
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Top ${hits.length} CivitAI creators ("${board}" leaderboard):\n\n${lines.join("\n\n")}\n\n` +
+                `Next: search_civitai_models {"creator": "<username>"} to list a creator's models, then download_civitai_model.`,
             },
           ],
         };
@@ -151,6 +411,56 @@ export function registerModelExtrasTools(server: McpServer): void {
         ];
         if (resolved.modelName) lines.push(`  Model: ${resolved.modelName}`);
         lines.push(`  Version id: ${resolved.versionId}`);
+        // NOT-A-MODEL guard (live panel finding: the agent downloaded a
+        // 'Workflows'-type zip into loras/ and told the user their LoRA was
+        // installed). Loud warning when the entry type / file extension can't
+        // load as a model so the agent corrects course instead of celebrating.
+        const civitaiType = resolved.metadata?.modelType;
+        const NON_MODEL_TYPES = new Set(["Workflows", "Poses", "Wildcards", "Other"]);
+        const fileExt = (filename ?? savedPath).toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+        const NON_MODEL_EXTS = new Set(["zip", "rar", "7z", "json", "txt", "png", "jpg"]);
+        if ((civitaiType && NON_MODEL_TYPES.has(civitaiType)) || (fileExt && NON_MODEL_EXTS.has(fileExt))) {
+          lines.push(
+            `  WARNING: this CivitAI entry is type "${civitaiType ?? "unknown"}" (file: .${fileExt ?? "?"}) — it is NOT a loadable model file and will not appear in a ${args.target_subfolder} loader. ` +
+              `If the user wanted a LoRA/checkpoint, re-run search_civitai_models with types:["LORA"] (or ["Checkpoint"]) and download a hit whose type matches. Do not tell the user a model was installed.`,
+          );
+        }
+
+        // Write usage-docs sidecars beside the file so the panel agent has the
+        // description, trigger words, and example generation params on hand.
+        // Local-only: remote mode has no local FS (savedPath is a status string).
+        if (isLocalMode() && resolved.metadata) {
+          const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
+          if (sidecar) {
+            const tw = resolved.metadata.trainedWords;
+            if (tw.length) lines.push(`  Trigger words: ${tw.join(", ")}`);
+            const recipes = resolved.metadata.examples.filter(
+              (e) => e.meta && Object.keys(e.meta).length > 0,
+            ).length;
+            lines.push(
+              `  Metadata: ${sidecar.md}` +
+                (recipes ? ` (${recipes} example recipe${recipes === 1 ? "" : "s"})` : ""),
+            );
+          }
+        }
+
+        // Write usage-docs sidecars beside the file so the panel agent has the
+        // description, trigger words, and example generation params on hand.
+        // Local-only: remote mode has no local FS (savedPath is a status string).
+        if (isLocalMode() && resolved.metadata) {
+          const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
+          if (sidecar) {
+            const tw = resolved.metadata.trainedWords;
+            if (tw.length) lines.push(`  Trigger words: ${tw.join(", ")}`);
+            const recipes = resolved.metadata.examples.filter(
+              (e) => e.meta && Object.keys(e.meta).length > 0,
+            ).length;
+            lines.push(
+              `  Metadata: ${sidecar.md}` +
+                (recipes ? ` (${recipes} example recipe${recipes === 1 ? "" : "s"})` : ""),
+            );
+          }
+        }
 
         return {
           content: [{ type: "text" as const, text: lines.join("\n") }],
