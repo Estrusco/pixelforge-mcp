@@ -14,6 +14,7 @@ export type BackendId =
   | "codex"
   | "chatgpt"
   | "gemini"
+  | "antigravity"
   | "grok"
   | "glm"
   | "kimi"
@@ -233,6 +234,26 @@ export const GEMINI_CAPABILITIES: AgentCapabilities = {
   vision: true, // gemini-2.5 sees images; delivered as inline base64 image ContentBlocks
 };
 
+/** Capability descriptor for the Antigravity CLI backend (`agy`, issue #262) —
+ *  Google's official replacement for the individual-tier Gemini CLI subscription
+ *  path (Google AI Pro/Ultra). `agy` exposes no machine-readable event protocol,
+ *  only plain-text `-p` print mode + `--continue` conversation continuity — so
+ *  this is a spawn-per-turn adapter with honestly reduced capabilities:
+ *  streamingDeltas=true is the CLI's own progressive stdout (final answer text
+ *  only, no structured tool events), and vision=false (no documented -p image
+ *  input). Models come LIVE from `agy models` (no static catalog). */
+export const ANTIGRAVITY_CAPABILITIES: AgentCapabilities = {
+  persistentChannel: true, // spawn-per-turn, continuity via `agy --continue`
+  streamingDeltas: true, // progressive stdout of the final answer
+  interruptMidTurn: true, // kill the in-flight child tree; next turn continues
+  forkAtAnchor: false, // agy owns conversation storage; no per-turn anchor
+  inProcessMcp: false, // workspace .agents/mcp_config.json only
+  modelEnumeration: true, // `agy models` (live account catalog)
+  slashCommands: false,
+  hooks: false,
+  vision: false, // no documented image input in -p mode
+};
+
 /** Capability descriptor for the Grok CLI ACP backend (xAI / Grok Build).
  *  Same ACP posture as Gemini: persistent session, streaming deltas, interrupt,
  *  config-declared MCP servers, static model catalog at spawn. */
@@ -284,22 +305,16 @@ export const CHATGPT_CAPABILITIES: AgentCapabilities = {
   vision: true, // Responses input_image data URLs; strip-and-retry on rejection (#218)
 };
 
-/** Z.AI GLM Coding Plan — OpenAI-compatible /v1/chat/completions. */
-export const GLM_CAPABILITIES: AgentCapabilities = {
-  ...OLLAMA_CAPABILITIES,
-};
-
 /** Kimi Code subscription OAuth or KIMI_API_KEY — OpenAI-compatible coding API. */
 export const KIMI_CAPABILITIES: AgentCapabilities = {
   ...OLLAMA_CAPABILITIES,
 };
 
-/** Moonshot platform API (Kimi K3) — MOONSHOT_API_KEY, OpenAI-compatible
- *  /v1/chat/completions. Distinct from the `kimi` backend (Kimi Code coding
- *  subscription): a general pay-per-token platform key, its own host + model. */
-export const MOONSHOT_CAPABILITIES: AgentCapabilities = {
-  ...OLLAMA_CAPABILITIES,
-};
+// NOTE: glm/moonshot no longer need dedicated *_CAPABILITIES consts — the generic
+// api-key factory (services/openai-provider-registry + makeOpenAiKeyBackend in
+// orchestrator/index.ts) builds a plain OllamaBackend, which already reports
+// OLLAMA_CAPABILITIES (the value the old GLM_CAPABILITIES/MOONSHOT_CAPABILITIES
+// spreads carried). Their BackendId union members are retained above.
 
 /** GitHub Copilot chat via in-panel device-code OAuth — EXPERIMENTAL (ToS risk,
  *  see OAUTH_PROVIDERS.copilot). OpenAI-compatible chat/completions + the same

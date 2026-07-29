@@ -26,6 +26,7 @@ import { randomBytes } from "node:crypto";
 import { startQuickTunnel, type QuickTunnel } from "./tunnel.js";
 import { RelayClient } from "./relay-client.js";
 import { logger } from "../utils/logger.js";
+import { getComfyUIAuthHeaders } from "../config.js";
 import type { UiBridge } from "./ui-bridge.js";
 
 export interface SecureBridge {
@@ -46,16 +47,6 @@ function toWssUrl(httpsUrl: string, token: string): string {
   return u.toString();
 }
 
-/** Auth headers for the pod's ComfyUI, mirroring the connect-time env the docs
- *  document (COMFYUI_AUTH_TOKEN + optional header/scheme). Empty when unset. */
-function comfyuiAuthHeaders(): Record<string, string> {
-  const token = process.env.COMFYUI_AUTH_TOKEN?.trim();
-  if (!token) return {};
-  const header = process.env.COMFYUI_AUTH_HEADER?.trim() || "Authorization";
-  const scheme = process.env.COMFYUI_AUTH_SCHEME?.trim() ?? "Bearer";
-  return { [header]: scheme ? `${scheme} ${token}` : token };
-}
-
 /** Mask the token when logging a wss URL. */
 function maskToken(url: string): string {
   return url.replace(/token=[^&]+/, "token=…");
@@ -66,7 +57,7 @@ function maskToken(url: string): string {
  * Retries a few times — the orchestrator may advertise before the pod route is
  * warm. Returns true on the first 2xx.
  */
-export async function advertiseBridge(comfyuiUrl: string, wssUrl: string): Promise<boolean> {
+export async function advertiseBridge(comfyuiUrl: string, wssUrl: string, shouldAdvertise?: (target: string) => boolean): Promise<boolean> {
   let endpoint: string;
   try {
     endpoint = new URL("/comfyui_mcp_panel/advertise_bridge", comfyuiUrl).toString();
@@ -74,10 +65,13 @@ export async function advertiseBridge(comfyuiUrl: string, wssUrl: string): Promi
     return false;
   }
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    // Re-check per attempt: the target may have moved DURING the retry sequence
+    // — a stale pod must never receive the bridge URL (codex finding).
+    if (shouldAdvertise && !shouldAdvertise(comfyuiUrl)) return false;
     try {
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...comfyuiAuthHeaders() },
+        headers: { "Content-Type": "application/json", ...getComfyUIAuthHeaders() },
         body: JSON.stringify({ url: wssUrl }),
       });
       if (res.ok) return true;
@@ -99,6 +93,10 @@ export interface SetupSecureBridgeOpts {
   /** Needed only by the relay backend, to feed relay-multiplexed panel
    *  connections into the same routing logic a direct loopback socket gets. */
   bridge: UiBridge;
+  /** Optional guard evaluated PER ADVERTISE TARGET (a slow tunnel setup or a
+   *  later retarget must not hand the bridge URL to a stale pod — codex).
+   *  Receives each candidate target URL. */
+  shouldAdvertise?: (target: string) => boolean;
 }
 
 /**
@@ -143,13 +141,20 @@ async function setupRelayBridge(opts: SetupSecureBridgeOpts): Promise<SecureBrid
     onAttach: (sock) => bridge.attachRelayConnection(sock),
   });
   client.start();
-  await client.waitUntilOpen();
+  try {
+    await client.waitUntilOpen();
+  } catch (err) {
+    // A failed setup must not leave a reconnecting client behind — the 5s
+    // retry would pile one on every attempt during a relay outage (codex).
+    client.stop();
+    throw err;
+  }
 
   const wssUrl = `${relayUrl.replace(/\/+$/, "")}/s/${sessionId}?token=${token}`;
   logger.info(`[secure-bridge] bridge exposed via relay at ${maskToken(wssUrl)}`);
 
   const advertise = async (target: string): Promise<boolean> => {
-    const ok = await advertiseBridge(target, wssUrl);
+    const ok = await advertiseBridge(target, wssUrl, opts.shouldAdvertise);
     if (ok) {
       logger.info(`[secure-bridge] advertised the secure bridge URL to the pod panel`);
     } else {
@@ -161,7 +166,9 @@ async function setupRelayBridge(opts: SetupSecureBridgeOpts): Promise<SecureBrid
     return ok;
   };
 
-  await advertise(comfyuiUrl);
+  if (!opts.shouldAdvertise || opts.shouldAdvertise(comfyuiUrl)) {
+    await advertise(comfyuiUrl);
+  }
 
   return {
     wssUrl,
@@ -193,7 +200,7 @@ async function setupCloudflaredBridge(opts: SetupSecureBridgeOpts): Promise<Secu
   logger.info(`[secure-bridge] bridge exposed securely at ${maskToken(wssUrl)}`);
 
   const advertise = async (target: string): Promise<boolean> => {
-    const ok = await advertiseBridge(target, wssUrl);
+    const ok = await advertiseBridge(target, wssUrl, opts.shouldAdvertise);
     if (ok) {
       logger.info(`[secure-bridge] advertised the secure bridge URL to the pod panel`);
     } else {
@@ -205,7 +212,9 @@ async function setupCloudflaredBridge(opts: SetupSecureBridgeOpts): Promise<Secu
     return ok;
   };
 
-  await advertise(comfyuiUrl);
+  if (!opts.shouldAdvertise || opts.shouldAdvertise(comfyuiUrl)) {
+    await advertise(comfyuiUrl);
+  }
 
   return {
     wssUrl,

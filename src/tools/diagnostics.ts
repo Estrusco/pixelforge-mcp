@@ -5,8 +5,100 @@ import {
   getHistory,
   type HistoryEntry,
 } from "../comfyui/client.js";
-import { selectNewestHistoryEntry } from "../services/history-select.js";
+import { selectNewestHistoryEntry, extractWorkflowGraph } from "../services/history-select.js";
+import { validateWorkflow } from "../services/workflow-validator.js";
 import { errorToToolResult } from "../utils/errors.js";
+
+/** The `execution_error` payload ComfyUI records in a history entry's status.messages. */
+interface ExecutionErrorInfo {
+  node_id?: string | number;
+  node_type?: string;
+  exception_type?: string;
+  exception_message?: string;
+  traceback?: string[];
+}
+
+function findExecutionError(entry: HistoryEntry): ExecutionErrorInfo | null {
+  const msg = (entry.status?.messages ?? []).find((m) => m[0] === "execution_error");
+  return msg ? (msg[1] as ExecutionErrorInfo) : null;
+}
+
+/** The `execution_interrupted` payload (user/agent cancel mid-run). */
+interface ExecutionInterruptedInfo {
+  node_id?: string | number;
+  node_type?: string;
+}
+
+function findExecutionInterrupted(entry: HistoryEntry): ExecutionInterruptedInfo | null {
+  const msg = (entry.status?.messages ?? []).find((m) => m[0] === "execution_interrupted");
+  return msg ? ((msg[1] ?? {}) as ExecutionInterruptedInfo) : null;
+}
+
+/**
+ * The Status line + outcome section of a diagnosis. Exported for tests.
+ *
+ * ComfyUI records an INTERRUPTED run with status_str "error" (plus an
+ * execution_interrupted message and NO execution_error) — echoing that raw
+ * "error" made cancelled runs read as failures ("Render failed" on mobile,
+ * see comfyui-mcp-mobile#23). Report it as interrupted instead; a genuine
+ * execution_error always wins over the interrupted marker.
+ */
+export function formatRunOutcome(entry: HistoryEntry): string[] {
+  const lines: string[] = [];
+  const execError = findExecutionError(entry);
+  const interrupted = execError ? null : findExecutionInterrupted(entry);
+  lines.push(`**Status**: ${interrupted ? "interrupted" : (entry.status?.status_str ?? "unknown")}`);
+
+  if (execError) {
+    lines.push("");
+    lines.push("### Runtime failure");
+    lines.push(`**Failed node**: ${execError.node_id ?? "?"} (${execError.node_type ?? "unknown type"})`);
+    if (execError.exception_type) lines.push(`**Type**: ${execError.exception_type}`);
+    if (execError.exception_message) {
+      lines.push(`**Message**: ${execError.exception_message}`);
+    }
+    if (Array.isArray(execError.traceback) && execError.traceback.length > 0) {
+      // Tail only — the last frames carry the cause, and a full traceback can
+      // be hundreds of lines (this reply goes straight into an agent's context).
+      const tail = execError.traceback.slice(-12);
+      lines.push("");
+      lines.push("```");
+      lines.push(tail.join("").trimEnd());
+      lines.push("```");
+    }
+  } else if (interrupted) {
+    lines.push("");
+    lines.push("### Interrupted");
+    const where =
+      interrupted.node_id !== undefined
+        ? ` at node ${interrupted.node_id}${interrupted.node_type ? ` (${interrupted.node_type})` : ""}`
+        : "";
+    lines.push(
+      `**This run was interrupted/cancelled${where}** — it did not crash. Nothing is broken; re-queue it if the cancellation wasn't intended.`,
+    );
+  } else {
+    lines.push("");
+    lines.push(
+      "_No runtime error recorded for this run_ — if the user still sees a problem, it was likely rejected BEFORE execution (see validation below) or the run simply produced an unwanted result.",
+    );
+  }
+  return lines;
+}
+
+/**
+ * Pick the run to diagnose. An explicit id wins; otherwise prefer the most recent
+ * FAILED run over a newer successful one — "why did it fail?" should land on the
+ * failure even when the user has since kicked off something that worked.
+ */
+function selectRunToDiagnose(
+  history: Record<string, HistoryEntry>,
+  promptId?: string,
+): [string, HistoryEntry] | undefined {
+  if (promptId) return selectNewestHistoryEntry(history, promptId);
+  const failed = Object.entries(history).filter(([, e]) => findExecutionError(e));
+  if (failed.length > 0) return selectNewestHistoryEntry(Object.fromEntries(failed));
+  return selectNewestHistoryEntry(history);
+}
 
 function formatHistoryEntry(
   promptId: string,
@@ -159,7 +251,7 @@ export function registerDiagnosticsTools(server: McpServer): void {
 
   server.tool(
     "get_history",
-    "Get execution history for a ComfyUI prompt. Returns status, timing, cached nodes, output details, and full error information including Python tracebacks. Use after a failed enqueue_workflow to diagnose what went wrong.",
+    "Get execution history for a ComfyUI prompt: status, timing, cached nodes, and output details (media filenames for get_image). Also carries the raw error/traceback. To diagnose WHY a run FAILED or what's missing, prefer `diagnose_run` — it returns the same failure info PLUS missing models (with the file + widget) and missing node types, which this tool does not. Use get_history when you need the run's OUTPUTS or timing for a specific prompt_id.",
     {
       prompt_id: z
         .string()
@@ -189,6 +281,107 @@ export function registerDiagnosticsTools(server: McpServer): void {
         const [promptId, entry] = selected;
         const text = formatHistoryEntry(promptId, entry);
         return { content: [{ type: "text", text }] };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "diagnose_run",
+    "WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_view_errored_nodes (\"why is this red?\"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to search_civitai_models/download_model to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes/install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.",
+    {
+      prompt_id: z
+        .string()
+        .optional()
+        .describe(
+          "Specific run to diagnose (the prompt_id from enqueue_workflow). Omit to diagnose the most recent FAILED run — preferred over a newer successful one — falling back to the most recent run if nothing failed.",
+        ),
+    },
+    async (args) => {
+      try {
+        const history = await getHistory(args.prompt_id);
+        const selected = selectRunToDiagnose(history, args.prompt_id);
+        if (!selected) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: args.prompt_id
+                  ? `No history found for prompt ${args.prompt_id}.`
+                  : "No execution history available — nothing has run yet on this ComfyUI.",
+              },
+            ],
+          };
+        }
+
+        const [promptId, entry] = selected;
+        const lines: string[] = [];
+        lines.push(`## Diagnosis: ${promptId}`);
+        // 1. Status + outcome: runtime failure, interruption, or clean.
+        lines.push(...formatRunOutcome(entry));
+
+        // 2. Re-validate the exact graph that ran, so we can name what's missing.
+        //    Reuses the same validator behind validate_workflow — the graph is the
+        //    one ComfyUI recorded, so this reflects what actually executed.
+        const graph = extractWorkflowGraph(entry);
+        if (!graph) {
+          lines.push("");
+          lines.push(
+            "_This history entry has no recorded graph_, so missing models/nodes can't be checked for it.",
+          );
+        } else {
+          const result = await validateWorkflow(graph, { health: false });
+          const errors = result.issues.filter((i) => i.severity === "error");
+          const missingModels = errors.filter((i) => i.kind === "missing_model");
+          const missingNodeTypes = errors.filter((i) => i.kind === "missing_node_type");
+          const otherErrors = errors.filter(
+            (i) => i.kind !== "missing_model" && i.kind !== "missing_node_type",
+          );
+
+          if (missingModels.length > 0) {
+            lines.push("");
+            lines.push("### Missing models");
+            for (const i of missingModels) {
+              lines.push(
+                `- **${i.value ?? "(unknown file)"}** — node ${i.node_id} (${i.node_type}), widget \`${i.input ?? "?"}\``,
+              );
+            }
+            lines.push(
+              "_Fix_: search_civitai_models / search_models by that filename, then download_model (or download_civitai_model) into the loader's directory.",
+            );
+          }
+
+          if (missingNodeTypes.length > 0) {
+            lines.push("");
+            lines.push("### Missing node types (packs this install lacks)");
+            const uniq = [...new Set(missingNodeTypes.map((i) => i.node_type))];
+            for (const t of uniq) lines.push(`- **${t}**`);
+            lines.push(
+              "_Fix_: search_custom_nodes for the owning pack, install_custom_node, then restart ComfyUI to load it.",
+            );
+          }
+
+          if (otherErrors.length > 0) {
+            lines.push("");
+            lines.push("### Validation errors");
+            for (const i of otherErrors.slice(0, 20)) {
+              lines.push(`- node ${i.node_id} (${i.node_type}): ${i.message}`);
+            }
+            if (otherErrors.length > 20) {
+              lines.push(`- …and ${otherErrors.length - 20} more`);
+            }
+          }
+
+          if (errors.length === 0) {
+            lines.push("");
+            lines.push(
+              "_The recorded graph validates clean_ — nothing is missing, so the failure was a runtime one (see above), not a setup problem.",
+            );
+          }
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
         return errorToToolResult(err);
       }

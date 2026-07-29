@@ -9,10 +9,10 @@
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
 // key. See docs/design/panel-orchestrator.md.
 
-import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { tmpdir, networkInterfaces } from "node:os";
-import { join } from "node:path";
+import { tmpdir, homedir, networkInterfaces } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import readline from "node:readline";
@@ -46,7 +46,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
-import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget } from "../config.js";
+import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
 import {
   buildComfyuiMcpEnv,
   comfyuiSecretKeys,
@@ -59,23 +59,35 @@ import {
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
+import { AntigravityBackend } from "./antigravity-backend.js";
 import { GrokBackend, GROK_DEFAULT_MODEL } from "./grok-backend.js";
-import { OllamaBackend, OLLAMA_SYSTEM_PROMPT } from "./ollama-backend.js";
+import { OllamaBackend, OLLAMA_SYSTEM_PROMPT, type OllamaBackendDeps } from "./ollama-backend.js";
 import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL } from "./chatgpt-oauth-backend.js";
-import { GlmBackend, GLM_DEFAULT_MODEL } from "./glm-backend.js";
-import { KimiBackend, KIMI_DEFAULT_MODEL } from "./kimi-backend.js";
-import { MoonshotBackend, MOONSHOT_DEFAULT_MODEL } from "./moonshot-backend.js";
+import { KimiBackend } from "./kimi-backend.js";
+import {
+  OPENAI_KEY_PROVIDER_IDS,
+  openAiKeyProvider,
+  simpleKeyProvider,
+  openAiKeyProviderModel,
+  type OpenAiKeyProvider,
+} from "../services/openai-provider-registry.js";
+import { resolveOpenAiKeyCredentials } from "../services/code-provider-auth.js";
 import { CopilotBackend, COPILOT_DEFAULT_MODEL } from "./copilot-backend.js";
 import { SYSTEM as MODEL_CARD_SYSTEM } from "./ai-proposer.js";
 import { resolvePrompt, registerPrompt, onPromptsChanged } from "../services/prompt-overrides.js";
 import { allBackendReadiness } from "./backend-readiness.js";
 import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth-bridge.js";
+import { buildStartFailureNotice } from "./start-failure-notice.js";
 import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
 import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
+import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
+import { getPod } from "../services/runpod-client.js";
+import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX } from "../services/download-progress.js";
+import { hasActiveTrainingJob, reconcileStaleTrainingJobs } from "../services/training-jobs.js";
 import {
   buildQueueStatusFrame,
   createQueueStatusBroadcaster,
@@ -110,6 +122,8 @@ If a workflow needs a custom node the user doesn't have, don't silently skip it 
 
 CRASH RECOVERY — when a custom node BREAKS or CRASHED ComfyUI, fix it before giving up. If your turn begins with a "⚠️ ComfyUI crashed …" note (it names the fatal log block and the most likely culprit custom node + file:line), or a run dies with a node-level error you can pin to one pack, do NOT just re-run the same graph — ESCALATE to actually fix that node, narrating each step to the user as you go: (a) UPDATE it to the latest code — call panel_update_node with the culprit's id (or the comfyui MCP update_custom_node / fix_custom_node). Try version 'nightly' to grab a just-landed upstream fix. Poll panel_node_queue_status, then panel_restart_comfyui → you resume and RETRY the action to see if the crash is gone. (b) If updating doesn't fix it, reach into COMFYUI_PATH/custom_nodes/<NodeDir> with your shell (Bash): if it's a git repo (a .git dir), run git fetch && git pull (or check out the nightly branch) to force the latest, reinstall its requirements if needed, then restart + retry. (c) If there's no git or it's still broken, attempt a TARGETED source patch of the crashing file:line, then VERIFY the fix actually resolves the crash (restart + retry the same action — confirm it no longer faults). Once verified, OFFER to suggest the fix upstream to the repo owner (open an issue or PR describing the crash + your patch) — describe it and ask the user first; do NOT auto-file anything. Combine this cleanly with the normal install→restart→continue flow above: a fresh install that crashes on first use is the same loop (update/patch the just-installed node, don't abandon it).
 
+REPORT OUR OWN BUGS (we're in beta — bias HARD toward filing) — distinct from the third-party case above. Whenever YOU hit a defect in comfyui-mcp or the sidebar panel ITSELF — a tool/panel/orchestrator call that errors, crashes ComfyUI, returns wrong/misleading/empty output, fails silently, or a limitation that forced you into an awkward workaround/retry — invoke the report-bug skill (read_skill "report-bug") to autonomously file a via-panel report, EVEN IF you already recovered or worked around it. You do NOT need to be blocked, and it does NOT need to be fatal — the workaround itself is the signal. The skill scrubs secrets and files through our intake Worker (which dedupes server-side, so over-reporting is cheap); then just drop the user a one-line note. Do NOT ask permission for OUR bugs — file them autonomously (unlike third-party/custom-node bugs above, where you OFFER and ask first). Ordinary generation errors (OOM, missing model, bad params, user mistakes) are NOT bug reports — those stay troubleshooting.
+
 WEDGED RENDER / OOM / VRAM PINNED — when a generation is stuck or hits CUDA out-of-memory, or a cancel didn't actually free GPU memory (models still resident, VRAM pinned, the next run still OOMs), call panel_free_vram to UNLOAD all models and free VRAM before retrying — it does NOT restart ComfyUI, so it's the cheap first move. Escalation ladder: cancel the run → panel_free_vram (unload + free) → retry; only as a LAST RESORT panel_restart_comfyui (which refuses mid-render and guards the running generation). Reach for panel_free_vram before a restart whenever a cancel left memory pinned.
 
 WORKFLOW TARGETING — by default your panel_* graph edits follow whichever workflow tab the user is currently viewing. If the user wants you to work on a DIFFERENT open workflow while they browse another tab, call panel_set_workflow_target(mode:"pinned", path:<from panel_list_workflows>) to pin edits to that workflow; panel_get_workflow_target shows the current binding. Set mode:"current" to follow the user's active tab again. Pinning does NOT switch what the user sees — it only routes your graph tools. When pinned, still use panel_open_workflow only when you intentionally want to switch the user's view.
@@ -127,6 +141,8 @@ PREFER READY EXPERTISE OVER HAND-BUILDING. When the user asks you to "set up", "
 OPENING A STAGED / DOWNLOADED WORKFLOW. When you've saved or downloaded a workflow .json into the user's ComfyUI workflows folder (e.g. an example you fetched), open it with panel_open_workflow(path:<name-or-path>) — it now REFRESHES the frontend's (cached) workflow list before searching, so a just-staged file is found and opened natively in its own tab. For a workflow .json that lives OUTSIDE the workflows folder (any absolute path on the ComfyUI machine, or a downloaded example you didn't move into workflows/), load it directly onto the live canvas with panel_load_workflow(path:<file>) — the orchestrator reads + parses the JSON server-side and drops it on the canvas in one shot, so even a large (100KB+) workflow never has to shuttle through this chat. Prefer panel_load_workflow(path:<file>) over pasting a big workflow JSON inline as the graph arg.
 
 RESOLVING A TANGLED / TOGGLE-HEAVY WORKFLOW (Get/Set buses + rgthree-bypassed pipelines). Expert and community graphs are often thick with VIRTUAL WIRING — GetNode/SetNode buses and Reroutes that hide the real connections — and rgthree "Fast Groups Bypasser/Muter" TOGGLED PIPELINES (one graph holding several pipelines, only one active at a time). Do NOT hand-trace GetNode→SetNode links or guess which branches are live. To get the REAL wiring: call panel_strip_workflow(path:<file> | pack:<name> | graph:<json>) — it resolves Get/Set buses, Reroutes, subgraph definitions, and bypassed/muted nodes into REAL connections and returns the flat, runnable graph (read server-side, never shuttled through chat). If the file is a MULTI-PIPELINE monolith and you only want ONE pipeline, FIRST panel_slice_workflow(path:<file>, groups:[<group-title substrings>]) to carve that pipeline into a standalone activated graph (it seeds from the output nodes in those groups, takes their backward closure through links + Set/Get buses, and un-bypasses the kept nodes), THEN panel_strip_workflow to flatten the buses. Reach for panel_strip_workflow whenever a graph is too tangled to read directly or you need to UNDERSTAND or REBUILD its actual wiring (e.g. a staged expert example full of GetNode/SetNode/Reroute); reach for panel_slice_workflow when an ULTRA-style monolith bundles several toggled pipelines and you want just one. (The same two tools exist as the MCP strip_workflow / slice_workflow for non-panel sessions.)
+
+RECOMMENDING CIVITAI MODELS — SHOW, DON'T JUST TELL. When the user asks about or you're recommending specific CivitAI resources (a "good relight LoRA?", "which Flux checkpoint?", "find me an anime style"), LEAN TOWARD opening the docked CivitAI browser and highlighting your picks rather than answering with only a text table. Flow: panel_open_civitai (docked, matched query/tab/filters) → panel_civitai_search to refine → panel_civitai_results to read the metadata + URLs → panel_civitai_highlight the one(s) you recommend, with a BRIEF text summary of why each fits. This docks beside the chat so both stay visible, and lets the user SEE the actual cards. (Note: you read metadata + URLs only, not the images.) It's a nudge, not a mandate — a quick factual answer or a resource the user already named is fine as text; reach for the browser when they're choosing between options or exploring.
 
 DOWNLOADING MODELS — use the download_model tool, NOT a raw shell download. When a workflow needs model weights you don't have (checkpoints, LoRAs, VAEs, text encoders, etc.), download them with the comfyui MCP download_model tool (or download_civitai_model for CivitAI): it streams the file into the correct ComfyUI models/ subfolder AND surfaces live progress in the panel's download tray so the user can watch it. Pass target_subfolder to land the file exactly where it belongs (e.g. 'loras', 'checkpoints', 'vae', 'text_encoders', or a nested path like 'loras/<subdir>'). Do NOT shell out to curl/wget/aria2 for model files — a raw shell download has no progress in the panel and can drop the file in the wrong place. Reserve the shell for things download_model can't do.
 
@@ -212,7 +228,11 @@ const HEADLESS_DIRECTIVE =
   "There is NO panel to auto-deliver a finished render, so you MUST deliver the result YOURSELF IN THIS SAME TURN: " +
   "enqueuing returns a prompt_id immediately, so wait for it with get_job_status(prompt_id) — poll it briefly until " +
   "it reports completion (this is the ONE case where polling IS correct) — then fetch the output with get_history and " +
-  "show it with panel_show_media. Do NOT end your turn expecting an automatic notification; none will arrive.";
+  "show it with panel_show_media. Do NOT end your turn expecting an automatic notification; none will arrive. " +
+  "If the run FAILED — or the user asks why a render failed / what's missing — call diagnose_run FIRST, and do NOT use " +
+  "get_history for that: diagnose_run returns everything get_history would (failed node + exception + traceback) PLUS the " +
+  "missing models (exact file + the widget holding it) and missing node types that get_history omits, in one call. It is " +
+  "the canvas-less equivalent of the panel's \"why is this red?\", so also do NOT try panel_view_errored_nodes here.";
 
 /** Live stall threshold (seconds) pushed from the panel setting via a `set_config`
  *  frame — applies WITHOUT a reconnect. null = not set, fall back to env then the
@@ -644,6 +664,78 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // tap, and (without clear_pending, which the mobile client never sends) it
   // never touches other pending jobs in a shared queue.
   "cancel_job",
+  // "Why did my render fail?" for canvas-less clients. The panel answers this from
+  // live canvas state (panel_view_errored_nodes); a phone has no canvas, so it reads
+  // the same story server-side from history + re-validating the graph that ran.
+  // Read-only.
+  "diagnose_run",
+  // Read-only training surface: flow/model discovery + progress polling +
+  // docker/GPU/image preflight for the panel/mobile Training tab, and the
+  // dataset/job-config/file readers behind its Jobs/Datasets views.
+  "train_list_flows",
+  "train_status",
+  "train_doctor",
+  "train_list_datasets",
+  "train_dataset_detail",
+  "train_job_config",
+  "train_file",
+  "train_preview_config",
+  "train_dataset_update",
+  "train_dataset_delete",
+  "train_caption_image",
+  "train_caption_dataset",
+  "train_delete_job",
+  // User-initiated training ops (panel/mobile Training wizard): stage a dataset,
+  // launch a GPU-container training run, cancel one. All validation lives in the
+  // tools themselves (dataset checks, docker/image preflight, liveness-verified
+  // cancel); the whitelist only gates reachability.
+  "train_prepare_dataset",
+  "train_start",
+  "train_cancel",
+  // RunPod control panel (desktop + mobile): the one-tap pod lifecycle + the
+  // local⇄pod host switch. Read-only status/list/troubleshoot, the COST-SAVING
+  // actions (stop/use_local), connect (retarget only — a pod must already be
+  // RUNNING, so it neither spins nor keeps one billing), watch/unwatch, and the
+  // referral deploy link. Each tool validates its own pod state; the whitelist
+  // only gates reachability from a canvas-less client.
+  // NOTE: runpod_pod_create AND runpod_pod_start are deliberately EXCLUDED
+  // (#269/#278) — both put a pod into a BILLING state (create deploys; start
+  // RESUMES billing on a stopped pod). A confirmation-less mirrored/foreign tab
+  // must not be able to spend money, so both go through an agent turn / explicit
+  // UI action. stop is kept (it SAVES money).
+  "runpod_pod_status",
+  "runpod_list_pods",
+  "runpod_pod_stop",
+  "runpod_pod_connect",
+  "runpod_pod_troubleshoot",
+  "runpod_use_local",
+  "runpod_watch",
+  "runpod_unwatch",
+  "runpod_deploy_link",
+  // Micro-Apps (panel "Apps" feature): the canvas-less client's list/run/poll
+  // surface. Same risk posture as enqueue_workflow (already whitelisted): run
+  // queues a job the user explicitly tapped; list/get/status are read-only.
+  "apps_list",
+  "apps_get",
+  "apps_run",
+  "apps_run_status",
+  // Registry install (mobile Explore): the rig fetches the bundle from the
+  // public registry and imports it locally. Same risk as save_workflow +
+  // download_model (already whitelisted): writes a local app bundle, no
+  // model/system mutation. Deps install stays a separate consented action.
+  "apps_import",
+  // App dependency side-panel (Explore/detail): the ✓/download panel reads what
+  // an app needs vs what's installed and offers per-item fetches. Reads are safe
+  // (missing-model detection + candidate resolution, node-pack presence); model
+  // downloads reuse the already-whitelisted download_civitai_model/download_model.
+  // install_custom_node is a MUTATION that runs the pack's code on install —
+  // reachable for the panel's "install missing node" button, gated behind an
+  // explicit themed confirm client-side. (Revisit if a canvas-less/foreign tab
+  // must not be able to trigger a node install.)
+  "resolve_missing_models",
+  "extract_workflow_dependencies",
+  "list_installed_nodes",
+  "install_custom_node",
 ]);
 
 /** Lazily build ONE in-process MCP client wired to the full comfyui tool surface,
@@ -765,13 +857,21 @@ export async function runPanelOrchestrator(): Promise<void> {
   const bridgeHost = (process.env.COMFYUI_MCP_BRIDGE_HOST ?? "127.0.0.1").trim() || "127.0.0.1";
   const lanBridge = !isLoopbackBindHost(bridgeHost);
   const envBridgeToken = process.env.COMFYUI_MCP_BRIDGE_TOKEN?.trim() || null;
-  const bridgeToken =
+  // Provisioned eagerly for secure/LAN boots, LAZILY on the first remote
+  // retarget (a loopback boot must not permanently rule out the secure bridge
+  // the pod's HTTPS panel needs — codex finding).
+  let bridgeToken =
     envBridgeToken ?? (wantSecureBridge || lanBridge ? randomBytes(24).toString("hex") : null);
 
   // Dedicated PANEL bridge port (default 9180). Token-gated in secure/LAN mode.
   const lockPort = Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180;
   const lockPath = orchLockPath(lockPort);
   const bridge = startUiBridge(lockPort, bridgeToken, bridgeHost);
+  // The LISTENER'S auth was fixed at construction: a null boot token means a
+  // tokenless listener FOREVER — lazily provisioning a token later would
+  // advertise a tunnel whose token is not enforced (codex finding). The lazy
+  // secure-bridge path must refuse in that case, not expose it publicly.
+  const bridgeListenerTokenless = bridgeToken === null;
 
   // On-demand phone pairing (the panel "Remote control" button). Off by default:
   // the FIRST pair request lazily binds a SECOND, token-gated listener on all
@@ -970,7 +1070,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     isForceRemoteFlagSet() || !isLoopbackUrl(comfyuiUrl)
       ? { COMFYUI_MCP_FORCE_REMOTE: "1" }
       : {};
-  const model = process.env.COMFYUI_MCP_PANEL_MODEL ?? "claude-opus-4-8";
+  const model = process.env.COMFYUI_MCP_PANEL_MODEL ?? "claude-opus-5";
   const envEffort = process.env.COMFYUI_MCP_PANEL_EFFORT;
   const effort: Effort | undefined = isEffort(envEffort) ? envEffort : undefined;
   // Single-port multi-provider: ONE orchestrator on ONE bridge port (default
@@ -996,10 +1096,31 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
   }
 
-  // Cross-process download-progress channel: each tab's comfyui MCP subprocess
-  // writes per-download JSON here; the watcher below broadcasts it to the panel
-  // tray. Port-scoped so parallel orchestrators don't cross streams.
-  const progressDir = join(tmpdir(), `comfyui-mcp-progress-${bridgePort}`);
+  // Cross-process download-progress + control channel: each tab's comfyui MCP
+  // subprocess writes per-download JSON (and runpod_* target requests) here;
+  // the watcher below broadcasts downloads to the panel tray and applies
+  // control requests. Port-scoped so parallel orchestrators don't cross
+  // streams, NONCED + mode-0700 so another local user can't pre-create the
+  // predictable path and inject a hostile retarget (codex finding — the
+  // applied URL receives configured auth headers on later requests).
+  const progressNonce = randomBytes(12).toString("hex");
+  const progressDir = join(tmpdir(), `comfyui-mcp-progress-${bridgePort}-${progressNonce}`);
+  // Reap dirs from dead processes on this port (auto-restarts would otherwise
+  // accumulate them forever — codex finding). Same port ⇒ same orchestrator,
+  // so any other dir with the prefix belongs to a previous life.
+  try {
+    for (const d of readdirSync(tmpdir())) {
+      if (d.startsWith(`comfyui-mcp-progress-${bridgePort}-`) && join(tmpdir(), d) !== progressDir) {
+        rmSync(join(tmpdir(), d), { recursive: true, force: true });
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  mkdirSync(progressDir, { recursive: true, mode: 0o700 });
+  // Late-bind the channel dir so the control channel works IN-PROCESS too
+  // (direct/mobile tool calls — codex finding: it was dead without the env var).
+  setProgressDir(progressDir);
 
   // The bundled plugin (skills) ships alongside dist/ in the package root. Load
   // it so the background agents are ComfyUI experts out of the box.
@@ -1051,7 +1172,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // declared to the app-server alongside the headless comfyui (stdio) MCP. Claude
   // keeps its in-process SDK panel server unchanged.
   const backendId = (process.env.PANEL_AGENT_BACKEND ?? "claude").toLowerCase();
-  // The panel's `model` is a Claude id (e.g. claude-opus-4-8) and is NOT a valid
+  // The panel's `model` is a Claude id (e.g. claude-opus-5) and is NOT a valid
   // Codex model — so for codex we only pass a model when COMFYUI_MCP_CODEX_MODEL
   // is set explicitly; otherwise Codex uses the account's default (e.g. gpt-5.5).
   const codexModel = process.env.COMFYUI_MCP_CODEX_MODEL;
@@ -1059,6 +1180,9 @@ export async function runPanelOrchestrator(): Promise<void> {
   // COMFYUI_MCP_GEMINI_MODEL (default gemini-2.5-pro). The model is applied at spawn
   // via the CLI `--model` flag (ACP exposes no per-session model setter).
   const geminiModel = process.env.COMFYUI_MCP_GEMINI_MODEL ?? GEMINI_DEFAULT_MODEL;
+  // Antigravity (`agy`, issue #262): no default on purpose — unset means the
+  // account's own default model; the live catalog comes from `agy models`.
+  const antigravityModel = process.env.COMFYUI_MCP_ANTIGRAVITY_MODEL;
   const grokModel = process.env.COMFYUI_MCP_GROK_MODEL ?? GROK_DEFAULT_MODEL;
   // Ollama (local LLMs, issue #97): the model is a local tag applied PER
   // REQUEST — switching live is free. Default = OUR FINE-TUNE,
@@ -1086,17 +1210,23 @@ export async function runPanelOrchestrator(): Promise<void> {
   {
     const hydrated = new Set(hydratedSecrets);
     const src = (k: string) => (process.env[k] ? (hydrated.has(k) ? "store" : "env") : "none");
+    const registryKeyed = OPENAI_KEY_PROVIDER_IDS.map(
+      (id) => `${id}=${src(openAiKeyProvider(id)!.envKeys[0]!)}`,
+    ).join(", ");
     logger.info(
-      `[panel-orchestrator] keyed providers: openrouter=${src("OPENROUTER_API_KEY")}, glm=${src("GLM_API_KEY")}, kimi=${src("KIMI_API_KEY")}, moonshot=${src("MOONSHOT_API_KEY")}`,
+      `[panel-orchestrator] keyed providers: openrouter=${src("OPENROUTER_API_KEY")}, ${registryKeyed}`,
     );
   }
   const persistedAgent = getAgentSettings();
   let ollamaModel =
     process.env.COMFYUI_MCP_OLLAMA_MODEL ?? persistedAgent.ollama?.model ?? "artokun/gemma4-comfyui-mcp:e4b";
   const chatgptModel = process.env.COMFYUI_MCP_CHATGPT_MODEL ?? CHATGPT_DEFAULT_MODEL;
-  const glmModel = process.env.COMFYUI_MCP_GLM_MODEL ?? GLM_DEFAULT_MODEL;
-  const kimiModel = process.env.COMFYUI_MCP_KIMI_MODEL ?? KIMI_DEFAULT_MODEL;
-  const moonshotModel = process.env.COMFYUI_MCP_MOONSHOT_MODEL ?? MOONSHOT_DEFAULT_MODEL;
+  // kimi keeps a local model var (its bespoke KimiBackend takes it). glm/moonshot
+  // read their model straight from the registry via the shared factory, so no
+  // per-provider model var is needed for them anymore. All three still resolve to
+  // the exact value the old <provider>Model consts held
+  // (process.env.COMFYUI_MCP_<X>_MODEL ?? <X>_DEFAULT_MODEL).
+  const kimiModel = openAiKeyProviderModel(openAiKeyProvider("kimi")!);
   // EXPERIMENTAL (ToS risk) — off by default, only reachable once the user has
   // signed in via the panel's experimental row (oauth-bridge.ts's
   // allow_experimental gate); never the defaultBackend/auto-pick.
@@ -1193,10 +1323,10 @@ export async function runPanelOrchestrator(): Promise<void> {
     "codex",
     "chatgpt",
     "gemini",
+    "antigravity",
     "grok",
-    "glm",
-    "kimi",
-    "moonshot",
+    // Simple api-key providers (glm/kimi/moonshot) come from the registry.
+    ...OPENAI_KEY_PROVIDER_IDS,
     "ollama",
     "openrouter",
     "lmstudio",
@@ -1234,6 +1364,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // just the static text (no env block). Built once; refreshed after a ComfyUI
   // restart/reconnect via refreshEnvCapabilities() below.
   let envCaps: EnvCapabilities | undefined;
+  // Our own build versions, auto-stamped into the agent's ENV block so bug
+  // reports are version-pinned without the agent digging. mcp version is a local
+  // fact; panel version is learned from the panel's `hello` frame (below) and, on
+  // first sight, triggers an env refresh so the block picks it up.
+  const mcpVersion = detectInstallMode().currentVersion ?? undefined;
+  let latestPanelVersion: string | undefined;
   let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
@@ -1241,12 +1377,22 @@ export async function runPanelOrchestrator(): Promise<void> {
   // panelSystemAppend at each makeBackend(). Updating both keeps the providers in
   // sync without rebuilding the manager.
   let liveManager: PanelAgentManager | undefined;
+  // Generation guard: refreshes can overlap (ComfyUI reconnect + a panel hello
+  // carrying a new panel_version). Without this, an OLDER gather finishing LAST
+  // would clobber envCaps with stale values — and since latestPanelVersion has
+  // already advanced, later identical hellos dedupe and never repair it. So each
+  // call takes a ticket and only the newest-started refresh may publish its result.
+  let envRefreshGen = 0;
   async function refreshEnvCapabilities(): Promise<void> {
+    const gen = ++envRefreshGen;
     try {
-      envCaps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId });
+      const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion, panelVersion: latestPanelVersion });
+      if (gen !== envRefreshGen) return; // a newer refresh superseded us — drop this stale result
+      envCaps = caps;
       panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
+      if (gen !== envRefreshGen) return; // superseded — let the newer refresh own the prompt
       // Belt-and-suspenders: gather is internally guarded, but never let a stray
       // throw break the prompt — fall back to the static append.
       panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
@@ -1275,7 +1421,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   QueueMonitor.start(comfyuiUrl);
   if (envCaps) {
     logger.info(
-      `[panel-orchestrator] env: OS=${envCaps.os ?? "?"} GPU=${envCaps.gpu ?? "?"}${typeof envCaps.vramTotalGb === "number" ? ` ${envCaps.vramTotalGb}GB` : ""} torch=${envCaps.torch ?? "?"} cuda=${envCaps.cuda ?? "?"} py=${envCaps.python ?? "?"} comfyui=${envCaps.comfyui ?? "?"} (${envCaps.location ?? "?"}) triton=${envCaps.triton ?? "?"} sage=${envCaps.sageattention ?? "?"} backend=${envCaps.backend ?? "?"}`,
+      `[panel-orchestrator] env: OS=${envCaps.os ?? "?"} GPU=${envCaps.gpu ?? "?"}${typeof envCaps.vramTotalGb === "number" ? ` ${envCaps.vramTotalGb}GB` : ""} torch=${envCaps.torch ?? "?"} cuda=${envCaps.cuda ?? "?"} py=${envCaps.python ?? "?"} comfyui=${envCaps.comfyui ?? "?"} (${envCaps.location ?? "?"}) triton=${envCaps.triton ?? "?"} sage=${envCaps.sageattention ?? "?"} backend=${envCaps.backend ?? "?"} mcp=${envCaps.mcpVersion ?? "?"} panel=${envCaps.panelVersion ?? "?"}`,
     );
   }
 
@@ -1286,6 +1432,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // the same secrets — reach either provider.
   // A FUNCTION (not a frozen object) so it always reflects the CURRENT retargeted
   // comfyuiUrl/comfyuiPath — makeHttpBackendMcpServers calls it per (re)spawn.
+  // Tabs whose panel Blind toggle is ON (issue #90): their comfyui tool-server
+  // spawns get COMFYUI_MCP_BLIND=1 so image-returning tools withhold pixels
+  // mechanically. Seeded from `blind` on hello; toggled live via the
+  // set_content_mode frame (which respawns the tab's agent at idle so the new
+  // env applies). Keyed by tab id (the spawn is per tab, not per backend).
+  const blindTabs = new Set<string>();
+
   const comfyuiBaseEnv = (): Record<string, string> => ({
     COMFYUI_URL: comfyuiUrl,
     COMFYUI_MCP_PROGRESS_DIR: progressDir,
@@ -1353,7 +1506,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       args: [mcpEntry], // dist/index.js
       // Merge persisted tool secrets at SPAWN time so a respawn picks up a
       // just-saved CIVITAI_API_TOKEN / HF_TOKEN without a process restart.
-      env: buildComfyuiMcpEnv(comfyuiBaseEnv()),
+      // Blind tabs (issue #90) add COMFYUI_MCP_BLIND=1 so the tool server
+      // withholds image pixels from the model.
+      env: buildComfyuiMcpEnv({
+        ...comfyuiBaseEnv(),
+        ...(blindTabs.has(tabId) ? { COMFYUI_MCP_BLIND: "1" } : {}),
+      }),
     },
     // Live-graph panel_* tools for THIS tab over the loopback HTTP MCP.
     ...(panelMcpHttp
@@ -1385,6 +1543,27 @@ export async function runPanelOrchestrator(): Promise<void> {
       close: async () => {},
     }) as unknown as AgentBackend;
 
+  // ONE code path for the simple OpenAI-compatible api-key providers (glm,
+  // moonshot, …): resolve the provider's key + base URL (throws if absent), then
+  // build the shared OllamaBackend openai driver pinned to that host/key/model.
+  // Collapses the near-identical GlmBackend/MoonshotBackend classes. `kimi` is
+  // excluded (simpleKeyProvider filters it) — its OAuth prepare() keeps KimiBackend.
+  const makeOpenAiKeyBackend = (
+    reg: OpenAiKeyProvider,
+    extra: Partial<OllamaBackendDeps> = {},
+  ): OllamaBackend => {
+    const creds = resolveOpenAiKeyCredentials(reg.id);
+    return new OllamaBackend({
+      ...extra,
+      cwd: comfyuiPath ?? process.cwd(),
+      backendId: reg.id,
+      model: openAiKeyProviderModel(reg),
+      api: "openai",
+      host: creds.baseUrl,
+      apiKey: creds.apiKey,
+    });
+  };
+
   const makeBackend = (key: string): AgentBackend | undefined => {
     const backend = backendOf(key);
     const panelTabId = panelTabOf(key);
@@ -1404,6 +1583,14 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: geminiModel,
         systemAppend: panelSystemAppend,
         comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "antigravity") {
+      return new AntigravityBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        ...(antigravityModel ? { model: antigravityModel } : {}),
+        systemAppend: panelSystemAppend,
         mcpServers: makeHttpBackendMcpServers(panelTabId),
       });
     }
@@ -1475,10 +1662,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         mcpServers: makeHttpBackendMcpServers(panelTabId),
       });
     }
-    if (backend === "glm") {
-      return new GlmBackend({
-        cwd: comfyuiPath ?? process.cwd(),
-        model: glmModel,
+    const simpleKeyReg = simpleKeyProvider(backend);
+    if (simpleKeyReg) {
+      // glm/moonshot (and any future simple api-key provider) share one factory.
+      return makeOpenAiKeyBackend(simpleKeyReg, {
         systemAppend: panelSystemAppend,
         comfyuiUrl,
         mcpServers: makeHttpBackendMcpServers(panelTabId),
@@ -1488,15 +1675,6 @@ export async function runPanelOrchestrator(): Promise<void> {
       return new KimiBackend({
         cwd: comfyuiPath ?? process.cwd(),
         model: kimiModel,
-        systemAppend: panelSystemAppend,
-        comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
-      });
-    }
-    if (backend === "moonshot") {
-      return new MoonshotBackend({
-        cwd: comfyuiPath ?? process.cwd(),
-        model: moonshotModel,
         systemAppend: panelSystemAppend,
         comfyuiUrl,
         mcpServers: makeHttpBackendMcpServers(panelTabId),
@@ -1537,20 +1715,23 @@ export async function runPanelOrchestrator(): Promise<void> {
     let pb = probeBackends.get(backend);
     if (!pb) {
       try {
-      pb =
-        backend === "codex"
+      const simpleKeyReg = simpleKeyProvider(backend);
+      pb = simpleKeyReg
+        ? makeOpenAiKeyBackend(simpleKeyReg)
+        : backend === "codex"
           ? new CodexBackend({ cwd: comfyuiPath ?? process.cwd(), model: codexModel })
           : backend === "chatgpt"
             ? new ChatGptOAuthBackend({ cwd: comfyuiPath ?? process.cwd(), model: chatgptModel })
-          : backend === "glm"
-            ? new GlmBackend({ cwd: comfyuiPath ?? process.cwd(), model: glmModel })
           : backend === "kimi"
             ? new KimiBackend({ cwd: comfyuiPath ?? process.cwd(), model: kimiModel })
-          : backend === "moonshot"
-            ? new MoonshotBackend({ cwd: comfyuiPath ?? process.cwd(), model: moonshotModel })
           : backend === "ollama"
             ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: ollamaModel, ...ollamaDeps() })
-            : backend === "grok"
+            : backend === "antigravity"
+            ? new AntigravityBackend({
+                cwd: comfyuiPath ?? process.cwd(),
+                ...(antigravityModel ? { model: antigravityModel } : {}),
+              })
+          : backend === "grok"
               ? new GrokBackend({ cwd: comfyuiPath ?? process.cwd(), model: grokModel })
               : backend === "openrouter"
                 ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: openrouterModel, ...openrouterDeps() })
@@ -1582,7 +1763,9 @@ export async function runPanelOrchestrator(): Promise<void> {
   // (persisted by panel-secrets) lands in the comfyui server's spawn env. The
   // comfyui server is declared LAST so it always wins over any user entry that
   // slipped through (defensive — the reader already filters comfyui-mcp entries).
-  const buildMcpServers = () => ({
+  // `panelTab` (when given) layers per-tab spawn env — the Blind content gate
+  // (panel issue #90). The tab-less form remains for the static fallback.
+  const buildMcpServers = (panelTab?: string) => ({
     // The user's inherited servers first… (re-read so a panel_add_mcp is picked
     // up on the same in-process respawn, mirroring a soft reload).
     ...readUserMcpServers(),
@@ -1597,6 +1780,8 @@ export async function runPanelOrchestrator(): Promise<void> {
         // Local mode → enables download_model, apply_manifest (installer packs),
         // and model scans so the agent installs the right way instead of curl.
         ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : forceRemoteEnv()),
+        // Blind tab (issue #90): this tab's tool server withholds image pixels.
+        ...(panelTab && blindTabs.has(panelTab) ? { COMFYUI_MCP_BLIND: "1" } : {}),
       }),
     },
   });
@@ -1615,6 +1800,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         ? createPanelMcpServer(bridge, panelTabOf(key), workflowTargets)
         : undefined,
     mcpServers: buildMcpServers(),
+    // Per-KEY factory — the CLAUDE path's spawns must also reflect per-tab state
+    // (the Blind gate); the static set above stays as the fallback. Codex-review
+    // F1 on issue #90: without this, the default backend bypassed the gate.
+    makeMcpServers: (key) => buildMcpServers(panelTabOf(key)),
     // NOTE: manager callbacks fire with the composite agent key `tabId::backend`;
     // panelTabOf() recovers the PANEL tab so every push reaches the right socket.
     onSay: (key, text, meta) => {
@@ -1657,13 +1846,35 @@ export async function runPanelOrchestrator(): Promise<void> {
     onSeen: (key, mid) => {
       bridge.push({ type: "ack", ok: true, kind: "seen", mid }, panelTabOf(key));
     },
+    // PER-TAB start failure (issue #250): a backend that rejects at
+    // prepare()/first-connect — an invalid API key 401ing on an OpenAI-dialect
+    // provider (moonshot/glm/custom/openrouter), an unreachable endpoint — is a
+    // tab-local configuration error, the same class as the keyless ctor path
+    // (#209), one step later. Degrade THAT tab only: an honest say naming the
+    // provider with check-your-key guidance, plus a degraded ack so the panel
+    // shows the real state. The manager already dropped the dead agent, so
+    // fixing the key and Disconnect → Connect (or just re-sending) retries
+    // cleanly. This must NOT self-exit — a bad moonshot key on one tab was
+    // killing healthy sessions on every other tab.
+    onStartFailure: (key, message) => {
+      // Frame construction (hint selection via the key-provider registry,
+      // composite-key → panel-tab split, say + degraded ack + turn:done) lives
+      // in start-failure-notice.ts so it is unit-testable (issue #255).
+      const { panelTab, backend, frames } = buildStartFailureNotice(key, message, defaultBackend);
+      for (const frame of frames) bridge.push(frame, panelTab);
+      logger.warn(
+        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} (${backend}) agent failed to start — degraded THIS tab only, other tabs unaffected (${message})`,
+      );
+    },
     // ROOT-CAUSE self-exit (the "bridge open but no panel agent responded" wedge):
-    // a tab's agent died fatally (couldn't start, or its bounded self-restart gave
-    // up). The orchestrator is alive and the bridge is up, but no agent will ever
-    // handshake — exactly the wedge. Exit cleanly so the panel pack's bridge-death
-    // → reclaim + sticky-reconnect respawns a FRESH orchestrator, instead of
-    // leaving the user staring at the manual "fully restart ComfyUI" warning.
-    // Mirrors the uncaughtException exit above (Node's own default on a fatal).
+    // a tab's agent died fatally — its bounded self-restart loop gave up (the
+    // session kept dropping immediately). The orchestrator is alive and the
+    // bridge is up, but no agent will ever handshake — exactly the wedge. Exit
+    // cleanly so the panel pack's bridge-death → reclaim + sticky-reconnect
+    // respawns a FRESH orchestrator, instead of leaving the user staring at the
+    // manual "fully restart ComfyUI" warning. Mirrors the uncaughtException exit
+    // above (Node's own default on a fatal). Start failures no longer route here
+    // (issue #250) — they degrade per-tab via onStartFailure above.
     onAgentFatal: (tabId, reason) => {
       requestSelfExit(`tab ${tabId.slice(0, 8)} ${reason}`);
     },
@@ -1740,6 +1951,20 @@ export async function runPanelOrchestrator(): Promise<void> {
   // ComfyUI the user actually has open — local OR a RunPod proxy — with no
   // `connect <url>`. Loopback → LOCAL mode (keep COMFYUI_PATH); non-loopback →
   // REMOTE mode (drop the path). No-op if unchanged. Returns true if it retargeted.
+  // Same-URL canonicalization, DEFAULT-PORT-INSENSITIVE but SCHEME-AWARE:
+  // strip only the scheme's actual default (:443 for https, :80 for http) —
+  // http://h:443 and http://h are NOT the same endpoint (codex finding).
+  // Shared by applyComfyuiUrl's dedupe and the control-channel ack check
+  // (runpodProxyUrl omits :443 while getComfyUIBaseUrl includes it — codex).
+  const canonTargetUrl = (u: string): string => {
+    try {
+      const p = new URL(u);
+      if ((p.protocol === "https:" && p.port === "443") || (p.protocol === "http:" && p.port === "80")) p.port = "";
+      return p.toString().replace(/\/+$/, "");
+    } catch {
+      return u.replace(/\/+$/, "");
+    }
+  };
   const applyComfyuiUrl = (rawUrl: unknown): boolean => {
     if (typeof rawUrl !== "string") return false;
     const next = rawUrl.trim().replace(/\/+$/, "");
@@ -1752,7 +1977,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     } catch {
       return false; // not a valid URL — ignore (keep current target)
     }
-    if (!host || next === comfyuiUrl) return false;
+    if (!host || canonTargetUrl(next) === canonTargetUrl(comfyuiUrl)) return false;
     const prev = comfyuiUrl;
     comfyuiUrl = next;
     comfyuiPath = localPathForTarget(next);
@@ -1764,21 +1989,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     // forces getClient() to rebuild against the new host on its next use.
     setComfyuiTarget(next);
     resetClient();
-    // Point every provider at the new target: Claude via its rebuilt MCP env, the
-    // manager's image-fetch URL, then respawn active agents so the live comfyui MCP
-    // subprocess is recreated with the new COMFYUI_URL (no-op if none are running —
-    // the next spawn picks it up from the now-updated closures).
-    manager.setMcpServers(buildMcpServers());
-    manager.setComfyuiUrl(comfyuiUrl);
-    manager.restartAllForMcpEnv();
-    // Re-point the render watchdog and re-probe the env (remote vs local differs).
-    try {
-      QueueMonitor.stop();
-    } catch {
-      /* best-effort */
-    }
-    QueueMonitor.start(comfyuiUrl);
-    void refreshEnvCapabilities();
+    // The heavy retarget work (QueueMonitor restart, agent MCP-env respawn,
+    // env-capability re-probe) runs in the onComfyuiTargetChanged listener
+    // fired by setComfyuiTarget above — ONE fan-out for every retarget path
+    // (hello, runpod tools, watcher auto-stop/vanish), so they can't drift
+    // split-brained again (#269).
     logger.info(
       `[panel-orchestrator] retargeted ComfyUI ${prev} → ${comfyuiUrl} (${isLoopbackUrl(next) ? "local" : "remote"} mode) from panel hello`,
     );
@@ -1810,23 +2025,35 @@ export async function runPanelOrchestrator(): Promise<void> {
   // the next probe uses the new key, and re-push readiness + models to every
   // live tab so the OpenRouter provider flips to "ready" and lists its models
   // without a reconnect.
+  const KEYED_PROVIDERS = ["openrouter", "custom", "glm", "kimi", "moonshot"];
   const unsubscribeAgentSecrets = onAgentSecretsChanged(() => {
     hydrateAgentSecretsIntoEnv();
     // A key change can affect ANY keyed provider (OpenRouter/Custom endpoints and
     // the hosted API-key backends GLM / Kimi / Moonshot) — drop each one's cached
     // probe backend + model list so the next probe carries the fresh credentials
     // (and a revoked key immediately stops reading as "ready" from a stale cache).
-    for (const b of ["openrouter", "custom", "glm", "kimi", "moonshot"]) {
+    for (const b of KEYED_PROVIDERS) {
       modelsByBackend.delete(b);
       const pb = probeBackends.get(b);
       if (pb?.close) void pb.close().catch(() => {});
       probeBackends.delete(b);
     }
+    // Cache-drop alone does NOT rotate the key on a LIVE agent: keyed backends
+    // capture the credential at construction and keep using the OLD key until
+    // rebuilt (#278). So a live tab running a keyed provider must be restarted
+    // for the new/revoked key to take effect — a SILENT rebuild at idle (no
+    // download-retry nudge; the guard's job was only to stop the spurious nudge
+    // + unrelated Claude/Codex restarts, not to stop key rotation).
+    for (const [tabId, backend] of tabBackends.entries()) {
+      if (KEYED_PROVIDERS.includes(backend)) {
+        manager.restartForProviderKey(agentKeyFor(tabId));
+      }
+    }
     for (const tabId of tabBackends.keys()) {
       pushReadiness(tabId);
       pushModels(tabId);
     }
-    logger.info("[panel-orchestrator] provider key saved → readiness + models refreshed");
+    logger.info("[panel-orchestrator] provider key saved → readiness + models refreshed + keyed agents rebuilt");
   });
 
   // Debounce the connect ack: the panel re-sends `hello` on reconnect and on
@@ -1927,6 +2154,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   function currentModelFor(backend: string): string | undefined {
     if (backend === "codex") return codexModel;
     if (backend === "gemini") return geminiModel;
+    if (backend === "antigravity") return antigravityModel;
     if (backend === "grok") return grokModel;
     if (backend === "ollama") return ollamaModel;
     if (backend === "openrouter") return openrouterModel;
@@ -1934,9 +2162,8 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (backend === "llamacpp") return llamacppModel || undefined;
     if (backend === "custom") return customModel || undefined;
     if (backend === "chatgpt") return chatgptModel;
-    if (backend === "glm") return glmModel;
-    if (backend === "kimi") return kimiModel;
-    if (backend === "moonshot") return moonshotModel;
+    const reg = openAiKeyProvider(backend);
+    if (reg) return openAiKeyProviderModel(reg); // glm / kimi / moonshot
     if (backend === "copilot") return copilotModel;
     return model;
   }
@@ -2038,9 +2265,33 @@ export async function runPanelOrchestrator(): Promise<void> {
     // tell the difference (and warn if no ack arrives).
     if (event.type === "hello" && event.tab_id) {
       const panelTab = event.tab_id;
+      // Learn the sidebar panel's version from its hello and, the first time we
+      // see it (or when it changes on a panel update), refresh the env block so
+      // the agent's ENVIRONMENT line carries the panel version — bug reports get
+      // both our versions auto-stamped, no digging.
+      const helloPanelVer = (event as { panel_version?: unknown }).panel_version;
+      if (typeof helloPanelVer === "string" && helloPanelVer && helloPanelVer !== latestPanelVersion) {
+        latestPanelVersion = helloPanelVer;
+        void refreshEnvCapabilities();
+      }
       // Retarget ComfyUI to the URL the browser was served from (window.location),
-      // BEFORE the readiness probe so the "ready" ack reflects the right instance.
-      applyComfyuiUrl((event as { comfyui_url?: unknown }).comfyui_url);
+      // BEFORE the readiness probe so the "ready" ack reflects the right instance —
+      // but a hello can arrive from a STALE browser tab on a DEAD instance (E2E
+      // finding: a zombie :8189 tab kept retargeting the orchestrator to a corpse
+      // and silently breaking every tool that probes the target). Probe
+      // loopback/LAN hellos first; RunPod proxies skip the probe (booting pods
+      // answer late — readiness is the connector's job).
+      const helloUrl = (event as { comfyui_url?: unknown }).comfyui_url;
+      void (async () => {
+        if (typeof helloUrl === "string" && !/\.proxy\.runpod\.net/i.test(helloUrl)) {
+          const base = helloUrl.trim().replace(/\/+$/, "");
+          if (base && !(await probeOk(`${base}/system_stats`, 3_000))) {
+            logger.warn(`[panel-orchestrator] ignoring hello retarget to unreachable ${base} (stale tab on a dead instance?) — keeping ${comfyuiUrl}`);
+            return;
+          }
+        }
+        applyComfyuiUrl(helloUrl);
+      })();
       // Re-advertise the secure bridge on EVERY hello, not just when the URL
       // changes: advertiseBridge's own retries are short (~3s) and can race a
       // pod-side ComfyUI restart, permanently leaving the pod's stored bridge
@@ -2102,6 +2353,28 @@ export async function runPanelOrchestrator(): Promise<void> {
         headlessTabs.delete(migratedFrom);
         workflowTargets.clear(migratedFrom);
       }
+      // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
+      // already carries the right tool-server env. A CHANGE against a live
+      // agent also respawns it (codex-review F2: the set_content_mode frame is
+      // lost when toggled during a socket drop — the re-hello is the recovery
+      // path, so it must enforce, not just record). Runs AFTER the migrated_from
+      // rebind so a simultaneous lost-toggle + tab-id migration still finds the
+      // (rebound) live agent (review note). Absence = no-op (old panels
+      // never send the field; it must not clear a prior state).
+      {
+        const helloBlind = (event as { blind?: unknown }).blind;
+        if (helloBlind === true || helloBlind === false) {
+          const changed = helloBlind !== blindTabs.has(panelTab);
+          if (helloBlind) blindTabs.add(panelTab);
+          else blindTabs.delete(panelTab);
+          if (changed && manager.hasLiveAgent(agentKeyFor(panelTab))) {
+            manager.restartForMcpEnv(agentKeyFor(panelTab));
+            logger.info(
+              `[panel-orchestrator] tab ${panelTab.slice(0, 8)} blind=${String(helloBlind)} via hello — live agent respawn queued`,
+            );
+          }
+        }
+      }
       const prev = tabBackends.get(panelTab);
       if (prev && prev !== backend) {
         // Provider switch: retire the previous provider's agent for this tab so it
@@ -2134,6 +2407,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       // are change-only, so a tab connecting MID-render would otherwise wait for
       // the next state transition to learn a job is already running.
       bridge.push(buildQueueStatusFrame(QueueMonitor.snapshot()), panelTab);
+      // Seed the RunPod control panel too — a tab that just connected gets the
+      // current pod-status frame (or a cleared one when nothing is watched).
+      const rpFrame = getRunpodWatcher()?.current();
+      if (rpFrame) bridge.push(rpFrame, panelTab);
+      // Seed any failed auto-connect warnings too — they live SEPARATELY from
+      // the watched frame so this tab sees every still-billing failure (codex).
+      for (const f of getRunpodWatcher()?.failedFrames() ?? []) bridge.push(f, panelTab);
+      // Seed the honest host indicator: tell this tab where renders run now.
+      bridge.push({ type: "comfyui_target", url: getComfyUIBaseUrl(), is_local: isTargetingLocalOrLan() }, panelTab);
       // Re-push the last usage so the context meter isn't blank after a reload.
       const lastStatus = manager.lastStatusFor(key);
       if (lastStatus) pushStatus(panelTab, lastStatus);
@@ -2143,10 +2425,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       const isCx = backend === "codex";
       const isCg = backend === "chatgpt";
       const isGm = backend === "gemini";
+      const isAg = backend === "antigravity";
       const isGk = backend === "grok";
-      const isGl = backend === "glm";
-      const isKm = backend === "kimi";
-      const isMs = backend === "moonshot";
+      // glm/kimi/moonshot share one registry-driven ack (label + ready + degraded).
+      const reg = openAiKeyProvider(backend);
       const isOl = backend === "ollama";
       const isOr = backend === "openrouter";
       const isLs = backend === "lmstudio";
@@ -2196,20 +2478,18 @@ export async function runPanelOrchestrator(): Promise<void> {
       )
         .then((models) => {
           if (models.length) {
-            const agentLabel = isCx
+            const agentLabel = reg
+              ? (openAiKeyProviderModel(reg) ?? (models[0] as { value?: string }).value ?? reg.ackFallbackLabel)
+              : isCx
               ? (codexModel ?? (models[0] as { value?: string }).value ?? "Codex")
               : isCg
                 ? (chatgptModel ?? (models[0] as { value?: string }).value ?? "ChatGPT")
               : isGm
                 ? (geminiModel ?? (models[0] as { value?: string }).value ?? "Gemini")
+                : isAg
+                  ? (antigravityModel ?? (models[0] as { value?: string }).value ?? "Antigravity")
                 : isGk
                   ? (grokModel ?? (models[0] as { value?: string }).value ?? "Grok")
-                : isGl
-                  ? (glmModel ?? (models[0] as { value?: string }).value ?? "GLM")
-                : isKm
-                  ? (kimiModel ?? (models[0] as { value?: string }).value ?? "Kimi")
-                : isMs
-                  ? (moonshotModel ?? (models[0] as { value?: string }).value ?? "Kimi K3")
                 : isOl
                   ? (ollamaModel ?? (models[0] as { value?: string }).value ?? "Ollama")
                   : isLs
@@ -2258,20 +2538,18 @@ export async function runPanelOrchestrator(): Promise<void> {
             }
             // Greet only on a FRESH session (a resume/reconnect already has the thread).
             if (!resume) {
-              const readyText = isCx
+              const readyText = reg
+                ? reg.readyMessage(agentLabel)
+                : isCx
                 ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Codex (ChatGPT) account. Ask away.`
                 : isCg
                   ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your ChatGPT subscription (direct OAuth). Ask away.`
                 : isGm
                   ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Google account (Gemini Code Assist). Ask away.`
+                  : isAg
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Google AI subscription via Antigravity CLI. Note: agy turns show final answers only (no live tool progress). Ask away.`
                   : isGk
                     ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Grok (xAI) account. Ask away.`
-                  : isGl
-                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Z.AI GLM Coding Plan. Ask away.`
-                  : isKm
-                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Kimi Code subscription. Ask away.`
-                  : isMs
-                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Moonshot platform (Kimi K3) API key. Ask away.`
                   : isOl
                     ? `🟢 comfyui-mcp agent ready — ${agentLabel} running locally via Ollama (no account, no API key). Small local models are slower and simpler than frontier ones — expect fewer frills. Ask away.`
                     : isLs
@@ -2290,20 +2568,18 @@ export async function runPanelOrchestrator(): Promise<void> {
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: agentLabel, backend }, panelTab);
             logger.debug(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) — agent healthy, ready ack`);
           } else {
-            const degradedText = isCx
+            const degradedText = reg
+              ? reg.degradedMessage
+              : isCx
               ? "⚠️ The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry."
               : isCg
                 ? "⚠️ The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry."
               : isGm
                 ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
+                : isAg
+                  ? "⚠️ The background agent isn't responding — the Antigravity CLI couldn't answer `agy models`. Install it from https://antigravity.google, run `agy` once and complete the Google Sign-In, then Disconnect → Connect to retry."
                 : isGk
                   ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
-                : isGl
-                  ? "⚠️ The background agent isn't responding — GLM Code API couldn't start. Set ZAI_API_KEY (Z.AI Coding Plan), then Disconnect → Connect to retry."
-                : isKm
-                  ? "⚠️ The background agent isn't responding — Kimi Code couldn't start. Run Kimi Code login (~/.kimi/credentials/kimi-code.json) or set KIMI_API_KEY, then Disconnect → Connect to retry."
-                : isMs
-                  ? "⚠️ The background agent isn't responding — Moonshot (Kimi K3) couldn't start. Set MOONSHOT_API_KEY from platform.kimi.ai, then Disconnect → Connect to retry."
                 : isOl
                   ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite — arena-best local model; `:12b` for ~8 GB VRAM), then Disconnect → Connect to retry."
                   : isLs
@@ -2721,6 +2997,34 @@ export async function runPanelOrchestrator(): Promise<void> {
     // reaches this handler); the ack echoes it verbatim (plus
     // `requested_model`, the pre-guard id) so the client can resolve exactly
     // the attempt each ack answers. See options-ack.ts.
+    // Blind toggle (issue #90): record the tab's content mode and, when an
+    // agent is live, respawn it at idle so the comfyui tool server restarts
+    // with the new COMFYUI_MCP_BLIND env — the same coalesced restart path a
+    // saved secret uses. The session resumes; only the tool subprocess env
+    // changes.
+    if (event.type === "set_content_mode" && event.tab_id) {
+      const tabId = event.tab_id;
+      const nextBlind = (event as { blind?: unknown }).blind === true;
+      const changed = nextBlind !== blindTabs.has(tabId);
+      if (nextBlind) blindTabs.add(tabId);
+      else blindTabs.delete(tabId);
+      const key = agentKeyFor(tabId);
+      if (changed && manager.hasLiveAgent(key)) {
+        manager.restartForMcpEnv(key);
+        bridge.push(
+          {
+            type: "say",
+            text: nextBlind
+              ? "🕶️ Blind mode ON — the agent's image tools now withhold pixels (applies after the current turn; the session resumes automatically)."
+              : "👁️ Blind mode OFF — the agent's image tools deliver pixels again (applies after the current turn).",
+          },
+          tabId,
+        );
+      }
+      bridge.push({ type: "ack", ok: true, kind: "set_content_mode", blind: nextBlind }, tabId);
+      return;
+    }
+
     if (event.type === "set_options" && event.tab_id) {
       const tabId = event.tab_id;
       const meta = optionsRequestMeta(event as { cid?: unknown; model?: unknown });
@@ -2781,7 +3085,12 @@ export async function runPanelOrchestrator(): Promise<void> {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run_error → agent (interrupt)`);
         return;
       }
-      const delivered = manager.injectEvent(agentKeyFor(event.tab_id), ev);
+      // Blind tab (issue #90, codex-review F3): strip render pixels at the
+      // SERVER boundary too — the desktop panel already drops them client-side,
+      // but a mirror viewer (mobile has no Blind concept) can inject
+      // agent_event frames with images onto a blinded desktop tab.
+      const evForTab = blindTabs.has(event.tab_id) ? { ...ev, images: [] } : ev;
+      const delivered = manager.injectEvent(agentKeyFor(event.tab_id), evForTab);
       if (delivered) {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} event → agent: ${event.kind}`);
       }
@@ -3036,9 +3345,18 @@ export async function runPanelOrchestrator(): Promise<void> {
         ? ((event as { context?: string }).context as string).trim()
         : "";
     if (replay) outText = `${replay}\n\n${outText}`;
+    // Blind tab (issue #90): the toggle promises the agent NEVER receives
+    // pixels — that includes composer attachments. Withhold them with an
+    // honest note (the user can toggle Blind off to share an image).
+    const attachedImages = (event as { images?: Array<{ filename: string; subfolder?: string; type?: string }> })
+      .images;
+    const tabIsBlind = blindTabs.has(event.tab_id);
+    if (tabIsBlind && attachedImages?.length) {
+      outText += `\n\n[panel note: ${attachedImages.length} image attachment(s) withheld — Blind mode is ON. You cannot see them; ask the user to describe the content or turn Blind off.]`;
+    }
     const sendOpts = {
       title: event.title,
-      images: (event as { images?: Array<{ filename: string; subfolder?: string; type?: string }> }).images,
+      images: tabIsBlind ? undefined : attachedImages,
       mid: userMid,
     };
     // Local-agent VRAM pause: if this tab runs the local Ollama model AND a
@@ -3061,7 +3379,17 @@ export async function runPanelOrchestrator(): Promise<void> {
         },
         event.tab_id,
       );
-      bridge.push({ type: "turn", state: "idle" }, event.tab_id); // clear the working spinner
+      // Clear the working spinner — the panel's turn handler only recognizes
+      // "working" and "done", so the old "idle" frame never cleared it and the
+      // spinner ran until the 120s safety timeout (issue #257). But ONLY when no
+      // agent turn is actually in flight for this tab: a tab-wide "done" during
+      // an ACTIVE earlier turn would hide THAT turn's spinner and disarm its
+      // resume nudge (the idle frame was a load-bearing no-op in that case —
+      // #260 review). When a turn IS active we push nothing: the live turn's own
+      // turn:"done" clears the spinner at the right moment.
+      if (!manager.isTurnActive(key)) {
+        bridge.push({ type: "turn", state: "done" }, event.tab_id);
+      }
       return;
     }
     manager.send(agentKeyFor(event.tab_id), outText, sendOpts);
@@ -3074,6 +3402,78 @@ export async function runPanelOrchestrator(): Promise<void> {
   // a downloading row that stops updating for 60s is treated as a dead writer.
   const DOWNLOAD_LINGER_MS = 8000;
   const downloadRemoveAt = new Map<string, number>();
+  /** Boolean URL probe with a timeout — readiness checks for pending pod connects. */
+  const probeOk = async (url: string, timeoutMs = 8_000): Promise<boolean> => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      // Carry configured auth (COMFYUI_AUTH_TOKEN / custom header) — a
+      // protected pod's ComfyUI 401s otherwise and connect:true always times
+      // out (codex finding).
+      const res = await fetch(url, { signal: ctl.signal, headers: getComfyUIAuthHeaders() });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(t);
+    }
+  };
+  // Genuinely-in-flight download rows (set by pollDownloads) — read by the pod
+  // idle-stop veto, SCOPED per pod via each row's stamped target (#269).
+  let downloadingRows: Array<Record<string, unknown>> = [];
+  // create-with-connect pending boot: per-pod pending connects (a second
+  // create(connect:true) must not silently displace the first's promise —
+  // codex finding: the displaced pod kept billing with no deadline, no
+  // notification, and no auto-stop). Any deliberate target event clears ALL
+  // of them (the user chose something else) — EXCEPT a readiness-driven
+  // completion, which would otherwise wipe its siblings' promises (codex):
+  // machineRetargetInFlight distinguishes machine- from user-driven retargets.
+  // PERSISTED (user-private config dir): an orchestrator self-restart mid-boot
+  // must not strand a promised auto-connect (codex finding — the replacement
+  // process gets a fresh progress dir, so in-memory state alone is lost).
+  const pendingPodConnects = new Map<string, { url: string; deadline: number; lastProbe: number }>();
+  let machineRetargetInFlight = false;
+  const pendingConnectsFile = join(homedir(), ".comfyui-mcp", `runpod-pending-connects-${bridgePort}.json`);
+  // Port-scope the saved-target file too, and re-restore for a pod boot (the
+  // module-init read ran unscoped at import — codex finding).
+  rescopeLocalTargetFile(join(homedir(), ".comfyui-mcp", `local-target-${bridgePort}.json`));
+  const persistPendingConnects = () => {
+    try {
+      if (pendingPodConnects.size === 0) {
+        unlinkSync(pendingConnectsFile);
+        return;
+      }
+      mkdirSync(dirname(pendingConnectsFile), { recursive: true });
+      writeFileSync(pendingConnectsFile, JSON.stringify(Object.fromEntries([...pendingPodConnects].map(([k, v]) => [k, { url: v.url, deadline: v.deadline }]))));
+    } catch {
+      /* best-effort */
+    }
+  };
+  // Restore promises made before a restart; an already-past deadline fires the
+  // honest timeout on the first poll tick. RESTORE on a pod boot OR any
+  // self-restart generation (the common create(connect:true) case restarts
+  // with the target still LOCAL mid-wait — codex finding: requiring a pod
+  // target deleted the promise on the normal self-restart). A deliberate
+  // fresh non-pod boot (gen 0) invalidates old pendings instead.
+  try {
+    const restartGen = Number(process.env.COMFYUI_MCP_RESTART_GEN ?? "0");
+    if (!isTargetingPod() && !(restartGen > 0)) {
+      if (existsSync(pendingConnectsFile)) {
+        logger.info("[panel-orchestrator] discarding saved pending pod auto-connect(s) — this boot selected a non-pod target explicitly");
+        unlinkSync(pendingConnectsFile);
+      }
+    } else {
+      const saved = JSON.parse(readFileSync(pendingConnectsFile, "utf-8")) as Record<string, { url: string; deadline: number }>;
+      for (const [podId, v] of Object.entries(saved)) {
+        if (typeof v?.url === "string" && typeof v?.deadline === "number") {
+          pendingPodConnects.set(podId, { url: v.url, deadline: v.deadline, lastProbe: 0 });
+        }
+      }
+      if (pendingPodConnects.size > 0) logger.info(`[panel-orchestrator] restored ${pendingPodConnects.size} pending pod auto-connect(s) from before the restart`);
+    }
+  } catch {
+    // no saved state
+  }
   let lastDownloadSnapshot = "[]";
   const pollDownloads = () => {
     let files: string[] = [];
@@ -3085,6 +3485,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     const now = Date.now();
     const downloads: Array<Record<string, unknown>> = [];
     for (const f of files) {
+      if (f.startsWith(CONTROL_PREFIX)) continue; // control channel, not a download row
       const full = join(progressDir, f);
       let row: Record<string, unknown>;
       try {
@@ -3113,11 +3514,204 @@ export async function runPanelOrchestrator(): Promise<void> {
       }
       downloads.push(row);
     }
+    // Live-download rows for the idle-stop veto (#269): rows surviving the loop
+    // above are fresh (dead writers >60s are already unlinked), so a
+    // "downloading" row here is genuinely in flight — and a pod mid-download
+    // must not count as idle. Self-healing: a crashed writer's row ages out.
+    downloadingRows = downloads.filter((d) => d.status === "downloading");
     downloads.sort((a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")));
     const snapshot = JSON.stringify(downloads);
     if (snapshot !== lastDownloadSnapshot) {
       lastDownloadSnapshot = snapshot;
       bridge.push({ type: "download_progress", downloads }); // broadcast to all tabs
+    }
+    // MCP-child control channel (#269): runpod_* tools that ran in spawned
+    // agent children ask the orchestrator to retarget / watch / unwatch /
+    // auto-connect here — through the SAME applyComfyuiUrl fan-out as a panel
+    // hello. Each request is its own file: consumption deletes exactly the
+    // file read, so concurrent children can't clobber each other (codex).
+    try {
+      for (const { req, file } of listTargetChangeRequests(progressDir)) {
+        // Apply EVERY request — per-request files make the old timestamp
+        // watermark both unnecessary and wrong (two same-millisecond requests
+        // — e.g. create's watch + auto-connect — would drop the second, codex
+        // finding). A crash between apply and delete replays an idempotent op
+        // once on restart; a dropped auto-connect bills an unwatched pod.
+        // A `local` request resolves the fallback HERE — the orchestrator owns
+        // the learned-LAN memory; the requesting child (spawned post-connect)
+        // may know nothing but loopback (codex finding). `onlyIfTarget` guards
+        // it: a stale child's stop-fallback applies only when the CURRENT
+        // target really is that pod (codex finding — it dragged the target
+        // off a newer pod). The ack below reports the resulting URL either
+        // way, so the stale child ALIGNS to it.
+        const localGuardOk = !req.onlyIfTarget || getComfyUIBaseUrl().includes(req.onlyIfTarget);
+        // Generation guard for URL retargets: drop the retarget when a NEWER
+        // direct choice moved the target after the child wrote this (codex
+        // finding: a queued pod-A request applied after the user picked pod B).
+        const urlGenOk = !req.expectedCurrentUrl || canonTargetUrl(getComfyUIBaseUrl()) === canonTargetUrl(req.expectedCurrentUrl);
+        // Only an APPLIED target/unwatch choice supersedes pending auto-connects
+        // (watch-ONLY isn't a choice; a guarded-OUT or generation-STALE request
+        // applied nothing and must not drop a booting pod's promise — codex
+        // findings on both axes).
+        const appliedChoice = urlGenOk && (!!req.url || ((!!req.local || !!req.unwatch) && localGuardOk));
+        if (!req.connectWhenReady && appliedChoice) { pendingPodConnects.clear(); persistPendingConnects(); }
+        if (req.local && localGuardOk && urlGenOk) applyComfyuiUrl(getLocalComfyuiUrl());
+        else if (req.url && urlGenOk) applyComfyuiUrl(req.url); // dropped when a newer choice superseded it
+        if (req.unwatch && localGuardOk && urlGenOk) {
+          // Scoped for stop-fallbacks: only the stopped pod's own watch dies
+          // (codex finding: stopping A killed unrelated watched B).
+          if (req.unwatchPodId) {
+            const w = getRunpodWatcher();
+            if (w?.watchedPodId() === req.unwatchPodId) w.unwatch();
+          } else {
+            getRunpodWatcher()?.unwatch();
+          }
+        }
+        // A confirmed stop clears the pod's recorded auto-connect failure —
+        // including the spawned-child case, where the caller had no watcher
+        // of its own (codex finding: stopped pods kept "billing" forever).
+        // And it CANCELS any pending auto-connect for it — otherwise the
+        // readiness loop could still retarget to a just-stopped pod, or warn
+        // about a timeout for a pod the user deliberately stopped (codex).
+        if (req.stoppedPodId) {
+          getRunpodWatcher()?.clearConnectFailed(req.stoppedPodId);
+          if (pendingPodConnects.delete(req.stoppedPodId)) persistPendingConnects();
+        }
+        if (req.watchPodId) {
+          // Boot-status arm for a create: never displace the ACTIVE render
+          // target's watch — its idle auto-stop / dead-target cleanup is the
+          // billing guard (codex finding: creating pod B while rendering on
+          // pod A left A unguarded and billing indefinitely). The new pod gets
+          // watched when its pending connect completes (it becomes the target).
+          const w = getRunpodWatcher();
+          const cur = w?.watchedPodId();
+          const curIsActiveTarget = !!cur && !isTargetingLocal() && getComfyUIBaseUrl().includes(cur);
+          if (!(curIsActiveTarget && cur !== req.watchPodId)) w?.watch(req.watchPodId);
+        }
+        // Whether the watch request actually LANDED (the guard above may have
+        // refused it) — computed AFTER the attempt; the ack carries it so the
+        // child's create result can't claim a watch we rejected (codex finding).
+        const watchApplied = !!req.watchPodId && getRunpodWatcher()?.watchedPodId() === req.watchPodId;
+        // Whether a URL retarget landed (generation-guarded): the ack must
+        // confirm the AUTHORITATIVE retarget before the child reports success
+        // (codex finding: rejected writes still read "connected").
+        const connectApplied = !!req.url && urlGenOk && canonTargetUrl(getComfyUIBaseUrl()) === canonTargetUrl(req.url);
+        if (req.connectWhenReady && urlGenOk) {
+          // The ORCHESTRATOR waits for boot (the tool call returned inside the
+          // MCP 60s lifetime): probe every ~10s, retarget+watch on ready, and
+          // report honestly on deadline — never block the MCP child (codex).
+          // Per-pod slot: concurrent creates each keep their own deadline.
+          // Generation-guarded: a stale registration must not re-arm after the
+          // user already chose a newer target (codex finding).
+          pendingPodConnects.set(req.connectWhenReady.podId, {
+            url: req.connectWhenReady.url,
+            deadline: Date.now() + 8 * 60_000,
+            lastProbe: 0,
+          });
+          persistPendingConnects();
+        }
+        consumeTargetChange(file);
+        // Ack with the RESULTING target ONLY when the requester is waiting —
+        // fire-and-forget requests would leak ack files (codex finding). The
+        // `applied` flag distinguishes an applied local switch from a guarded
+        // skip (onlyIfTarget didn't match — codex finding).
+        if (req.wantAck) ackTargetChange(file, getComfyUIBaseUrl(), req.onlyIfTarget ? localGuardOk && urlGenOk : req.url ? connectApplied : req.connectWhenReady ? urlGenOk : req.watchPodId ? watchApplied : true);
+      }
+    } catch {
+      /* best-effort — the next tick retries a partially-written file */
+    }
+
+    // Pending create-and-connects: probe each until its pod's ComfyUI answers
+    // BOTH readiness endpoints, then retarget through the shared fan-out.
+    const reportConnectFailed = async (podId: string, supersededBy?: string) => {
+      // HONEST failure frame (codex finding: fabricated watching:true/RUNNING
+      // read as a healthy pod while it bills unguarded). Fetch the real state;
+      // `watching` reflects whether the single watcher actually follows it.
+      let status = "UNKNOWN"; // unconfirmed — never present a terminal state we didn't verify (codex)
+      let name: string | null = null;
+      let gpu: string | null = null;
+      let costPerHr: number | null = null;
+      let uptime: number | null = null;
+      try {
+        const pod = await getPod(podId);
+        status = pod?.desiredStatus ?? "TERMINATED";
+        name = pod?.name ?? null;
+        gpu = pod?.machine?.gpuDisplayName ?? null;
+        costPerHr = pod?.costPerHr ?? null;
+        uptime = pod?.runtime?.uptimeInSeconds ?? null;
+      } catch { /* keep fallbacks */ }
+      // RECHECK before installing: a manual connect/stop during the getPod
+      // await already resolved this — installing now would resurrect a stale
+      // alert on a healthy target (codex finding).
+      if (!isTargetingLocal() && getComfyUIBaseUrl().includes(podId)) return;
+      // Suppress the alert ONLY for proven terminal/gone states — a booting
+      // (CREATED/RESTARTING) or unverifiable (UNKNOWN) pod may still be billing
+      // and keeps its warning (codex finding).
+      if (status === "EXITED" || status === "TERMINATED" || status === "DEAD" || status === "PAUSED") return;
+      const frame = {
+        type: "runpod_alert",
+        pod_id: podId,
+        reason: supersededBy ? "superseded" : "timeout",
+        status,
+        name,
+        gpu,
+        cost_per_hr: costPerHr,
+        uptime_seconds: uptime,
+        ...(supersededBy ? { superseded_by: supersededBy } : {}),
+      } satisfies RunpodAlertFrame;
+      // Route through the watcher so the failure STICKS (seeds to new tabs and
+      // rides later frames until the pod exits — codex finding: a one-shot
+      // push lets the only warning evaporate on the next routine poll). The
+      // alert channel can't clobber the watched pod's status slot (codex).
+      const w = getRunpodWatcher();
+      if (w) w.markConnectFailed(podId, frame);
+      else void bridge.push(frame);
+    };
+    for (const [podId, p] of pendingPodConnects) {
+      if (Date.now() > p.deadline) {
+        pendingPodConnects.delete(podId);
+        persistPendingConnects();
+        logger.warn(`[panel-orchestrator] pod ${podId} was not ready within 8 minutes — NOT auto-connecting (connect manually with runpod_pod_connect)`);
+        // The tool call is long gone and idle auto-stop can't fire on a pod we
+        // never connected to (renderingOnPod is false) — the failed pod keeps
+        // billing with no visible failure unless we say so (codex finding).
+        void reportConnectFailed(podId);
+        continue;
+      }
+      if (Date.now() - p.lastProbe >= 10_000) {
+        p.lastProbe = Date.now();
+        void (async () => {
+          const stats = await probeOk(`${p.url}/system_stats`);
+          const queue = stats ? await probeOk(`${p.url}/queue`) : false;
+          if (!pendingPodConnects.has(podId) || pendingPodConnects.get(podId) !== p) return; // superseded/cleared
+          if (stats && queue) {
+            pendingPodConnects.delete(podId);
+            persistPendingConnects();
+            // A readiness-driven retarget — NOT a user override: siblings'
+            // pending connects stay alive through the listener (codex).
+            machineRetargetInFlight = true;
+            try {
+              applyComfyuiUrl(p.url);
+            } finally {
+              machineRetargetInFlight = false;
+            }
+            // ONE winner: a second readiness would displace this pod's watch
+            // (its idle-stop guard), so competing pending connects are resolved
+            // as SUPERSEDED — with an HONEST frame: the loser is UNWATCHED
+            // (nothing guards its cost) and connect_failed says why (codex).
+            for (const [otherId, other] of pendingPodConnects) {
+              pendingPodConnects.delete(otherId);
+              persistPendingConnects();
+              logger.warn(`[panel-orchestrator] pod ${otherId} auto-connect superseded by pod ${podId} (one active target) — it is UNWATCHED and still billing; stop it to end billing if unused`);
+              void reportConnectFailed(otherId, podId);
+              void other;
+            }
+            getRunpodWatcher()?.watch(podId);
+            logger.info(`[panel-orchestrator] pod ${podId} ready — auto-connected (${p.url})`);
+            void bridge.push({ type: "runpod_connected", pod_id: podId, url: p.url });
+          }
+        })();
+      }
     }
   };
   const downloadTimer = setInterval(pollDownloads, 700);
@@ -3133,9 +3727,149 @@ export async function runPanelOrchestrator(): Promise<void> {
   const queueStatusBroadcaster = createQueueStatusBroadcaster(
     () => QueueMonitor.snapshot(),
     (frame) => void bridge.push(frame),
+    () => QueueMonitor.drainCompletions(),
   );
-  const queueStatusTimer = setInterval(() => queueStatusBroadcaster.tick(), 1000);
+  // Each tick first refreshes the monitor over HTTP (GET /queue + /history
+  // tail): on modern ComfyUI (0.28+) the passive watchdog WS carries no
+  // prompt_id and no completion events for foreign runs, so the poll is what
+  // restores run attribution (#258) and catches runs shorter than the tick
+  // (#259). poll() never rejects and self-guards against overlap.
+  const queueStatusTimer = setInterval(() => {
+    void QueueMonitor.poll().finally(() => queueStatusBroadcaster.tick());
+  }, 1000);
   queueStatusTimer.unref?.();
+
+  // RunPod live-status broadcast + idle auto-stop (services/runpod-watch.ts).
+  // Polls the WATCHED pod (set by runpod_pod_connect / runpod_watch) every ~15s
+  // and pushes a `runpod_status` frame to the panel/mobile control panels; when
+  // the connected pod's ComfyUI sits idle past RUNPOD_IDLE_STOP_MINUTES (default
+  // 15; 0 disables) it auto-stops the pod to save GPU cost (gpu-cli parity). No
+  // pod watched → the poller is a no-op, so this costs an idle rig nothing.
+  const runpodIdleStopMinutes = (() => {
+    const v = Number(process.env.RUNPOD_IDLE_STOP_MINUTES);
+    return Number.isFinite(v) && v >= 0 ? v : 15;
+  })();
+  initRunpodWatcher({
+    push: (frame) => void bridge.push(frame),
+    // Persist unresolved connect-failure alerts per port (restart-proof — a
+    // self-restart must not lose a still-billing warning, codex finding).
+    persistPath: join(homedir(), ".comfyui-mcp", `runpod-connect-failures-${bridgePort}.json`),
+    comfyuiIdle: (podId) => {
+      const s = QueueMonitor.snapshot();
+      // NOT idle while a training job is alive on THIS pod: training isn't a
+      // ComfyUI queue job, so the queue alone would call an hours-long LoRA
+      // run "idle" and auto-stop the pod mid-flight (P4 guard; review finding
+      // on the connector). hasActiveTrainingJob is a probe-free file scan,
+      // scoped to the watched pod so a run on another pod doesn't suppress
+      // this pod's idle-stop (codex #274). Also NOT idle while THIS POD is
+      // downloading — rows are target-stamped by their writer (#269; an
+      // unstamped pre-fix row errs toward "busy", the cost-safe direction).
+      const podDownloading = downloadingRows.some((d) => {
+        const t = typeof d.target === "string" ? d.target : "";
+        return t === "" || t.includes(podId);
+      });
+      return s.connected && !s.running && s.queueDepth === 0 && !podDownloading && !hasActiveTrainingJob("pod", podId);
+    },
+    // Idle auto-stop only applies to a pod we're actually rendering on: the active
+    // ComfyUI target is that pod's proxy (its id appears in the URL). A pod we
+    // merely watch while it boots stays local-targeted, so this is false and it is
+    // never auto-stopped on the local rig's idleness.
+    renderingOnPod: (podId) => !isTargetingLocal() && getComfyUIBaseUrl().includes(podId),
+    // The watched pod vanished or was auto-stopped (#269 dead-target cleanup):
+    // when renders were pointing AT it, fall back to the local target — via
+    // setComfyuiTarget, so the shared retarget fan-out (QueueMonitor, agents,
+    // frame) runs too. Not every watched pod is the render target, so guard.
+    onPodUnavailable: (goneId) => {
+      if (isTargetingLocal() || !getComfyUIBaseUrl().includes(goneId)) return;
+      const local = getLocalComfyuiUrl();
+      logger.warn(`[panel-orchestrator] pod ${goneId} unavailable while targeted — retargeting local ComfyUI (${local})`);
+      // A MACHINE-driven fallback (auto-stop/vanish), not a user override:
+      // pending create-and-connects on OTHER pods must survive it — otherwise
+      // a booting pod silently loses its promised auto-connect (codex finding).
+      machineRetargetInFlight = true;
+      try {
+        setComfyuiTarget(local);
+      } finally {
+        machineRetargetInFlight = false;
+      }
+      resetClient();
+    },
+    idleStopMinutes: runpodIdleStopMinutes,
+  });
+
+  // Boot re-watch (#269 r2): a restart rebuilds the watcher EMPTY — a pod that
+  // stayed the ACTIVE target across the restart (its proxy URL is still the
+  // configured target) would otherwise get no more heartbeats and self-stop
+  // ~20min later even though renders keep flowing. Re-watch it immediately:
+  // beats + live status resume, and its dead-man watchdog stays fed.
+  const bootPodMatch = getComfyUIBaseUrl().match(/^https:\/\/([a-z0-9]+)-\d+\.proxy\.runpod\.net/i);
+  if (bootPodMatch) {
+    logger.info(`[panel-orchestrator] re-watching active RunPod target ${bootPodMatch[1]} after restart`);
+    getRunpodWatcher()?.watch(bootPodMatch[1]);
+  }
+
+  // Money guard (codex #263): the idle predicate above trusts persisted
+  // training records blindly (hasActiveTrainingJob is a probe-free file scan),
+  // and owner-death reconciliation otherwise only runs via getJob/listJobs —
+  // so if the harness that launched a pod training run dies and nobody ever
+  // calls train_status again, the stale "running" record would suppress the
+  // pod auto-stop FOREVER. Periodically reconcile dead-owner records (probes
+  // fire only for dead/stale owners, so a healthy run costs nothing here).
+  const trainingReconcileTimer = setInterval(() => {
+    void reconcileStaleTrainingJobs()
+      .then((n) => {
+        if (n > 0) logger.info(`[panel-orchestrator] reconciled ${n} dead-owner training job(s) — pod idle auto-stop unblocked`);
+      })
+      .catch((err) => {
+        logger.debug(`[panel-orchestrator] training reconcile: ${err instanceof Error ? err.message : String(err)}`);
+      });
+  }, 5 * 60_000);
+  trainingReconcileTimer.unref?.();
+
+  // Honest host indicator + RETARGET FAN-OUT: whenever the ComfyUI target moves
+  // (RunPod connect, pod stop → local fallback, "Local" switch, panel hello),
+  // setComfyuiTarget fires this ONE listener — it repoints everything that was
+  // previously left split-brained (#269): QueueMonitor (its WS/polls keep
+  // talking to the OLD host), the agent subprocesses' MCP env (respawned via
+  // restartAllForMcpEnv), and the env-capability probe, then broadcasts the
+  // `comfyui_target` frame so every panel truthfully shows where renders run.
+  // Same-URL retargets (a repeated connect to the current target) skip the
+  // restart storm and only re-broadcast. Seeded per tab on connect (below) so
+  // a fresh tab knows the host without waiting for a switch.
+  let lastRetargetUrl: string | null = comfyuiUrl; // seeded: a first same-URL event must not restart everything
+  onComfyuiTargetChanged((url, isLocal) => {
+    // ANY target event — a change OR a reaffirmation of the current target —
+    // supersedes ALL pending auto-connects (codex findings: direct
+    // setComfyuiTarget callers bypass applyComfyuiUrl, and an explicit
+    // Local/Stop at the SAME target must not let a booting pod steal it back
+    // later) — EXCEPT a readiness-driven completion, which must leave its
+    // siblings' pending promises intact (codex finding).
+    if (!machineRetargetInFlight) { pendingPodConnects.clear(); persistPendingConnects(); }
+    if (url !== lastRetargetUrl) {
+      lastRetargetUrl = url;
+      // Sync the shared target closures FIRST: retargets that did NOT come
+      // through applyComfyuiUrl (runpod tools, watcher callbacks) leave them
+      // holding the OLD host — and buildMcpServers()/refreshEnvCapabilities()
+      // below would rebuild/respawn agents against it (codex finding).
+      comfyuiUrl = url;
+      comfyuiPath = localPathForTarget(url);
+      try {
+        QueueMonitor.stop();
+      } catch {
+        /* best-effort */
+      }
+      QueueMonitor.start(url);
+      manager.setMcpServers(buildMcpServers());
+      manager.setComfyuiUrl(url);
+      manager.restartAllForMcpEnv();
+      void refreshEnvCapabilities();
+    }
+    // The readvertise timer follows the target too (created only at startup
+    // before — a local→pod retarget left the pod unable to learn the bridge
+    // URL, codex finding). Cheap no-op for same-url events.
+    syncReadvertise(url);
+    void bridge.push({ type: "comfyui_target", url, is_local: isLocal });
+  });
 
   // Keep the pod's stored bridge URL fresh so a ComfyUI RESTART self-heals fast.
   // The panel's advertised wss:// URL/token lives in the pod ComfyUI process's
@@ -3149,14 +3883,98 @@ export async function runPanelOrchestrator(): Promise<void> {
   // the advertise on a cheap idempotent timer repopulates the pod's store within
   // one interval of any reboot (from any cause: the agent's restart, a Manager
   // UI restart, a crash), so the browser's reclaim poll reconnects promptly.
-  // Only meaningful for a remote https target with a secure bridge.
+  // Only meaningful for a remote https target with a secure bridge. Driven by
+  // syncReadvertise at STARTUP and on every retarget (codex finding: a
+  // local→pod retarget later left the timer nonexistent, so the pod could
+  // never learn the WSS URL/token — the very deadlock it prevents). The
+  // bridge itself is created LAZILY on the first remote target too (a local
+  // boot has wantSecureBridge=false — codex finding).
   let readvertiseTimer: ReturnType<typeof setInterval> | null = null;
-  if (secureBridge && isRemoteHttpsUrl(comfyuiUrl)) {
-    readvertiseTimer = setInterval(() => {
-      if (secureBridge && isRemoteHttpsUrl(comfyuiUrl)) void secureBridge.advertise(comfyuiUrl);
-    }, 5000);
-    readvertiseTimer.unref?.();
-  }
+  // One in-flight setup MAX — concurrent ticks must not each start a tunnel
+  // (codex finding: a slow first attempt spawned multiple cloudflared clients).
+  let secureBridgeSetup: Promise<void> | null = null;
+  // A tokenless primary listener does NOT rule out pod panels: the tunnel gets
+  // its OWN token-gated listener (same addListener mechanism the phone-pair
+  // flow uses) on a dedicated port — never retrofit auth onto the public path
+  // and never open a tunnel in front of an unauthenticated one (codex P1).
+  // Port map: +0 bridge, +1 panel_* HTTP-MCP, +2 phone-pair, +3 console (line
+  // ~1427), +4 tunnel listener (codex finding: +3 was already taken).
+  const tunnelPort = lockPort + 4;
+  let tunnelToken: string | null = null;
+  let tunnelListenerStarted = false;
+  const ensureSecureBridge = async (url: string): Promise<void> => {
+    if (secureBridge) return;
+    if (!secureBridgeSetup) {
+      secureBridgeSetup = (async () => {
+        try {
+          let port = lockPort;
+          let token: string;
+          if (bridgeListenerTokenless) {
+            // Primary listener stays tokenless for local use; the tunnel binds
+            // its own token-gated listener (pair-flow precedent) and advertises
+            // THAT token — enforced, because this listener was built with it.
+            // Bound ONCE: a retried setup must reuse it, not EADDRINUSE (codex).
+            tunnelToken ??= randomBytes(24).toString("hex");
+            if (!tunnelListenerStarted) {
+              await bridge.addListener("0.0.0.0", tunnelPort, tunnelToken);
+              tunnelListenerStarted = true;
+            }
+            port = tunnelPort;
+            token = tunnelToken;
+          } else if (bridgeToken) {
+            token = bridgeToken;
+          } else {
+            return; // unreachable — the tokenless branch above covers this
+          }
+          secureBridge = await setupSecureBridge({
+            bridgePort: port,
+            comfyuiUrl: url,
+            token,
+            bridge,
+            // The setup itself advertises on completion — guard it too: a slow
+            // tunnel must not hand the bridge URL to a pod the user already
+            // left (codex finding: the post-await guard alone couldn't stop it).
+            shouldAdvertise: (t) => comfyuiUrl === t && isRemoteHttpsUrl(t),
+          });
+        } catch (err) {
+          logger.error(
+            `[panel-orchestrator] secure bridge (cloudflared) failed: ${err instanceof Error ? err.message : String(err)}. ` +
+              `Install cloudflared (npm i -g cloudflared), or re-run with --insecure-bridge and open the pod through an ` +
+              `SSH tunnel (ssh -L 3000:localhost:3000 …) at http://localhost:3000.`,
+          );
+        } finally {
+          secureBridgeSetup = null;
+        }
+      })();
+    }
+    return secureBridgeSetup;
+  };
+  const syncReadvertise = (url: string) => {
+    const wanted = !insecureBridge && isRemoteHttpsUrl(url);
+    if (wanted && !readvertiseTimer) {
+      // Immediate first advertise (creating the tunnel on a local→pod
+      // transition), then the interval.
+      void (async () => {
+        await ensureSecureBridge(url);
+        // The user may have moved on while the tunnel came up — advertising an
+        // OLD pod now would let its panel hello steal the newer target (codex).
+        if (secureBridge && comfyuiUrl === url && isRemoteHttpsUrl(url)) void secureBridge.advertise(url);
+      })();
+      readvertiseTimer = setInterval(() => {
+        void (async () => {
+          if (isRemoteHttpsUrl(comfyuiUrl)) {
+            await ensureSecureBridge(comfyuiUrl);
+            if (secureBridge) void secureBridge.advertise(comfyuiUrl);
+          }
+        })();
+      }, 5000);
+      readvertiseTimer.unref?.();
+    } else if (!wanted && readvertiseTimer) {
+      clearInterval(readvertiseTimer);
+      readvertiseTimer = null;
+    }
+  };
+  syncReadvertise(comfyuiUrl);
 
   // The no-path suffix must not read as an error when it is BY DESIGN: for a
   // remote target a local path is the wrong filesystem and is deliberately
@@ -3187,6 +4005,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     clearInterval(queueStatusTimer);
     if (readvertiseTimer) clearInterval(readvertiseTimer);
     QueueMonitor.stop();
+    // Remove OUR nonced progress dir (startup reaps previous lives') so the
+    // auto-restart cycle doesn't accumulate temp dirs (codex finding).
+    try {
+      rmSync(progressDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
     unsubscribeSecrets();
     unsubscribeAgentSecrets();
     await manager.stopAll();
@@ -3226,6 +4051,11 @@ export async function runPanelOrchestrator(): Promise<void> {
   selfRestarter = new SelfRestarter({
     allIdle: () =>
       manager.allIdle() &&
+      // Failed-start held mail (issue #256): teardown erases it, so a restart
+      // while it's parked would silently drop the messages awaiting re-delivery.
+      // (allIdle() already covers this; kept explicit alongside heldDuringGen so
+      // the gate reads as the full "nothing queued or held" contract.)
+      !manager.hasHeldMail() &&
       ![...heldDuringGen.values()].some((msgs) => msgs.length > 0) &&
       !QueueMonitor.isBusy(),
     announce: (text) => void bridge.push({ type: "say", text }),

@@ -6,6 +6,331 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.5] - 2026-07-28
+
+### MCP
+
+#### Added
+- bias hard toward via-panel bug reports during beta (#339)
+
+
+## [0.48.4] - 2026-07-28
+
+### MCP
+
+#### Fixed
+- resolve Windows argv paths host-agnostically (#330)
+- anchor a relative main.py argv[0] to the ComfyUI root (#330)
+- rebind panel session tabId on explicit signal — self-heal after reconnect/reload/workflow-switch (#322, #331, #332)
+- relaunch ComfyUI via resolved Python, not sys.argv[0] script (#330)
+- stop truncating the model list at 150 (#326)
+
+
+## [0.48.3] - 2026-07-28
+
+### MCP
+
+#### Fixed
+- reject path-traversal filenames in image/media upload (#329)
+- default all bundled-workflow seeds to randomize (#325)
+
+
+## [0.48.2] - 2026-07-27
+
+### MCP
+
+#### Fixed
+- default the z.ai GLM provider to glm-5.2 (#323)
+
+
+## [0.48.1] - 2026-07-26
+
+### MCP
+
+#### Fixed
+- remove wait_for_job — copy-paste holdover from the official Comfy MCP/CLI (#320)
+
+
+## [0.48.0] - 2026-07-24
+
+### MCP
+
+#### Changed
+- **The panel agent now defaults to Claude Opus 5.** `COMFYUI_MCP_PANEL_MODEL`
+  still pinned `claude-opus-4-8`, so new panel sessions started on the previous
+  Opus unless you overrode it. Set `COMFYUI_MCP_PANEL_MODEL` to pin a different
+  model. No panel-side change was required: the model picker is populated from
+  `query.supportedModels()` rather than a hardcoded catalog, its fallback row
+  uses the `opus` family alias, the advertised Claude effort scale already
+  covers Opus 5's full `low|medium|high|xhigh|max` ladder, and the context
+  window is read from the SDK rather than assumed.
+
+#### Fixed
+- **Double-encoded em dash in published metadata.** The em dash in
+  `package.json`'s `description` and in `docs/docs.json` had been decoded as
+  CP1252 and re-encoded as UTF-8, leaving a literal `â€"`. The description ships
+  to npm and is scraped by third-party directories, so the artifact propagated
+  to every downstream listing.
+
+## [0.47.0] - 2026-07-23
+
+### MCP
+
+#### Added
+- **Cloudflare Access service tokens on every ComfyUI endpoint.** A ComfyUI
+  fronted by Cloudflare Access served a sign-in page to the CLI instead of the
+  API, which broke connect/advertise and the queue watcher (the
+  `--insecure-bridge` workaround existed only to dodge this). Set
+  `CF_ACCESS_CLIENT_ID` + `CF_ACCESS_CLIENT_SECRET` and the headers are attached
+  to every request. (#289)
+- **RunPod pod-side dead-man switch.** Pods created via `runpod_pod_create` now
+  carry a watchdog (`deadman_server.py` heartbeat + `deadman_watch.sh` self-stop
+  loop): while comfyui-mcp is minding the pod it heartbeats each poll, and if the
+  controller disappears the pod stops itself rather than billing forever. Adds
+  structural GraphQL validation. Closes the last deferred findings from #269. (#301)
+- **Training data is now readable by app clients.** `train_list_datasets`,
+  dataset detail, effective job-config, and `train_file` readers over the
+  whitelisted channel, plus `list_output_images` gaining a `format: 'json'`
+  mode — the backend half of "see my labeled datasets / job settings / run it
+  again", unblocking the mobile Training tab. (#302, #306)
+
+#### Fixed
+- **Downloads no longer pin the turn, and a download that ran is never disclaimed.**
+  `download_model` and `download_civitai_model` awaited the entire transfer, so a
+  multi-GB checkpoint left the turn pending for minutes — and cancelling to break
+  the apparent hang made the agent report a download as not-done while the file
+  was still streaming to disk. Both tools now return a handle after a grace window
+  (small files still return a path inline), with a new `download_status` tool.
+  Reported by seanmcmagic. (#290)
+- **Interrupted and retrying Codex turns are recoverable.** Bounds the three
+  unbounded waits that let a live-but-silent Codex app-server hang a turn forever;
+  emits one controlled interrupted result, detaches the stale client, and lets
+  PanelAgent resume on a fresh app-server. Honors `ErrorNotification.willRetry`.
+  Thanks to @JusticeWay for the diagnosis. (#294)
+- **A zombie browser tab can no longer drag the orchestrator to a dead ComfyUI.**
+  A stale tab pointed at a dead instance kept re-helloing and retargeting the
+  orchestrator to the corpse, silently degrading every target-probing tool.
+  Unreachable hello retargets are now ignored. (#303)
+- **`train_doctor` no longer flaps red on a cold Docker.** The parallel GPU
+  docker-run and image-inspect raced on a cold Docker Desktop and intermittently
+  reported the trainer image absent when it was present; the probes are serialized
+  and the image check retries once. (#304)
+- **`train_start` rejects doomed parameter values.** The Custom preset is
+  free-form, so `steps=10^9` / `rank=100000` used to pass the schema and start an
+  OOM-bound billed run. Bounded: `steps<=100000`, `lr<=1`, `rank<=1024`,
+  resolution 64..4096. (#300)
+- **IP-Adapter generation works again.** The `ip_adapter` template omitted
+  `weight_type`, which current `ComfyUI_IPAdapter_plus` requires, so every
+  `generate_with_ip_adapter` failed validation. Now always sent (default
+  `standard`). Reported on 0.46.0. (#305)
+
+#### Internal
+- CI pins GitHub Actions to commit SHAs. (#295)
+
+
+## [0.46.0] - 2026-07-22
+
+### MCP
+
+#### Added
+- **`apps_*` tools — run a micro-app from a canvas-less client.** Sibling to the
+  panel Apps work: thin proxies over the panel pack's
+  `/comfyui_mcp_panel/apps/*` routes, so the panel remains the single storage and
+  run implementation for both desktop and mobile. `apps_list` / `apps_get` read the
+  registered micro-apps (manifest with appMode inputs/outputs, deps, hideWorkflow);
+  `apps_run` patches `<nodeId>.<widget>` values into the app's prompt snapshot and
+  queues it, returning a `prompt_id`; `apps_run_status` polls status and outputs;
+  `apps_import` fetches a bundle from the public registry and installs it. (#285)
+- **Grok 4.5** in the Agent Panel model catalog. (#283)
+- **`restart_comfyui` now works against a remote or tunnelled ComfyUI.** It used to
+  hard-throw in remote mode (`--comfyui-url`), so an agent pointed at a tunnelled
+  ComfyUI Desktop could not restart it — even though Desktop self-supervises and a
+  ComfyUI-Manager HTTP reboot brings it straight back. Remote mode now fires a
+  Manager reboot (`POST /v2/manager/reboot`, falling back to `GET /manager/reboot`)
+  and polls for readiness instead of refusing. (#296)
+
+#### Fixed
+- **RunPod retarget, connection and idle-stop correctness.** Switching the ComfyUI
+  target now performs the full fan-out on *every* path — queue-monitor restart,
+  agent MCP-env respawn, capability probe, host-indicator frame — after syncing the
+  closed-over URL so the hello, tool and watcher origins cannot drift apart. Adds
+  `connect: true` semantics, a LAN fallback, and download-aware idle so a pod is not
+  auto-stopped while a model download is still streaming. Closes the remaining
+  cluster from #269. (#286)
+
+
+## [0.45.0] - 2026-07-22
+
+### MCP
+
+#### Added
+- **Train a LoRA on a rented GPU (RunPod P4).** The CLI LoRA trainer now has a
+  dockerless native driver + an SSH transport that bootstraps ai-toolkit on a
+  RunPod pod (clone@pin → venv → torch cu128 → requirements), rsyncs the dataset
+  up, streams training progress back, and stops/prunes via ssh — so `train_*`
+  runs on a pod GPU with the same job-registry plumbing as local/GPU-Docker
+  training. Companion to the P1 local trainer. (#263)
+- **Dockerless local training** — `train_start` now falls back to the native
+  trainer when Docker/the image is missing, gated on a complete bootstrap, with
+  full lifecycle parity (config-scoped cancel + dead-owner recovery). (#275)
+- **`resolve_missing_models`** — one call finds every model a workflow needs but
+  the server doesn't have, and proposes VRAM-aware download candidates. Detection
+  is mapping-free (a model-looking value absent from its own ComfyUI combo is
+  missing), so it covers checkpoints, LoRAs, VAEs, ControlNets, UNets, CLIP and
+  custom-pack types alike; candidates carry size, source, precision/quant and a
+  fits/too-big verdict against real `/system_stats` VRAM. (#267)
+- **Provider model discoverability** — the api-key credential card now says which
+  model a provider is actually on (env override if set, else the pinned default)
+  and names the env var to change it, generated from the registry so it can't
+  drift. Answers "why am I not on the model I set?" for GLM/Kimi/Moonshot. (#264)
+
+#### Fixed
+- Antigravity (agy) backend hardening — no secrets at rest, ownership-aware config
+  lifecycle, turn-settlement guarantees, `--effort` support; idle-interrupt
+  poisoning, 32K argv preflight, console backend list; verified live against agy
+  1.1.5 with catalog-aware model guard. (#262, #271)
+- prefer `HF_TOKEN` over `HUGGINGFACE_TOKEN` for the Hugging Face token
+- close deferred RunPod/training/review findings (#268, #269, #273, #274, #276, #277)
+
+### RunPod image
+
+#### Fixed
+- close a live secret-leak + billing bug path on RunPod pod control (#270)
+
+### MCP
+
+#### Added
+- lean toward the docked CivitAI browser over text-only answers (#284)
+- panel_* tools to drive the CivitAI browser + training wizard (#281)
+
+#### Fixed
+- close deferred RunPod/training/codex review findings (#268/#269/#273/#274/#276/#277) (#278)
+- #271 hardening — no secrets at rest, ownership-aware config lifecycle, turn-settlement guarantees, --effort (#271)
+- review fixes — idle-interrupt poisoning, 32K argv preflight, console backend list (#262)
+- verified live against agy 1.1.5 — real MCP path + catalog-aware model guard (#262)
+- prefer HF_TOKEN over HUGGINGFACE_TOKEN for the HF token
+
+
+## [0.44.0] - 2026-07-21
+
+### RunPod image
+
+#### Added
+- broaden default GPU fallback list (A6000, RTX PRO 4500 Blackwell)
+- one-tap deploy (runpod_pod_create) + honest local⇄pod host switch
+- allow RUNPOD_API_KEY as a comfyui tool secret (panel-savable)
+- add RunPod to the panel API-Keys card (RUNPOD_API_KEY slot)
+- live status broadcast + idle auto-stop (gpu-cli-style control-panel backbone)
+- RunPod connector — manage a live pod by ID (status/start/stop/troubleshoot/connect) + referral deploy link
+
+#### Fixed
+- target port 3000 (RunPod ComfyUI convention), not 8188
+- idle auto-stop only applies to a pod we're rendering on
+- createPod falls back COMMUNITY→SECURE across GPU types
+
+### MCP
+
+#### Added
+- Antigravity CLI (agy) backend for Google subscription users (#262)
+- **`ltx-director` skill** — the LTX Director (Timeline) node's *Add Image /
+  Text / Audio* buttons are DOM-only and cannot be clicked by an agent, which
+  read as "the agent can't control this node". They only serialize into one
+  hidden `timeline_data` widget, which IS settable — so the node was always
+  drivable and only the knowledge was missing. Documents the verified schema
+  (track gates that silently ignore segments when off; `imageB64` actually
+  holding an `/api/view` URL, making image segments reachable via
+  `upload_image`; fractional pixel-space frames; the `guide_data` →
+  `LTXDirectorGuide` edge). Same pattern covers `PromptRelayEncodeTimeline`. (#265)
+
+#### Fixed
+- a Stop pressed during turn startup was silently dropped (#266)
+- foreign-run attribution + sub-tick run completions in the queue_status broadcast (#261)
+- start-failure follow-ups — rebind-safe settle, held mail, real spinner clear (#260)
+- a per-tab start failure can never self-exit the orchestrator (#253)
+- steer failure-diagnosis to diagnose_run over get_history (#246)
+
+#### Changed
+- make ~/.comfyui-mcp/.env the single canonical store for token secrets
+- provider registry for simple OpenAI api-key backends (#234)
+
+
+## [0.43.1] - 2026-07-20
+
+### MCP
+
+#### Fixed
+- **Text-preview node results are no longer invisible to the agent.** Nodes like
+  *Preview as Text* / `PreviewAny` / `ShowText` write no file — they publish into
+  the node's `ui` dict, which ComfyUI stores under `outputs[nodeId].text`. We only
+  ever harvested `images` / `videos` from history, so caption, prompt-builder and
+  other LLM-text workflows completed with **nothing for the agent to read**: it
+  would say it was going to report the text back, then have nothing to report.
+  History analysis now also extracts text, and it surfaces as `text_outputs` on
+  both `get_job_status` and the job-watcher completion record (omitted entirely
+  for image-only runs). Tolerates the shapes seen in the wild — `{text:[…]}`,
+  `{text:"…"}`, and packs that use `string` — and the parser is pinned by a
+  regression test using a payload captured verbatim from a live ComfyUI run.
+  (reported by seanmcmagic, #247)
+
+
+## [0.43.0] - 2026-07-20
+
+### MCP
+
+#### Added
+- **CLI LoRA trainer (P1) — character LoRAs on FLUX.1-dev, driven by the agent.**
+  Seven `train_*` tools (`train_list_flows`, `train_prepare_dataset`,
+  `train_start`, `train_status`, `train_cancel`, `train_build_image`,
+  `train_doctor`) wrap ostris **ai-toolkit**'s `run.py` inside a headless
+  GPU Docker image, so training is an agent-orchestrated flow rather than a
+  hardcoded UI. Includes an ai-toolkit config generator, a job registry with
+  cross-process persistence + recovery (a cancel from another process is never
+  clobbered by finalize), live step/loss/sample progress parsing, and an output
+  handoff that drops the finished `.safetensors` into `models/loras/` and
+  upserts it into the LoRA catalog. Ships the `train-character-lora` skill.
+  `train_list_flows` / `train_status` are mobile-whitelisted (read-only).
+  End-to-end proven on a 4090 (200-step character LoRA, validated in a live Flux
+  workflow); the ai-toolkit ref is pinned to the commit that run was validated
+  against. (#237)
+
+## [0.42.0] - 2026-07-20
+
+### MCP
+
+#### Fixed
+- the panel's **Blind** toggle now mechanically gates EVERY image-returning
+  tool (get_image, view_image, convert previews, …): blind tabs spawn their
+  comfyui tool server with COMFYUI_MCP_BLIND=1 and a single registration-
+  boundary wrapper replaces image blocks with an honest "withheld" note — on
+  both the full MCP surface and the compact call_tool router; toggling Blind
+  live respawns the tab's tool server at idle (panel issue #90)
+- **Gemini model catalog was dead on arrival** — both catalog entries
+  (`gemini-2.5-pro`, the default, and `gemini-2.5-flash`) now return 404 *"no
+  longer available to new users"* from Google, so every new Gemini user hit a
+  failing turn on the very first prompt. The catalog now leads with Google's
+  floating aliases (`gemini-pro-latest`, `gemini-flash-latest`) so it stops
+  rotting, plus the pinned models they currently resolve to (`gemini-3.1-pro-preview`,
+  `gemini-3.5-flash`). Default is now `gemini-pro-latest`. Verified live against
+  the Gemini API on 2026-07-20.
+- **Gemini backend auth** — on an ACP `auth_required`, the backend now selects the
+  API-key auth method (`USE_GEMINI`) when `GEMINI_API_KEY` is set, instead of
+  blindly retrying `authMethods[0]` (the Google/Code-Assist OAuth method). Google
+  retired the free "Sign in with Google" login for individuals on 2026-06-18, which
+  turned that blind retry into an infinite auth loop and took the whole backend
+  down. API keys still work; set a restricted Gemini API key (Google AI Studio) in
+  `~/.comfyui-mcp/.env`. Failure messages now point at the key path rather than a
+  dead sign-in flow.
+
+### MCP
+
+#### Added
+- diagnose_run — canvas-less 'why did my render fail?' (mobile parity with panel_view_errored_nodes) (#243)
+
+#### Fixed
+- API-key auth over stale OAuth + refresh the dead model catalog (#242)
+- Blind mechanically gates every image-returning tool (fixes comfyui-mcp-panel#90) (#245)
+
+
 ## [0.41.0] - 2026-07-20
 
 ### MCP

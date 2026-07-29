@@ -1,6 +1,6 @@
 ---
 title: "Cloud deployment (RunPod)"
-description: "Run ComfyUI on a cloud GPU pod with the Agent Panel + ComfyUI-Manager v2 preinstalled, then drive its live graph from the agent on your own machine — one command, no agent login on the box."
+description: "Deploy, connect, monitor, and stop a cloud GPU pod for ComfyUI without leaving the Agent Panel — one-tap deploy, an honest local⇄pod host switch, live cost/GPU status, and idle auto-stop. Or drive an existing pod with one command."
 icon: "cloud"
 ---
 
@@ -31,6 +31,58 @@ ComfyUI-Manager v2 are baked in, no setup:
    serves until it's ready (~30–60s ComfyUI init).
 
 Then jump to [Connect from your machine](#connect-from-your-machine).
+
+## Deploy & control it from the Agent Panel (v0.44+)
+
+Since **comfyui-mcp 0.44**, you don't have to touch the RunPod console or run a
+CLI command at all — the [Agent Panel](/panel) has a **RunPod control panel** that
+deploys, connects, monitors, and stops a pod for you, and the same control sheet
+ships in the [mobile app](/mobile).
+
+1. **Set your key once.** In the panel's **API-Keys** card, paste your
+   `RUNPOD_API_KEY`. It's stored server-side in `~/.comfyui-mcp/.env` — never in
+   the browser.
+2. **Open the RunPod control panel** from the host pill in the panel toolbar (it
+   reads **🟢 Local · your rig** to start).
+3. **Deploy or connect.** Hit **Deploy** for a one-tap pod (it routes through the
+   template's deploy link and falls back across GPU types / COMMUNITY→SECURE when
+   capacity is tight), or pick an existing pod **by name** from the dropdown and
+   **Connect**.
+4. **Watch it live.** The status card shows GPU / VRAM / uptime / **$·hr** and an
+   **idle auto-stop** countdown, and the host pill flips to **🔵 RunPod · <pod> ·
+   GPU · $/hr** — so where a render runs is never ambiguous. The agent installs
+   your custom nodes + LoRAs and downloads your models onto the pod, so you get
+   **exact canvas parity** with your local rig.
+5. **Switch back and stop.** **Use Local** retargets rendering to your own rig
+   instantly; **Stop** shuts the pod down. Idle auto-stop
+   (`RUNPOD_IDLE_STOP_MINUTES`, default 15; only counts while you're actually
+   rendering on the pod) is the cost backstop if you forget.
+
+**Dead-man switch (v0.46+).** Idle auto-stop lives in the comfyui-mcp process —
+if that process dies (crash, closed laptop), the backstop used to die with it
+and the pod billed forever. Pods **created through the connector** now carry a
+pod-side watchdog: while comfyui-mcp minds the pod it heartbeats every few
+seconds; if the beats stop, the pod **stops itself** (never terminates — your
+`/workspace` survives) after a grace period (45 min after boot with no
+heartbeat, then 20 min between beats; `RUNPOD_DEADMAN_BOOT_GRACE_S` /
+`RUNPOD_DEADMAN_BEAT_GRACE_S`). "Minding" survives **Use Local** and
+**Unwatch** — those only change what the UI shows; the watchdog fires only
+when comfyui-mcp itself is gone (or the pod exits). The watchdog stops the pod
+with the **pod-scoped API key RunPod auto-injects into every pod** — your
+account-wide key never leaves your machine, and there is nothing credential-
+wise to opt out of. Leave it unarmed with `deadman:false` on
+`runpod_pod_create` (or `RUNPOD_DEADMAN=0`), or `DEADMAN_DISABLE=1` as a pod
+env. Console-deployed pods never carry the heartbeat token, and custom-
+template deploys (`RUNPOD_TEMPLATE_ID`) default it **off** — pass
+`deadman:true` only if that image ships our watchdog.
+
+<Note>
+New to renting GPUs for ComfyUI? The blog walks the whole flow end to end:
+[Run ComfyUI on a rented cloud GPU](/blog/runpod-comfyui).
+</Note>
+
+The rest of this page is the **manual / CLI path** — still fully supported, and
+what the control panel drives under the hood.
 
 ## Connect from your machine
 
@@ -66,7 +118,11 @@ gated by a per-session random token — so it just works everywhere with no prom
 
 <Note>
 If the pod sits behind auth, set `COMFYUI_AUTH_TOKEN` (plus optional
-`COMFYUI_AUTH_HEADER` / `COMFYUI_AUTH_SCHEME`) on the local `connect` command.
+`COMFYUI_AUTH_HEADER` / `COMFYUI_AUTH_SCHEME`) on the local `connect` command. For a
+pod fronted by **Cloudflare Access**, create an Access **service token** and set
+`CF_ACCESS_CLIENT_ID` + `CF_ACCESS_CLIENT_SECRET` — both ride every ComfyUI request
+(HTTP + the queue-watcher WebSocket), so the connector passes the gate while the
+human sign-in page stays up for browsers.
 </Note>
 
 ### Keep everything on your machine (no Cloudflare)

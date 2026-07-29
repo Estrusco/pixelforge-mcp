@@ -66,3 +66,14 @@ orch.err.log
 
 # Beads / Dolt files (added by bd init)
 .beads/proxieddb/
+
+# Dev-only docs untracked upstream — CLAUDE.md/AGENTS.md stay tracked in this
+# fork (see CLAUDE.md's "PixelForge MCP" section), the rest are upstream's own
+# stale duplicates we never carried forward.
+/GEMINI.md
+/TODO.md
+/PACK-SPLIT-STATUS.md
+/design/embedded-agent-panel.md
+/design/mobile-agent-client.md
+/design/remote-and-cloud-modes.md
+/blog/comfyui-mcp-tdqs-case-study.md

@@ -17,6 +17,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 import { platform, release, totalmem, cpus } from "node:os";
 import { join } from "node:path";
 import { isForceRemoteFlagSet } from "../config.js";
@@ -48,6 +49,8 @@ export interface EnvCapabilities {
   sageattention?: TriState;
   backend?: "Claude" | "Codex" | "Gemini"; // active provider (human label)
   otherBackendAvailable?: boolean; // is the OTHER provider resolvable?
+  mcpVersion?: string; // comfyui-mcp package version, e.g. "0.48.4"
+  panelVersion?: string; // sidebar panel version from the panel's hello, e.g. "0.11.3" / "nightly"
 }
 
 // Shape of the bits of /system_stats we read (mirrors get_environment).
@@ -155,7 +158,7 @@ async function probeManagerGeneration(
 ): Promise<"v4" | "legacy" | "unknown"> {
   const probe = async (path: string): Promise<boolean> => {
     try {
-      const res = await fetch(new URL(path, comfyuiUrl), {
+      const res = await comfyuiFetch(new URL(path, comfyuiUrl), {
         signal: AbortSignal.timeout(timeoutMs),
       });
       return res.ok;
@@ -198,7 +201,7 @@ async function fetchSystemStats(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
   try {
-    const res = await fetch(`${base}/system_stats`, { signal: controller.signal });
+    const res = await comfyuiFetch(`${base}/system_stats`, { signal: controller.signal });
     if (!res.ok) return undefined;
     return (await res.json()) as SystemStatsLike;
   } catch {
@@ -462,6 +465,10 @@ export interface GatherOptions {
   comfyuiPath?: string;
   /** "claude" | "codex" — the active PANEL_AGENT_BACKEND. */
   backendId?: string;
+  /** comfyui-mcp package version (caller supplies; kept out of this module). */
+  mcpVersion?: string;
+  /** Sidebar panel version, learned from the panel's `hello` frame. */
+  panelVersion?: string;
   /** Override probe timeouts (tests). */
   statsTimeoutMs?: number;
   tritonTimeoutMs?: number;
@@ -469,6 +476,10 @@ export interface GatherOptions {
 
 export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCapabilities> {
   const caps: EnvCapabilities = {};
+
+  // --- our own build versions (caller-supplied; panel version rides the hello) ---
+  caps.mcpVersion = opts.mcpVersion;
+  caps.panelVersion = opts.panelVersion;
 
   // --- cheap, synchronous local machine facts (node os) ---
   caps.os = friendlyOs();
@@ -616,6 +627,14 @@ export function formatEnvBlock(caps: EnvCapabilities): string {
     const otherClause = caps.otherBackendAvailable ? "; other providers available" : "";
     parts.push(`Backend: ${caps.backend}${otherClause}`);
   }
+
+  // Our own build versions — so the agent can stamp them into bug reports without
+  // digging (report-bug skill requires both).
+  const versions = [
+    caps.mcpVersion && `comfyui-mcp ${caps.mcpVersion}`,
+    caps.panelVersion && `panel ${caps.panelVersion}`,
+  ].filter(Boolean);
+  if (versions.length) parts.push(versions.join(" · "));
 
   if (parts.length === 0) return "";
 

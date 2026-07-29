@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**108 MCP tools** | **32 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **13 installer packs** | **11 slash commands** | **4 autonomous agents** | **4 hooks**
+**181 MCP tools** | **35 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -119,7 +119,7 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 
 ### Built-in skills
 
-32 skills total — model-family guides (Flux, WAN, LTX 2.3, Qwen, Z-Image, Ideogram 4, ERNIE, ANIMA + anime / WAN / Z-Image LoRA training), the **model-registry** (curated download URLs), the **civitai** pairing skill, node authoring, the **launch/performance-flags** matrix, and the core four below. Full list on the [plugin docs page](https://comfyui-mcp.artokun.io/docs/plugin).
+35 skills total — model-family guides (Flux, WAN, LTX 2.3, Qwen, Z-Image, Ideogram 4, ERNIE, ANIMA + anime / WAN / Z-Image LoRA training), the **model-registry** (curated download URLs), the **civitai** pairing skill, node authoring, the **launch/performance-flags** matrix, and the core four below. Full list on the [plugin docs page](https://comfyui-mcp.artokun.io/docs/plugin).
 
 > **Installer packs.** [`packs/`](packs/) bundles 13 one-command ComfyUI setups — ANIMA, Ideogram 4, LTX-2.3, ERNIE, WAN (animate / longer-videos / transparent), Qwen (image / image-edit), Z-Image (turbo / base / xy-plot) and artokun-flow (WAN Animate — replace / animate). Each is a manifest of custom nodes + model URLs + workflow that drives both `apply_manifest` and generated `install-windows.bat` / `install-runpod.sh`, with CI that validates every model link + payload size. See [`packs/README.md`](packs/README.md).
 
@@ -203,6 +203,14 @@ of asking the ComfyUI host to spawn an orchestrator it can't run.)
 - **`CodexBackend`** — OpenAI Codex over the **`codex app-server`** JSON-RPC
   protocol (`@openai/codex`), on the ChatGPT subscription (`codex login`, no key).
 
+Further adapters follow the same port — Gemini CLI (ACP), **Antigravity
+(`agy`, the Google AI Pro/Ultra subscription path — install from
+[antigravity.google](https://antigravity.google) and run `agy` once to sign
+in)**, Grok, Kimi, GLM, Ollama/LM Studio/llama.cpp (local), OpenRouter, and
+any OpenAI-compatible endpoint. See
+[docs/backends](https://comfyui-mcp.artokun.io/docs/backends) for the full
+matrix.
+
 Both are optional dependencies, and the panel picks a **provider, not a port** —
 each backend runs its own orchestrator on its own loopback bridge port. A
 capability matrix lets the panel degrade gracefully (e.g. conversation-rollback is
@@ -236,7 +244,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-108 tools across workflow execution, generation, iteration, composition, models, and more:
+181 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 

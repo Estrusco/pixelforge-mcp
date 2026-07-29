@@ -13,7 +13,9 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readOAuthStatus } from "../services/code-provider-auth.js";
+import { resolveAgyBin } from "./antigravity-backend.js";
 import type { OAuthStatusRecord } from "../services/panel-secrets.js";
+import { simpleKeyProvider } from "../services/openai-provider-registry.js";
 
 export type BackendReadiness = {
   backend: string;
@@ -170,14 +172,16 @@ export function backendReadiness(
     const auth = fileExists(home, ".codex", "auth.json");
     return { backend: "chatgpt", cli: true, auth, ready: !!auth };
   }
-  if (b === "glm") {
-    const apiKey =
-      process.env.ZAI_API_KEY?.trim() ||
-      process.env.GLM_API_KEY?.trim() ||
-      process.env.ZHIPUAI_API_KEY?.trim() ||
-      process.env.ZHIPU_API_KEY?.trim();
-    const auth = !!apiKey;
-    return { backend: "glm", cli: true, auth, ready: auth };
+  const simpleKeyReg = simpleKeyProvider(b);
+  if (simpleKeyReg) {
+    // Simple OpenAI-compatible api-key providers (glm, moonshot, …) — hosted, no
+    // CLI. Readiness = one of the provider's env keys is set (a bad key still
+    // surfaces via the connect ack's model probe → degraded). Derived from the
+    // openai-provider-registry so a new such provider needs no branch here.
+    // `kimi` is deliberately EXCLUDED (simpleKeyAuth=false): its dual OAuth-or-
+    // KIMI_API_KEY readiness is kept bespoke just below.
+    const auth = simpleKeyReg.envKeys.some((k) => !!process.env[k]?.trim());
+    return { backend: b, cli: true, auth, ready: auth };
   }
   if (b === "kimi") {
     const apiKey = process.env.KIMI_API_KEY?.trim();
@@ -186,13 +190,6 @@ export function backendReadiness(
     const auth = !!apiKey || oauth;
     return { backend: "kimi", cli: true, auth, ready: auth };
   }
-  if (b === "moonshot") {
-    // Moonshot platform (Kimi K3) — hosted, no CLI. Readiness = MOONSHOT_API_KEY
-    // in the orchestrator's env (a bad key still surfaces via the connect ack's
-    // model probe → degraded). Distinct from `kimi` (Kimi Code subscription).
-    const auth = !!process.env.MOONSHOT_API_KEY?.trim();
-    return { backend: "moonshot", cli: true, auth, ready: auth };
-  }
   if (b === "gemini") {
     const cli = onPath(CLI_NAMES.gemini);
     // The gemini CLI caches its Google OAuth at <home>/.gemini/oauth_creds.json
@@ -200,6 +197,17 @@ export function backendReadiness(
     const geminiHome = process.env.GEMINI_CLI_HOME || home;
     const auth = fileExists(geminiHome, ".gemini", "oauth_creds.json");
     return { backend: "gemini", cli, auth, ready: cli && auth };
+  }
+  if (b === "antigravity") {
+    // Antigravity CLI (`agy`, issue #262) — Google subscription (AI Pro/Ultra).
+    // Auth lives in the system keyring, which we deliberately do NOT read
+    // (per #262: no token extraction) — so auth is UNKNOWN (null, don't nag)
+    // when the CLI is present; the real auth signal is the connect ack's
+    // `agy models` probe, which degrades with sign-in guidance when it fails.
+    // resolveAgyBin covers COMFYUI_MCP_ANTIGRAVITY_PATH, PATH, and the official
+    // installers' well-known locations (%LOCALAPPDATA%\agy\bin, ~/.local/bin).
+    const cli = !!resolveAgyBin(home);
+    return { backend: "antigravity", cli, auth: cli ? null : false, ready: cli };
   }
   if (b === "grok") {
     const cli = onPath(CLI_NAMES.grok);

@@ -27,6 +27,7 @@ import { z } from "zod";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -82,6 +83,49 @@ function fail(err: unknown): ToolResult {
 }
 
 const slotRef = z.union([z.string(), z.number().int().min(0)]);
+
+// CivitAI browsing-level bitmask values: PG=1, PG-13=2, R=4, X=8, XXX=16.
+const KNOWN_BROWSING_LEVELS = [1, 2, 4, 8, 16];
+// R/X/XXX are adult and gated behind the persistent NSFW consent (getNsfwConsent()).
+const ADULT_BROWSING_LEVELS = [4, 8, 16];
+
+/**
+ * SERVER-SIDE enforcement of the persistent NSFW consent gate on any
+ * agent-supplied browsing levels. The agent can pass arbitrary bitmask values;
+ * this walls them before they reach the panel so adult content is never
+ * surfaced without consent (matching panel_get_content_mode / the consent gate).
+ *
+ * - Rejects unknown levels (not in the PG..XXX enum).
+ * - Rejects a supplied-but-empty array.
+ * - When consent is NOT granted, strips R/X/XXX (4/8/16); if that leaves nothing,
+ *   THROWS so the agent gets an honest, actionable error instead of silent SFW.
+ * - Returns the sanitized, de-duped levels, or undefined when none were supplied
+ *   (preserving the panel's own default, currently [1] = PG).
+ */
+function sanitizeBrowsingLevels(levels: unknown): number[] | undefined {
+  if (levels === undefined || levels === null) return undefined;
+  if (!Array.isArray(levels) || levels.length === 0) {
+    throw new Error(
+      "browsingLevels must be a non-empty array of level values (PG=1, PG-13=2, R=4, X=8, XXX=16).",
+    );
+  }
+  const nums = levels.map((l) => Number(l));
+  for (const n of nums) {
+    if (!KNOWN_BROWSING_LEVELS.includes(n)) {
+      throw new Error(
+        `Unknown browsing level ${String(n)}. Allowed: 1 (PG), 2 (PG-13), 4 (R), 8 (X), 16 (XXX).`,
+      );
+    }
+  }
+  if (getNsfwConsent().allowed) return [...new Set(nums)];
+  const safe = [...new Set(nums.filter((n) => !ADULT_BROWSING_LEVELS.includes(n)))];
+  if (safe.length === 0) {
+    throw new Error(
+      "Adult content (R/X/XXX) requires consent, which the user hasn't granted. Call panel_request_adult_consent first, or request SFW levels only (PG=1, PG-13=2).",
+    );
+  }
+  return safe;
+}
 
 // ---- server-side pack workflow resolution (for panel_load_workflow) --------
 // Read a bundled pack's UI workflow.json on the SERVER so the (large) graph
@@ -241,6 +285,21 @@ export interface PanelToolCtx {
   tabId: string;
   /** Per-tab workflow pin store (optional for tests). */
   workflowTarget?: WorkflowTargetStore;
+  /**
+   * EXPLICIT self-heal: re-point THIS session at the currently active/sole
+   * connected tab. The tabId captured at session creation is frozen; a full
+   * ComfyUI reconnect (#332), a frontend reload (#322), or switching to a
+   * different workflow FILE (#331) can surface a brand-NEW browser socket under
+   * a NEW tab id with no migration alias, orphaning the session so every
+   * panel_* call throws `no connected tab`. This rebinds `ctx.tabId` (which
+   * `call`/`confirm` read LIVE) to the active tab — but ONLY when the current
+   * tabId no longer reaches a live tab, so a healthy (possibly multi-tab)
+   * session is never disturbed. It is the deliberate consent signal wired into
+   * panel_set_workflow_target({mode:"current"}) and panel_reload — NOT baked
+   * into resolveTarget. Throws (clear message) when a single active tab can't be
+   * determined. Optional so lightweight test contexts can omit it.
+   */
+  rebindToActiveTab?: () => { previous: string; current: string; rebound: boolean };
 }
 
 /** Build a tab-bound execution context shared by both transports. */
@@ -249,11 +308,20 @@ export function makePanelToolCtx(
   tabId: string,
   workflowTargets?: WorkflowTargetStore,
 ): PanelToolCtx {
+  // The routing tab id is held on the returned ctx object (NOT captured by
+  // value) so an explicit rebind can re-point this session in place: call/
+  // confirm and every handler read `ctx.tabId` LIVE. See rebindToActiveTab.
+  const ctx = {
+    bridge,
+    tabId,
+    workflowTarget: workflowTargets,
+  } as PanelToolCtx;
+
   const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
     try {
-      const target = workflowTargets?.get(tabId);
+      const target = workflowTargets?.get(ctx.tabId);
       const routed = target ? withWorkflowTarget(cmd, target) : cmd;
-      return ok(await bridge.send(routed as { cmd: string }, { tabId, timeoutMs }));
+      return ok(await bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs }));
     } catch (err) {
       return fail(err);
     }
@@ -276,14 +344,38 @@ export function makePanelToolCtx(
             { label: "No, cancel", description: "" },
           ],
         } as { cmd: string },
-        { tabId, timeoutMs: 300000 },
+        { tabId: ctx.tabId, timeoutMs: 300000 },
       );
       return isAffirmative(reply);
     } catch {
       return false;
     }
   };
-  return { call, confirm, bridge, tabId, workflowTarget: workflowTargets };
+
+  // EXPLICIT self-heal — see PanelToolCtx.rebindToActiveTab. Only rebinds when
+  // the current tabId is genuinely orphaned (no live tab reachable); a healthy
+  // session is left untouched so this never hijacks routing on a multi-tab
+  // deployment. Throws (clear message, via resolveActiveTabId) when a single
+  // active tab can't be picked.
+  const rebindToActiveTab = (): { previous: string; current: string; rebound: boolean } => {
+    const previous = ctx.tabId;
+    if (bridge.canReach(previous)) return { previous, current: previous, rebound: false };
+    const current = bridge.resolveActiveTabId(); // throws if no single active tab
+    // Carry a pinned workflow target across to the new tab id so a pinned
+    // session keeps its pin after self-healing.
+    const pinned = workflowTargets?.get(previous);
+    if (workflowTargets && pinned && pinned.mode === "pinned") {
+      workflowTargets.clear(previous);
+      workflowTargets.set(current, pinned);
+    }
+    ctx.tabId = current;
+    return { previous, current, rebound: true };
+  };
+
+  ctx.call = call;
+  ctx.confirm = confirm;
+  ctx.rebindToActiveTab = rebindToActiveTab;
+  return ctx;
 }
 
 /**
@@ -918,8 +1010,22 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .optional()
           .describe("'orchestrator' (default): respawn the agent for new backend code. 'frontend': reload the panel UI for new web code."),
       },
-      async (args: A, ctx) =>
-        ctx.call({ cmd: "soft_reload", scope: (args.scope as string) ?? "orchestrator" }, 15000),
+      async (args: A, ctx) => {
+        // panel_reload is an explicit "recover me now" signal — if THIS session's
+        // tab id was orphaned by a reconnect/reload/workflow-switch, self-heal it
+        // onto the active tab first so a stuck session can recover by calling this
+        // (and so the soft_reload frame actually reaches a live tab). A healthy
+        // session is left untouched; an ambiguous multi-tab case surfaces a clear
+        // error rather than guessing.
+        if (ctx.rebindToActiveTab) {
+          try {
+            ctx.rebindToActiveTab();
+          } catch (err) {
+            return fail(err);
+          }
+        }
+        return ctx.call({ cmd: "soft_reload", scope: (args.scope as string) ?? "orchestrator" }, 15000);
+      },
     ),
     def(
       "panel_list_mcp",
@@ -1149,7 +1255,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_open_civitai",
-      "Open the in-panel CivitAI browser for the user, pre-seeded with a search term and suggested filters, so they can VISUALLY browse and pick a model / LoRA / checkpoint / workflow / image. Use this whenever the user wants to find or choose a resource on CivitAI: set a helpful query + filters matched to their goal (including the browsing level), and they pick. Their selection comes back to you as a normal chat message — UNLESS the panel is muted, in which case they download it directly themselves. Prefer this over guessing a specific model or asking them to paste a URL.",
+      "Open the in-panel CivitAI browser for the user, pre-seeded with a search term and suggested filters, so they can VISUALLY browse and pick a model / LoRA / checkpoint / workflow / image. When the user asks about — or you're recommending — specific CivitAI models/LoRAs/checkpoints (e.g. 'what's a good relight LoRA?'), PREFER opening this docked browser and highlighting your picks over a text-only answer: it docks beside the chat (dock defaults true) so chat and results stay visible together, and it lets the user SEE the actual cards instead of reading a table. Typical show-don't-tell flow: panel_open_civitai (docked) → panel_civitai_search to refine → panel_civitai_results to READ the metadata + URLs → panel_civitai_highlight the one(s) you recommend, with a brief text summary of why. Set a helpful query + filters matched to their goal (including the browsing level). Their selection comes back to you as a normal chat message — UNLESS the panel is muted, in which case they download it directly themselves. Prefer this over guessing a specific model or asking them to paste a URL.",
       {
         query: z
           .string()
@@ -1162,7 +1268,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         browsingLevels: z
           .array(z.number())
           .optional()
-          .describe("Content levels to show, as a set of bitmask values: PG=1, PG-13=2, R=4, X=8, XXX=16. e.g. [1,2] for SFW only, [1,2,4,8,16] for everything. Default [1]. Match the user's stated comfort."),
+          .describe("Content levels to show, as a set of bitmask values: PG=1, PG-13=2, R=4, X=8, XXX=16. e.g. [1,2] for SFW only, [1,2,4,8,16] for everything. Default [1]. Match the user's stated comfort. Adult levels (R/X/XXX = 4/8/16) are enforced server-side against the persistent NSFW consent gate and stripped/rejected unless the user has consented (panel_request_adult_consent)."),
         filters: z
           .object({
             period: z.string().optional(),
@@ -1172,18 +1278,174 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           })
           .optional()
           .describe("Optional filter hints: period, a sort, and base-model names (e.g. ['Flux.1 D'])."),
+        dock: z
+          .boolean()
+          .optional()
+          .describe(
+            "Side-dock the browser beside the chat instead of a centered overlay, so chat and results stay visible together while you drive it. Default true (agent-opened browsers dock). Set false to force the old full-screen centered overlay.",
+          ),
       },
-      async (args: A, ctx) =>
-        ctx.call(
-          {
-            cmd: "open_civitai",
-            query: args.query,
-            tab: args.tab,
-            browsingLevels: args.browsingLevels,
-            filters: args.filters,
-          },
-          10000,
-        ),
+      async (args: A, ctx) => {
+        try {
+          const browsingLevels = sanitizeBrowsingLevels(args.browsingLevels);
+          return await ctx.call(
+            {
+              cmd: "open_civitai",
+              query: args.query,
+              tab: args.tab,
+              browsingLevels,
+              filters: args.filters,
+              dock: args.dock,
+            },
+            10000,
+          );
+        } catch (err) {
+          return fail(err);
+        }
+      },
+    ),
+    def(
+      "panel_civitai_results",
+      "READ the CivitAI browser's CURRENT results as text (metadata + media URLs only — you will NOT be shown the images; you reason from the text and pick which URLs matter). This is the READ step of the show-don't-tell flow: rather than answering a 'good X model/LoRA?' question purely in a text table, open the docked browser, read the real results here, then panel_civitai_highlight your picks so the user SEES the cards. Open the browser first with panel_open_civitai. Returns { items, total, loading }. Each item carries EXACTLY these fields and nothing else — a MEDIA item is { id, kind:'image'|'video', title:null, creator, baseModel, type, stats:{ reactions }, prompt (length-capped ~600 chars), urls:[] }; a MODEL item is { id, kind:'model', title (the model's name), creator, baseModel, type, stats:{ downloadCount, thumbsUp }, prompt:null, urls:[] }. Note: stats is a NESTED object (reactions for media; downloadCount+thumbsUp for models), urls is an ARRAY of media URL(s), and media items have title:null while models have prompt:null. Model descriptions are NOT included (they require a separate detail fetch) — do not expect them. Use this to see what's on screen before you highlight, switch tabs, or open the lightbox. `loading:true` means a fetch is still in flight and the panel is reporting what it has so far. The browser must be open — otherwise the panel replies with an honest error.",
+      {
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Max results to serialize (1–50, default 20). The grid is ordered as shown to the user."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "civitai_results", limit: args.limit }, 10000),
+    ),
+    def(
+      "panel_civitai_highlight",
+      "Draw the user's attention to specific results by wrapping their cards in a glowing green outline (and scrolling the first into view) — this is how you say 'these are the ones I mean.' This is the PAYOFF of the show-don't-tell flow: when you recommend a CivitAI model/LoRA/checkpoint, highlight it here (plus a short text note on why) instead of only describing it in prose — the user then sees exactly which cards you mean. Call panel_civitai_results FIRST to get the ids. Pass a LIST of ids to light up several at once ('these three'). The browser must be open — otherwise the panel replies with an honest error. Non-destructive; it only changes what's highlighted, never downloads or selects.",
+      {
+        ids: z
+          .array(z.union([z.string(), z.number()]))
+          .min(1)
+          .describe("Result ids to glow green (from panel_civitai_results). Pass several to highlight a set."),
+        kind: z
+          .enum(["media", "model"])
+          .optional()
+          .describe("Which result kind these ids refer to (media = images/videos, model = checkpoints/loras/workflows). Match the active tab if omitted."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "civitai_highlight", ids: args.ids, kind: args.kind }, 10000),
+    ),
+    def(
+      "panel_civitai_clear_highlight",
+      "Remove any green highlight glow from the CivitAI results — clears what panel_civitai_highlight set. The browser must be open — otherwise the panel replies with an honest error.",
+      {},
+      async (_args: A, ctx) => ctx.call({ cmd: "civitai_clear_highlight" }, 10000),
+    ),
+    def(
+      "panel_civitai_switch_tab",
+      "Switch the OPEN CivitAI browser to a different tab (crossfades and re-fetches that tab's results). Use to move between images, videos, checkpoints, loras, workflows, or the user's favorites while driving the browse. Follow with panel_civitai_results to read what loaded. The browser must be open — otherwise the panel replies with an honest error.",
+      {
+        tab: z
+          .enum(["images", "videos", "checkpoints", "loras", "workflows", "favorites"])
+          .describe("The tab to switch to."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "civitai_switch_tab", tab: args.tab }, 10000),
+    ),
+    def(
+      "panel_civitai_search",
+      "Run a NEW search inside the already-open CivitAI browser (re-queries the current tab with a fresh term and optional filters). Use this to refine or pivot the browse after reading results — e.g. narrow by base model or change the sort — while keeping the recommendation VISUAL: this is a step in the show-don't-tell flow, so drive the docked browser toward the models/LoRAs you'll recommend rather than dropping back to a text-only list. Follow with panel_civitai_results to read the new results, then panel_civitai_highlight your picks. To open the browser in the first place, use panel_open_civitai instead. The browser must be open — otherwise the panel replies with an honest error.",
+      {
+        query: z.string().describe("The new search term (e.g. 'ghibli background', 'Flux portrait')."),
+        filters: z
+          .object({
+            period: z.string().optional().describe("Time window filter (e.g. 'Week', 'Month', 'AllTime')."),
+            modelSort: z.string().optional().describe("Sort for model tabs (e.g. 'Most Downloaded')."),
+            imageSort: z.string().optional().describe("Sort for image/video tabs (e.g. 'Most Reactions')."),
+            baseModels: z.array(z.string()).optional().describe("Base-model names to filter to (e.g. ['Flux.1 D'])."),
+          })
+          .optional()
+          .describe("Optional filters applied to this search."),
+        browsingLevels: z
+          .array(z.number())
+          .optional()
+          .describe("Content levels for this search, as bitmask values: PG=1, PG-13=2, R=4, X=8, XXX=16. Omit to keep the browser's current levels. Adult levels (R/X/XXX = 4/8/16) are enforced server-side against the persistent NSFW consent gate and stripped/rejected unless the user has consented (panel_request_adult_consent)."),
+      },
+      async (args: A, ctx) => {
+        try {
+          const browsingLevels = sanitizeBrowsingLevels(args.browsingLevels);
+          return await ctx.call(
+            { cmd: "civitai_search", query: args.query, filters: args.filters, browsingLevels },
+            10000,
+          );
+        } catch (err) {
+          return fail(err);
+        }
+      },
+    ),
+    def(
+      "panel_civitai_open_lightbox",
+      "Open the full-size lightbox viewer for one result by id, so the user gets a big look at that specific image/video. Get the id from panel_civitai_results. Use sparingly — as the finishing flourish after you've highlighted your pick. The browser must be open — otherwise the panel replies with an honest error.",
+      {
+        id: z
+          .union([z.string(), z.number()])
+          .describe("The result id to open in the lightbox (from panel_civitai_results)."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "civitai_open_lightbox", id: args.id }, 10000),
+    ),
+    def(
+      "panel_training_open",
+      "Open the in-panel LoRA/model TRAINING wizard for the user, so they can configure a training run visually while you guide them. Opens side-docked beside the chat by default so the wizard and chat stay visible together. After it's open, read it with panel_training_get_state and drive it with panel_training_set_field, panel_training_goto_step, panel_training_set_target, and panel_training_highlight. This only OPENS and configures the wizard — you have NO command to start a run; the user reviews the setup and launches training themselves from the wizard's Launch control.",
+      {
+        dock: z
+          .boolean()
+          .optional()
+          .describe("Side-dock the wizard beside chat (default true). Set false for the centered overlay."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "open_training", dock: args.dock }, 10000),
+    ),
+    def(
+      "panel_training_get_state",
+      "READ the OPEN training wizard's current state so you can drive it SAFELY. Returns the current view/step, which transitions are allowed right now (so you know if a step's prerequisites are met), the current field values, target availability (e.g. whether a remote pod is SSH-ready), and any async/loading status. Call this BEFORE panel_training_goto_step or panel_training_set_target — the wizard enforces the same gates as its own buttons and will reject a premature move, so check readiness here first. Open the wizard first with panel_training_open. The wizard must be open — otherwise the panel replies with an honest error.",
+      {},
+      async (_args: A, ctx) => ctx.call({ cmd: "training_get_state" }, 10000),
+    ),
+    def(
+      "panel_training_set_field",
+      "Set one field in the OPEN training wizard. The panel applies a strict per-field ALLOWLIST — the ONLY accepted `name` values are: 'datasetName' (string — the LoRA/dataset name), 'trigger' (string — the trigger word), 'preset' (one of 'smoke' | 'standard' | 'custom'), and 'target' (one of 'local' | 'pod', same as panel_training_set_target). Any other name is rejected server-side. There is NO learning-rate/step-count/base-model/dataset-path field here — those come from the chosen preset. Open the wizard first with panel_training_open. This configures only — you have no command to launch training. The wizard must be open — otherwise the panel replies with an honest error.",
+      {
+        name: z
+          .enum(["datasetName", "trigger", "preset", "target"])
+          .describe("The wizard field to set. Only these four are accepted; anything else is rejected."),
+        value: z
+          .union([z.string(), z.number(), z.boolean()])
+          .describe("The value: datasetName/trigger are strings; preset is 'smoke'|'standard'|'custom'; target is 'local'|'pod'."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "training_set_field", name: args.name, value: args.value }, 10000),
+    ),
+    def(
+      "panel_training_goto_step",
+      "Navigate the OPEN training wizard to one of its four steps (1-based): 1 = dataset (gather images), 2 = label (caption them), 3 = launch (choose target + start), 4 = monitor (watch progress). Move the user forward/back as you explain each stage. This enforces the SAME gates as the wizard's Next button (backend capability, a valid name, uploads settled, images present); if the step's prerequisites aren't met the panel rejects it and throws honestly, so call panel_training_get_state first to check readiness. Open the wizard first with panel_training_open. The wizard must be open — otherwise the panel replies with an honest error.",
+      {
+        step: z.number().int().min(1).max(4).describe("The step to jump to: 1=dataset, 2=label, 3=launch, 4=monitor."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "training_goto_step", step: args.step }, 10000),
+    ),
+    def(
+      "panel_training_set_target",
+      "Set WHERE the training run will execute — 'local' (this machine) or 'pod' (a remote GPU pod). Use this in the wizard to steer the user toward the right compute for their job. Choosing 'pod' runs the same preflight as the wizard's own button (a train_doctor check) and is REJECTED if there is no SSH-ready pod — call panel_training_get_state first to confirm pod availability. Open the wizard first with panel_training_open. This only configures the target; you have no command to launch the run. The wizard must be open — otherwise the panel replies with an honest error.",
+      {
+        target: z.enum(["local", "pod"]).describe("Execution target: 'local' machine or remote 'pod'."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "training_set_target", target: args.target }, 10000),
+    ),
+    def(
+      "panel_training_highlight",
+      "Draw the user's attention to specific parts of the OPEN training wizard (steps or fields) with a glowing green outline — this is how you point at 'set this here.' Pass a LIST of refs to light up several. Open the wizard first with panel_training_open. Non-destructive. The wizard must be open — otherwise the panel replies with an honest error.",
+      {
+        refs: z
+          .array(z.string())
+          .min(1)
+          .describe("Wizard step/field refs to glow green (as the wizard labels them). Pass several to highlight a set."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "training_highlight", refs: args.refs }, 10000),
     ),
     def(
       "panel_ask",
@@ -1241,7 +1503,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_workflow_target",
-      "Pin the agent to a specific open workflow tab, or release the pin to follow the user's current tab. Use pinned when the user asks you to work on workflow A while they browse workflow B — set mode:'pinned' and path from panel_list_workflows. Set mode:'current' (or omit path) to follow the active tab again. Does NOT switch what the user sees; it only routes your panel_* graph edits.",
+      "Pin the agent to a specific open workflow tab, or release the pin to follow the user's current tab. Use pinned when the user asks you to work on workflow A while they browse workflow B — set mode:'pinned' and path from panel_list_workflows. Set mode:'current' (or omit path) to follow the active tab again. Does NOT switch what the user sees; it only routes your panel_* graph edits. mode:'current' is ALSO the explicit RECOVERY signal: if your panel_* calls started failing with `no connected tab` after ComfyUI reconnected, the panel reloaded, or the user switched to a different workflow FILE, call this with mode:'current' to rebind this session onto the tab that's live now.",
       {
         mode: z
           .enum(["current", "pinned"])
@@ -1262,13 +1524,29 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (mode === "pinned" && !(path ?? "").trim()) {
           return fail("Provide path when pinning — use panel_list_workflows to list open workflows.");
         }
+        // mode:'current' is the explicit, user/agent-initiated "rebind me to the
+        // tab that's live now" consent signal. Self-heal a session whose captured
+        // tab id was orphaned (reconnect/reload/workflow-switch) BEFORE writing the
+        // pin store, so subsequent panel_* calls route to the live tab. Surfaces a
+        // clear error if a single active tab can't be determined.
+        let rebindNote = "";
+        if (mode === "current" && ctx.rebindToActiveTab) {
+          try {
+            const { previous, current, rebound } = ctx.rebindToActiveTab();
+            if (rebound) {
+              rebindNote = ` Rebound this session from tab ${previous.slice(0, 8)} onto the active tab ${current.slice(0, 8)}.`;
+            }
+          } catch (err) {
+            return fail(err);
+          }
+        }
         const target = ctx.workflowTarget.set(ctx.tabId, { mode, path, filename });
         ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
         const hint =
           target.mode === "pinned"
             ? `Pinned to "${target.filename ?? target.path}". Graph tools will target that workflow without switching the user's view.`
             : "Following the user's current workflow tab.";
-        return ok({ ...target, note: hint });
+        return ok({ ...target, note: hint + rebindNote });
       },
     ),
     def(
@@ -1755,7 +2033,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 const base = (process.env.COMFYUI_URL ?? "http://127.0.0.1:8188").replace(/\/+$/, "");
                 const qs = new URLSearchParams({ filename: src.filename, type: src.type ?? "output" });
                 if (src.subfolder) qs.set("subfolder", src.subfolder);
-                const resp = await fetch(`${base}/view?${qs.toString()}`);
+                const resp = await comfyuiFetch(`${base}/view?${qs.toString()}`);
                 if (resp.ok) {
                   const mime = resp.headers.get("content-type") ?? "";
                   const buf = Buffer.from(await resp.arrayBuffer());

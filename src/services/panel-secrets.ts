@@ -21,6 +21,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
+import { OPENAI_KEY_PROVIDERS, providerModelHint } from "./openai-provider-registry.js";
 
 interface PanelSecrets {
   /** Env vars injected into the built-in comfyui MCP server's spawn env. */
@@ -66,6 +67,7 @@ export const COMFYUI_SECRET_ENV_ALLOWLIST = [
   "GOOGLE_GENERATIVE_AI_API_KEY",
   "GOOGLE_API_KEY",
   "RUNCOMFY_API_KEY",
+  "RUNPOD_API_KEY",
   "REGISTRY_ACCESS_TOKEN",
 ] as const;
 
@@ -82,16 +84,14 @@ export function isAllowedComfyuiSecretKey(key: string): boolean {
 // the same allowlist discipline so a corrupt file can't set arbitrary env.
 //   OPENROUTER_API_KEY → the OpenRouter provider backend (OllamaBackend openai)
 //   COMFYUI_MCP_CUSTOM_API_KEY → the user-defined Custom endpoint provider
-export const AGENT_SECRET_ENV_ALLOWLIST = [
+// The registry providers' keys (GLM_API_KEY/ZHIPU*/ZAI_API_KEY, KIMI_API_KEY,
+// MOONSHOT_API_KEY) are DERIVED from openai-provider-registry so a new api-key
+// provider is allowlisted by adding one registry entry, not editing this array.
+export const AGENT_SECRET_ENV_ALLOWLIST: readonly string[] = [
   "OPENROUTER_API_KEY",
   "COMFYUI_MCP_CUSTOM_API_KEY",
-  "GLM_API_KEY",
-  "ZHIPU_API_KEY",
-  "ZHIPUAI_API_KEY",
-  "ZAI_API_KEY",
-  "KIMI_API_KEY",
-  "MOONSHOT_API_KEY",
-] as const;
+  ...OPENAI_KEY_PROVIDERS.flatMap((p) => p.envKeys),
+];
 const AGENT_ALLOWLIST_SET = new Set<string>(AGENT_SECRET_ENV_ALLOWLIST);
 
 /** Is `key` a permitted orchestrator agent-secret env var? */
@@ -145,6 +145,156 @@ function write(secrets: PanelSecrets): void {
   } catch {
     /* chmod is a no-op on Windows; ignore */
   }
+}
+
+// ── Canonical env-secret store: ~/.comfyui-mcp/.env ─────────────────────────
+// The SINGLE source of truth for flat API-token secrets (RUNPOD/CIVITAI/HF/…).
+// config.ts loads this file into process.env at boot for BOTH the orchestrator
+// and every spawned comfyui-mcp agent, so a token here reaches everywhere with
+// no separate injection. (Structured OAuth login state stays in the JSON store —
+// it isn't a flat KEY=value env var.) Writes are a surgical single-line upsert:
+// the rest of the user's .env — comments, other keys — is preserved byte-for-byte.
+
+/** Path to the canonical dotenv. Matches config.ts; overridable for tests. */
+export function envFilePath(): string {
+  return process.env.COMFYUI_MCP_ENV_FILE || join(homedir(), ".comfyui-mcp", ".env");
+}
+
+/** Encode a value for a .env line — quote only when it contains characters a
+ *  bare value can't hold; double-quoted + JSON-escaped is dotenv-compatible. */
+function encodeEnvValue(value: string): string {
+  return /[\s#"'\\]/.test(value) ? JSON.stringify(value) : value;
+}
+
+/** Upsert `KEY=value` into the canonical .env, 0600, preserving every other line
+ *  (comments included). Replaces the first uncommented `KEY=` line, else appends. */
+function upsertEnvFile(key: string, value: string): void {
+  const p = envFilePath();
+  mkdirSync(dirname(p), { recursive: true });
+  const raw = existsSync(p) ? readFileSync(p, "utf-8") : "";
+  const lines = raw.length ? raw.split(/\r?\n/) : [];
+  const line = `${key}=${encodeEnvValue(value)}`;
+  const re = new RegExp(`^\\s*${key}\\s*=`);
+  let replaced = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (!replaced && re.test(lines[i])) {
+      lines[i] = line;
+      replaced = true;
+    }
+  }
+  if (!replaced) {
+    // Drop a single trailing empty line so we don't accumulate blanks, then add.
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    lines.push(line);
+    lines.push("");
+  }
+  writeFileSync(p, lines.join("\n"), { mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* chmod is a no-op on Windows; ignore */
+  }
+}
+
+/** Remove every uncommented `KEY=` line from the canonical .env. Returns whether
+ *  anything was removed. */
+function removeEnvFileKey(key: string): boolean {
+  const p = envFilePath();
+  if (!existsSync(p)) return false;
+  const lines = readFileSync(p, "utf-8").split(/\r?\n/);
+  const re = new RegExp(`^\\s*${key}\\s*=`);
+  const kept = lines.filter((l) => !re.test(l));
+  if (kept.length === lines.length) return false;
+  writeFileSync(p, kept.join("\n"), { mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
+/** True when `key` may be persisted (union of the comfyui-tool + agent-provider
+ *  allowlists — both now land in the same canonical .env). */
+export function isAllowedSecretKey(key: string): boolean {
+  return isAllowedComfyuiSecretKey(key) || isAllowedAgentSecretKey(key);
+}
+
+/**
+ * THE canonical secret setter: persist a flat token to ~/.comfyui-mcp/.env,
+ * apply it to process.env immediately (so in-process readers see it now), and
+ * emit so the orchestrator re-probes provider readiness AND respawns the agent
+ * on idle (the respawn reloads .env → the child gets the new key). Rejects a
+ * non-allowlisted key so a stray key can never be written.
+ */
+export function setEnvSecret(key: string, value: string): void {
+  const trimmed = key.trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+    throw new Error(`Invalid env var name "${key}" — use a valid shell identifier.`);
+  }
+  if (!isAllowedSecretKey(trimmed)) {
+    throw new Error(
+      `Env var "${trimmed}" is not an accepted secret. Allowed: ${[...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_ENV_ALLOWLIST])].join(", ")}.`,
+    );
+  }
+  upsertEnvFile(trimmed, value);
+  process.env[trimmed] = value; // live in-process effect (env wins over the file)
+  // Only a COMFYUI tool secret should restart the comfyui MCP child + inject the
+  // "retry the download that needed this token" nudge (#269): saving an
+  // agent-ONLY provider key (OPENROUTER/GLM/KIMI…) previously restarted every
+  // agent with that nonsensical download-retry message. Agent-only keys fire
+  // just "agentChange" (readiness/model refresh) below.
+  if (isAllowedComfyuiSecretKey(trimmed)) emitter.emit("change");
+  if (isAllowedAgentSecretKey(trimmed)) emitter.emit("agentChange"); // flip provider readiness live
+}
+
+/** Canonical remover: drop a token from .env + process.env + emit. Also PURGES
+ *  the legacy panel-secrets.json maps (#269): without this a key revoked from
+ *  .env would RESURRECT on the next boot, because migrateSecretsToEnv() re-adds
+ *  any key still present in the JSON store that .env no longer provides. */
+export function removeEnvSecret(key: string): boolean {
+  const removed = removeEnvFileKey(key);
+  if (process.env[key] !== undefined) delete process.env[key];
+  // Purge the legacy JSON maps so a revoked key can't resurrect via migration.
+  const s = read();
+  let purgedJson = false;
+  for (const map of [s.comfyuiEnv, s.agentEnv]) {
+    if (map && Object.prototype.hasOwnProperty.call(map, key)) {
+      delete map[key];
+      purgedJson = true;
+    }
+  }
+  if (purgedJson) write(s);
+  const changed = removed || purgedJson;
+  if (changed) {
+    if (isAllowedComfyuiSecretKey(key)) emitter.emit("change"); // comfyui-only restart (#269)
+    if (isAllowedAgentSecretKey(key)) emitter.emit("agentChange");
+  }
+  return changed;
+}
+
+/**
+ * One-time migration to the canonical .env: any flat token still living in the
+ * legacy panel-secrets.json (comfyuiEnv / agentEnv) is upserted into .env unless
+ * .env / a real env var already provides it. NON-DESTRUCTIVE — it only ADDS
+ * missing keys; it never rewrites unrelated .env lines and never deletes from the
+ * JSON store (left inert). Idempotent. Returns the keys migrated.
+ */
+export function migrateSecretsToEnv(): string[] {
+  const s = read();
+  const migrated: string[] = [];
+  for (const map of [s.comfyuiEnv, s.agentEnv]) {
+    if (!map || typeof map !== "object") continue;
+    for (const [k, v] of Object.entries(map)) {
+      if (typeof v !== "string" || !v) continue;
+      if (!isAllowedSecretKey(k)) continue;
+      if (process.env[k]) continue; // .env / real env already wins
+      upsertEnvFile(k, v);
+      process.env[k] = v;
+      migrated.push(k);
+    }
+  }
+  return migrated;
 }
 
 // SANITIZE on every write: copy only the five known status fields and coerce
@@ -204,11 +354,12 @@ export function clearOAuthStatus(provider: string): void {
  *  FILTERED through the allowlist (defense in depth): even a hand-edited/corrupt
  *  panel-secrets.json can only ever contribute allowlisted credential keys. */
 export function loadComfyuiSecretEnv(): Record<string, string> {
-  const env = read().comfyuiEnv;
-  if (!env || typeof env !== "object") return {};
+  // Canonical source is process.env (loaded from ~/.comfyui-mcp/.env at boot +
+  // updated live by setEnvSecret), allowlist-filtered.
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (isAllowedComfyuiSecretKey(k) && typeof v === "string") out[k] = v;
+  for (const k of COMFYUI_SECRET_ENV_ALLOWLIST) {
+    const v = process.env[k];
+    if (typeof v === "string" && v) out[k] = v;
   }
   return out;
 }
@@ -234,34 +385,22 @@ export function setComfyuiSecret(key: string, value: string): void {
       `Env var "${trimmed}" is not an accepted comfyui tool secret. Allowed: ${COMFYUI_SECRET_ENV_ALLOWLIST.join(", ")}.`,
     );
   }
-  const secrets = read();
-  const env = secrets.comfyuiEnv && typeof secrets.comfyuiEnv === "object" ? secrets.comfyuiEnv : {};
-  env[trimmed] = value;
-  secrets.comfyuiEnv = env;
-  write(secrets);
-  emitter.emit("change");
+  setEnvSecret(trimmed, value); // canonical store = ~/.comfyui-mcp/.env
 }
 
 /** Remove a stored comfyui secret. Returns false if absent. Emits on removal. */
 export function removeComfyuiSecret(key: string): boolean {
-  const secrets = read();
-  const env = secrets.comfyuiEnv;
-  if (!env || !(key in env)) return false;
-  delete env[key];
-  secrets.comfyuiEnv = env;
-  write(secrets);
-  emitter.emit("change");
-  return true;
+  return removeEnvSecret(key);
 }
 
 /** The persisted agent-provider secrets (e.g. OPENROUTER_API_KEY), filtered
  *  through the agent allowlist. Never logged. */
 export function loadAgentSecretEnv(): Record<string, string> {
-  const env = read().agentEnv;
-  if (!env || typeof env !== "object") return {};
+  // Canonical source is process.env (from ~/.comfyui-mcp/.env), allowlist-filtered.
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (isAllowedAgentSecretKey(k) && typeof v === "string") out[k] = v;
+  for (const k of AGENT_SECRET_ENV_ALLOWLIST) {
+    const v = process.env[k];
+    if (typeof v === "string" && v) out[k] = v;
   }
   return out;
 }
@@ -274,14 +413,12 @@ export function loadAgentSecretEnv(): Record<string, string> {
  * and whenever an agent secret changes. Returns the keys it hydrated.
  */
 export function hydrateAgentSecretsIntoEnv(): string[] {
-  const hydrated: string[] = [];
-  for (const [k, v] of Object.entries(loadAgentSecretEnv())) {
-    if (!process.env[k]) {
-      process.env[k] = v;
-      hydrated.push(k);
-    }
-  }
-  return hydrated;
+  // Canonical secrets already come from ~/.comfyui-mcp/.env (dotenv at boot). This
+  // now performs the one-time, non-destructive migration of any legacy tokens
+  // still in panel-secrets.json into .env, so everything converges to one place.
+  // Idempotent — a no-op once migrated. (Kept this name so the boot/agent-change
+  // callers are unchanged.)
+  return migrateSecretsToEnv();
 }
 
 /** Subscribe to "an agent provider secret changed". Returns an unsubscribe fn. */
@@ -304,28 +441,14 @@ export function setAgentSecret(key: string, value: string): void {
       `Env var "${trimmed}" is not an accepted agent secret. Allowed: ${AGENT_SECRET_ENV_ALLOWLIST.join(", ")}.`,
     );
   }
-  const secrets = read();
-  const env = secrets.agentEnv && typeof secrets.agentEnv === "object" ? secrets.agentEnv : {};
-  env[trimmed] = value;
-  secrets.agentEnv = env;
-  write(secrets);
-  process.env[trimmed] = value; // a freshly-set key must take effect now (env wins)
-  emitter.emit("agentChange");
+  setEnvSecret(trimmed, value); // canonical store = ~/.comfyui-mcp/.env
 }
 
 /** Remove a stored agent secret. Returns false if absent. Also drops it from
  *  process.env (setAgentSecret put it there — a revoked key must stop applying
  *  NOW, not on the next restart). Emits on removal. */
 export function removeAgentSecret(key: string): boolean {
-  const secrets = read();
-  const env = secrets.agentEnv;
-  if (!env || !(key in env)) return false;
-  delete env[key];
-  secrets.agentEnv = env;
-  write(secrets);
-  delete process.env[key];
-  emitter.emit("agentChange");
-  return true;
+  return removeEnvSecret(key);
 }
 
 /**
@@ -337,6 +460,38 @@ export function removeAgentSecret(key: string): boolean {
  */
 export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string, string> {
   return { ...base, ...loadComfyuiSecretEnv() };
+}
+
+// ── Agent-provider spawn env (tool-secret scoping) ───────────────────────────
+// Tool secrets (RunPod/HF/CivitAI/RunComfy/Registry tokens…) live in process.env
+// because config.ts loads ~/.comfyui-mcp/.env at boot and setEnvSecret applies
+// live. That is CORRECT for the comfyui tool child (buildComfyuiMcpEnv), but the
+// agent-provider subprocesses (Codex app-server, Gemini/Grok CLI…) must NEVER
+// inherit them — a tool credential has no business in an LLM vendor's process.
+// buildAgentSpawnEnv is the single spawn-env builder those backends use: a copy
+// of process.env with every TOOL-ONLY secret key stripped.
+
+/** Secret env keys that are TOOL-only (comfyui allowlist minus agent allowlist)
+ *  — these must never reach an agent-provider subprocess's env. */
+export const TOOL_ONLY_SECRET_ENV_KEYS: readonly string[] =
+  COMFYUI_SECRET_ENV_ALLOWLIST.filter((k) => !AGENT_ALLOWLIST_SET.has(k));
+
+/**
+ * Build the env an AGENT-PROVIDER subprocess (Codex/Gemini/Grok CLI…) spawns
+ * with: `base` (default process.env) with all tool-only secret keys removed.
+ * `keep` re-admits specific keys when they double as the provider's OWN
+ * credential (e.g. GEMINI_API_KEY for the Gemini CLI — same vendor, not a leak).
+ */
+export function buildAgentSpawnEnv(
+  base: NodeJS.ProcessEnv = process.env,
+  opts: { keep?: readonly string[] } = {},
+): NodeJS.ProcessEnv {
+  const keep = new Set(opts.keep ?? []);
+  const out: NodeJS.ProcessEnv = { ...base };
+  for (const k of TOOL_ONLY_SECRET_ENV_KEYS) {
+    if (!keep.has(k)) delete out[k];
+  }
+  return out;
 }
 
 export interface CredentialSlot {
@@ -351,13 +506,25 @@ export interface CredentialSlot {
  *  store. `store` decides which allowlist/setter applies. */
 export const CREDENTIAL_SLOTS: CredentialSlot[] = [
   { id: "openrouter", label: "OpenRouter", envKeys: ["OPENROUTER_API_KEY"], store: "agent", help: "Hosted models (MiMo, MiniMax, GPT, Claude…)" },
-  { id: "glm", label: "GLM / Zhipu", envKeys: ["GLM_API_KEY", "ZHIPU_API_KEY", "ZHIPUAI_API_KEY", "ZAI_API_KEY"], store: "agent", help: "GLM provider" },
-  { id: "kimi", label: "Kimi (API)", envKeys: ["KIMI_API_KEY"], store: "agent", help: "Kimi via API key (vs its OAuth)" },
-  { id: "moonshot", label: "Kimi K3 (Moonshot)", envKeys: ["MOONSHOT_API_KEY"], store: "agent", help: "Kimi K3 via the Moonshot platform API key" },
+  // The simple api-key providers (glm/kimi/moonshot) are DERIVED from the
+  // openai-provider-registry — one entry there feeds its slot here automatically.
+  ...OPENAI_KEY_PROVIDERS.map(
+    (p): CredentialSlot => ({
+      id: p.id,
+      label: p.slotLabel,
+      envKeys: p.envKeys,
+      store: "agent",
+      // Append the generated model hint so the card says which model the
+      // provider is actually on and how to change it — the override env var
+      // existed but was invisible outside the source.
+      help: `${p.slotHelp} · ${providerModelHint(p)}`,
+    }),
+  ),
   { id: "civitai", label: "Civitai", envKeys: ["CIVITAI_API_TOKEN"], store: "comfyui", help: "Model downloads" },
   { id: "huggingface", label: "HuggingFace", envKeys: ["HF_TOKEN", "HUGGINGFACE_TOKEN"], store: "comfyui", help: "Model downloads" },
   { id: "google", label: "Google / Gemini", envKeys: ["GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"], store: "comfyui", help: "Nano Banana concept images" },
   { id: "runcomfy", label: "RunComfy", envKeys: ["RUNCOMFY_API_KEY"], store: "comfyui", help: "Cloud pods / training" },
+  { id: "runpod", label: "RunPod", envKeys: ["RUNPOD_API_KEY"], store: "comfyui", help: "Manage GPU pods (status/start/stop/connect)" },
   { id: "registry", label: "Comfy Registry", envKeys: ["REGISTRY_ACCESS_TOKEN"], store: "comfyui", help: "Publishing custom nodes" },
 ];
 

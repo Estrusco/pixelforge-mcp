@@ -44,7 +44,8 @@
             "pages": [
               "index",
               "quickstart",
-              "installation"
+              "installation",
+              "roadmap"
             ]
           },
           {
@@ -57,7 +58,9 @@
               "concepts",
               "plugin",
               "panel",
+              "apps",
               "mobile",
+              "third-party-hosts",
               "backends",
               "local-llms",
               "arena",
@@ -83,6 +86,10 @@
               "tools/install-environment",
               "tools/process-control",
               "tools/defaults-stats-skills",
+              "tools/runpod",
+              "tools/training",
+              "tools/apps",
+              "tools/comfy-cli",
               "tools/skills-knowledge"
             ]
           }
@@ -95,6 +102,22 @@
             "group": "Blog",
             "pages": [
               "blog/index",
+              "blog/micro-apps",
+              "blog/runpod-comfyui",
+              "blog/train-lora-runpod",
+              "blog/lora-trainer-p1",
+              "blog/blind-mode-privacy",
+              "blog/gpt-5-6-comfyui",
+              "blog/kimi-k3-comfyui",
+              "blog/manager-405-dialects",
+              "blog/panel-owned-sessions",
+              "blog/civitai-in-comfyui",
+              "blog/comfyui-mobile-app",
+              "blog/flatten-workflows",
+              "blog/self-updating-orchestrator",
+              "blog/gemma4-fine-tune-arena",
+              "blog/vision-per-model",
+              "blog/local-llms-comfyui",
               "blog/comfyui-agent-claude-or-chatgpt",
               "blog/self-healing-comfyui-agent",
               "blog/panel-agent-subscription",
@@ -129,6 +152,19 @@
             "group": "Changelog",
             "pages": [
               "changelog/index",
+              "changelog/2026-07-28",
+              "changelog/2026-07-21",
+              "changelog/2026-07-20",
+              "changelog/2026-07-19",
+              "changelog/2026-07-18",
+              "changelog/2026-07-17",
+              "changelog/2026-07-16",
+              "changelog/2026-07-15",
+              "changelog/2026-07-14",
+              "changelog/2026-07-12",
+              "changelog/2026-07-09",
+              "changelog/2026-07-08",
+              "changelog/2026-06-29",
               "changelog/2026-06-27",
               "changelog/2026-06-26",
               "changelog/2026-06-25",
@@ -166,7 +202,7 @@
     "404": {
       "redirect": false,
       "title": "Lost in the latent space",
-      "description": "That page doesn't exist or moved. Head to the [docs home](/), browse the [blog](/blog), or [get started](/quickstart) â€” install comfyui-mcp and drive ComfyUI from your own Claude session. Still stuck? [Open an issue](https://github.com/artokun/comfyui-mcp/issues)."
+      "description": "That page doesn't exist or moved. Head to the [docs home](/), browse the [blog](/blog), or [get started](/quickstart) — install comfyui-mcp and drive ComfyUI from your own Claude session. Still stuck? [Open an issue](https://github.com/artokun/comfyui-mcp/issues)."
     }
   },
   "seo": {
