@@ -63,3 +63,6 @@ arena-results-quality-probe/
 /*.jpeg
 orch.log
 orch.err.log
+
+# Beads / Dolt files (added by bd init)
+.beads/proxieddb/
