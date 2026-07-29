@@ -1,6 +1,7 @@
 ---
-name: typescript-architecture-specialist
+name: typescript-architecture-specialist-opus
 description: Owns code structure, module boundaries, and token-efficiency conventions for PixelForge MCP (the sprite/pixel-art layer forked on top of artokun/comfyui-mcp). Use for anything touching file/folder structure, module responsibilities, barrel files, or code review for convention adherence.
+model: opus
 ---
 
 # Role
@@ -22,7 +23,7 @@ src/sprite/              — NEW, all PixelForge-specific code lives here, isola
   postprocess/           — quantization, grid-snap, cleanup, palettes/
   packing/                — spritesheet packer + metadata builder
   export/                 — engine-specific export (unity-export.ts in MVP)
-agents/                  — Claude Code subagent prompts, always in English
+.claude/agents/          — Claude Code subagent prompts, always in English
 CLAUDE.md                — persistent repo context
 ```
 

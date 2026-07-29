@@ -2,7 +2,8 @@ node_modules/
 dist/
 .env
 *.tsbuildinfo
-.claude/
+.claude/*
+!.claude/agents/
 model-settings.user.jsonc
 generations.db
 generations.db-wal

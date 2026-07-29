@@ -178,7 +178,9 @@ src/sprite/          — NEW. All PixelForge-specific code. Isolated from upstre
   postprocess/       — quantization, grid-snap, isolated-pixel cleanup, palettes/
   packing/           — spritesheet packer + frame metadata builder
   export/            — engine-specific export (unity-export.ts in MVP; others throw "not implemented")
-agents/              — Claude Code subagent prompts, always in English, one per role
+.claude/agents/      — Claude Code subagent prompts, always in English. One orchestrator plus six
+                       specialist domains, each as a sonnet/opus tier pair (see "Subagent
+                       orchestration" below).
 ```
 
 ## Tool surface (MVP — locked, do not add/remove without recorded decision)
@@ -231,6 +233,34 @@ During discovery, these were evaluated and rejected as a substitute for building
   as a downstream post-processing dependency, deliberately rejected in favor of a native pipeline
   (see above).
 
+## Subagent orchestration
+
+`.claude/agents/` holds six specialist domains (`mcp-protocol-architect`,
+`comfyui-integration-specialist`, `pixel-art-postprocessing-specialist`, `sprite-export-specialist`,
+`prompt-engineer`, `typescript-architecture-specialist`), each present as two variants —
+`<domain>-sonnet` and `<domain>-opus` — identical prompts, differing only in the `model` frontmatter
+field. There is no bare `<domain>` agent; always dispatch to a tiered variant.
+
+`orchestrator` (`.claude/agents/orchestrator.md`, `model: opus`) is the entry point for requests
+that aren't obviously single-domain: given a user request, it decides which domain(s) apply and
+which model tier to use for each, then dispatches via the `Agent` tool. Use it directly when a
+request could span multiple domains or the right specialist/tier isn't obvious; for an
+unambiguous single-domain request, dispatching straight to the right `<domain>-sonnet`/`-opus`
+agent is also fine.
+
+### Subagent model tiers
+
+- **Opus** — ambiguous requirements needing a judgment call; anything that touches or risks
+  reversing a "locked architectural decision" (see below); cross-cutting design/tradeoff work;
+  first-pass design of a new tool, pipeline, or schema; reviewing/critiquing another agent's output.
+- **Sonnet** — well-scoped, mechanical work following an already-documented pattern (e.g. adding a
+  row to an existing mapping table, a straightforward bug fix with a clear root cause, incremental
+  changes to an existing pure-transformation module that don't change its contract).
+- **Default to opus when unsure** — a misrouted sonnet task that comes back wrong costs more (a
+  second round-trip, possible silent scope violation) than the extra tokens of running opus once.
+- The `orchestrator` agent itself always runs on opus — routing mistakes are more expensive than
+  the agent's own token cost.
+
 ## Conventions (non-negotiable)
 
 - Every `index.ts` is a **barrel file only** — re-exports, zero logic.
@@ -240,11 +270,11 @@ During discovery, these were evaluated and rejected as a substitute for building
 - Reuse the inherited queue/transport/VRAM-watchdog machinery from upstream artokun code — never
   duplicate it inside `src/sprite/`.
 - Use `image-q`/`sharp` for quantization/resizing — don't hand-roll these algorithms.
-- `/agents/*.md` subagent prompts are always in English. Project discussion/design docs are Italian.
+- `.claude/agents/*.md` subagent prompts are always in English. Project discussion/design docs are Italian.
 - Task tracking follows the **beads (`bd`)** workflow documented above — do not use TodoWrite or
   markdown TODO lists for PixelForge work either.
 
 ## Working language
 
-Code, comments, `/agents/*.md`, and this file: English.
+Code, comments, `.claude/agents/*.md`, and this file: English.
 Project design discussion (in the companion claude.ai Project): Italian.

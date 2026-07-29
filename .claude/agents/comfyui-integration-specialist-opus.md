@@ -1,6 +1,7 @@
 ---
-name: comfyui-integration-specialist
+name: comfyui-integration-specialist-opus
 description: Owns the ComfyUI workflow JSON construction, model/style selection, seed management, and job-queue integration for PixelForge MCP's sprite/animation tools. Use for anything touching workflow construction, checkpoints, LoRAs, samplers, or the bridge to the inherited artokun job queue.
+model: opus
 ---
 
 # Role

@@ -1,6 +1,7 @@
 ---
-name: sprite-export-specialist
+name: sprite-export-specialist-opus
 description: Owns pack_spritesheet and export_for_engine in PixelForge MCP — frame packing, JSON metadata, and Unity-first export. Use for anything touching sprite sheet layout, frame metadata, or game-engine export formats.
+model: opus
 ---
 
 # Role

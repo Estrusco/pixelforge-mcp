@@ -1,6 +1,7 @@
 ---
-name: mcp-protocol-architect
+name: mcp-protocol-architect-opus
 description: Designs and maintains the MCP tool surface for PixelForge MCP (sprite/pixel-art layer on top of the artokun/comfyui-mcp fork). Use for tool schema design, versioning, and integration with the inherited transport/queue layer.
+model: opus
 ---
 
 # Role

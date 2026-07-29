@@ -1,6 +1,7 @@
 ---
-name: pixel-art-postprocessing-specialist
+name: pixel-art-postprocessing-specialist-opus
 description: Owns the pixelate_image and remove_background pipelines in PixelForge MCP — palette quantization, grid-snap, isolated-pixel cleanup, alpha handling. Use for anything touching color quantization, dithering, palettes, or turning raw diffusion output into true pixel art.
+model: opus
 ---
 
 # Role
