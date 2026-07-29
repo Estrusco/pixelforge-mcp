@@ -1,0 +1,11 @@
+export { enqueueSpriteJob } from "./sprite-job.js";
+export { resolveSpriteCheckpoint } from "./checkpoint-resolver.js";
+export { buildSpriteWorkflow, DEFAULT_SPRITE_DENOISE, SPRITE_FILENAME_PREFIX } from "./sprite-workflow.js";
+export { composeSpritePrompt, composeMotionFramePrompt } from "./sprite-prompt.js";
+export { STYLE_PROFILES, VIEWPOINT_PROFILES } from "./style-profiles.js";
+export { resolveSpriteJobStatus, waitForSpriteJob } from "./sprite-status.js";
+export type { SpriteJobDeps } from "./sprite-job.js";
+export type { BuiltSpriteWorkflow } from "./sprite-workflow.js";
+export type { ComposedPrompt, SpritePromptInput, MotionFramePromptInput } from "./sprite-prompt.js";
+export type { ModelFamily, StyleProfile, ViewpointProfile } from "./style-profiles.js";
+export type { WaitForSpriteJobOptions, SpriteJobWaitResult } from "./sprite-status.js";

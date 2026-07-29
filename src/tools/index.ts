@@ -56,7 +56,12 @@ import { registerSelfUpdateTools } from "./self-update.js";
 import { registerCalculateTools } from "./calculate.js";
 import { registerComfyUISettingsTools } from "./comfyui-settings.js";
 import { registerNodeDevTools } from "./node-dev.js";
-import { registerPixelateImageTool } from "../sprite/tools/index.js";
+import {
+  registerPixelateImageTool,
+  registerGenerateSpriteTool,
+  registerGetSpriteResultTool,
+  registerGenerateAnimationSetTool,
+} from "../sprite/tools/index.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
 import { registerAppsTools } from "./apps.js";
@@ -135,6 +140,11 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // Appended (not inserted next to queue-management) because tools/list order
   // is observable and must not shift for existing tools.
   ["workflows", registerBatchTools],
+  // PixelForge sprite layer. Appended for the same reason — new sprite tools go
+  // at the END of this array, never next to registerPixelateImageTool.
+  ["images-assets", registerGenerateSpriteTool],
+  ["images-assets", registerGetSpriteResultTool],
+  ["images-assets", registerGenerateAnimationSetTool],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────
