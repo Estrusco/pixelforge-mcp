@@ -61,6 +61,7 @@ import {
   registerGenerateSpriteTool,
   registerGetSpriteResultTool,
   registerGenerateAnimationSetTool,
+  registerPackSpritesheetTool,
 } from "../sprite/tools/index.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
@@ -145,6 +146,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["images-assets", registerGenerateSpriteTool],
   ["images-assets", registerGetSpriteResultTool],
   ["images-assets", registerGenerateAnimationSetTool],
+  ["images-assets", registerPackSpritesheetTool],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────

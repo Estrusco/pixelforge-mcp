@@ -472,3 +472,117 @@ export interface AnimationSetResult {
   /** One entry per motion state, in the caller's order. Never empty. */
   readonly states: readonly AnimationStateResult[];
 }
+
+// ===========================================================================
+// Spritesheet packing contracts (pack_spritesheet)
+//
+// Deliberately independent of the generation tools: the packer takes ANY set of
+// equally-sized frame images, whether they came from generate_animation_set,
+// pixelate_image, or a file the user drew by hand.
+//
+// The metadata produced here is ENGINE-AGNOSTIC. Unity-specific translation
+// (bottom-left rect origin, sprite naming, import-script JSON) belongs to
+// export_for_engine — never leak it back into this layer.
+// ===========================================================================
+
+export const SPRITESHEET_LAYOUTS = ["grid", "horizontal", "vertical"] as const;
+
+/**
+ * Sheet layout:
+ *   - "grid"       — `columns` per row, wrapping (default `ceil(sqrt(n))`).
+ *   - "horizontal" — one row, every frame side by side.
+ *   - "vertical"   — one column, every frame stacked.
+ */
+export type SpritesheetLayout = (typeof SPRITESHEET_LAYOUTS)[number];
+
+export const DEFAULT_SPRITESHEET_LAYOUT: SpritesheetLayout = "grid";
+
+/** Playback rate defaults to a classic pixel-art cycle rate, not 30/60. */
+export const DEFAULT_SPRITESHEET_FPS = 12;
+export const SPRITESHEET_MIN_FPS = 1;
+export const SPRITESHEET_MAX_FPS = 120;
+
+/** Wall-clock/memory guards. The sheet cap matches Unity's max texture size. */
+export const SPRITESHEET_MAX_FRAMES = 256;
+export const SPRITESHEET_MAX_SHEET_DIMENSION = 16384;
+
+/**
+ * Normalized anchor inside ONE frame: 0..1 on each axis, `{x: 0.5, y: 0.5}` is
+ * the frame's center and `y = 0` is its BOTTOM edge.
+ *
+ * Normalized (not a pixel offset) on purpose: it survives a later resize of the
+ * frames, and it is what every engine's sprite pivot field expects.
+ */
+export interface SpritePivot {
+  readonly x: number;
+  readonly y: number;
+}
+
+export const DEFAULT_SPRITE_PIVOT: SpritePivot = { x: 0.5, y: 0.5 };
+
+/** Fully resolved packing request — no undefined fields reach the packer. */
+export interface SpritesheetPackOptions {
+  readonly layout: SpritesheetLayout;
+  /** Grid layout only; ignored for horizontal/vertical. Positive integer. */
+  readonly columns?: number;
+  readonly fps: number;
+  readonly pivot: SpritePivot;
+}
+
+/**
+ * One frame's rectangle inside the packed sheet.
+ *
+ * COORDINATE SYSTEM: image space — origin at the sheet's TOP-LEFT corner, `y`
+ * increasing DOWNWARD. This is what sharp/PNG use and it is the stable contract
+ * here. Engines that address sprites from the bottom-left (Unity) convert with
+ * `engine_y = sheet_height - y - height` in their own export module.
+ *
+ * `index` is the frame's 0-based position in the caller's frame list, which is
+ * also its playback order — never re-sorted by the packer.
+ */
+export interface SpritesheetFrameRect {
+  readonly index: number;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * The pack_spritesheet metadata document — a PUBLIC CONTRACT. Users consume
+ * this JSON from their own Unity-side import tooling, and export_for_engine
+ * consumes it too, so it is versioned and its field names are snake_case
+ * BECAUSE THE TYPE IS THE WIRE SHAPE (no camelCase-to-JSON mapper sits in
+ * between that could silently drift from it).
+ *
+ * Compatible changes: adding an optional field, bumping nothing. Renaming or
+ * removing a field, or changing the rect coordinate system, is BREAKING and
+ * must bump `version`.
+ *
+ * All frames share one size (`frame_width`/`frame_height`) — the packer rejects
+ * mismatched frames rather than cropping or padding them.
+ */
+export interface SpritesheetMetadata {
+  /** Schema version of this document. Bumped only on a breaking change. */
+  readonly version: 1;
+  readonly frame_width: number;
+  readonly frame_height: number;
+  readonly sheet_width: number;
+  readonly sheet_height: number;
+  readonly layout: SpritesheetLayout;
+  readonly columns: number;
+  readonly rows: number;
+  readonly frame_count: number;
+  /** Suggested playback rate for the frame sequence, in frames per second. */
+  readonly fps: number;
+  /** Normalized per-frame anchor; see `SpritePivot`. */
+  readonly pivot: SpritePivot;
+  /** In playback order, `index` ascending from 0. Never empty. */
+  readonly frames: readonly SpritesheetFrameRect[];
+}
+
+/** What the packer returns: the encoded sheet plus its metadata document. */
+export interface PackedSpritesheet {
+  readonly png: Buffer;
+  readonly metadata: SpritesheetMetadata;
+}

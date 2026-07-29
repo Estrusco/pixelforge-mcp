@@ -169,15 +169,38 @@ Notes:
 src/                — inherited from artokun/comfyui-mcp. Touch only when necessary.
                        Provides: stdio/streamable-HTTP transport, enqueue_workflow, get_job_status,
                        WebSocket progress, VRAM watchdog, process management.
-src/sprite/          — NEW. All PixelForge-specific code. Isolated from upstream to keep future
+  tools/remove-background.ts — the one upstream file PixelForge intentionally touches, because it
+                       already WAS locked tool #6 in all but name: widened to also accept
+                       asset_id/path (via src/sprite/reference-image.ts) alongside the original
+                       `image` filename param. Same tool name, same ComfyUI-RMBG workflow, no new
+                       registration — do not fork this into a second sprite-namespaced tool.
+src/sprite/          — PixelForge-specific code. Isolated from upstream to keep future
                        `git pull` from upstream low-conflict.
-  types.ts           — shared interfaces: tool I/O contracts, Style, Viewpoint, MotionState
-  tools/             — one file per MCP tool (see "Tool surface" below)
-  comfyui/           — workflow JSON construction, style/viewpoint → checkpoint mapping,
-                       job-bridge (thin wrapper over inherited enqueue_workflow/get_job_status)
+  types.ts           — shared interfaces: tool I/O contracts (Style, Viewpoint, MotionState,
+                       SpriteJobRequest/Result, AnimationSet*, packing types, ...) — source of truth.
+  reference-image.ts — resolveReferenceImage(assetId, path): stages a registered asset or a
+                       filesystem path as a bare filename in ComfyUI's input dir. Shared by
+                       generate_sprite, generate_animation_set, and the upstream remove_background
+                       enhancement above — the one legitimate place this logic lives.
+  image-io.ts        — asset_id/path → local RawImage bytes, plus out_path safety. Used by
+                       pack_spritesheet; pixelate_image still has its own private duplicate of this
+                       (tracked as pixelforge-mcp-b3u — dedupe when picked up).
+  arg-validation.ts  — shared dimension/seed/denoise validators used across sprite tool schemas.
+  animation-runner.ts — the sequential frame-chaining engine behind generate_animation_set: one job
+                       in flight at a time (frame N+1 needs frame N's actual pixels), one seed for
+                       the whole set, partial failures recorded per-frame rather than thrown.
+  comfyui/           — workflow JSON construction, style→checkpoint mapping (checkpoint is keyed by
+                       STYLE ALONE — `ViewpointProfile` has structurally no checkpoint field, so
+                       "viewpoint implies a model" is inexpressible, not just discouraged; see
+                       style-profiles.ts), the sprite job-bridge (thin wrapper over inherited
+                       enqueueWorkflow), and the sprite layer's one polling loop
+                       (sprite-status.ts → waitForSpriteJob, used by get_sprite_result and the
+                       animation runner — never hand-roll a second poll loop).
   postprocess/       — quantization, grid-snap, isolated-pixel cleanup, palettes/
-  packing/           — spritesheet packer + frame metadata builder
-  export/            — engine-specific export (unity-export.ts in MVP; others throw "not implemented")
+  packing/           — spritesheet packer (fixed-cell grid, NOT a bin-packer — sprite frames are
+                       uniform-size and a grid is what a Unity slice-import wants) + metadata builder.
+  tools/             — one file per MCP tool (see "Tool surface" below)
+  export/            — not created yet; `export_for_engine` (Unity) is still open.
 .claude/agents/      — Claude Code subagent prompts, always in English. One orchestrator plus six
                        specialist domains, each as a sonnet/opus tier pair (see "Subagent
                        orchestration" below).
@@ -185,26 +208,39 @@ src/sprite/          — NEW. All PixelForge-specific code. Isolated from upstre
 
 ## Tool surface (MVP — locked, do not add/remove without recorded decision)
 
-1. `generate_sprite` — single sprite from prompt (+ optional reference image), style + viewpoint, seed.
-2. `get_sprite_result` — thin wrapper over inherited `get_job_status`.
-3. `generate_animation_set` — coherent set of frames for `motion_states` (free-form strings, NOT a
+Status as of 2026-07-29 — check `bd list` for current truth, this is a snapshot, not the tracker.
+
+1. `generate_sprite` **(implemented)** — single sprite from prompt (+ optional reference image), style + viewpoint, seed.
+2. `get_sprite_result` **(implemented)** — thin wrapper over inherited `get_job_status`.
+3. `generate_animation_set` **(implemented)** — coherent set of frames for `motion_states` (free-form strings, NOT a
    fixed humanoid walk/attack/jump vocabulary — a snake needs slither/eat, a bird needs flap/glide).
-4. `generate_arcade_topdown_set` — preset wrapper over (1)/(3) for topdown arcade assets (e.g. Math
+4. `generate_arcade_topdown_set` **(not yet implemented — pixelforge-mcp-z9v)** — preset wrapper over (1)/(3) for topdown arcade assets (e.g. Math
    Serpent). Forces `viewpoint: "topdown"`. `symmetric_rotation_safe: true` (default) generates ONE
    canonical frame and expects the engine to rotate it at runtime (safe for 90°-aligned movement;
    do not use for non-90° rotation needs — causes pixel-grid aliasing).
-5. `pixelate_image` — nearest-neighbor grid-snap → palette quantization → nearest-color mapping →
+5. `pixelate_image` **(implemented)** — nearest-neighbor grid-snap → palette quantization → nearest-color mapping →
    isolated-pixel cleanup, alpha-preserving throughout.
-6. `remove_background` — routes to a ComfyUI custom node (rembg/BiRefNet/U2Net). NEVER reimplement
+6. `remove_background` **(implemented — reuses/extends the inherited upstream tool, see "Repo layout")** — routes to a ComfyUI custom node (rembg/BiRefNet/U2Net). NEVER reimplement
    background removal in TypeScript.
-7. `pack_spritesheet` — frames → packed sheet + JSON metadata (frame rects, fps, pivot).
-8. `export_for_engine` — MVP: Unity only, outputs **PNG + JSON slicing metadata for manual import**.
+7. `pack_spritesheet` **(implemented)** — frames → packed sheet + JSON metadata (frame rects, fps, pivot).
+8. `export_for_engine` **(not yet implemented — pixelforge-mcp-7mn)** — MVP: Unity only, outputs **PNG + JSON slicing metadata for manual import**.
    No `.meta` file generation. Godot/GameMaker must throw "not implemented," never silently no-op.
 
 ## Locked architectural decisions (do not silently reverse)
 
 - **`style` and `viewpoint` are independent axes.** Style = rendering aesthetic (16bit, chibi,
   hand-painted...). Viewpoint = camera angle (side, topdown, isometric). Never conflate them.
+  Enforced structurally in `src/sprite/comfyui/style-profiles.ts`: checkpoint mapping is keyed by
+  style alone, and `ViewpointProfile` has no checkpoint/sampler field at all — a
+  (style × viewpoint) → checkpoint table would silently reintroduce the conflation this decision
+  forbids, even if no one intended it.
+- **The inherited `img2img` template (`services/workflow-composer.ts`) derives its latent size from
+  the reference image**, so a caller's requested width/height would otherwise be silently ignored
+  in img2img mode. Fixed at the sprite layer, not upstream: `buildSpriteWorkflow` in
+  `src/sprite/comfyui/sprite-workflow.ts` inserts an `ImageScale` node between `LoadImage` and
+  `VAEEncode` after calling `createWorkflow("img2img", ...)`. Do not "fix" this by editing the
+  upstream template — that would touch inherited code for a PixelForge-only need and fight future
+  `git merge upstream/main` for no benefit.
 - **`consistency_mode` for animation**: MVP default is `"img2img_low_denoise"` (implemented,
   known limitation: pose changes are approximate without ControlNet). `"controlnet_pose"` is
   schema-ready but **NOT implemented** — it requires per-frame pose skeletons and, for real
