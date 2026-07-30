@@ -11,8 +11,6 @@ import { ValidationError } from "../utils/errors.js";
 //
 // This is the ONLY place the sprite layer reads source images from; the
 // packing/ and postprocess/ modules stay pure (buffers in, buffers out).
-// pixelate_image predates this module and still carries its own private copy of
-// the same logic — deduplicating it is tracked separately.
 // ---------------------------------------------------------------------------
 
 /** Where an image came from — asset id or filesystem path, never both. */

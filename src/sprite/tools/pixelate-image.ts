@@ -1,11 +1,8 @@
-import { readFile, writeFile } from "node:fs/promises";
-import { isAbsolute, resolve, sep } from "node:path";
+import { writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { AssetRegistry } from "../../services/asset-registry.js";
-import { getOutputImage } from "../../services/image-management.js";
-import { resolveOutputDir } from "../../services/output-dir.js";
 import { ComfyUIError, ValidationError, errorToToolResult } from "../../utils/errors.js";
+import { loadImageSource, resolveWritableOutputPath } from "../image-io.js";
 import { quantizeImage, LOSPEC_PRESET_SLUGS } from "../postprocess/index.js";
 import type { LospecPresetSlug, PaletteSource } from "../types.js";
 
@@ -126,67 +123,6 @@ function resolvePaletteSource(args: PixelateImageArgs): PaletteSource {
   }
 }
 
-async function resolveSafePath(path: string): Promise<string> {
-  if (path.trim().length === 0) {
-    throw new ValidationError("path must be a non-empty string.");
-  }
-  if (isAbsolute(path)) return resolve(path);
-  const outputDir = await resolveOutputDir();
-  const resolved = resolve(outputDir, path);
-  if (resolved !== outputDir && !resolved.startsWith(outputDir + sep)) {
-    throw new ValidationError("A relative path must stay within the ComfyUI output directory.");
-  }
-  return resolved;
-}
-
-interface ResolvedSource {
-  label: string;
-  bytes: Buffer;
-}
-
-async function resolveSourceImage(args: PixelateImageArgs): Promise<ResolvedSource> {
-  if (Boolean(args.asset_id) === Boolean(args.path)) {
-    throw new ValidationError("Provide exactly one image source: asset_id or path.");
-  }
-
-  if (args.asset_id) {
-    const record = AssetRegistry.get(args.asset_id);
-    if (!record) {
-      throw new ValidationError(
-        `No asset found for id "${args.asset_id}". It may have expired or never been registered.`,
-      );
-    }
-    const validType = record.type === "output" || record.type === "input" || record.type === "temp";
-    const fetchType: "output" | "input" | "temp" = validType
-      ? (record.type as "output" | "input" | "temp")
-      : "output";
-    const image = await getOutputImage(record.filename, fetchType, record.subfolder);
-    return {
-      label: `asset ${args.asset_id} (${record.filename})`,
-      bytes: Buffer.from(image.base64, "base64"),
-    };
-  }
-
-  const resolvedPath = await resolveSafePath(args.path!);
-  try {
-    return { label: resolvedPath, bytes: await readFile(resolvedPath) };
-  } catch {
-    throw new ValidationError(`Source image not found or unreadable: ${resolvedPath}`);
-  }
-}
-
-async function resolveWritableOutputPath(path: string): Promise<string> {
-  if (path.trim().length === 0) {
-    throw new ValidationError("out_path must be a non-empty path.");
-  }
-  const outputDir = await resolveOutputDir();
-  const resolved = isAbsolute(path) ? resolve(path) : resolve(outputDir, path);
-  if (resolved !== outputDir && !resolved.startsWith(outputDir + sep)) {
-    throw new ValidationError("out_path must stay within the ComfyUI output directory.");
-  }
-  return resolved;
-}
-
 export function registerPixelateImageTool(server: McpServer): void {
   server.tool(
     "pixelate_image",
@@ -201,7 +137,7 @@ export function registerPixelateImageTool(server: McpServer): void {
         const targetWidth = assertPositiveInteger(args.target_width, "target_width");
         const targetHeight = assertPositiveInteger(args.target_height, "target_height");
         const palette = resolvePaletteSource(args);
-        const source = await resolveSourceImage(args);
+        const source = await loadImageSource({ assetId: args.asset_id, path: args.path }, "image");
 
         let result;
         try {
@@ -218,7 +154,7 @@ export function registerPixelateImageTool(server: McpServer): void {
 
         let outPath: string | undefined;
         if (args.out_path) {
-          outPath = await resolveWritableOutputPath(args.out_path);
+          outPath = await resolveWritableOutputPath(args.out_path, "out_path");
           await writeFile(outPath, result.png);
         }
 
