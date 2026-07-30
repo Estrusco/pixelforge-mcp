@@ -112,8 +112,13 @@ type GenerateSpriteArgs = {
   denoise?: number;
 };
 
-/** img2img-only gate; the 0 < denoise <= 1 range check is shared. */
-function assertDenoise(denoise: number | undefined, hasReference: boolean): number | undefined {
+/**
+ * img2img-only gate; the 0 < denoise <= 1 range check is shared.
+ * Exported: generate_arcade_topdown_set's rotation-safe (single-frame) path
+ * wraps the same generate_sprite semantics and must apply the same gate
+ * rather than a re-declared copy.
+ */
+export function assertDenoise(denoise: number | undefined, hasReference: boolean): number | undefined {
   if (denoise === undefined) return undefined;
   if (!hasReference) {
     throw new ValidationError(

@@ -171,7 +171,7 @@ type GenerateAnimationSetArgs = {
  * apart from trimming: motion states are FREE-FORM (locked decision) and must
  * never be matched against a fixed vocabulary here or anywhere downstream.
  */
-function assertMotionStates(states: readonly string[]): readonly MotionState[] {
+export function assertMotionStates(states: readonly string[]): readonly MotionState[] {
   if (states.length === 0) {
     throw new ValidationError("motion_states must contain at least one motion state.");
   }
@@ -196,7 +196,7 @@ function assertMotionStates(states: readonly string[]): readonly MotionState[] {
   return trimmed;
 }
 
-function assertFramesPerState(value: number | undefined, stateCount: number): number {
+export function assertFramesPerState(value: number | undefined, stateCount: number): number {
   const frames = value ?? ANIMATION_DEFAULT_FRAMES_PER_STATE;
   if (
     !Number.isInteger(frames) ||
@@ -219,14 +219,22 @@ function assertFramesPerState(value: number | undefined, stateCount: number): nu
   return frames;
 }
 
-/** Animation policy: denoise always applies (every frame after the first is img2img). */
-function assertDenoise(denoise: number | undefined): number {
+/**
+ * Animation policy: denoise always applies (every frame after the first is
+ * img2img). Exported: generate_arcade_topdown_set's rotation-unsafe (full
+ * animation set) path is the same policy under a forced topdown viewpoint.
+ */
+export function assertDenoise(denoise: number | undefined): number {
   if (denoise === undefined) return ANIMATION_DEFAULT_DENOISE;
   return assertDenoiseRange(denoise);
 }
 
-/** Frame result -> the snake_case JSON shape the tool returns. */
-function frameToJson(frame: AnimationFrameResult): Record<string, unknown> {
+/**
+ * Frame result -> the snake_case JSON shape the tool returns. Exported so
+ * generate_arcade_topdown_set's animation-set path reports frames in the
+ * identical shape rather than a re-declared copy.
+ */
+export function frameToJson(frame: AnimationFrameResult): Record<string, unknown> {
   if (frame.status === "skipped") {
     return { frame_index: frame.frameIndex, status: frame.status, reason: frame.reason };
   }
@@ -253,7 +261,8 @@ function frameToJson(frame: AnimationFrameResult): Record<string, unknown> {
   };
 }
 
-function noteForOutcome(result: AnimationSetResult): string {
+/** Exported for reuse by generate_arcade_topdown_set's animation-set path. */
+export function noteForOutcome(result: AnimationSetResult): string {
   const limitation =
     "Pose changes are APPROXIMATE: img2img without ControlNet cannot guarantee frame-accurate " +
     "poses. This is a known, accepted limitation of img2img_low_denoise, not a failure.";

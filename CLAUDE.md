@@ -208,16 +208,18 @@ src/sprite/          — PixelForge-specific code. Isolated from upstream to kee
 
 ## Tool surface (MVP — locked, do not add/remove without recorded decision)
 
-Status as of 2026-07-29 — check `bd list` for current truth, this is a snapshot, not the tracker.
+Status as of 2026-07-30 — check `bd list` for current truth, this is a snapshot, not the tracker.
 
 1. `generate_sprite` **(implemented)** — single sprite from prompt (+ optional reference image), style + viewpoint, seed.
 2. `get_sprite_result` **(implemented)** — thin wrapper over inherited `get_job_status`.
 3. `generate_animation_set` **(implemented)** — coherent set of frames for `motion_states` (free-form strings, NOT a
    fixed humanoid walk/attack/jump vocabulary — a snake needs slither/eat, a bird needs flap/glide).
-4. `generate_arcade_topdown_set` **(not yet implemented — pixelforge-mcp-z9v)** — preset wrapper over (1)/(3) for topdown arcade assets (e.g. Math
+4. `generate_arcade_topdown_set` **(implemented — pixelforge-mcp-z9v)** — preset wrapper over (1)/(3) for topdown arcade assets (e.g. Math
    Serpent). Forces `viewpoint: "topdown"`. `symmetric_rotation_safe: true` (default) generates ONE
    canonical frame and expects the engine to rotate it at runtime (safe for 90°-aligned movement;
-   do not use for non-90° rotation needs — causes pixel-grid aliasing).
+   do not use for non-90° rotation needs — causes pixel-grid aliasing). `symmetric_rotation_safe: false`
+   wraps `generate_animation_set` instead (forced topdown), requiring `motion_states` for distinct
+   per-facing/per-state art.
 5. `pixelate_image` **(implemented)** — nearest-neighbor grid-snap → palette quantization → nearest-color mapping →
    isolated-pixel cleanup, alpha-preserving throughout.
 6. `remove_background` **(implemented — reuses/extends the inherited upstream tool, see "Repo layout")** — routes to a ComfyUI custom node (rembg/BiRefNet/U2Net). NEVER reimplement
