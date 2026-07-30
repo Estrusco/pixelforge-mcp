@@ -183,8 +183,8 @@ src/sprite/          — PixelForge-specific code. Isolated from upstream to kee
                        generate_sprite, generate_animation_set, and the upstream remove_background
                        enhancement above — the one legitimate place this logic lives.
   image-io.ts        — asset_id/path → local RawImage bytes, plus out_path safety. Used by
-                       pack_spritesheet; pixelate_image still has its own private duplicate of this
-                       (tracked as pixelforge-mcp-b3u — dedupe when picked up).
+                       pack_spritesheet and export_for_engine; pixelate_image still has its own
+                       private duplicate of this (tracked as pixelforge-mcp-b3u — dedupe when picked up).
   arg-validation.ts  — shared dimension/seed/denoise validators used across sprite tool schemas.
   animation-runner.ts — the sequential frame-chaining engine behind generate_animation_set: one job
                        in flight at a time (frame N+1 needs frame N's actual pixels), one seed for
@@ -200,7 +200,11 @@ src/sprite/          — PixelForge-specific code. Isolated from upstream to kee
   packing/           — spritesheet packer (fixed-cell grid, NOT a bin-packer — sprite frames are
                        uniform-size and a grid is what a Unity slice-import wants) + metadata builder.
   tools/             — one file per MCP tool (see "Tool surface" below)
-  export/            — not created yet; `export_for_engine` (Unity) is still open.
+  export/            — engine translation for `export_for_engine`: `unity.ts` is the pure
+                       top-left/y-down → bottom-left/y-up rect translator (Unity only in MVP);
+                       `validate-metadata.ts` is the boundary check on the caller-supplied
+                       `pack_spritesheet` metadata object (frame_count/frames.length agreement,
+                       rects within sheet bounds). Neither touches disk or `sharp`.
 .claude/agents/      — Claude Code subagent prompts, always in English. One orchestrator plus six
                        specialist domains, each as a sonnet/opus tier pair (see "Subagent
                        orchestration" below).
@@ -225,8 +229,14 @@ Status as of 2026-07-30 — check `bd list` for current truth, this is a snapsho
 6. `remove_background` **(implemented — reuses/extends the inherited upstream tool, see "Repo layout")** — routes to a ComfyUI custom node (rembg/BiRefNet/U2Net). NEVER reimplement
    background removal in TypeScript.
 7. `pack_spritesheet` **(implemented)** — frames → packed sheet + JSON metadata (frame rects, fps, pivot).
-8. `export_for_engine` **(not yet implemented — pixelforge-mcp-7mn)** — MVP: Unity only, outputs **PNG + JSON slicing metadata for manual import**.
-   No `.meta` file generation. Godot/GameMaker must throw "not implemented," never silently no-op.
+8. `export_for_engine` **(implemented — pixelforge-mcp-7mn)** — MVP: Unity only, outputs **PNG + JSON slicing metadata for manual import**.
+   No `.meta` file generation. Godot/GameMaker are advertised in the schema but rejected by
+   `assertImplementedExportEngine` (`src/sprite/types.ts`) before any image is loaded or file
+   written — never a silent no-op. Takes the exact `metadata` object `pack_spritesheet` returns as
+   input (validated as a boundary in `src/sprite/export/validate-metadata.ts`) and flips each frame
+   rect from `pack_spritesheet`'s top-left/y-down convention to Unity's bottom-left/y-up convention
+   in the pure `src/sprite/export/unity.ts` translator; the normalized pivot passes through
+   unchanged (already bottom-origin).
 
 ## Locked architectural decisions (do not silently reverse)
 

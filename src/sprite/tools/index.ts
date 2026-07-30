@@ -4,3 +4,4 @@ export { registerGetSpriteResultTool } from "./get-sprite-result.js";
 export { registerGenerateAnimationSetTool } from "./generate-animation-set.js";
 export { registerPackSpritesheetTool } from "./pack-spritesheet.js";
 export { registerGenerateArcadeTopdownSetTool } from "./generate-arcade-topdown-set.js";
+export { registerExportForEngineTool } from "./export-for-engine.js";

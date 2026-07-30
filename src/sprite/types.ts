@@ -586,3 +586,83 @@ export interface PackedSpritesheet {
   readonly png: Buffer;
   readonly metadata: SpritesheetMetadata;
 }
+
+// ===========================================================================
+// Engine export contracts (export_for_engine)
+//
+// LOCKED DECISION (CLAUDE.md): MVP is Unity-only, PNG + JSON slicing metadata
+// for MANUAL import — no .meta file generation. Godot/GameMaker are present in
+// the schema for contract stability but MUST throw "not implemented", never
+// silently no-op. Same schema-ready-but-rejected shape as
+// `ConsistencyMode`/`IMPLEMENTED_CONSISTENCY_MODES` above: the full union is
+// advertised, only `IMPLEMENTED_EXPORT_ENGINES` may actually run, and
+// `assertImplementedExportEngine` is the one sanctioned narrowing path.
+// ===========================================================================
+
+export const EXPORT_ENGINES = ["unity", "godot", "gamemaker"] as const;
+
+export type ExportEngine = (typeof EXPORT_ENGINES)[number];
+
+/** The subset of `ExportEngine` actually implemented in MVP. */
+export const IMPLEMENTED_EXPORT_ENGINES = ["unity"] as const;
+
+export type ImplementedExportEngine = (typeof IMPLEMENTED_EXPORT_ENGINES)[number];
+
+/**
+ * The ONLY sanctioned way to turn a caller-supplied `ExportEngine` into the
+ * `ImplementedExportEngine` the export layer demands. Godot/GameMaker are
+ * REJECTED here, never downgraded to a Unity export and never a silent no-op.
+ */
+export function assertImplementedExportEngine(engine: ExportEngine): ImplementedExportEngine {
+  if (engine === "unity") return engine;
+  throw new ValidationError(
+    `Engine "${engine}" is not implemented. export_for_engine supports "unity" only in MVP; ` +
+      "Godot and GameMaker are present in the schema for contract stability but are rejected " +
+      "here rather than silently skipped.",
+  );
+}
+
+/** Unity's own default Pixels Per Unit; used when the caller omits one. */
+export const DEFAULT_PIXELS_PER_UNIT = 100;
+
+/**
+ * One frame's rectangle in Unity's texture coordinate convention: origin at
+ * the sheet's BOTTOM-LEFT corner, `y` increasing UPWARD. This is the one
+ * place `SpritesheetFrameRect`'s top-left/y-down rect gets converted, via
+ * `engine_y = sheet_height - y - height` (see the locked note on
+ * `SpritesheetFrameRect` above) — never leaked back into the engine-agnostic
+ * packing layer.
+ */
+export interface UnitySpriteRect {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** One sprite Unity's manual importer should slice out of the sheet. */
+export interface UnitySpriteEntry {
+  readonly name: string;
+  /** Matches the source `SpritesheetFrameRect.index` — the original playback order. */
+  readonly frame_index: number;
+  readonly rect: UnitySpriteRect;
+  /** Same normalized pivot as the source metadata — already bottom-origin, no conversion needed. */
+  readonly pivot: SpritePivot;
+}
+
+/**
+ * The export_for_engine Unity output document — a PUBLIC CONTRACT, same
+ * versioning rule as `SpritesheetMetadata`: adding an optional field is
+ * compatible, renaming/removing one or changing the rect coordinate system is
+ * breaking and must bump `version`.
+ */
+export interface UnityExportMetadata {
+  readonly version: 1;
+  readonly engine: "unity";
+  readonly sheet_width: number;
+  readonly sheet_height: number;
+  readonly pixels_per_unit: number;
+  readonly fps: number;
+  /** In the source metadata's frame order, `frame_index` ascending from 0. Never empty. */
+  readonly sprites: readonly UnitySpriteEntry[];
+}

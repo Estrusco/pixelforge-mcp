@@ -31,6 +31,20 @@ export async function decodeFrameImage(bytes: Buffer): Promise<RawImage> {
 }
 
 /**
+ * Probe an encoded image's dimensions WITHOUT decoding its raw pixels — unlike
+ * `decodeFrameImage`, this reads only the header. Used by export_for_engine to
+ * cross-check a caller-supplied sheet against its metadata without risking a
+ * multi-hundred-MB raw buffer for a sheet at the packing size cap.
+ */
+export async function probeImageDimensions(bytes: Buffer): Promise<Dimensions> {
+  const { width, height } = await sharp(bytes, { limitInputPixels: 100_000_000 }).metadata();
+  if (width === undefined || height === undefined) {
+    throw new ValidationError("Could not read image dimensions: the file is not a decodable image.");
+  }
+  return { width, height };
+}
+
+/**
  * Every frame must share one size. Mismatches FAIL LOUDLY (with the offending
  * indices) instead of being cropped or padded: silently resizing a frame is a
  * change to the user's art, and a half-scaled frame in a finished sheet is far
