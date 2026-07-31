@@ -2,7 +2,18 @@
 
 This folder is separate from the upstream `docs/` folder (the Mintlify site for the inherited
 comfyui-mcp project). It holds PixelForge-specific documentation artifacts that aren't part of the
-public docs site — starting with a portable "expert user" subagent.
+public docs site.
+
+## `fork-customization/`
+
+Maintainer-facing documentation on how PixelForge MCP customizes/extends its upstream fork
+(`artokun/comfyui-mcp`) — project overview, upstream-sync procedure, repo layout, the locked tool
+surface, locked architectural decisions, rejected alternatives, subagent orchestration, and coding
+conventions. Start at [`fork-customization/INDEX.md`](fork-customization/INDEX.md).
+
+`CLAUDE.md`'s "PixelForge MCP — Project Context" section keeps only what must be known by default
+in every session and links into this folder for full detail — read the linked doc before touching
+the area it covers.
 
 ## `agents/`
 
