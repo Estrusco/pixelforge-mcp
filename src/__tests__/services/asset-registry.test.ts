@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import { AssetRegistry, applyOverrides } from "../../services/asset-registry.js";
+import { AssetRegistry, applyOverrides, isLocalAsset } from "../../services/asset-registry.js";
 import type { WorkflowJSON } from "../../comfyui/types.js";
 
 function sampleWorkflow(): WorkflowJSON {
@@ -204,6 +204,59 @@ describe("AssetRegistry", () => {
     wf["3"].inputs.cfg = 999;
     const fetched = AssetRegistry.get(rec.assetId);
     expect(fetched?.workflow["3"].inputs.cfg).toBe(7);
+  });
+});
+
+describe("AssetRegistry.registerLocal", () => {
+  let now = 1_700_000_000_000;
+  const clock = () => now;
+
+  beforeEach(() => {
+    now = 1_700_000_000_000;
+    AssetRegistry.configure({ ttlMs: 60_000, now: clock });
+    AssetRegistry.clear();
+  });
+
+  it("registers a record with a synthetic local: promptId and empty workflow", () => {
+    const record = AssetRegistry.registerLocal({ filename: "pixelated_abc123.png" });
+    expect(record.promptId.startsWith("local:")).toBe(true);
+    expect(record.filename).toBe("pixelated_abc123.png");
+    expect(record.subfolder).toBe("");
+    expect(record.type).toBe("input");
+    expect(record.workflow).toEqual({});
+  });
+
+  it("is retrievable via get()", () => {
+    const record = AssetRegistry.registerLocal({ filename: "pixelated_abc123.png" });
+    expect(AssetRegistry.get(record.assetId)?.assetId).toBe(record.assetId);
+  });
+
+  it("marks registered records as local via isLocalAsset", () => {
+    const local = AssetRegistry.registerLocal({ filename: "pixelated_abc123.png" });
+    expect(isLocalAsset(local)).toBe(true);
+
+    const [real] = AssetRegistry.register({
+      promptId: "p1",
+      workflow: sampleWorkflow(),
+      outputs: sampleOutputs(),
+    });
+    expect(isLocalAsset(real)).toBe(false);
+  });
+
+  it("generates distinct asset ids for repeated calls with the same filename", () => {
+    const a = AssetRegistry.registerLocal({ filename: "pixelated_abc123.png" });
+    const b = AssetRegistry.registerLocal({ filename: "pixelated_abc123.png" });
+    expect(a.assetId).not.toBe(b.assetId);
+  });
+
+  it("respects explicit subfolder/type overrides", () => {
+    const record = AssetRegistry.registerLocal({
+      filename: "sheet.png",
+      subfolder: "batch1",
+      type: "output",
+    });
+    expect(record.subfolder).toBe("batch1");
+    expect(record.type).toBe("output");
   });
 });
 

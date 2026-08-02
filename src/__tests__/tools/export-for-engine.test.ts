@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { SpritesheetMetadata } from "../../sprite/types.js";
 
@@ -48,6 +48,8 @@ interface ToolBody {
   sprite_count?: number;
   out_png_path?: string;
   out_json_path?: string;
+  save_png_path?: string;
+  save_json_path?: string;
   metadata?: {
     version: 1;
     engine: "unity";
@@ -277,5 +279,47 @@ describe("export_for_engine", () => {
     expect(body.out_json_path).toBeUndefined();
     expect(result.content[1].type).toBe("image");
     expect(result.content[1].data).toBeTruthy();
+  });
+
+  // ── save_dir: arbitrary local directory, independent of COMFYUI_PATH ────
+
+  describe("save_dir", () => {
+    let saveDir: string;
+
+    beforeEach(() => {
+      saveDir = mkdtempSync(join(tmpdir(), "pixelforge-export-save-"));
+    });
+
+    afterEach(async () => {
+      const { rm } = await import("node:fs/promises");
+      await rm(saveDir, { recursive: true, force: true });
+    });
+
+    it("writes '<sprite_name>.png/.json' to an arbitrary save_dir", async () => {
+      const handler = await getHandler();
+      const body = parse(
+        await handler({ ...BASE_ARGS, sheet_path: sheetPath, save_dir: saveDir }),
+      );
+
+      expect(body.save_png_path).toBe(join(saveDir, "Player.png"));
+      expect(body.save_json_path).toBe(join(saveDir, "Player.json"));
+      expect(readFileSync(body.save_png_path!).length).toBeGreaterThan(0);
+      expect(JSON.parse(readFileSync(body.save_json_path!, "utf-8"))).toEqual(body.metadata);
+    });
+
+    it("sanitizes a sprite_name that isn't a safe bare filename", async () => {
+      const handler = await getHandler();
+      const body = parse(
+        await handler({
+          ...BASE_ARGS,
+          sheet_path: sheetPath,
+          sprite_name: "../../evil/Player Name!",
+          save_dir: saveDir,
+        }),
+      );
+
+      expect(body.save_png_path).toBe(join(saveDir, "Player_Name_.png"));
+      expect(readFileSync(body.save_png_path!).length).toBeGreaterThan(0);
+    });
   });
 });

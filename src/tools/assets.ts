@@ -1,9 +1,9 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { AssetRegistry, applyOverrides } from "../services/asset-registry.js";
+import { AssetRegistry, applyOverrides, isLocalAsset } from "../services/asset-registry.js";
 import { enqueueWorkflow } from "../services/workflow-executor.js";
 import { viewAssetImage } from "../services/view-image.js";
-import { errorToToolResult } from "../utils/errors.js";
+import { ValidationError, errorToToolResult } from "../utils/errors.js";
 
 function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
   if (!record) return null;
@@ -143,6 +143,14 @@ export function registerAssetTools(server: McpServer): void {
           return errorToToolResult(
             new Error(
               `No asset found for id "${asset_id}". It may have expired or never been registered.`,
+            ),
+          );
+        }
+        if (isLocalAsset(record)) {
+          return errorToToolResult(
+            new ValidationError(
+              `Asset "${asset_id}" was registered from a local file (e.g. pixelate_image), not a ` +
+                "ComfyUI job — there is no workflow to re-enqueue.",
             ),
           );
         }

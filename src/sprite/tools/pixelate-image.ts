@@ -1,8 +1,13 @@
+import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { uploadImageHttp } from "../../comfyui/client.js";
+import { AssetRegistry } from "../../services/asset-registry.js";
 import { ComfyUIError, ValidationError, errorToToolResult } from "../../utils/errors.js";
-import { loadImageSource, resolveWritableOutputPath } from "../image-io.js";
+import { logger } from "../../utils/logger.js";
+import { loadImageSource, resolveSaveDir, resolveWritableOutputPath } from "../image-io.js";
 import { quantizeImage, LOSPEC_PRESET_SLUGS } from "../postprocess/index.js";
 import type { LospecPresetSlug, PaletteSource } from "../types.js";
 
@@ -58,6 +63,14 @@ const pixelateImageSchema = {
     .string()
     .optional()
     .describe("Optional path under the ComfyUI output directory to also write the pixelated PNG to."),
+  save_dir: z
+    .string()
+    .optional()
+    .describe(
+      "Optional local directory (arbitrary, not required to be inside the ComfyUI output " +
+        "directory or to have COMFYUI_PATH configured) to also save the pixelated PNG to, under " +
+        "an auto-generated filename. Created if it does not exist.",
+    ),
 };
 
 type PixelateImageArgs = {
@@ -71,7 +84,40 @@ type PixelateImageArgs = {
   custom_palette?: string[];
   despeckle?: boolean;
   out_path?: string;
+  save_dir?: string;
 };
+
+/** Content-addressed so re-running the same result never collides with a stale upload. */
+function derivePixelatedFilename(png: Buffer): string {
+  const hash = createHash("sha256").update(png).digest("hex").slice(0, 12);
+  return `pixelated_${hash}.png`;
+}
+
+/**
+ * Upload the pixelated PNG to ComfyUI's input/ dir and register it as an
+ * asset, so the result can be chained into remove_background/pack_spritesheet
+ * via asset_id without the caller managing files. Best-effort: a ComfyUI
+ * that's unreachable must not fail the whole tool call, since the pixelated
+ * bytes are already being returned inline regardless.
+ */
+async function registerPixelatedAsset(
+  png: Buffer,
+): Promise<{ assetId?: string; filename?: string; error?: string }> {
+  const filename = derivePixelatedFilename(png);
+  try {
+    const uploaded = await uploadImageHttp(filename, png, "image/png");
+    const record = AssetRegistry.registerLocal({
+      filename: uploaded.name,
+      subfolder: uploaded.subfolder,
+      type: uploaded.type,
+    });
+    return { assetId: record.assetId, filename: uploaded.name };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn("pixelate_image: could not register result as an asset", { error: message });
+    return { error: message };
+  }
+}
 
 function assertPositiveInteger(value: number, label: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
@@ -129,8 +175,11 @@ export function registerPixelateImageTool(server: McpServer): void {
     "Convert an arbitrary image into clean pixel art: nearest-neighbor grid-snap to a target " +
       "resolution, palette quantization (a built-in Lospec preset, an auto-derived k-means-style " +
       "palette, or a caller-provided hex list), nearest-color mapping, and an isolated-pixel " +
-      "despeckle pass. Alpha is preserved throughout. Source is an asset_id or a path; returns the " +
-      "result inline as a PNG and optionally writes it to out_path.",
+      "despeckle pass. Alpha is preserved throughout. Source is an asset_id or a path (a relative " +
+      "path works even without COMFYUI_PATH configured, fetched over HTTP); returns the result " +
+      "inline as a PNG, optionally writes it to out_path and/or an arbitrary local save_dir, and " +
+      "registers it as a new asset_id (uploaded to ComfyUI's input dir) so it can be chained " +
+      "straight into remove_background/pack_spritesheet/export_for_engine.",
     pixelateImageSchema,
     async (args: PixelateImageArgs) => {
       try {
@@ -158,6 +207,15 @@ export function registerPixelateImageTool(server: McpServer): void {
           await writeFile(outPath, result.png);
         }
 
+        let savePath: string | undefined;
+        if (args.save_dir) {
+          const saveDir = await resolveSaveDir(args.save_dir, "save_dir");
+          savePath = join(saveDir, derivePixelatedFilename(result.png));
+          await writeFile(savePath, result.png);
+        }
+
+        const asset = await registerPixelatedAsset(result.png);
+
         const summary = {
           source: source.label,
           width: result.width,
@@ -167,6 +225,14 @@ export function registerPixelateImageTool(server: McpServer): void {
           despeckle: args.despeckle !== false,
           output_bytes: result.png.length,
           out_path: outPath,
+          save_path: savePath,
+          asset_id: asset.assetId,
+          asset_registration_error: asset.error,
+          note: asset.assetId
+            ? "asset_id is registered from this local file, not a ComfyUI job — regenerate is not " +
+              "supported for it, but it can be passed to remove_background/pack_spritesheet/" +
+              "export_for_engine as asset_id."
+            : undefined,
         };
 
         return {

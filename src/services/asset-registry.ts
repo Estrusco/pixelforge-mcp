@@ -31,6 +31,16 @@ export interface RegisterArgs {
   outputs: AssetOutput[];
 }
 
+export interface RegisterLocalArgs {
+  filename: string;
+  subfolder?: string;
+  /** ComfyUI directory the file was uploaded/written to. Default "input". */
+  type?: string;
+}
+
+/** Prefix marking a promptId as synthetic (no real ComfyUI job behind it). */
+const LOCAL_PROMPT_PREFIX = "local:";
+
 export interface ListArgs {
   limit?: number;
   since?: number;
@@ -97,6 +107,34 @@ export const AssetRegistry = {
     return created;
   },
 
+  /**
+   * Register a locally produced image (e.g. pixelate_image output) that has
+   * no real ComfyUI job behind it. Uses a synthetic `local:<hash>` promptId
+   * and an empty workflow snapshot, so `regenerate` can detect and reject it
+   * (see isLocalAsset()) instead of enqueueing an empty prompt.
+   */
+  registerLocal({ filename, subfolder = "", type = "input" }: RegisterLocalArgs): AssetRecord {
+    const now = state.config.now();
+    const promptId = `${LOCAL_PROMPT_PREFIX}${createHash("sha256")
+      .update(`${filename}\0${subfolder}\0${type}\0${now}\0${Math.random()}`)
+      .digest("hex")
+      .slice(0, 16)}`;
+    const assetId = makeAssetId(promptId, { filename, subfolder, type, url: "" });
+    const record: AssetRecord = {
+      assetId,
+      promptId,
+      nodeId: "local",
+      filename,
+      subfolder,
+      type,
+      url: "",
+      workflow: {},
+      createdAt: now,
+    };
+    state.records.set(assetId, record);
+    return record;
+  },
+
   /** Look up a record by id. Returns undefined for missing or expired. */
   get(assetId: string): AssetRecord | undefined {
     const record = state.records.get(assetId);
@@ -144,6 +182,11 @@ export const AssetRegistry = {
     return state.records.size;
   },
 };
+
+/** True for assets registered via `AssetRegistry.registerLocal()` — no real workflow to re-enqueue. */
+export function isLocalAsset(record: AssetRecord): boolean {
+  return record.promptId.startsWith(LOCAL_PROMPT_PREFIX);
+}
 
 /**
  * Apply a flat override map to every node input in a workflow.

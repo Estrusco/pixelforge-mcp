@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { AssetRegistry } from "../services/asset-registry.js";
 import { getOutputImage } from "../services/image-management.js";
@@ -25,20 +25,6 @@ export interface LoadedImage {
   readonly bytes: Buffer;
 }
 
-/** Path safety: absolute paths pass; relative ones must stay inside the output dir. */
-export async function resolveReadablePath(path: string, label: string): Promise<string> {
-  if (path.trim().length === 0) {
-    throw new ValidationError(`${label} must be a non-empty string.`);
-  }
-  if (isAbsolute(path)) return resolve(path);
-  const outputDir = await resolveOutputDir();
-  const resolved = resolve(outputDir, path);
-  if (resolved !== outputDir && !resolved.startsWith(outputDir + sep)) {
-    throw new ValidationError(`A relative ${label} must stay within the ComfyUI output directory.`);
-  }
-  return resolved;
-}
-
 /** Same rule for writes, so a tool can never be talked into writing outside it. */
 export async function resolveWritableOutputPath(path: string, label: string): Promise<string> {
   if (path.trim().length === 0) {
@@ -50,6 +36,43 @@ export async function resolveWritableOutputPath(path: string, label: string): Pr
     throw new ValidationError(`${label} must stay within the ComfyUI output directory.`);
   }
   return resolved;
+}
+
+/**
+ * Resolve (and create) an arbitrary local directory to write into — no
+ * containment check against the ComfyUI output dir, and no COMFYUI_PATH
+ * dependency. The caller explicitly chose this location, so this is safe
+ * unlike a relative `out_path` (which must stay inside the output dir).
+ * Mirrors get_image's `save_dir` handling (src/tools/image-management.ts).
+ */
+export async function resolveSaveDir(saveDir: string, label: string): Promise<string> {
+  if (saveDir.trim().length === 0) {
+    throw new ValidationError(`${label} must be a non-empty path.`);
+  }
+  const resolved = resolve(saveDir);
+  await mkdir(resolved, { recursive: true });
+  return resolved;
+}
+
+/**
+ * Resolve ComfyUI's local output dir, or undefined when none is knowable:
+ * no --output-directory/--base-directory override reported by a reachable
+ * ComfyUI, and no COMFYUI_PATH fallback configured. Never throws.
+ */
+async function tryResolveOutputDir(): Promise<string | undefined> {
+  try {
+    return await resolveOutputDir();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Split "sub/dir/file.png" into { subfolder: "sub/dir", filename: "file.png" }. */
+function splitRelativePath(path: string): { filename: string; subfolder: string } {
+  const slash = path.lastIndexOf("/");
+  return slash === -1
+    ? { filename: path, subfolder: "" }
+    : { filename: path.slice(slash + 1), subfolder: path.slice(0, slash) };
 }
 
 /**
@@ -87,10 +110,47 @@ export async function loadImageSource(
     };
   }
 
-  const resolved = await resolveReadablePath(ref.path!, `${context} path`);
+  const path = ref.path!;
+  if (isAbsolute(path)) {
+    const resolved = resolve(path);
+    try {
+      return { label: resolved, bytes: await readFile(resolved) };
+    } catch {
+      throw new ValidationError(`${context}: source image not found or unreadable: ${resolved}`);
+    }
+  }
+
+  const outputDir = await tryResolveOutputDir();
+  if (outputDir !== undefined) {
+    const resolved = resolve(outputDir, path);
+    if (resolved !== outputDir && !resolved.startsWith(outputDir + sep)) {
+      throw new ValidationError(
+        `A relative ${context} path must stay within the ComfyUI output directory.`,
+      );
+    }
+    try {
+      return { label: resolved, bytes: await readFile(resolved) };
+    } catch {
+      throw new ValidationError(`${context}: source image not found or unreadable: ${resolved}`);
+    }
+  }
+
+  // No local output dir is knowable (COMFYUI_PATH unset and ComfyUI reported
+  // no --output-directory/--base-directory override) — the common case when
+  // ComfyUI runs with its default output dir and COMFYUI_PATH was never set.
+  // Treat the relative path as a ComfyUI-relative filename[/subfolder] and
+  // fetch it over HTTP /view, the same mechanism asset_id already uses.
+  const { filename, subfolder } = splitRelativePath(path);
   try {
-    return { label: resolved, bytes: await readFile(resolved) };
-  } catch {
-    throw new ValidationError(`${context}: source image not found or unreadable: ${resolved}`);
+    const image = await getOutputImage(filename, "output", subfolder);
+    return {
+      label: `${context} path "${path}" (via ComfyUI /view)`,
+      bytes: Buffer.from(image.base64, "base64"),
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new ValidationError(
+      `${context}: source image not found or unreadable: ${path} (${message})`,
+    );
   }
 }

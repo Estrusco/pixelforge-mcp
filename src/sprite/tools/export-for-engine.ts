@@ -1,9 +1,10 @@
 import { writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ValidationError, errorToToolResult } from "../../utils/errors.js";
 import { assertMetadataConsistent, assertSheetMatchesMetadata, translateToUnity } from "../export/index.js";
-import { loadImageSource, resolveWritableOutputPath } from "../image-io.js";
+import { loadImageSource, resolveSaveDir, resolveWritableOutputPath } from "../image-io.js";
 import { probeImageDimensions } from "../packing/index.js";
 import {
   DEFAULT_PIXELS_PER_UNIT,
@@ -94,6 +95,15 @@ const exportForEngineSchema = {
       "Optional PNG path under the ComfyUI output directory to also write to. The JSON metadata " +
         "is written alongside it with a .json extension. Omit to receive both inline only.",
     ),
+  save_dir: z
+    .string()
+    .optional()
+    .describe(
+      "Optional local directory (arbitrary, not required to be inside the ComfyUI output " +
+        "directory or to have COMFYUI_PATH configured) to also write '<sprite_name>.png' and " +
+        "'<sprite_name>.json' to. Created if it does not exist — e.g. point this straight at a " +
+        "Unity project's Assets/ folder.",
+    ),
 };
 
 type ExportForEngineArgs = {
@@ -104,11 +114,22 @@ type ExportForEngineArgs = {
   sprite_name: string;
   pixels_per_unit?: number;
   out_path?: string;
+  save_dir?: string;
 };
 
 /** `foo.png` -> `foo.json`; anything else gets `.json` appended. */
 function deriveJsonPath(pngPath: string): string {
   return /\.png$/i.test(pngPath) ? pngPath.replace(/\.png$/i, ".json") : `${pngPath}.json`;
+}
+
+/**
+ * `sprite_name` is caller-supplied free text, not a trusted path — strip any
+ * directory components (basename) and collapse anything else that isn't a
+ * safe filename character before using it to build a save_dir file path.
+ */
+function safeSpriteFilename(spriteName: string, ext: string): string {
+  const base = basename(spriteName.trim()).replace(/[^A-Za-z0-9._-]/g, "_");
+  return `${base.length > 0 ? base : "sprite"}${ext}`;
 }
 
 export function registerExportForEngineTool(server: McpServer): void {
@@ -120,7 +141,8 @@ export function registerExportForEngineTool(server: McpServer): void {
       "are REJECTED, never silently skipped. The Unity translation flips each frame rect from " +
       "pack_spritesheet's top-left/y-down convention to Unity's bottom-left/y-up convention and " +
       "names each frame '<sprite_name>_<frame_index>'; the normalized pivot passes through " +
-      "unchanged (already bottom-origin).",
+      "unchanged (already bottom-origin). save_dir writes '<sprite_name>.png/.json' straight to " +
+      "an arbitrary local directory, independent of out_path's ComfyUI-output-dir constraint.",
     exportForEngineSchema,
     async (args: ExportForEngineArgs) => {
       try {
@@ -156,6 +178,16 @@ export function registerExportForEngineTool(server: McpServer): void {
           await writeFile(outJsonPath, JSON.stringify(unityMetadata, null, 2));
         }
 
+        let savePngPath: string | undefined;
+        let saveJsonPath: string | undefined;
+        if (args.save_dir) {
+          const saveDir = await resolveSaveDir(args.save_dir, "save_dir");
+          savePngPath = join(saveDir, safeSpriteFilename(args.sprite_name, ".png"));
+          saveJsonPath = join(saveDir, safeSpriteFilename(args.sprite_name, ".json"));
+          await writeFile(savePngPath, sheet.bytes);
+          await writeFile(saveJsonPath, JSON.stringify(unityMetadata, null, 2));
+        }
+
         const summary = {
           status: "exported",
           tool: "export_for_engine",
@@ -164,6 +196,8 @@ export function registerExportForEngineTool(server: McpServer): void {
           sheet_source: sheet.label,
           out_png_path: outPngPath,
           out_json_path: outJsonPath,
+          save_png_path: savePngPath,
+          save_json_path: saveJsonPath,
           metadata: unityMetadata,
           note:
             "sprites[].rect uses Unity's BOTTOM-LEFT origin (y up) — already converted from " +
