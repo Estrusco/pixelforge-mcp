@@ -25,11 +25,14 @@ const state = vi.hoisted(() => ({
   /** Asset ids whose staging blows up (breaks the chain without failing the frame). */
   stagingFailsFor: new Set<string>(),
   enqueueThrowsFor: null as ((req: SpriteJobRequest) => boolean) | null,
+  /** Attach a fake downloadedModels payload to the FIRST enqueued job only. */
+  downloadOnFirstEnqueue: false,
 }));
 
 vi.mock("../../sprite/comfyui/sprite-job.js", () => ({
   enqueueSpriteJob: vi.fn(async (req: SpriteJobRequest) => {
     if (state.enqueueThrowsFor?.(req)) throw new Error("queue refused the prompt");
+    const isFirst = state.enqueued.length === 0;
     state.enqueued.push(req);
     state.inFlight += 1;
     state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
@@ -41,6 +44,17 @@ vi.mock("../../sprite/comfyui/sprite-job.js", () => ({
       checkpoint: req.checkpoint ?? "mapped.safetensors",
       seed: req.seed,
       mode: req.referenceImage === undefined ? "txt2img" : "img2img",
+      downloadedModels:
+        state.downloadOnFirstEnqueue && isFirst
+          ? [
+              {
+                requested: "missing.safetensors",
+                installed: "installed.safetensors",
+                source: "huggingface" as const,
+                nodeType: "CheckpointLoaderSimple",
+              },
+            ]
+          : undefined,
     };
   }),
 }));
@@ -144,6 +158,7 @@ interface ToolBody {
   succeeded_frame_count?: number;
   failed_frame_count?: number;
   skipped_frame_count?: number;
+  downloaded_models?: Array<{ requested: string; installed: string; source: string; nodeType: string }>;
   states: StateJson[];
 }
 
@@ -182,6 +197,7 @@ describe("generate_animation_set", () => {
     state.fateFor = null;
     state.stagingFailsFor.clear();
     state.enqueueThrowsFor = null;
+    state.downloadOnFirstEnqueue = false;
   });
 
   // ── LOCKED DECISION: controlnet_pose is rejected, NEVER downgraded ────────
@@ -497,5 +513,51 @@ describe("generate_animation_set", () => {
     expect(
       body.succeeded_frame_count + body.failed_frame_count + body.skipped_frame_count,
     ).toBe(12);
+  });
+
+  // ── auto_download_missing propagation (pixelforge-mcp-7dc.2) ─────────────
+
+  it("forwards auto_download_missing to every frame's enqueueSpriteJob request", async () => {
+    const handler = await getHandler();
+    await handler({
+      ...BASE_ARGS,
+      motion_states: ["slither", "coil"],
+      frames_per_state: 2,
+      auto_download_missing: true,
+    });
+
+    expect(state.enqueued).toHaveLength(4);
+    for (const req of state.enqueued) {
+      expect(req.autoDownloadMissing).toBe(true);
+    }
+  });
+
+  it("defaults auto_download_missing to unset (never silently on)", async () => {
+    const handler = await getHandler();
+    await handler({ ...BASE_ARGS, motion_states: ["slither"], frames_per_state: 1 });
+
+    expect(state.enqueued[0].autoDownloadMissing).toBeUndefined();
+  });
+
+  it("surfaces downloaded_models in the result when a frame job reports one", async () => {
+    state.downloadOnFirstEnqueue = true;
+    const handler = await getHandler();
+    const body = parse(
+      await handler({
+        ...BASE_ARGS,
+        motion_states: ["slither"],
+        frames_per_state: 1,
+        auto_download_missing: true,
+      }),
+    );
+
+    expect(body.downloaded_models).toEqual([
+      {
+        requested: "missing.safetensors",
+        installed: "installed.safetensors",
+        source: "huggingface",
+        nodeType: "CheckpointLoaderSimple",
+      },
+    ]);
   });
 });

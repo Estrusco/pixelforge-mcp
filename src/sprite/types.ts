@@ -159,6 +159,27 @@ export interface SpriteJobRequest {
    * Meaningless (and rejected by the tool layer) without `referenceImage`.
    */
   readonly denoise?: number;
+  /**
+   * Explicit opt-in (default false — NEVER silent): when the built workflow
+   * fails validation because a model it references isn't installed, resolve
+   * and download the best CivitAI/HuggingFace candidate before enqueueing,
+   * instead of enqueueing a graph ComfyUI will only fail on later. See
+   * `enqueueSpriteJob` (sprite-job.ts) for the full resolve/download/re-validate
+   * sequence. Never wired for LoRA (pixelforge-mcp-7dc.1) — checkpoints only.
+   */
+  readonly autoDownloadMissing?: boolean;
+}
+
+/** One model auto-downloaded during an `enqueueSpriteJob` call. */
+export interface DownloadedModelInfo {
+  /** The filename the workflow originally asked for (not installed). */
+  readonly requested: string;
+  /** The filename actually installed and wired into the workflow (best-ranked
+   *  candidate — usually equal to `requested` on an exact match, but not always). */
+  readonly installed: string;
+  readonly source: "civitai" | "huggingface";
+  /** The node class_type that needed it, e.g. "CheckpointLoaderSimple". */
+  readonly nodeType: string;
 }
 
 /** What the tool layer echoes back to the caller after a successful enqueue. */
@@ -170,6 +191,8 @@ export interface SpriteJobResult {
   /** Must equal `SpriteJobRequest.seed`; echoed for reproducibility. */
   readonly seed: number;
   readonly mode: SpriteGenerationMode;
+  /** Present only when `autoDownloadMissing` actually triggered a download. */
+  readonly downloadedModels?: readonly DownloadedModelInfo[];
 }
 
 /**
@@ -358,6 +381,8 @@ export interface AnimationSetRequest {
    * runs txt2img; present => it runs img2img at `denoise`.
    */
   readonly referenceImage?: string;
+  /** Forwarded verbatim to every frame's `SpriteJobRequest` — see its doc comment. */
+  readonly autoDownloadMissing?: boolean;
 }
 
 /** Why one frame is in the frame list. Discriminant of `AnimationFrameResult`. */
@@ -471,6 +496,8 @@ export interface AnimationSetResult {
   readonly skippedFrameCount: number;
   /** One entry per motion state, in the caller's order. Never empty. */
   readonly states: readonly AnimationStateResult[];
+  /** Models auto-downloaded across every frame's `enqueueSpriteJob` call, deduped. */
+  readonly downloadedModels?: readonly DownloadedModelInfo[];
 }
 
 // ===========================================================================

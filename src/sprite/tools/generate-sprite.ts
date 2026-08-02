@@ -96,6 +96,16 @@ const generateSpriteSchema = {
       "img2img denoise strength, 0 < denoise <= 1. Lower keeps more of the reference. " +
         "Only valid together with a reference image.",
     ),
+  auto_download_missing: z
+    .boolean()
+    .optional()
+    .describe(
+      "Explicit opt-in (default false — NEVER silent): if the resolved checkpoint isn't actually " +
+        "installed, download the best-ranked CivitAI/HuggingFace candidate before enqueueing, " +
+        "instead of enqueueing a graph ComfyUI will only reject later. Reports what was downloaded " +
+        "in the result. If no installable candidate is found, fails with an actionable error " +
+        "instead of proceeding with a broken checkpoint.",
+    ),
 };
 
 type GenerateSpriteArgs = {
@@ -110,6 +120,7 @@ type GenerateSpriteArgs = {
   reference_asset_id?: string;
   reference_path?: string;
   denoise?: number;
+  auto_download_missing?: boolean;
 };
 
 /**
@@ -168,6 +179,7 @@ export function registerGenerateSpriteTool(server: McpServer): void {
           checkpoint: args.checkpoint,
           referenceImage: reference?.filename,
           denoise,
+          autoDownloadMissing: args.auto_download_missing,
         };
 
         const result: SpriteJobResult = await enqueueSpriteJob(request);
@@ -190,6 +202,7 @@ export function registerGenerateSpriteTool(server: McpServer): void {
                   width,
                   height,
                   reference_image: reference?.source,
+                  downloaded_models: result.downloadedModels,
                   note:
                     "Fire-and-forget. The asset_id arrives in the completion notification; pass this " +
                     "prompt_id to get_sprite_result to fetch the sprite. Reuse `seed` to reproduce it.",

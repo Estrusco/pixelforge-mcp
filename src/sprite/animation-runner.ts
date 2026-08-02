@@ -13,6 +13,7 @@ import type {
   AnimationSetRequest,
   AnimationSetResult,
   AnimationStateResult,
+  DownloadedModelInfo,
   MotionState,
   SpriteGenerationMode,
   SpriteJobRequest,
@@ -128,6 +129,7 @@ export async function runAnimationSet(
   const checkpoint = await deps.resolveCheckpoint(request.style, request.checkpoint);
 
   const states: AnimationStateResult[] = [];
+  const downloadedModels: DownloadedModelInfo[] = [];
 
   for (let stateIndex = 0; stateIndex < request.motionStates.length; stateIndex++) {
     const motionState = request.motionStates[stateIndex];
@@ -164,11 +166,13 @@ export async function runAnimationSet(
         referenceImage: reference,
         // denoise is meaningless for txt2img; only send it with a reference.
         denoise: reference === undefined ? undefined : request.denoise,
+        autoDownloadMissing: request.autoDownloadMissing,
       };
 
       let job: SpriteJobResult;
       try {
         job = await deps.enqueue(jobRequest);
+        if (job.downloadedModels) downloadedModels.push(...job.downloadedModels);
       } catch (err) {
         frames.push({
           status: "failed",
@@ -291,5 +295,6 @@ export async function runAnimationSet(
     failedFrameCount,
     skippedFrameCount,
     states,
+    downloadedModels: downloadedModels.length > 0 ? downloadedModels : undefined,
   };
 }

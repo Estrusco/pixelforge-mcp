@@ -147,6 +147,16 @@ const generateAnimationSetSchema = {
         "the FIRST frame of the FIRST motion state only. At most one of reference_asset_id / " +
         "reference_path.",
     ),
+  auto_download_missing: z
+    .boolean()
+    .optional()
+    .describe(
+      "Explicit opt-in (default false — NEVER silent): if the resolved checkpoint isn't actually " +
+        "installed, download the best-ranked CivitAI/HuggingFace candidate before the first frame " +
+        "enqueues (every later frame then finds it already installed). Reports what was downloaded " +
+        "in the result. If no installable candidate is found, fails with an actionable error " +
+        "instead of proceeding with a broken checkpoint.",
+    ),
 };
 
 type GenerateAnimationSetArgs = {
@@ -164,6 +174,7 @@ type GenerateAnimationSetArgs = {
   denoise?: number;
   reference_asset_id?: string;
   reference_path?: string;
+  auto_download_missing?: boolean;
 };
 
 /**
@@ -339,6 +350,7 @@ export function registerGenerateAnimationSetTool(server: McpServer): void {
           consistencyMode,
           denoise,
           referenceImage: reference?.filename,
+          autoDownloadMissing: args.auto_download_missing,
         };
 
         const result = await runAnimationSet(request);
@@ -366,6 +378,7 @@ export function registerGenerateAnimationSetTool(server: McpServer): void {
                   failed_frame_count: result.failedFrameCount,
                   skipped_frame_count: result.skippedFrameCount,
                   base_image: reference?.source,
+                  downloaded_models: result.downloadedModels,
                   states: result.states.map((state) => ({
                     motion_state: state.motionState,
                     succeeded_frame_count: state.succeededFrameCount,

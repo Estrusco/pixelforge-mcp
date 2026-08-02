@@ -1,15 +1,13 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
-import { getObjectInfo, getSystemStats } from "../comfyui/client.js";
-import { searchCivitaiModels } from "../services/civitai-resolver.js";
-import { searchHuggingFaceModels } from "../services/model-resolver.js";
+import { getObjectInfo } from "../comfyui/client.js";
 import {
   findMissingModels,
+  liveResolveDeps,
   resolveCandidates,
   type ModelCandidate,
   type ObjectInfoLike,
-  type ResolveDeps,
 } from "../services/missing-models.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
 
@@ -30,54 +28,6 @@ function parseWorkflow(input: unknown): WorkflowJSON {
     return input as WorkflowJSON;
   }
   throw new ValidationError("Workflow must be a JSON string or object");
-}
-
-/** Weight files worth offering; skip READMEs, configs, previews. */
-const WEIGHT_RE = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft)$/i;
-
-/**
- * List a HuggingFace repo's weight files WITH sizes. HF search returns REPOS,
- * not files, so without this expansion a candidate has no size, no precision and
- * no fit verdict — i.e. none of what makes the list useful on a small GPU.
- *
- * Must be `/tree/main`: the plain `/api/models/{id}` response carries
- * `siblings[].rfilename` but NO size, and `?blobs=true` 400s. Verified live.
- * The repo id is `org/name` — its slash is part of the PATH, so it must not be
- * percent-encoded (encoding the whole id yields a 404).
- */
-async function hfRepoFiles(repoId: string): Promise<Array<{ filename: string; size_bytes?: number }>> {
-  const path = repoId.split("/").map(encodeURIComponent).join("/");
-  const res = await fetch(`https://huggingface.co/api/models/${path}/tree/main`, {
-    headers: process.env.HF_TOKEN ? { authorization: `Bearer ${process.env.HF_TOKEN}` } : undefined,
-  });
-  if (!res.ok) return [];
-  const body = (await res.json()) as Array<{ type?: string; path?: string; size?: number }>;
-  if (!Array.isArray(body)) return [];
-  return body
-    .filter((e) => e.type === "file" && typeof e.path === "string" && WEIGHT_RE.test(e.path))
-    .map((e) => ({ filename: e.path as string, size_bytes: typeof e.size === "number" ? e.size : undefined }));
-}
-
-function liveDeps(): ResolveDeps {
-  return {
-    searchCivitai: async (query, types) => {
-      const res = await searchCivitaiModels(query, { types, limit: 6 });
-      return res.hits.map((h) => ({
-        name: h.name,
-        model_id: h.model_id,
-        version_id: h.version_id,
-        size_mb: h.size_mb,
-        base_model: h.base_model,
-      }));
-    },
-    searchHf: async (query) => (await searchHuggingFaceModels(query, { limit: 4 })).map((m) => ({ id: m.id })),
-    hfRepoFiles,
-    vramBytes: async () => {
-      const stats = await getSystemStats();
-      const vram = stats.devices?.[0]?.vram_total;
-      return typeof vram === "number" && vram > 0 ? vram : undefined;
-    },
-  };
 }
 
 function human(bytes?: number): string {
@@ -142,7 +92,7 @@ export function registerMissingModelTools(server: McpServer): void {
           };
         }
 
-        const deps = liveDeps();
+        const deps = liveResolveDeps();
         const lines: string[] = [`## ${missing.length} missing model(s)`, ""];
 
         for (const m of missing) {

@@ -1,3 +1,7 @@
+import { getSystemStats } from "../comfyui/client.js";
+import { searchCivitaiModels } from "./civitai-resolver.js";
+import { searchHuggingFaceModels } from "./model-resolver.js";
+
 // Missing-model resolution: figure out which model files a workflow wants but
 // this ComfyUI doesn't have, then find installable candidates for them.
 //
@@ -371,4 +375,60 @@ export function dedupeCandidates(candidates: ModelCandidate[]): ModelCandidate[]
     if (!prevKnows && nextKnows) best.set(key, c);
   }
   return [...best.values()];
+}
+
+// ── Live ResolveDeps ────────────────────────────────────────────────────────
+// The network-touching implementation of `ResolveDeps`, shared by every caller
+// that resolves candidates against real CivitAI/HuggingFace/ComfyUI — the
+// resolve_missing_models tool AND generate_sprite/generate_animation_set's
+// auto_download_missing path. Lives here (not in tools/) so the sprite layer
+// can reuse it without importing from tools/.
+
+/** Weight files worth offering; skip READMEs, configs, previews. */
+const WEIGHT_RE = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft)$/i;
+
+/**
+ * List a HuggingFace repo's weight files WITH sizes. HF search returns REPOS,
+ * not files, so without this expansion a candidate has no size, no precision and
+ * no fit verdict — i.e. none of what makes the list useful on a small GPU.
+ *
+ * Must be `/tree/main`: the plain `/api/models/{id}` response carries
+ * `siblings[].rfilename` but NO size, and `?blobs=true` 400s. Verified live.
+ * The repo id is `org/name` — its slash is part of the PATH, so it must not be
+ * percent-encoded (encoding the whole id yields a 404).
+ */
+async function hfRepoFiles(repoId: string): Promise<Array<{ filename: string; size_bytes?: number }>> {
+  const path = repoId.split("/").map(encodeURIComponent).join("/");
+  const res = await fetch(`https://huggingface.co/api/models/${path}/tree/main`, {
+    headers: process.env.HF_TOKEN ? { authorization: `Bearer ${process.env.HF_TOKEN}` } : undefined,
+  });
+  if (!res.ok) return [];
+  const body = (await res.json()) as Array<{ type?: string; path?: string; size?: number }>;
+  if (!Array.isArray(body)) return [];
+  return body
+    .filter((e) => e.type === "file" && typeof e.path === "string" && WEIGHT_RE.test(e.path))
+    .map((e) => ({ filename: e.path as string, size_bytes: typeof e.size === "number" ? e.size : undefined }));
+}
+
+/** The real, network-touching `ResolveDeps` — CivitAI + HuggingFace + this ComfyUI's VRAM. */
+export function liveResolveDeps(): ResolveDeps {
+  return {
+    searchCivitai: async (query, types) => {
+      const res = await searchCivitaiModels(query, { types, limit: 6 });
+      return res.hits.map((h) => ({
+        name: h.name,
+        model_id: h.model_id,
+        version_id: h.version_id,
+        size_mb: h.size_mb,
+        base_model: h.base_model,
+      }));
+    },
+    searchHf: async (query) => (await searchHuggingFaceModels(query, { limit: 4 })).map((m) => ({ id: m.id })),
+    hfRepoFiles,
+    vramBytes: async () => {
+      const stats = await getSystemStats();
+      const vram = stats.devices?.[0]?.vram_total;
+      return typeof vram === "number" && vram > 0 ? vram : undefined;
+    },
+  };
 }
