@@ -240,13 +240,24 @@ interface RemoveBackgroundParams {
   /** BiRefNet model file (ComfyUI-RMBG auto-downloads it on first run). */
   model?: string;
   filename_prefix?: string;
+  /** "birefnet" (default, salient-object matting) or "luma_key" (core-node-only
+   *  luminance key — see buildRemoveBackgroundLumaKey). */
+  mode?: "birefnet" | "luma_key";
+  /** luma_key only: cut the combined R+G+B mask at this value (0-1) before
+   *  softening/inverting. Omit for the original unthresholded continuous mask
+   *  (the exact graph verified in the gap report — soft glow alpha preserved). */
+  threshold?: number;
+  /** luma_key only: GrowMask `expand` (pixels) applied to the (optionally
+   *  thresholded) mask before inverting — positive grows/softens the opaque
+   *  region's edge, negative shrinks it. Omit to skip this step entirely. */
+  softness?: number;
 }
 
 // Uses ComfyUI-RMBG's BiRefNetRMBG node (cnr id: comfyui-rmbg). The node loads a
 // BiRefNet matting model (auto-downloaded to models/RMBG/BiRefNet/ on first use)
 // and outputs the cutout (IMAGE, output 0), a MASK, and a MASK_IMAGE. We save the
 // transparent cutout. Proven in packs/wan-transparent.
-function buildRemoveBackground(p: RemoveBackgroundParams): WorkflowJSON {
+function buildRemoveBackgroundBiRefNet(p: RemoveBackgroundParams): WorkflowJSON {
   const imagePath = p.image_path ?? "input.png";
   const model = p.model ?? "BiRefNet_toonout";
   const prefix = p.filename_prefix ?? "ComfyUI_cutout";
@@ -279,6 +290,83 @@ function buildRemoveBackground(p: RemoveBackgroundParams): WorkflowJSON {
       inputs: { images: conn("2", 0), filename_prefix: prefix },
     },
   };
+}
+
+// Core-node-only luminance key: no custom node dependency (unlike BiRefNet),
+// so it always works. Built from a real workaround the user hand-wired around
+// BiRefNet's two failure modes on neon-on-black pixel art: BiRefNet's salient-
+// object matting fills hollow centers with opaque black, and hard-mattes away
+// the emissive glow halo that IS the art direction. A per-pixel R+G+B
+// luminance sum instead gives a naturally soft alpha (dark background/hollow
+// centers -> transparent, bright glow -> partially opaque) with no custom
+// node required. Verified end-to-end by the reporting user (histogram: ~48k
+// transparent / ~12k semi-transparent / ~5.5k opaque px on a real sprite).
+//
+// TRAP (verified, must stay documented): JoinImageWithAlpha computes
+// `alpha = 1.0 - mask` internally. Feeding it the raw luminance mask directly
+// would invert the result (opaque background, transparent subject) — an
+// InvertMask right before it cancels that out, so the final alpha ends up
+// EQUAL to the raw luminance mask (bright = opaque), which is what we want.
+// This is why LoadImage's own MASK output (already `1 - alpha`) can go
+// straight into JoinImageWithAlpha with no extra InvertMask: the two `1 - x`
+// steps are not both present in that path, so there's nothing to cancel.
+function buildRemoveBackgroundLumaKey(p: RemoveBackgroundParams): WorkflowJSON {
+  const imagePath = p.image_path ?? "input.png";
+  const prefix = p.filename_prefix ?? "ComfyUI_cutout";
+
+  const wf: WorkflowJSON = {
+    "1": { class_type: "LoadImage", inputs: { image: imagePath } },
+    "2": { class_type: "ImageToMask", inputs: { image: conn("1", 0), channel: "red" } },
+    "3": { class_type: "ImageToMask", inputs: { image: conn("1", 0), channel: "green" } },
+    "4": { class_type: "ImageToMask", inputs: { image: conn("1", 0), channel: "blue" } },
+    "5": {
+      class_type: "MaskComposite",
+      inputs: { destination: conn("2", 0), source: conn("3", 0), x: 0, y: 0, operation: "add" },
+    },
+    "6": {
+      class_type: "MaskComposite",
+      inputs: { destination: conn("5", 0), source: conn("4", 0), x: 0, y: 0, operation: "add" },
+    },
+  };
+
+  let maskId = "6";
+  let nextId = 7;
+
+  if (p.threshold !== undefined) {
+    const id = String(nextId++);
+    wf[id] = { class_type: "ThresholdMask", inputs: { mask: conn(maskId, 0), value: p.threshold } };
+    maskId = id;
+  }
+
+  if (p.softness !== undefined) {
+    const id = String(nextId++);
+    wf[id] = {
+      class_type: "GrowMask",
+      inputs: { mask: conn(maskId, 0), expand: p.softness, tapered_corners: true },
+    };
+    maskId = id;
+  }
+
+  const invertId = String(nextId++);
+  wf[invertId] = { class_type: "InvertMask", inputs: { mask: conn(maskId, 0) } };
+
+  const joinId = String(nextId++);
+  wf[joinId] = {
+    class_type: "JoinImageWithAlpha",
+    inputs: { image: conn("1", 0), alpha: conn(invertId, 0) },
+  };
+
+  const saveId = String(nextId++);
+  wf[saveId] = {
+    class_type: "SaveImage",
+    inputs: { images: conn(joinId, 0), filename_prefix: prefix },
+  };
+
+  return wf;
+}
+
+function buildRemoveBackground(p: RemoveBackgroundParams): WorkflowJSON {
+  return p.mode === "luma_key" ? buildRemoveBackgroundLumaKey(p) : buildRemoveBackgroundBiRefNet(p);
 }
 
 // =============================================================

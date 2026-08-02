@@ -29,8 +29,11 @@ interface RemoveBackgroundToolArgs {
   image?: string;
   asset_id?: string;
   path?: string;
+  mode?: "birefnet" | "luma_key";
   model?: string;
   filename_prefix?: string;
+  threshold?: number;
+  softness?: number;
 }
 
 /**
@@ -56,13 +59,20 @@ export function registerRemoveBackgroundTool(server: McpServer): void {
   server.tool(
     "remove_background",
     "Remove an image's background, returning a transparent (RGBA) cutout — the high-level entry point. " +
-      `Builds a LoadImage → ${REMBG_NODE} → SaveImage workflow using the ComfyUI-RMBG (BiRefNet) matting ` +
-      "node and enqueues it on your LOCAL GPU. Provide exactly one image source: image (a filename already " +
-      "in ComfyUI's input dir — upload it first with upload_image, or stage a prior output with " +
+      "Two modes: 'birefnet' (default) builds a " +
+      `LoadImage → ${REMBG_NODE} → SaveImage workflow using the ComfyUI-RMBG salient-object matting ` +
+      "node — good general-purpose cutout, but fills hollow interior regions with opaque background " +
+      "color and hard-mattes away soft glow/emissive halos. 'luma_key' builds a LoadImage → R/G/B " +
+      "channel masks → summed → [threshold] → [softness] → invert → JoinImageWithAlpha workflow from " +
+      "ComfyUI's core mask nodes only (no custom node dependency) — for dark-background art (e.g. " +
+      "neon-on-black pixel art) where BiRefNet's hard matte destroys the glow: gives a naturally soft " +
+      "alpha (dark → transparent, bright → opaque) and never opacifies a hollow dark interior. Enqueues " +
+      "on your LOCAL GPU either way. Provide exactly one image source: image (a filename already in " +
+      "ComfyUI's input dir — upload it first with upload_image, or stage a prior output with " +
       "stage_output_as_input), asset_id (a registered asset id from a completed job), or path (a filesystem " +
-      "path, absolute or relative to the ComfyUI output directory). Requires the ComfyUI-RMBG custom node " +
-      "(pack: wan-transparent, or install_custom_node 'comfyui-rmbg'); the BiRefNet model auto-downloads on " +
-      "first run. If the node isn't installed, returns an actionable error telling you how to install it. " +
+      "path, absolute or relative to the ComfyUI output directory). 'birefnet' requires the ComfyUI-RMBG " +
+      "custom node (pack: wan-transparent, or install_custom_node 'comfyui-rmbg'); the BiRefNet model " +
+      "auto-downloads on first run, and an actionable error is returned if the node isn't installed. " +
       "Returns prompt_id immediately; the cutout asset_id arrives in the completion notification.",
     {
       image: z
@@ -85,20 +95,50 @@ export function registerRemoveBackgroundTool(server: McpServer): void {
           "Path to a source image: absolute, or relative to the ComfyUI output directory. " +
             "Provide exactly one of image, asset_id, or path.",
         ),
+      mode: z
+        .enum(["birefnet", "luma_key"])
+        .optional()
+        .describe(
+          "Matting mode (default 'birefnet'): 'birefnet' for general salient-object cutouts, " +
+            "'luma_key' for dark-background/glow art where BiRefNet's hard matte is wrong.",
+        ),
       model: z
         .string()
         .optional()
-        .describe("BiRefNet matting model (default 'BiRefNet_toonout'; auto-downloaded by ComfyUI-RMBG)"),
+        .describe(
+          "birefnet mode only: matting model (default 'BiRefNet_toonout'; auto-downloaded by ComfyUI-RMBG).",
+        ),
       filename_prefix: z
         .string()
         .optional()
         .describe("Output filename prefix (default 'ComfyUI_cutout')"),
+      threshold: z
+        .number()
+        .optional()
+        .describe(
+          "luma_key mode only: 0-1 cutoff on the combined R+G+B mask before inverting. Omit for the " +
+            "original continuous (unthresholded) soft alpha.",
+        ),
+      softness: z
+        .number()
+        .optional()
+        .describe(
+          "luma_key mode only: pixels to grow (positive) or shrink (negative) the mask's edge before " +
+            "inverting — a GrowMask pass applied after threshold, if any. Omit to skip.",
+        ),
     },
     async (args: RemoveBackgroundToolArgs) => {
       try {
         const image = await resolveImageFilename(args);
         const result = await removeBackground(
-          { image, model: args.model, filename_prefix: args.filename_prefix },
+          {
+            image,
+            mode: args.mode,
+            model: args.model,
+            filename_prefix: args.filename_prefix,
+            threshold: args.threshold,
+            softness: args.softness,
+          },
           deps,
         );
         return {
@@ -111,6 +151,7 @@ export function registerRemoveBackgroundTool(server: McpServer): void {
                   tool: "remove_background",
                   prompt_id: result.prompt_id,
                   queue_remaining: result.queue_remaining,
+                  mode: result.mode,
                   model: result.model,
                   note: "Transparent cutout asset_id arrives in the completion notification; use view_image with it.",
                 },
