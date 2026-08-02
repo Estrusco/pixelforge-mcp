@@ -67,6 +67,16 @@ export interface AnalyzeColorResult {
   >;
 }
 
+export interface AlphaStats {
+  /** % of pixels fully transparent (alpha === 0). */
+  transparentPct: number;
+  /** % of pixels partially transparent (0 < alpha < 255) — soft edges/glow. */
+  semiTransparentPct: number;
+  /** % of pixels fully opaque (alpha === 255). */
+  opaquePct: number;
+  meanAlpha: number;
+}
+
 // Heuristic thresholds (8-bit). Rough but practical; tuned for video frames.
 const TH = {
   liftedBlack: 16, // blackPoint above this = blacks not reaching 0
@@ -133,9 +143,14 @@ async function resolveSafePath(path: string): Promise<string> {
   return resolved;
 }
 
+/**
+ * Alpha is deliberately NOT stripped: computeStats' RGB loop only ever reads
+ * indices 0/1/2 within each pixel's stride, so a 4-channel RGBA buffer feeds
+ * it identically to a 3-channel one — and keeping the 4th byte is what lets
+ * computeAlphaStats read it below without a second decode.
+ */
 async function toRaw(bytes: Buffer): Promise<RawPixels> {
   const { data, info } = await sharp(bytes, { limitInputPixels: 100_000_000 })
-    .removeAlpha()
     .toColourspace("srgb")
     .raw()
     .toBuffer({ resolveWithObject: true });
@@ -277,6 +292,38 @@ export function computeStats(raw: RawPixels): ColorStats {
   };
 }
 
+/**
+ * Alpha-channel histogram bucketed into transparent/semi-transparent/opaque —
+ * undefined when the source has no alpha channel (e.g. a decoded JPEG), so
+ * callers can tell "no alpha data" from "0% transparent".
+ */
+export function computeAlphaStats(raw: RawPixels): AlphaStats | undefined {
+  const { data, width, height, channels } = raw;
+  if (channels < 4) return undefined;
+  const pixelCount = width * height;
+
+  let transparent = 0;
+  let semiTransparent = 0;
+  let opaque = 0;
+  let sum = 0;
+
+  for (let i = 0; i < data.length; i += channels) {
+    const a = data[i + 3];
+    sum += a;
+    if (a === 0) transparent++;
+    else if (a === 255) opaque++;
+    else semiTransparent++;
+  }
+
+  const round = (n: number, d = 1) => Number(n.toFixed(d));
+  return {
+    transparentPct: round((transparent / pixelCount) * 100, 2),
+    semiTransparentPct: round((semiTransparent / pixelCount) * 100, 2),
+    opaquePct: round((opaque / pixelCount) * 100, 2),
+    meanAlpha: round(sum / pixelCount),
+  };
+}
+
 // Render a compact overlaid R/G/B/luma histogram PNG for visual confirmation.
 async function renderHistogram(raw: RawPixels): Promise<{ data: string; mimeType: string }> {
   const { data, channels } = raw;
@@ -353,10 +400,11 @@ function deltaReport(target: ColorStats, ref: ColorStats): string {
 export async function analyzeColor(opts: AnalyzeColorOptions): Promise<AnalyzeColorResult> {
   const raw = await toRaw(await resolveBytes(opts));
   const stats = computeStats(raw);
+  const alpha = computeAlphaStats(raw);
 
   const content: AnalyzeColorResult["content"] = [];
   let summary = `analyze_color — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
-    JSON.stringify(stats, null, 2);
+    JSON.stringify({ ...stats, alpha }, null, 2);
 
   if (opts.reference_path) {
     const refRaw = await toRaw(await readFile(await resolveSafePath(opts.reference_path)));

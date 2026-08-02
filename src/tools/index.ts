@@ -70,6 +70,7 @@ import { registerTrainTools } from "./train.js";
 import { registerAppsTools } from "./apps.js";
 import { registerTemplateSchemaTools } from "./template-schema.js";
 import { registerRunTemplateTools } from "./run-template.js";
+import { registerContactSheetTool } from "./contact-sheet.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 import { ToolCatalog } from "./catalog.js";
 
@@ -151,6 +152,9 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["images-assets", registerPackSpritesheetTool],
   ["images-assets", registerGenerateArcadeTopdownSetTool],
   ["images-assets", registerExportForEngineTool],
+  // Generic (not sprite-specific) — appended here only because tools/list
+  // order is observable and must not shift for existing tools.
+  ["images-assets", registerContactSheetTool],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────

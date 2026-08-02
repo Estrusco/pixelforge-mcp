@@ -22,13 +22,20 @@ function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
 export function registerAssetTools(server: McpServer): void {
   server.tool(
     "view_image",
-    "Fetch a registered asset's bytes and return them as an inline image so the agent can see the result. Use this after enqueue_workflow completes (asset_id is included in the completion notification) to inspect, critique, or compare generated images. Only supports image mime types (PNG/JPEG/WebP); audio/video assets must be saved to disk via get_image.",
+    "Fetch a registered asset's bytes and return them as an inline image so the agent can see the result. Use this after enqueue_workflow completes (asset_id is included in the completion notification) to inspect, critique, or compare generated images. Only supports image mime types (PNG/JPEG/WebP); audio/video assets must be saved to disk via get_image. By default transparency composites onto whatever background the client renders (often white), which makes dark-on-transparent art (e.g. a neon-on-black luma_key cutout) look faded or broken at a glance even when the alpha is correct — pass background:'dark'/'light'/'checker' to composite it server-side onto a deliberate backdrop instead (always returned as PNG).",
     {
       asset_id: z.string().describe("Asset id returned by list_assets or job completion"),
+      background: z
+        .enum(["dark", "light", "checker"])
+        .optional()
+        .describe(
+          "Composite the image onto this backdrop before returning it (always PNG). Omit to " +
+            "return the raw bytes as-is (client renders transparency however it wants).",
+        ),
     },
-    async ({ asset_id }) => {
+    async ({ asset_id, background }) => {
       try {
-        const result = await viewAssetImage(asset_id);
+        const result = await viewAssetImage(asset_id, background);
         return {
           content: result.content.map((block) =>
             block.type === "image"

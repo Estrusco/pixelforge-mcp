@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
+import sharp from "sharp";
 
 vi.mock("../../services/image-management.js", () => ({
   getOutputImage: vi.fn(),
@@ -88,5 +89,103 @@ describe("viewAssetImage", () => {
     expect(text).toBeDefined();
     expect((text as { text: string }).text).toContain(assetId);
     expect((text as { text: string }).text).toContain("b.jpg");
+  });
+});
+
+describe("viewAssetImage — background compositing", () => {
+  beforeEach(() => {
+    AssetRegistry.configure({ ttlMs: 60_000, now: Date.now });
+    AssetRegistry.clear();
+    mockedGetOutputImage.mockReset();
+  });
+
+  /** A 4x4 fully-transparent RGBA PNG — background compositing must fill it in. */
+  async function transparentPng(): Promise<string> {
+    const png = await sharp({
+      create: { width: 4, height: 4, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    })
+      .png()
+      .toBuffer();
+    return png.toString("base64");
+  }
+
+  async function pixelAt(base64: string, x: number, y: number): Promise<[number, number, number, number]> {
+    const { data, info } = await sharp(Buffer.from(base64, "base64"))
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const i = (y * info.width + x) * info.channels;
+    return [data[i], data[i + 1], data[i + 2], data[i + 3]];
+  }
+
+  it("composites onto a dark background, always returning PNG", async () => {
+    const assetId = register("neon.png");
+    mockedGetOutputImage.mockResolvedValueOnce({
+      base64: await transparentPng(),
+      mimeType: "image/png",
+      filename: "neon.png",
+    });
+
+    const result = await viewAssetImage(assetId, "dark");
+    const image = result.content.find((c) => c.type === "image") as { data: string; mimeType: string };
+    expect(image.mimeType).toBe("image/png");
+    const [r, g, b, a] = await pixelAt(image.data, 0, 0);
+    expect([r, g, b]).toEqual([24, 24, 24]);
+    expect(a).toBe(255); // flattened opaque, no longer transparent
+  });
+
+  it("composites onto a light background", async () => {
+    const assetId = register("neon.png");
+    mockedGetOutputImage.mockResolvedValueOnce({
+      base64: await transparentPng(),
+      mimeType: "image/png",
+      filename: "neon.png",
+    });
+
+    const result = await viewAssetImage(assetId, "light");
+    const image = result.content.find((c) => c.type === "image") as { data: string };
+    const [r, g, b] = await pixelAt(image.data, 0, 0);
+    expect([r, g, b]).toEqual([255, 255, 255]);
+  });
+
+  it("composites onto a checker pattern", async () => {
+    const assetId = register("neon.png");
+    mockedGetOutputImage.mockResolvedValueOnce({
+      base64: await transparentPng(),
+      mimeType: "image/png",
+      filename: "neon.png",
+    });
+
+    const result = await viewAssetImage(assetId, "checker");
+    const image = result.content.find((c) => c.type === "image") as { data: string };
+    const [r, g, b, a] = await pixelAt(image.data, 0, 0);
+    // Checker cells are #cccccc / #999999 — either way it must be opaque gray, not transparent black.
+    expect(a).toBe(255);
+    expect(r).toBe(g);
+    expect(g).toBe(b);
+    expect([204, 153]).toContain(r);
+  });
+
+  it("returns the raw bytes unchanged when background is omitted", async () => {
+    const assetId = register("neon.png");
+    const raw = await transparentPng();
+    mockedGetOutputImage.mockResolvedValueOnce({ base64: raw, mimeType: "image/png", filename: "neon.png" });
+
+    const result = await viewAssetImage(assetId);
+    const image = result.content.find((c) => c.type === "image") as { data: string };
+    expect(image.data).toBe(raw);
+  });
+
+  it("mentions the background in the text summary when set", async () => {
+    const assetId = register("neon.png");
+    mockedGetOutputImage.mockResolvedValueOnce({
+      base64: await transparentPng(),
+      mimeType: "image/png",
+      filename: "neon.png",
+    });
+
+    const result = await viewAssetImage(assetId, "dark");
+    const text = result.content.find((c) => c.type === "text") as { text: string };
+    expect(text.text).toContain("dark");
   });
 });
