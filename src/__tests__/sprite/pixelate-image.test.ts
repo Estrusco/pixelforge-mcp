@@ -37,6 +37,9 @@ function fakeServer(): { server: McpServer; tools: Map<string, ToolHandler> } {
 
 interface ToolBody {
   error?: string;
+  message?: string;
+  grid_width?: number;
+  grid_height?: number;
   width?: number;
   height?: number;
   out_path?: string;
@@ -152,5 +155,52 @@ describe("pixelate_image — relative path without a local output dir", () => {
     const result = await handler({ ...BASE_ARGS, path: "remote-shot.png" });
     expect(result.isError).toBeFalsy();
     expect(getOutputImage).toHaveBeenCalledWith("remote-shot.png", "output", "");
+  });
+});
+
+describe("pixelate_image — output_size / output_scale", () => {
+  it("writes the PNG at the logical grid size by default (unchanged behavior)", async () => {
+    uploadImageHttp.mockResolvedValue({ name: "pixelated_abc.png", subfolder: "", type: "input" });
+    const handler = await getHandler();
+    const body = parse(await handler({ ...BASE_ARGS, path: sourcePath }));
+
+    expect(body.grid_width).toBe(2);
+    expect(body.grid_height).toBe(2);
+    expect(body.width).toBe(2);
+    expect(body.height).toBe(2);
+  });
+
+  it("upscales via output_scale, keeping grid_width/grid_height at the logical size", async () => {
+    uploadImageHttp.mockResolvedValue({ name: "pixelated_abc.png", subfolder: "", type: "input" });
+    const handler = await getHandler();
+    const body = parse(await handler({ ...BASE_ARGS, path: sourcePath, output_scale: 4 }));
+
+    expect(body.grid_width).toBe(2);
+    expect(body.grid_height).toBe(2);
+    expect(body.width).toBe(8);
+    expect(body.height).toBe(8);
+  });
+
+  it("upscales via explicit output_size", async () => {
+    uploadImageHttp.mockResolvedValue({ name: "pixelated_abc.png", subfolder: "", type: "input" });
+    const handler = await getHandler();
+    const body = parse(
+      await handler({ ...BASE_ARGS, path: sourcePath, output_size: { width: 128, height: 128 } }),
+    );
+
+    expect(body.width).toBe(128);
+    expect(body.height).toBe(128);
+  });
+
+  it("rejects passing both output_size and output_scale", async () => {
+    const handler = await getHandler();
+    const result = await handler({
+      ...BASE_ARGS,
+      path: sourcePath,
+      output_scale: 2,
+      output_size: { width: 8, height: 8 },
+    });
+    expect(result.isError).toBe(true);
+    expect(parse(result).message).toContain("at most one of output_size or output_scale");
   });
 });

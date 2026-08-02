@@ -92,16 +92,27 @@ export async function quantizeImage(bytes: Buffer, options: QuantizeOptions): Pr
   const cleaned =
     options.cleanupIsolatedPixels === false ? alphaPreserved : cleanupIsolatedPixels(alphaPreserved);
 
-  const png = await sharp(cleaned.data, {
+  let pipeline = sharp(cleaned.data, {
     raw: { width: cleaned.width, height: cleaned.height, channels: 4 },
-  })
-    .png()
-    .toBuffer();
+  });
+  let outputWidth = cleaned.width;
+  let outputHeight = cleaned.height;
+
+  // Upscale AFTER despeckle: the logical pixel grid is already fully quantized
+  // and cleaned at this point, so `nearest` here only blows up each logical
+  // pixel into a block — it never touches the grid/palette/cleanup passes above.
+  if (options.outputSize) {
+    outputWidth = options.outputSize.width;
+    outputHeight = options.outputSize.height;
+    pipeline = pipeline.resize(outputWidth, outputHeight, { kernel: "nearest" });
+  }
+
+  const png = await pipeline.png().toBuffer();
 
   return {
     png,
     palette: paletteToHexList(palette),
-    width: cleaned.width,
-    height: cleaned.height,
+    width: outputWidth,
+    height: outputHeight,
   };
 }

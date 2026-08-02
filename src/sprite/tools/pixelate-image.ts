@@ -71,6 +71,26 @@ const pixelateImageSchema = {
         "directory or to have COMFYUI_PATH configured) to also save the pixelated PNG to, under " +
         "an auto-generated filename. Created if it does not exist.",
     ),
+  output_size: z
+    .object({ width: z.number(), height: z.number() })
+    .optional()
+    .describe(
+      "Final PNG pixel dimensions, e.g. { width: 128, height: 128 } to render a 64x64 logical " +
+        "grid at 2x. Applied via nearest-neighbor resize AFTER quantization/despeckle — the " +
+        "logical pixel grid stays exactly target_width x target_height, only each logical pixel's " +
+        "on-disk size changes. At most one of output_size / output_scale.",
+    ),
+  output_scale: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Integer multiplier applied to target_width/target_height for the final PNG (e.g. 2 renders " +
+        "a 64x64 grid at 128x128), nearest-neighbor, after quantization/despeckle. Must be a whole " +
+        "number — a fractional scale would make pixel blocks uneven sizes. At most one of " +
+        "output_size / output_scale.",
+    ),
 };
 
 type PixelateImageArgs = {
@@ -85,6 +105,8 @@ type PixelateImageArgs = {
   despeckle?: boolean;
   out_path?: string;
   save_dir?: string;
+  output_size?: { width: number; height: number };
+  output_scale?: number;
 };
 
 /** Content-addressed so re-running the same result never collides with a stale upload. */
@@ -124,6 +146,30 @@ function assertPositiveInteger(value: number, label: string): number {
     throw new ValidationError(`${label} must be a positive integer (got ${value}).`);
   }
   return value;
+}
+
+/** Resolve output_size/output_scale into concrete final pixel dimensions, or undefined (no upscale). */
+function resolveOutputSize(
+  args: PixelateImageArgs,
+  targetWidth: number,
+  targetHeight: number,
+): { width: number; height: number } | undefined {
+  if (args.output_size !== undefined && args.output_scale !== undefined) {
+    throw new ValidationError("Provide at most one of output_size or output_scale, not both.");
+  }
+  if (args.output_size !== undefined) {
+    return {
+      width: assertPositiveInteger(args.output_size.width, "output_size.width"),
+      height: assertPositiveInteger(args.output_size.height, "output_size.height"),
+    };
+  }
+  if (args.output_scale !== undefined) {
+    return {
+      width: targetWidth * args.output_scale,
+      height: targetHeight * args.output_scale,
+    };
+  }
+  return undefined;
 }
 
 function resolvePaletteSource(args: PixelateImageArgs): PaletteSource {
@@ -179,12 +225,15 @@ export function registerPixelateImageTool(server: McpServer): void {
       "path works even without COMFYUI_PATH configured, fetched over HTTP); returns the result " +
       "inline as a PNG, optionally writes it to out_path and/or an arbitrary local save_dir, and " +
       "registers it as a new asset_id (uploaded to ComfyUI's input dir) so it can be chained " +
-      "straight into remove_background/pack_spritesheet/export_for_engine.",
+      "straight into remove_background/pack_spritesheet/export_for_engine. output_size/output_scale " +
+      "render the quantized logical grid larger on disk (e.g. a 64x64 grid at 128x128 nearest) " +
+      "without changing the grid itself — the format Unity import usually needs.",
     pixelateImageSchema,
     async (args: PixelateImageArgs) => {
       try {
         const targetWidth = assertPositiveInteger(args.target_width, "target_width");
         const targetHeight = assertPositiveInteger(args.target_height, "target_height");
+        const outputSize = resolveOutputSize(args, targetWidth, targetHeight);
         const palette = resolvePaletteSource(args);
         const source = await loadImageSource({ assetId: args.asset_id, path: args.path }, "image");
 
@@ -194,6 +243,7 @@ export function registerPixelateImageTool(server: McpServer): void {
             targetResolution: { width: targetWidth, height: targetHeight },
             palette,
             cleanupIsolatedPixels: args.despeckle,
+            outputSize,
           });
         } catch (err) {
           if (err instanceof ComfyUIError) throw err;
@@ -218,6 +268,8 @@ export function registerPixelateImageTool(server: McpServer): void {
 
         const summary = {
           source: source.label,
+          grid_width: targetWidth,
+          grid_height: targetHeight,
           width: result.width,
           height: result.height,
           palette_mode: args.palette_mode,

@@ -30,6 +30,14 @@ export interface QuantizeOptions {
   readonly palette: PaletteSource;
   // Default true. 4-neighbor despeckle pass after nearest-color mapping.
   readonly cleanupIsolatedPixels?: boolean;
+  /**
+   * Final PNG pixel dimensions, applied via a nearest-neighbor resize AFTER
+   * despeckle — the logical pixel grid is still quantized at `targetResolution`,
+   * this only changes how large each logical pixel renders in the output file
+   * (e.g. a 64x64 grid rendered at 128x128). Omit to write the grid 1:1 (the
+   * default, unchanged behavior).
+   */
+  readonly outputSize?: Dimensions;
 }
 
 export interface QuantizeResult {
