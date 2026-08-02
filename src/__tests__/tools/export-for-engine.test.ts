@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
@@ -48,8 +49,14 @@ interface ToolBody {
   sprite_count?: number;
   out_png_path?: string;
   out_json_path?: string;
+  out_meta_path?: string;
+  out_meta_written?: boolean;
+  out_meta_skipped_existing?: boolean;
   save_png_path?: string;
   save_json_path?: string;
+  save_meta_path?: string;
+  save_meta_written?: boolean;
+  save_meta_skipped_existing?: boolean;
   metadata?: {
     version: 1;
     engine: "unity";
@@ -320,6 +327,115 @@ describe("export_for_engine", () => {
 
       expect(body.save_png_path).toBe(join(saveDir, "Player_Name_.png"));
       expect(readFileSync(body.save_png_path!).length).toBeGreaterThan(0);
+    });
+  });
+
+  // ── generate_meta: Unity .meta generation ───────────────────────────────
+
+  describe("generate_meta", () => {
+    let unityRoot: string;
+    let assetsSprites: string;
+    let plainDir: string;
+
+    beforeEach(async () => {
+      unityRoot = mkdtempSync(join(tmpdir(), "pixelforge-export-unity-"));
+      assetsSprites = join(unityRoot, "Assets", "Sprites");
+      await mkdir(assetsSprites, { recursive: true });
+      await mkdir(join(unityRoot, "ProjectSettings"), { recursive: true });
+
+      plainDir = mkdtempSync(join(tmpdir(), "pixelforge-export-plain-"));
+    });
+
+    afterEach(async () => {
+      const { rm } = await import("node:fs/promises");
+      await rm(unityRoot, { recursive: true, force: true });
+      await rm(plainDir, { recursive: true, force: true });
+    });
+
+    it("auto-detects a Unity project under save_dir and writes a .meta", async () => {
+      const handler = await getHandler();
+      const body = parse(
+        await handler({ ...BASE_ARGS, sheet_path: sheetPath, save_dir: assetsSprites }),
+      );
+
+      expect(body.save_meta_path).toBe(`${body.save_png_path}.meta`);
+      expect(body.save_meta_written).toBe(true);
+      expect(body.save_meta_skipped_existing).toBe(false);
+
+      const meta = readFileSync(body.save_meta_path!, "utf-8");
+      expect(meta).toContain("guid: ");
+      expect(meta).toMatch(/textureType:\s*8/);
+      expect(meta).toContain(`spritePixelsToUnits: ${body.metadata?.pixels_per_unit}`);
+    });
+
+    it("does not write a .meta outside a detected Unity project by default", async () => {
+      const handler = await getHandler();
+      const body = parse(await handler({ ...BASE_ARGS, sheet_path: sheetPath, save_dir: plainDir }));
+
+      expect(body.save_meta_path).toBeUndefined();
+      expect(body.save_meta_written).toBeUndefined();
+    });
+
+    it("generate_meta:true forces a .meta even outside a detected Unity project", async () => {
+      const handler = await getHandler();
+      const body = parse(
+        await handler({ ...BASE_ARGS, sheet_path: sheetPath, save_dir: plainDir, generate_meta: true }),
+      );
+
+      expect(body.save_meta_written).toBe(true);
+      expect(readFileSync(body.save_meta_path!, "utf-8")).toContain("fileFormatVersion: 2");
+    });
+
+    it("generate_meta:false suppresses a .meta even inside a detected Unity project", async () => {
+      const handler = await getHandler();
+      const body = parse(
+        await handler({ ...BASE_ARGS, sheet_path: sheetPath, save_dir: assetsSprites, generate_meta: false }),
+      );
+
+      expect(body.save_meta_path).toBeUndefined();
+      expect(body.save_meta_written).toBeUndefined();
+    });
+
+    it("NEVER overwrites an existing .meta — skips and reports it instead", async () => {
+      const handler = await getHandler();
+      // First call creates Player.png + Player.png.meta.
+      const first = parse(
+        await handler({ ...BASE_ARGS, sheet_path: sheetPath, save_dir: assetsSprites }),
+      );
+      expect(first.save_meta_written).toBe(true);
+      await writeFile(first.save_meta_path!, "HAND-EDITED — DO NOT TOUCH\n");
+
+      // Second call must not clobber the human-edited .meta.
+      const second = parse(
+        await handler({ ...BASE_ARGS, sheet_path: sheetPath, save_dir: assetsSprites }),
+      );
+      expect(second.save_meta_written).toBe(false);
+      expect(second.save_meta_skipped_existing).toBe(true);
+      expect(readFileSync(second.save_meta_path!, "utf-8")).toBe("HAND-EDITED — DO NOT TOUCH\n");
+    });
+
+    it("generate_meta requires out_path or save_dir", async () => {
+      const handler = await getHandler();
+      const result = await handler({ ...BASE_ARGS, sheet_path: sheetPath, generate_meta: true });
+      expect(result.isError).toBe(true);
+      expect(parse(result).message).toContain("generate_meta requires");
+    });
+
+    it("writes independent .meta files for out_path and save_dir when both are given", async () => {
+      const handler = await getHandler();
+      const body = parse(
+        await handler({
+          ...BASE_ARGS,
+          sheet_path: sheetPath,
+          out_path: "Player.png",
+          save_dir: assetsSprites,
+        }),
+      );
+
+      // out_path lands in outRoot (not a Unity project) -> no .meta by default.
+      expect(body.out_meta_path).toBeUndefined();
+      // save_dir lands inside the detected Unity project -> .meta written.
+      expect(body.save_meta_written).toBe(true);
     });
   });
 });

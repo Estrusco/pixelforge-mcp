@@ -18,14 +18,17 @@
 6. `remove_background` **(implemented — reuses/extends the inherited upstream tool, see `repo-layout.md`)** — routes to a ComfyUI custom node (rembg/BiRefNet/U2Net). NEVER reimplement
    background removal in TypeScript.
 7. `pack_spritesheet` **(implemented)** — frames → packed sheet + JSON metadata (frame rects, fps, pivot).
-8. `export_for_engine` **(implemented — pixelforge-mcp-7mn)** — MVP: Unity only, outputs **PNG + JSON slicing metadata for manual import**.
-   No `.meta` file generation. Godot/GameMaker are advertised in the schema but rejected by
-   `assertImplementedExportEngine` (`src/sprite/types.ts`) before any image is loaded or file
+8. `export_for_engine` **(implemented — pixelforge-mcp-7mn, `.meta` added — pixelforge-mcp-8b3.6)** —
+   MVP: Unity only, outputs **PNG + JSON slicing metadata**, plus an opt-in-by-default minimal
+   Unity `.meta` (see `locked-decisions.md`). A single sprite is just `pack_spritesheet` called with
+   one frame — no special-casing needed. Godot/GameMaker are advertised in the schema but rejected
+   by `assertImplementedExportEngine` (`src/sprite/types.ts`) before any image is loaded or file
    written — never a silent no-op. Takes the exact `metadata` object `pack_spritesheet` returns as
    input (validated as a boundary in `src/sprite/export/validate-metadata.ts`) and flips each frame
    rect from `pack_spritesheet`'s top-left/y-down convention to Unity's bottom-left/y-up convention
    in the pure `src/sprite/export/unity.ts` translator; the normalized pivot passes through
-   unchanged (already bottom-origin).
+   unchanged (already bottom-origin). `.meta` generation (detection heuristic, GUID handling, the
+   never-overwrite mitigation) lives in `src/sprite/export/unity-meta.ts`.
 
 See also: [`../agents/`](../agents/) for a consumer-facing, self-contained tool reference (params,
 constraints, end-to-end recipes) meant to be copied into other projects — this page is the

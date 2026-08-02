@@ -29,7 +29,19 @@
   MIT, mature, Aseprite-based) and explicitly rejected in favor of a single self-contained
   TypeScript pipeline using `image-q`/`sharp`. Do not reintroduce this dependency without a new
   design decision.
-- **Unity export is PNG + JSON only in MVP** — no `.meta` generation, manual import expected.
+- **Unity export is PNG + JSON, with opt-in-by-default `.meta` generation** (revised from the
+  original "no `.meta`" MVP scope, with an explicit mitigation). `export_for_engine` writes a
+  minimal Unity TextureImporter `.meta` (`textureType: Sprite`, `spriteMode: Single`,
+  `filterMode: 0` / Point, `textureCompression: 0` / None, `spritePixelsToUnits` from
+  `pixels_per_unit`, a GUID generated once) next to each PNG it actually writes (`out_path` and/or
+  `save_dir`). Default is auto-detected per destination path — true when it resolves inside a real
+  Unity project (an ancestor `Assets/` directory whose parent has a sibling `ProjectSettings/`),
+  false otherwise — and the caller's `generate_meta: boolean` overrides the heuristic in either
+  direction. **An existing `.meta` is NEVER overwritten** — reassigning its GUID would break
+  scene/prefab references pointing at that texture — writing is skipped and reported in the result
+  instead. The generated `.meta` is deliberately NOT a byte-for-byte Editor capture, only the
+  fields this pipeline needs correct; Unity fills in every other default on first import. See
+  `src/sprite/export/unity-meta.ts`.
 
 See also: [`rejected-alternatives.md`](rejected-alternatives.md) for the third-party tools evaluated
 and rejected during design (context for "why don't we just use X"), and

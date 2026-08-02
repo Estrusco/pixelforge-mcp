@@ -159,7 +159,12 @@ Full contract per tool: [`tool-surface.md`](PixelForgeDocumentations/fork-custom
 - Palettes are hardcoded, no network fetch (no lospec.com API).
 - Background removal is always delegated to ComfyUI, never reimplemented server-side.
 - No Aseprite / no second MCP server dependency.
-- Unity export is PNG + JSON only in MVP — no `.meta` generation.
+- Unity export is PNG + JSON, with **opt-in-by-default `.meta` generation**: `export_for_engine`
+  writes a minimal Unity TextureImporter `.meta` (Sprite/Single/Point filter/no compression) next
+  to each PNG it writes, auto-detected when the destination resolves inside a real Unity project
+  (`generate_meta` overrides the heuristic either way) — and **never overwrites an existing
+  `.meta`** (would reassign a GUID scenes/prefabs may reference). See
+  `src/sprite/export/unity-meta.ts`.
 
 Full rationale, enforcement location in code, and the alternatives evaluated and rejected during
 design: [`locked-decisions.md`](PixelForgeDocumentations/fork-customization/locked-decisions.md) and
