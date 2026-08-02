@@ -9,3 +9,4 @@ export type { BuiltSpriteWorkflow } from "./sprite-workflow.js";
 export type { ComposedPrompt, SpritePromptInput, MotionFramePromptInput } from "./sprite-prompt.js";
 export type { ModelFamily, StyleProfile, ViewpointProfile } from "./style-profiles.js";
 export type { WaitForSpriteJobOptions, SpriteJobWaitResult } from "./sprite-status.js";
+export type { ResolvedCheckpoint, CheckpointLister } from "./checkpoint-resolver.js";

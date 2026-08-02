@@ -4,7 +4,7 @@ import {
   resolveSpriteCheckpoint,
   waitForSpriteJob,
 } from "./comfyui/index.js";
-import type { SpriteJobWaitResult } from "./comfyui/index.js";
+import type { ResolvedCheckpoint, SpriteJobWaitResult } from "./comfyui/index.js";
 import { resolveReferenceImage } from "./reference-image.js";
 import type { StagedReference } from "./reference-image.js";
 import type {
@@ -54,7 +54,7 @@ import type {
 
 /** Injection seam, mirroring `SpriteJobDeps`. Internal — the tool passes a request only. */
 export interface AnimationRunnerDeps {
-  readonly resolveCheckpoint: (style: Style, override?: string) => Promise<string>;
+  readonly resolveCheckpoint: (style: Style, override?: string) => Promise<ResolvedCheckpoint>;
   readonly enqueue: (request: SpriteJobRequest) => Promise<SpriteJobResult>;
   readonly waitForJob: (promptId: string) => Promise<SpriteJobWaitResult>;
   /** Stage a finished frame's asset back into ComfyUI's input dir for the next frame. */
@@ -126,7 +126,7 @@ export async function runAnimationSet(
   // Resolved ONCE for the whole set: every frame must sample from the same
   // weights or the set is not one character. Passed to each frame as an
   // explicit override, which `resolveSpriteCheckpoint` honours verbatim.
-  const checkpoint = await deps.resolveCheckpoint(request.style, request.checkpoint);
+  const { checkpoint, familyMismatchWarning } = await deps.resolveCheckpoint(request.style, request.checkpoint);
 
   const states: AnimationStateResult[] = [];
   const downloadedModels: DownloadedModelInfo[] = [];
@@ -167,6 +167,10 @@ export async function runAnimationSet(
         // denoise is meaningless for txt2img; only send it with a reference.
         denoise: reference === undefined ? undefined : request.denoise,
         autoDownloadMissing: request.autoDownloadMissing,
+        stepsOverride: request.stepsOverride,
+        cfgOverride: request.cfgOverride,
+        samplerOverride: request.samplerOverride,
+        schedulerOverride: request.schedulerOverride,
       };
 
       let job: SpriteJobResult;
@@ -296,5 +300,6 @@ export async function runAnimationSet(
     skippedFrameCount,
     states,
     downloadedModels: downloadedModels.length > 0 ? downloadedModels : undefined,
+    checkpointFamilyWarning: familyMismatchWarning,
   };
 }

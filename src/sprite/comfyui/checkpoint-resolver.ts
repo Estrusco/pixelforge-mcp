@@ -21,6 +21,20 @@ import type { ModelFamily } from "./style-profiles.js";
 /** Injection seam so callers/tests can supply a model listing. Internal. */
 export type CheckpointLister = (modelType: string) => Promise<LocalModel[]>;
 
+export interface ResolvedCheckpoint {
+  readonly checkpoint: string;
+  /**
+   * Set ONLY when the fallback path (no candidate named by the style is
+   * installed) landed on a checkpoint that does not even match the style's
+   * expected `ModelFamily` — e.g. style `32bit` wants sd15 but only SDXL is
+   * installed locally, so `pickByFamily` had to fall back further than "same
+   * family, unnamed file". Never set for an explicit `override` (the caller's
+   * choice is respected without second-guessing) or when no local checkpoints
+   * exist at all (nothing to compare `preferred` against).
+   */
+  readonly familyMismatchWarning?: string;
+}
+
 const CHECKPOINT_EXTENSIONS = [".safetensors", ".ckpt", ".sft", ".pt"];
 
 /**
@@ -78,9 +92,9 @@ export async function resolveSpriteCheckpoint(
   style: Style,
   override?: string,
   list: CheckpointLister = listLocalModels,
-): Promise<string> {
+): Promise<ResolvedCheckpoint> {
   const trimmedOverride = override?.trim();
-  if (trimmedOverride) return trimmedOverride;
+  if (trimmedOverride) return { checkpoint: trimmedOverride };
 
   const profile = STYLE_PROFILES[style];
   const preferred = profile.checkpointCandidates[0];
@@ -90,14 +104,14 @@ export async function resolveSpriteCheckpoint(
     available = (await list("checkpoints")).filter((m) => isCheckpointFile(m.name));
   } catch (err) {
     logger.debug("Checkpoint listing failed; using the style's preferred candidate", { err });
-    return preferred;
+    return { checkpoint: preferred };
   }
 
-  if (available.length === 0) return preferred;
+  if (available.length === 0) return { checkpoint: preferred };
 
   for (const candidate of profile.checkpointCandidates) {
     const hit = findInstalled(available, candidate);
-    if (hit) return hit;
+    if (hit) return { checkpoint: hit };
   }
 
   const familyHit = pickByFamily(available, profile.family);
@@ -108,5 +122,18 @@ export async function resolveSpriteCheckpoint(
     preferred,
     chosen,
   });
-  return chosen;
+
+  // pickByFamily's own "preferred" branch already matches these hints, so this
+  // is a no-op warning-wise on that path — it only fires when the fallback had
+  // to go further still (the "neutral" branch, or no local checkpoint at all
+  // avoids `avoid`/`prefer` cleanly, or the blind `available[0]` pick).
+  const { prefer, avoid } = FAMILY_HINTS[profile.family];
+  const matchesExpectedFamily = prefer.test(chosen) && !avoid.test(chosen);
+  const familyMismatchWarning = matchesExpectedFamily
+    ? undefined
+    : `style "${style}" expects a ${profile.family} checkpoint, but none is installed — using ` +
+      `"${chosen}" instead (a different base-model family). Results may look wrong for this style. ` +
+      `Pass an explicit checkpoint override, or install a ${profile.family} checkpoint.`;
+
+  return { checkpoint: chosen, familyMismatchWarning };
 }

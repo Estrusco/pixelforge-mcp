@@ -64,7 +64,7 @@ vi.mock("../../sprite/comfyui/sprite-status.js", () => ({
 vi.mock("../../sprite/comfyui/checkpoint-resolver.js", () => ({
   resolveSpriteCheckpoint: vi.fn(async (style: string, override?: string) => {
     state.checkpointCalls.push({ style, override });
-    return override ?? "mapped.safetensors";
+    return { checkpoint: override ?? "mapped.safetensors" };
   }),
 }));
 

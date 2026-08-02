@@ -81,10 +81,10 @@ export function buildSpriteWorkflow(
     // Seed is passed through verbatim and MUST survive to ComfyUI — the enqueue
     // side disables the inherited seed randomization for exactly this reason.
     seed: request.seed,
-    steps: profile.steps,
-    cfg: profile.cfg,
-    sampler_name: profile.samplerName,
-    scheduler: profile.scheduler,
+    steps: request.stepsOverride ?? profile.steps,
+    cfg: request.cfgOverride ?? profile.cfg,
+    sampler_name: request.samplerOverride ?? profile.samplerName,
+    scheduler: request.schedulerOverride ?? profile.scheduler,
   };
 
   const workflow =

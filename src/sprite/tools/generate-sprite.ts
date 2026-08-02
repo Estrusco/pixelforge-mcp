@@ -96,6 +96,33 @@ const generateSpriteSchema = {
       "img2img denoise strength, 0 < denoise <= 1. Lower keeps more of the reference. " +
         "Only valid together with a reference image.",
     ),
+  steps: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Sampling steps override — replaces the style profile's default. Needed for checkpoint " +
+        "families the style profile wasn't tuned for, e.g. Flux-schnell wants 4-8 steps, not the " +
+        "profile's SDXL-tuned ~30.",
+    ),
+  cfg: z
+    .number()
+    .positive()
+    .optional()
+    .describe(
+      "CFG scale override — replaces the style profile's default. Flux-schnell wants cfg 1.0, not " +
+        "the profile's ~7. NOTE: at cfg 1.0 the negative_prompt has NO effect (Flux-schnell ignores " +
+        "classifier-free guidance) — express exclusions in the positive prompt instead.",
+    ),
+  sampler: z
+    .string()
+    .optional()
+    .describe("Sampler name override (e.g. 'euler', 'dpmpp_2m') — replaces the style profile's default."),
+  scheduler: z
+    .string()
+    .optional()
+    .describe("Scheduler override (e.g. 'normal', 'karras') — replaces the style profile's default."),
   auto_download_missing: z
     .boolean()
     .optional()
@@ -120,6 +147,10 @@ type GenerateSpriteArgs = {
   reference_asset_id?: string;
   reference_path?: string;
   denoise?: number;
+  steps?: number;
+  cfg?: number;
+  sampler?: string;
+  scheduler?: string;
   auto_download_missing?: boolean;
 };
 
@@ -146,7 +177,11 @@ export function registerGenerateSpriteTool(server: McpServer): void {
       "'style' (rendering aesthetic: 8bit/16bit/chibi/hand_painted/...) and 'viewpoint' (camera " +
       "angle: side/topdown/isometric) are INDEPENDENT parameters — 'isometric' is a viewpoint, not " +
       "a style. Without a reference image this runs txt2img; with one it runs img2img. The " +
-      "style+viewpoint pair selects a checkpoint unless you override it with 'checkpoint'. " +
+      "style+viewpoint pair selects a checkpoint unless you override it with 'checkpoint'. Sampling " +
+      "(steps/cfg/sampler/scheduler) defaults to the style's tuned profile; override any of them " +
+      "when the chosen checkpoint needs different sampling (e.g. Flux-schnell: cfg 1.0, 4-8 steps). " +
+      "If the resolved checkpoint's base-model family doesn't match the style (nothing better " +
+      "installed), the result carries a checkpoint_warning instead of failing silently. " +
       "Fire-and-forget: returns prompt_id immediately along with the exact seed used, so the result " +
       "is reproducible and can be extended into an animation set. Retrieve the finished image with " +
       "get_sprite_result (or view_image) once the completion notification arrives. Generate at a " +
@@ -179,6 +214,10 @@ export function registerGenerateSpriteTool(server: McpServer): void {
           checkpoint: args.checkpoint,
           referenceImage: reference?.filename,
           denoise,
+          stepsOverride: args.steps,
+          cfgOverride: args.cfg,
+          samplerOverride: args.sampler,
+          schedulerOverride: args.scheduler,
           autoDownloadMissing: args.auto_download_missing,
         };
 
@@ -198,6 +237,7 @@ export function registerGenerateSpriteTool(server: McpServer): void {
                   style: args.style,
                   viewpoint: args.viewpoint,
                   checkpoint: result.checkpoint,
+                  checkpoint_warning: result.checkpointFamilyWarning,
                   seed: result.seed,
                   width,
                   height,

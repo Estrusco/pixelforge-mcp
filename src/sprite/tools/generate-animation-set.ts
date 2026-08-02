@@ -157,6 +157,32 @@ const generateAnimationSetSchema = {
         "in the result. If no installable candidate is found, fails with an actionable error " +
         "instead of proceeding with a broken checkpoint.",
     ),
+  steps: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Sampling steps override for EVERY frame — replaces the style profile's default. Needed for " +
+        "checkpoint families the style profile wasn't tuned for, e.g. Flux-schnell wants 4-8 steps.",
+    ),
+  cfg: z
+    .number()
+    .positive()
+    .optional()
+    .describe(
+      "CFG scale override for EVERY frame — replaces the style profile's default. Flux-schnell " +
+        "wants cfg 1.0, at which negative_prompt has NO effect (classifier-free guidance is off) — " +
+        "express exclusions in the positive prompt instead.",
+    ),
+  sampler: z
+    .string()
+    .optional()
+    .describe("Sampler name override for EVERY frame (e.g. 'euler', 'dpmpp_2m')."),
+  scheduler: z
+    .string()
+    .optional()
+    .describe("Scheduler override for EVERY frame (e.g. 'normal', 'karras')."),
 };
 
 type GenerateAnimationSetArgs = {
@@ -175,6 +201,10 @@ type GenerateAnimationSetArgs = {
   reference_asset_id?: string;
   reference_path?: string;
   auto_download_missing?: boolean;
+  steps?: number;
+  cfg?: number;
+  sampler?: string;
+  scheduler?: string;
 };
 
 /**
@@ -306,7 +336,10 @@ export function registerGenerateAnimationSetTool(server: McpServer): void {
       "NOT implemented and will be rejected rather than downgraded. This tool BLOCKS: it runs " +
       "every frame sequentially (one diffusion job at a time) and returns once the whole set is " +
       "done, so expect it to take minutes. Individual frame failures are reported, never thrown — " +
-      "a broken frame does not discard the frames that succeeded.",
+      "a broken frame does not discard the frames that succeeded. Sampling (steps/cfg/sampler/" +
+      "scheduler) defaults to the style's tuned profile and applies to EVERY frame when overridden. " +
+      "If the resolved checkpoint's base-model family doesn't match the style, the result carries a " +
+      "checkpoint_warning instead of failing silently.",
     generateAnimationSetSchema,
     async (args: GenerateAnimationSetArgs) => {
       try {
@@ -351,6 +384,10 @@ export function registerGenerateAnimationSetTool(server: McpServer): void {
           denoise,
           referenceImage: reference?.filename,
           autoDownloadMissing: args.auto_download_missing,
+          stepsOverride: args.steps,
+          cfgOverride: args.cfg,
+          samplerOverride: args.sampler,
+          schedulerOverride: args.scheduler,
         };
 
         const result = await runAnimationSet(request);
@@ -368,6 +405,7 @@ export function registerGenerateAnimationSetTool(server: McpServer): void {
                   viewpoint: result.viewpoint,
                   consistency_mode: result.consistencyMode,
                   checkpoint: result.checkpoint,
+                  checkpoint_warning: result.checkpointFamilyWarning,
                   seed: result.seed,
                   denoise,
                   width,

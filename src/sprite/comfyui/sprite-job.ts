@@ -16,7 +16,7 @@ import type { EnqueueWorkflowOptions } from "../../services/workflow-executor.js
 import { ValidationError } from "../../utils/errors.js";
 import type { DownloadedModelInfo, Style } from "../types.js";
 import type { SpriteJobRequest, SpriteJobResult } from "../types.js";
-import { resolveSpriteCheckpoint } from "./checkpoint-resolver.js";
+import { resolveSpriteCheckpoint, type ResolvedCheckpoint } from "./checkpoint-resolver.js";
 import { buildSpriteWorkflow } from "./sprite-workflow.js";
 
 // ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ import { buildSpriteWorkflow } from "./sprite-workflow.js";
 
 /** Internal injection seam. Callers pass a request and nothing else. */
 export interface SpriteJobDeps {
-  readonly resolveCheckpoint: (style: Style, override?: string) => Promise<string>;
+  readonly resolveCheckpoint: (style: Style, override?: string) => Promise<ResolvedCheckpoint>;
   readonly enqueue: (
     workflow: WorkflowJSON,
     options: EnqueueWorkflowOptions,
@@ -125,7 +125,7 @@ export async function enqueueSpriteJob(
   request: SpriteJobRequest,
   deps: SpriteJobDeps = DEFAULT_DEPS,
 ): Promise<SpriteJobResult> {
-  const checkpoint = await deps.resolveCheckpoint(request.style, request.checkpoint);
+  const { checkpoint, familyMismatchWarning } = await deps.resolveCheckpoint(request.style, request.checkpoint);
   const { workflow, mode } = buildSpriteWorkflow(request, checkpoint);
 
   let validation = await deps.validate(workflow);
@@ -181,5 +181,6 @@ export async function enqueueSpriteJob(
     seed: request.seed,
     mode,
     downloadedModels: downloaded.length > 0 ? downloaded : undefined,
+    checkpointFamilyWarning: familyMismatchWarning,
   };
 }

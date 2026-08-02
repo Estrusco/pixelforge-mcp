@@ -74,7 +74,9 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
   const enqueued: WorkflowJSON[] = [];
   const validate = vi.fn(async (): Promise<ValidationResult> => VALID);
   const deps = {
-    resolveCheckpoint: vi.fn(async (_style: string, override?: string) => override ?? "mapped.safetensors"),
+    resolveCheckpoint: vi.fn(async (_style: string, override?: string) => ({
+      checkpoint: override ?? "mapped.safetensors",
+    })),
     enqueue: vi.fn(async (workflow: WorkflowJSON) => {
       enqueued.push(workflow);
       return { prompt_id: "p1", queue_remaining: 0 };
@@ -103,9 +105,25 @@ describe("enqueueSpriteJob", () => {
     expect(deps.getObjectInfo).not.toHaveBeenCalled();
     expect(deps.resolveModelCandidates).not.toHaveBeenCalled();
     expect(result.downloadedModels).toBeUndefined();
+    expect(result.checkpointFamilyWarning).toBeUndefined();
     // disable_random_seed is REQUIRED — a random seed here would make the
     // seed echoed back to the caller a lie.
     expect(deps.enqueue).toHaveBeenCalledWith(expect.any(Object), { disable_random_seed: true });
+  });
+
+  it("echoes resolveCheckpoint's familyMismatchWarning straight through to the result", async () => {
+    const { enqueueSpriteJob } = await import("../../../sprite/comfyui/sprite-job.js");
+    const warning =
+      'style "32bit" expects a sd15 checkpoint, but none is installed — using "sd_xl_base_1.0.safetensors" instead';
+    const { deps } = makeDeps({
+      resolveCheckpoint: vi.fn(async () => ({
+        checkpoint: "sd_xl_base_1.0.safetensors",
+        familyMismatchWarning: warning,
+      })),
+    });
+
+    const result = await enqueueSpriteJob(baseRequest(), deps);
+    expect(result.checkpointFamilyWarning).toBe(warning);
   });
 
   it("throws without downloading when validation fails and autoDownloadMissing is unset", async () => {
@@ -149,7 +167,7 @@ describe("enqueueSpriteJob", () => {
     };
     const { deps, enqueued } = makeDeps({
       validate,
-      resolveCheckpoint: vi.fn(async () => missingName),
+      resolveCheckpoint: vi.fn(async () => ({ checkpoint: missingName })),
       getObjectInfo: vi.fn(async () => objectInfoMissingCheckpoint(missingName)),
       resolveModelCandidates: vi.fn(async () => [candidate]),
     });
@@ -187,7 +205,7 @@ describe("enqueueSpriteJob", () => {
     );
     const { deps, enqueued } = makeDeps({
       validate,
-      resolveCheckpoint: vi.fn(async () => missingName),
+      resolveCheckpoint: vi.fn(async () => ({ checkpoint: missingName })),
       getObjectInfo: vi.fn(async () => objectInfoMissingCheckpoint(missingName)),
       resolveModelCandidates: vi.fn(async () => []),
     });
@@ -215,7 +233,7 @@ describe("enqueueSpriteJob", () => {
     };
     const { deps, enqueued } = makeDeps({
       validate,
-      resolveCheckpoint: vi.fn(async () => missingName),
+      resolveCheckpoint: vi.fn(async () => ({ checkpoint: missingName })),
       getObjectInfo: vi.fn(async () => objectInfoMissingCheckpoint(missingName)),
       resolveModelCandidates: vi.fn(async () => [candidate]),
     });

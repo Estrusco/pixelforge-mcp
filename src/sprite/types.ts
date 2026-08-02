@@ -160,6 +160,19 @@ export interface SpriteJobRequest {
    */
   readonly denoise?: number;
   /**
+   * Sampling overrides — same pattern as generate_image's steps/cfg/sampler/
+   * scheduler. Each falls back to the style's profile default
+   * (STYLE_PROFILES[style]) when omitted; present ONLY to unblock a checkpoint
+   * whose family needs different sampling than the style profile assumes (the
+   * canonical case: a Flux-schnell checkpoint needs cfg 1.0 / 4-8 steps, not
+   * the profile's SDXL-tuned cfg 7 / 30 steps).
+   */
+  readonly stepsOverride?: number;
+  readonly cfgOverride?: number;
+  /** ComfyUI KSampler `sampler_name` (e.g. "euler", "dpmpp_2m"). */
+  readonly samplerOverride?: string;
+  readonly schedulerOverride?: string;
+  /**
    * Explicit opt-in (default false — NEVER silent): when the built workflow
    * fails validation because a model it references isn't installed, resolve
    * and download the best CivitAI/HuggingFace candidate before enqueueing,
@@ -193,6 +206,8 @@ export interface SpriteJobResult {
   readonly mode: SpriteGenerationMode;
   /** Present only when `autoDownloadMissing` actually triggered a download. */
   readonly downloadedModels?: readonly DownloadedModelInfo[];
+  /** See `ResolvedCheckpoint.familyMismatchWarning` (checkpoint-resolver.ts). */
+  readonly checkpointFamilyWarning?: string;
 }
 
 /**
@@ -383,6 +398,11 @@ export interface AnimationSetRequest {
   readonly referenceImage?: string;
   /** Forwarded verbatim to every frame's `SpriteJobRequest` — see its doc comment. */
   readonly autoDownloadMissing?: boolean;
+  /** Forwarded verbatim to every frame's `SpriteJobRequest` — see its doc comments. */
+  readonly stepsOverride?: number;
+  readonly cfgOverride?: number;
+  readonly samplerOverride?: string;
+  readonly schedulerOverride?: string;
 }
 
 /** Why one frame is in the frame list. Discriminant of `AnimationFrameResult`. */
@@ -498,6 +518,8 @@ export interface AnimationSetResult {
   readonly states: readonly AnimationStateResult[];
   /** Models auto-downloaded across every frame's `enqueueSpriteJob` call, deduped. */
   readonly downloadedModels?: readonly DownloadedModelInfo[];
+  /** See `ResolvedCheckpoint.familyMismatchWarning`; resolved once for the whole set. */
+  readonly checkpointFamilyWarning?: string;
 }
 
 // ===========================================================================
