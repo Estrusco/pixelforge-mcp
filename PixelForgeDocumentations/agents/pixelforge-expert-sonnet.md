@@ -59,10 +59,17 @@ Never conflate them (don't ask for "isometric" as a style, or expect topdown to 
 | flat_vector | sdxl | 26 | 6.5 | euler | normal |
 | realistic | sdxl | 30 | 7.0 | dpmpp_2m | karras |
 
-No dedicated pixel-art LoRA is wired in — 8/16/32bit rely on checkpoint + prompt alone. The actual
-pixel-grid snap and palette work happens downstream in `pixelate_image`, not at generation time. If
-raw generation output looks "AI-painterly" rather than crisp pixel art, that's expected — always
-run it through `pixelate_image` before treating it as final.
+No pixel-art LoRA is auto-selected by style — 8/16/32bit rely on checkpoint + prompt by default, and
+the actual pixel-grid snap/palette work still happens downstream in `pixelate_image`, not at
+generation time. An explicit `lora` param (`name`, optional `strength_model`/`strength_clip`/
+`source`) is available on `generate_sprite`/`generate_animation_set` to apply a LoRA on top of the
+resolved checkpoint via a `LoraLoader` node — e.g. an SDXL pixel-art LoRA like `nerijs/pixel-art-xl`
+paired with an SDXL checkpoint — but it is **never inferred** from style/prompt; name it explicitly
+(find the exact filename first with `search_civitai_models`/`search_models`/`list_local_models` if
+you don't already know it). If it isn't installed yet, `auto_download_missing: true` + `lora.source`
+fetches it (see the `generate_sprite` entry below). If raw generation output looks "AI-painterly"
+rather than crisp pixel art, that's expected regardless of any LoRA — always run it through
+`pixelate_image` before treating it as final.
 
 ## Tool-by-tool
 
@@ -79,10 +86,17 @@ reproduce or vary a specific generation.
   `scheduler` (each optional, override the style profile's tuned defaults — needed for checkpoint
   families the style table wasn't tuned for, e.g. Flux-schnell wants `steps: 4-8`, `cfg: 1.0`; at
   `cfg 1.0` `negative_prompt` has no effect since Flux-schnell ignores CFG — express exclusions in
-  the positive prompt instead), `auto_download_missing` (default false, **never silent** — if the
-  resolved checkpoint isn't actually installed, downloads the best-ranked CivitAI/HuggingFace
-  candidate before enqueueing instead of enqueueing a graph ComfyUI will only reject later; fails
-  with an actionable error if no installable candidate exists).
+  the positive prompt instead), `lora` (optional — `{name, strength_model?, strength_clip?, source?}`;
+  wires a `LoraLoader` between the checkpoint and the sampler/CLIP encoders; **never inferred** from
+  the prompt/style, name it explicitly, e.g. `pixel-art-xl.safetensors`; `strength_clip` defaults to
+  `strength_model`, which defaults to `1.0`), `auto_download_missing` (default false, **never
+  silent** — checkpoint: downloads the best-ranked CivitAI/HuggingFace candidate before enqueueing
+  instead of enqueueing a graph ComfyUI will only reject later; LoRA: when `lora.source` is given
+  (`civitai_version_id` preferred, else `civitai_model_id`, else `huggingface_repo` +
+  `huggingface_filename`), that EXACT file is fetched — no keyword search, no ranking, so a
+  "similar" LoRA can never be substituted for the one actually named; without a `source`, only an
+  exact filename match is accepted, never a fuzzy/stem "similar" one; fails with an actionable error
+  if nothing installable is found).
 - No reference ⇒ txt2img. Reference present ⇒ img2img.
 - Returns immediately (does not block): `status: "enqueued"`, `prompt_id`, `queue_remaining`,
   resolved `mode`/`style`/`viewpoint`/`checkpoint`/`seed`, and `checkpoint_warning` if the resolved
@@ -113,8 +127,9 @@ reproduce or vary a specific generation.
   bump like 0.35→0.45 for a moving-limb animation is a reasonable first adjustment if frames look
   too static), `reference_asset_id`/`reference_path` (applies only to the very first frame of the
   first motion state — everything after chains img2img off the previous frame's actual pixels).
-  Also accepts the same `steps`/`cfg`/`sampler`/`scheduler` overrides and `auto_download_missing`
-  flag as `generate_sprite`, applied uniformly across every frame.
+  Also accepts the same `steps`/`cfg`/`sampler`/`scheduler` overrides, `lora`, and
+  `auto_download_missing` as `generate_sprite` — all applied uniformly across every frame (the same
+  LoRA, if given, is wired into every frame's workflow).
 - Runs every frame sequentially as its own diffusion job — this is why it blocks (real wall-clock
   cost scales with total frame count). Per-frame failures are recorded, never thrown; if a frame
   in a chain fails, later frames in that state are marked `"skipped"` (distinct from `"failed"` —
@@ -296,8 +311,10 @@ faded or broken at a glance.
   user explicitly asks you to hand-build engine-specific metadata as a one-off.
 - `symmetric_rotation_safe: true` sprites will alias if rotated at non-90° angles by the game
   engine — this is a pixel-grid property of the source art, not fixable in post.
-- No pixel-art LoRA — 8/16/32bit "pixel" styles come from checkpoint+prompt only; the actual crisp
-  pixel grid always comes from `pixelate_image`, never from the generation step alone.
+- A LoRA is never auto-selected or inferred from style/prompt — pass `lora.name` explicitly (find
+  the exact filename first with `search_civitai_models`/`search_models`/`list_local_models` if you
+  don't already know it). Even with a pixel-art LoRA applied, the actual crisp pixel grid still comes
+  from `pixelate_image`, never from the generation step alone.
 - Palettes are hardcoded (PICO-8/Sweetie-16/Endesga-32/Resurrect-64) or derived locally
   (`auto_kmeans`/`custom`) — there's no lospec.com API lookup for arbitrary community palettes.
 
@@ -469,7 +486,11 @@ confirmed free of hosted-API cost, check this before running an unfamiliar pack)
   → `diagnose_run` (if a specific `prompt_id` failed) → `clear_vram` (if VRAM-shaped) →
   `restart_comfyui` (last resort, drops the current queue).
 - **A workflow references a model that isn't installed**: `resolve_missing_models` before manually
-  guessing a `download_model` URL.
+  guessing a `download_model` URL. Inside the sprite pipeline specifically, prefer
+  `auto_download_missing: true` with an explicit `checkpoint`/`lora.source` over a manual
+  `download_model` call — it fetches the EXACT file named (checkpoint: best-ranked candidate; LoRA
+  with a `source`: verbatim, no substitution) and rewires/re-validates the workflow before
+  enqueueing.
 - **Before any operation with real-world side effects outside this session** (`publish_custom_node`,
   `runpod_pod_create`/`_start`, `train_dataset_delete`, `node_pack_git` commit/push, `remove_model`,
   anything that spends money or is irreversible): state what you're about to do and confirm, don't
