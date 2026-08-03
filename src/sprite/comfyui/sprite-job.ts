@@ -18,6 +18,7 @@ import type { DownloadedModelInfo, SpriteLoraSource, Style } from "../types.js";
 import type { SpriteJobRequest, SpriteJobResult } from "../types.js";
 import { resolveSpriteCheckpoint, type ResolvedCheckpoint } from "./checkpoint-resolver.js";
 import { buildSpriteWorkflow } from "./sprite-workflow.js";
+import { resolveAndDownloadMissingModels } from "./model-download.js";
 
 // ---------------------------------------------------------------------------
 // Job bridge — a thin wrapper over the INHERITED queue machinery. It resolves a
@@ -189,57 +190,13 @@ export async function enqueueSpriteJob(
     const missing = findMissingModels(workflow as unknown as Record<string, unknown>, objectInfo);
 
     if (missing.length > 0) {
-      for (const m of missing) {
-        const isLora = m.directory === "loras";
+      const newlyDownloaded = await resolveAndDownloadMissingModels(workflow, missing, deps, {
         // An explicit lora.source is a caller-named EXACT model — fetch it
         // verbatim, bypassing search/ranking entirely, so no "similar" LoRA can
         // ever be substituted for the one actually requested.
-        const explicitSource = isLora && request.lora?.name === m.name ? request.lora.source : undefined;
-
-        if (explicitSource) {
-          await deps.downloadExplicitSource(m.directory as string, m.name, explicitSource);
-          // Installed under the exact requested filename — no rewire needed.
-          downloaded.push({
-            requested: m.name,
-            installed: m.name,
-            source: explicitSource.civitaiVersionId !== undefined || explicitSource.civitaiModelId !== undefined
-              ? "civitai"
-              : "huggingface",
-            nodeType: m.node_type,
-          });
-          continue;
-        }
-
-        const candidates = await deps.resolveModelCandidates(m);
-        // Already ranked exact-match-first, then best VRAM fit (rankCandidates).
-        // LoRA without an explicit source: restrict to an EXACT filename match
-        // only — never fall back to a stem/fuzzy "similar" candidate.
-        const pool = isLora ? candidates.filter((c) => c.match === "exact") : candidates;
-        const best = pool[0];
-        if (!best) {
-          throw new ValidationError(
-            isLora
-              ? `generate_sprite: LoRA "${m.name}" (needed by ${m.node_type}.${m.widget}) is not ` +
-                  "installed, and no EXACT filename match was found on CivitAI/HuggingFace — a " +
-                  "\"similar\" LoRA is never substituted automatically. Pass lora.source with an " +
-                  "explicit civitai_version_id/civitai_model_id, or huggingface_repo + " +
-                  "huggingface_filename, or install it manually."
-              : `generate_sprite: "${m.name}" (needed by ${m.node_type}.${m.widget}) is not installed, and ` +
-                  "auto_download_missing found no installable candidate on CivitAI or HuggingFace. Install it " +
-                  "manually, or pass an explicit checkpoint override.",
-          );
-        }
-        await deps.downloadModelCandidate(m, best);
-        // Rewire the graph at whatever actually got installed — correct even when
-        // `best` was a stem/fuzzy match under a different filename than `m.name`.
-        workflow[m.node_id].inputs[m.widget] = best.filename;
-        downloaded.push({
-          requested: m.name,
-          installed: best.filename,
-          source: best.source,
-          nodeType: m.node_type,
-        });
-      }
+        explicitSourceFor: (m) => (request.lora?.name === m.name ? request.lora.source : undefined),
+      });
+      downloaded.push(...newlyDownloaded);
       deps.resetObjectInfoCache();
       validation = await deps.validate(workflow);
     }

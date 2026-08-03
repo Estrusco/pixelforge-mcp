@@ -64,6 +64,7 @@ import {
   registerPackSpritesheetTool,
   registerGenerateArcadeTopdownSetTool,
   registerExportForEngineTool,
+  registerWorkflowFromPromptSpecTool,
 } from "../sprite/tools/index.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
@@ -155,6 +156,10 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // Generic (not sprite-specific) — appended here only because tools/list
   // order is observable and must not shift for existing tools.
   ["images-assets", registerContactSheetTool],
+  // 9th PixelForge sprite tool, outside the locked 8-tool MVP surface — a
+  // recorded decision (pixelforge-mcp-n0f), confirmed with the user before
+  // adding it. Appended for the same tools/list-order reason as above.
+  ["workflow-authoring", registerWorkflowFromPromptSpecTool],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────

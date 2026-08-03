@@ -11,6 +11,7 @@ import {
   convertUiToApi,
   convertApiToUi,
   collectNodeTypes,
+  saveWorkflowToLibrary,
 } from "../services/workflow-converter.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { queryApiGraph } from "../services/graph-query.js";
@@ -421,76 +422,8 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const client = getClient();
-        const encoded = encodeURIComponent(`workflows/${args.filename}`);
-
-        // API-format graphs can't be opened by the canvas — the #1 way agents
-        // strand users with workflows that "exist" in the library yet load
-        // blank. Auto-convert them to UI format with a generated layout; fall
-        // back to a verbatim save (with the loud warning) only if conversion
-        // itself fails.
-        let toSave: unknown = args.workflow;
-        let note = "";
-        if (!isUiFormat(args.workflow) && isApiFormat(args.workflow)) {
-          try {
-            const apiGraph = args.workflow as WorkflowJSON;
-            const bulk = await getObjectInfo();
-            const objectInfo = await backfillObjectInfo(
-              bulk,
-              Object.values(apiGraph).map((n) => n.class_type),
-            );
-            const { workflow: ui, warnings } = convertApiToUi(apiGraph, objectInfo);
-            toSave = ui;
-            note =
-              `\n\nℹ️ Input was API format — auto-converted to Web UI format (generated layout) ` +
-              `so it opens in the ComfyUI canvas.`;
-            if (warnings.length > 0) {
-              note += `\nConversion warnings (${warnings.length}):\n${warnings.map((w) => `- ${w}`).join("\n")}`;
-            }
-          } catch (convErr) {
-            note =
-              `\n\n⚠️ Input was API format and auto-conversion to Web UI format failed ` +
-              `(${convErr instanceof Error ? convErr.message : String(convErr)}) — saved verbatim. ` +
-              `The ComfyUI canvas CANNOT open or edit this file. If it is meant to be reopened in ` +
-              `the UI, rebuild it in Web UI format ({ nodes: [], links: [] }) — e.g. load the ` +
-              `on-canvas graph or an existing file via get_workflow format="ui", apply your ` +
-              `changes to that, and save again.`;
-          }
-        } else if (!isUiFormat(args.workflow)) {
-          note =
-            `\n\n⚠️ This JSON is neither Web UI format ({ nodes: [], links: [] }) nor API format ` +
-            `({ '1': { class_type, inputs } }) — saved verbatim, but the ComfyUI canvas likely ` +
-            `cannot open it.`;
-        }
-
-        const res = await client.fetchApi(
-          `/api/userdata/${encoded}`,
-          {
-            method: "POST",
-            body: JSON.stringify(toSave),
-          },
-        );
-
-        if (!res.ok) {
-          const errText = await res.text().catch(() => "");
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Failed to save workflow: ${res.status} ${res.statusText}${errText ? `\n${errText}` : ""}`,
-              },
-            ],
-          };
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Workflow saved as "${args.filename}" in the ComfyUI user library.${note}`,
-            },
-          ],
-        };
+        const result = await saveWorkflowToLibrary(args.filename, args.workflow);
+        return { content: [{ type: "text", text: result.message }] };
       } catch (err) {
         return errorToToolResult(err);
       }

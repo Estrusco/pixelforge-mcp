@@ -46,6 +46,30 @@
    unchanged (already bottom-origin). `.meta` generation (detection heuristic, GUID handling, the
    never-overwrite mitigation) lives in `src/sprite/export/unity-meta.ts`.
 
+## Beyond the MVP list
+
+9. `workflow_from_prompt_spec` **(implemented — pixelforge-mcp-n0f)** — NOT part of the locked
+   8-tool MVP surface above; a separate, explicitly-confirmed-with-the-user addition, listed here
+   rather than renumbered into it so the "locked" set above stays exactly what it always was.
+   Parses a structured plain-text "prompt spec" file (bracketed `[CHECKPOINT / MODEL]`, `[LORA]`,
+   `[SAMPLER & SCHEDULER SETTINGS]`, `[POSITIVE PROMPT]`, `[NEGATIVE PROMPT]`, optional
+   `[POST-PROCESSING / PIXEL PERFECT GRID]` sections — see `src/sprite/spec/prompt-spec-parser.ts`)
+   into a full ComfyUI workflow: `CheckpointLoaderSimple` → optional `VAELoader` (new — the rest of
+   PixelForge always uses the checkpoint's bundled VAE) → optional `LoraLoader` (reuses the same
+   connection-rewiring helper `generate_sprite` uses, extracted to `src/sprite/comfyui/graph-edit.ts`)
+   → `CLIPTextEncode` (positive/negative) → `KSampler` → `VAEDecode` → optional pixel-grid
+   downscale/upscale `ImageScale` pair baked directly into the graph (new — everywhere else in
+   PixelForge this step is client-side via `pixelate_image`, but the spec format names real
+   `ImageScale` nodes) → `SaveImage`. Same `auto_download_missing` opt-in-never-silent convention as
+   `generate_sprite` (checkpoint/VAE: best-ranked candidate; LoRA: exact match or an explicit
+   `lora_source`, never a "similar" substitute — reuses the resolve/download loop extracted to
+   `src/sprite/comfyui/model-download.ts`). Unlike every generation tool above, it never enqueues or
+   runs the workflow — it only builds, resolves, validates, and **saves** it into the connected
+   ComfyUI server's own workflow library (`src/services/workflow-converter.ts`'s
+   `saveWorkflowToLibrary`, extracted from the generic `save_workflow` tool) so it opens in the
+   ComfyUI web UI exactly as if a person had built it there by hand; running it afterward is the
+   generic `enqueue_workflow` tool's job, not this one's.
+
 See also: [`../agents/`](../agents/) for a consumer-facing, self-contained tool reference (params,
 constraints, end-to-end recipes) meant to be copied into other projects — this page is the
 maintainer-facing "what's locked and why" contract instead.

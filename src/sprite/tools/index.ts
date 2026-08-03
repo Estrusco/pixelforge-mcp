@@ -5,3 +5,4 @@ export { registerGenerateAnimationSetTool } from "./generate-animation-set.js";
 export { registerPackSpritesheetTool } from "./pack-spritesheet.js";
 export { registerGenerateArcadeTopdownSetTool } from "./generate-arcade-topdown-set.js";
 export { registerExportForEngineTool } from "./export-for-engine.js";
+export { registerWorkflowFromPromptSpecTool } from "./workflow-from-prompt-spec.js";

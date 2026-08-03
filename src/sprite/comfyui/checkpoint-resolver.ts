@@ -59,13 +59,13 @@ function leafName(name: string): string {
   return (parts[parts.length - 1] ?? name).toLowerCase();
 }
 
-function isCheckpointFile(name: string): boolean {
+export function isCheckpointFile(name: string): boolean {
   const lower = name.toLowerCase();
   return CHECKPOINT_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
 /** Match a candidate against the installed list by full name or by leaf name. */
-function findInstalled(available: readonly LocalModel[], candidate: string): string | undefined {
+export function findInstalled(available: readonly LocalModel[], candidate: string): string | undefined {
   const wanted = leafName(candidate);
   const hit = available.find(
     (m) => m.name.toLowerCase() === candidate.toLowerCase() || leafName(m.name) === wanted,
