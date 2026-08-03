@@ -75,11 +75,21 @@ reproduce or vary a specific generation.
 - Inputs: `prompt` (req), `style` (req), `viewpoint` (req), `width`/`height` (req, 64-4096 step 8),
   `negative_prompt`, `seed`, `checkpoint` (override — bypasses the style→checkpoint table),
   `reference_asset_id` OR `reference_path` (at most one — presence switches mode to img2img),
-  `denoise` (only valid *with* a reference; rejected without one).
+  `denoise` (only valid *with* a reference; rejected without one), `steps`/`cfg`/`sampler`/
+  `scheduler` (each optional, override the style profile's tuned defaults — needed for checkpoint
+  families the style table wasn't tuned for, e.g. Flux-schnell wants `steps: 4-8`, `cfg: 1.0`; at
+  `cfg 1.0` `negative_prompt` has no effect since Flux-schnell ignores CFG — express exclusions in
+  the positive prompt instead), `auto_download_missing` (default false, **never silent** — if the
+  resolved checkpoint isn't actually installed, downloads the best-ranked CivitAI/HuggingFace
+  candidate before enqueueing instead of enqueueing a graph ComfyUI will only reject later; fails
+  with an actionable error if no installable candidate exists).
 - No reference ⇒ txt2img. Reference present ⇒ img2img.
 - Returns immediately (does not block): `status: "enqueued"`, `prompt_id`, `queue_remaining`,
-  resolved `mode`/`style`/`viewpoint`/`checkpoint`/`seed`. **You must poll `get_sprite_result`** to
-  get the actual asset.
+  resolved `mode`/`style`/`viewpoint`/`checkpoint`/`seed`, and `checkpoint_warning` if the resolved
+  checkpoint's base-model family doesn't match the requested style with nothing better installed
+  (e.g. style `32bit`/family `sd15` but only SDXL checkpoints in the library) — surfaced
+  explicitly, never a silent wrong-family fallback. **You must poll `get_sprite_result`** to get
+  the actual asset.
 
 ### `get_sprite_result` — poll for a job's output
 - Input: `prompt_id` (from any sprite-generation call).
@@ -103,6 +113,8 @@ reproduce or vary a specific generation.
   bump like 0.35→0.45 for a moving-limb animation is a reasonable first adjustment if frames look
   too static), `reference_asset_id`/`reference_path` (applies only to the very first frame of the
   first motion state — everything after chains img2img off the previous frame's actual pixels).
+  Also accepts the same `steps`/`cfg`/`sampler`/`scheduler` overrides and `auto_download_missing`
+  flag as `generate_sprite`, applied uniformly across every frame.
 - Runs every frame sequentially as its own diffusion job — this is why it blocks (real wall-clock
   cost scales with total frame count). Per-frame failures are recorded, never thrown; if a frame
   in a chain fails, later frames in that state are marked `"skipped"` (distinct from `"failed"` —
@@ -141,17 +153,41 @@ output before treating it as a finished asset.
     its own fixed art-direction palette.
   - `despeckle` (default true) — cleans up isolated stray pixels; leave on unless you specifically
     want raw quantization output.
+  - `out_path` (optional, under the ComfyUI output dir) and `save_dir` (optional, **any** local
+    directory — no `COMFYUI_PATH` required, auto-created) both additionally write the PNG to disk;
+    the inline PNG in the response is returned either way.
+  - `output_size` (`{width, height}`) or `output_scale` (positive integer multiplier) — at most
+    one of the two — nearest-neighbor upscale applied *after* quantization/despeckle, so the
+    logical pixel grid stays exactly `target_width`×`target_height` and only the on-disk size of
+    each logical pixel changes (e.g. render a 64×64 grid at 128×128 for a crisper preview).
 - Pipeline: nearest-neighbor grid-snap to target resolution → palette quantization/nearest-color
-  mapping → despeckle. Alpha is preserved throughout (safe to run on already-transparent cutouts).
+  mapping → despeckle → optional upscale. Alpha is preserved throughout (safe to run on
+  already-transparent cutouts).
 - `target_width`/`target_height` here is the *final pixel-art resolution* (e.g. 32×32, 64×64) —
   usually much smaller than the diffusion output's `width`/`height`. Downscaling is the point.
+- The result is automatically re-uploaded and registered as an `asset_id` (best-effort — if
+  ComfyUI is unreachable the PNG is still returned inline, just without one), so you can chain
+  straight into `remove_background`/`pack_spritesheet`/`export_for_engine` without managing files
+  yourself. `regenerate` is not supported on assets registered this way — there's no real ComfyUI
+  job/workflow behind them to re-run.
 
 ### `remove_background` — always ComfyUI-side, never reimplement this yourself
 - Inputs: exactly one of `image` (filename already in ComfyUI's input dir), `asset_id`, `path`.
-  `model` (default `BiRefNet_toonout`), `filename_prefix` (default `ComfyUI_cutout`).
-- Enqueues `LoadImage → BiRefNetRMBG → SaveImage` on the local GPU; needs the ComfyUI-RMBG custom
-  node installed (if missing, the error tells you which `install_custom_node` call fixes it — the
-  model itself auto-downloads on first run). Returns `prompt_id` — poll with `get_job_status` (not
+  `mode`: `"birefnet"` (default) | `"luma_key"`. `model` (birefnet only, default
+  `BiRefNet_toonout`), `filename_prefix` (default `ComfyUI_cutout`), `threshold`/`softness`
+  (luma_key only, both optional).
+- `birefnet`: `LoadImage → BiRefNetRMBG → SaveImage` on the local GPU; needs the ComfyUI-RMBG
+  custom node installed (if missing, the error tells you which `install_custom_node` call fixes
+  it — the model auto-downloads on first run). Good general-purpose salient-object cutout, but
+  fills hollow interior regions with opaque background color and hard-mattes away soft
+  glow/emissive halos.
+- `luma_key`: `LoadImage → R/G/B channel masks → summed → [threshold] → [softness] → invert →
+  JoinImageWithAlpha`, built entirely from ComfyUI core nodes (no custom-node dependency). Use for
+  dark-background art (e.g. neon-on-black pixel art) where BiRefNet's hard matte destroys the
+  glow — gives a naturally soft alpha (dark → transparent, bright → opaque) and never opacifies a
+  hollow dark interior. `threshold` (0-1 cutoff on the combined mask, omit for continuous alpha)
+  and `softness` (pixels to grow/shrink the mask edge, positive or negative) are optional.
+- Either mode enqueues on your LOCAL GPU. Returns `prompt_id` — poll with `get_job_status` (not
   `get_sprite_result`, since this isn't a sprite-tool job) or `get_sprite_result` if the job was
   produced by the sprite pipeline's own reference-staging.
 - Typical order: generate → **remove_background** → **pixelate_image** (background removal on
@@ -173,19 +209,30 @@ Independent of generation — packs any equal-sized frame set, from any source.
 - Sheet dimension cap is 16384px (Unity's max texture size) — very large frame counts at large
   per-frame resolution can hit this; downscale frames or split into multiple sheets if so.
 
-### `export_for_engine` — Unity only in MVP, PNG + JSON for manual import
+### `export_for_engine` — Unity only in MVP, PNG + JSON (+ optional `.meta`)
 - Inputs: `engine` (`"unity"` — the only one implemented; `"godot"`/`"gamemaker"` are schema-visible
   but **always rejected outright before any file I/O**, never a silent no-op — if a task needs
   Godot/GameMaker export, say so plainly rather than attempting a workaround), `sheet_asset_id` XOR
   `sheet_path`, `metadata` (**must be the exact object `pack_spritesheet` returned** — this is
   validated as a hard boundary; don't hand-construct or edit this object), `sprite_name` (frame N
   is named `<sprite_name>_N`), `pixels_per_unit` (default 100), `out_path` (writes PNG + a
-  co-located `.json`).
+  co-located `.json`, under the ComfyUI output dir), `save_dir` (writes the same PNG + `.json`
+  straight to **any** local directory, independent of `out_path`'s ComfyUI-output-dir constraint —
+  use to point directly at a Unity project's `Assets/` folder), `generate_meta` (boolean, optional
+  — forces `.meta` generation on or off; omit to auto-detect).
+- A **single sprite** is just a `pack_spritesheet` call with one frame — that already produces a
+  valid 1-frame metadata object `export_for_engine` accepts as-is, no special handling needed.
 - Converts `pack_spritesheet`'s top-left/y-down rects into Unity's bottom-left/y-up convention.
   Pivot passes through unchanged (already bottom-origin, no conversion needed).
-- Output is **PNG + JSON metadata for manual import** in Unity (Sprite Mode: Multiple, sliced using
-  the JSON rects) — there is **no `.meta` file generation**. Don't imply or promise automatic Unity
-  import; the JSON is input to whatever import tooling the target project has (or you write one).
+- Output is **PNG + JSON metadata** (Sprite Mode: Multiple, sliced using the JSON rects), plus an
+  **opt-in-by-default Unity `.meta`** next to each PNG actually written: auto-detected when
+  `out_path`/`save_dir` resolves inside a real Unity project (an ancestor with `ProjectSettings/`
+  and the file living under `Assets/`), overridable either direction via `generate_meta`. The
+  `.meta` is a minimal `TextureImporter` (Sprite/Single/Point filter/no compression, GUID
+  generated once). **Never overwrites an existing `.meta`** — if one is already there it's left
+  alone and the result reports `skippedExisting: true` (an existing `.meta`'s GUID may already be
+  referenced by scenes/prefabs; overwriting it would break those references). `generate_meta: true`
+  requires `out_path` and/or `save_dir` — there's no PNG on disk to pair a `.meta` with otherwise.
 
 ## End-to-end recipes
 
@@ -197,7 +244,9 @@ Independent of generation — packs any equal-sized frame set, from any source.
    palette_mode of choice).
 4. `pack_spritesheet` with a single-frame array (still needed — `export_for_engine` requires
    `pack_spritesheet`'s metadata shape even for one frame).
-5. `export_for_engine` (`engine: "unity"`, the sheet + metadata from step 4, `sprite_name`).
+5. `export_for_engine` (`engine: "unity"`, the sheet + metadata from step 4, `sprite_name`). Point
+   `save_dir` straight at the Unity project's `Assets/` folder to skip a manual copy step —
+   `.meta` generation auto-detects in that case, no need to pass `generate_meta` explicitly.
 
 **Character animation set for Unity:**
 1. `generate_animation_set` (motion_states, style, viewpoint, frames_per_state) — blocks, returns
@@ -232,6 +281,11 @@ right):**
   remember these are *prompt conditioning*, not hard constraints — for a stubborn case, an explicit
   `checkpoint` override or added `negative_prompt` terms may do more than rephrasing the main prompt.
 
+**Batch QA across many generated sprites:** `contact_sheet(asset_ids: [...])` tiles them into one
+preview PNG — one glance instead of N separate `view_image` calls. Defaults to a dark backdrop
+(same reasoning as `view_image`'s `background` param below) so transparent/dark art doesn't look
+faded or broken at a glance.
+
 ## Known limitations — don't try to route around these, they're deliberate
 
 - `consistency_mode: "controlnet_pose"` is not implemented. Always rejected. Real pose-accurate
@@ -253,7 +307,7 @@ right):**
 
 Reach here when the sprite pipeline doesn't cover the need: raw image/video/audio generation,
 custom workflow authoring, model or custom-node management, LoRA training, or cloud GPU via
-RunPod. The server exposes roughly 180 tools total (fewer in compact mode — see the prefix note
+RunPod. The server exposes roughly 190 tools total (fewer in compact mode — see the prefix note
 above); this section groups them by purpose.
 
 ## Generation (beyond sprites)
@@ -344,11 +398,18 @@ minutes) · `update_comfyui` / `update_all` (updates ALL custom nodes, not core)
 
 ## Assets & images
 
-`view_image` / `get_image` (download by filename) · `convert_image` (png/jpeg/webp) ·
-`analyze_color` (histogram, shot-matching via `reference_path`) · `stage_output_as_input` (promote
-an output/temp file to a usable input filename) · `upload_output` (push to S3/Azure/HTTP/HF) ·
-`upload_image` / `upload_video` / `upload_audio` · `list_output_images` · `list_assets` ·
-`get_asset_metadata`.
+`view_image` (`background`: `"dark"`/`"light"`/`"checker"`, optional — composites transparency
+onto a deliberate backdrop server-side before returning the PNG; default client-side compositing
+onto white makes dark-on-transparent art like a `luma_key` cutout look faded/broken at a glance
+even when the alpha is correct) / `get_image` (download by filename) · `convert_image`
+(png/jpeg/webp) · `analyze_color` (histogram, shot-matching via `reference_path`, plus an `alpha`
+breakdown — % fully transparent / partially transparent (soft edges/glow) / fully opaque — when
+the source has an alpha channel) · `contact_sheet` (`asset_ids[]`, tiled into ONE preview PNG for
+batch QA instead of N separate `view_image` calls — frames need not share dimensions, each is
+centered in a uniform cell; same `background` param, defaults to `"dark"`) ·
+`stage_output_as_input` (promote an output/temp file to a usable input filename) · `upload_output`
+(push to S3/Azure/HTTP/HF) · `upload_image` / `upload_video` / `upload_audio` ·
+`list_output_images` · `list_assets` · `get_asset_metadata`.
 
 ## Defaults, settings, stats
 

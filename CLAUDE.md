@@ -34,11 +34,13 @@ See the **Official comfy-cli** section in `README.md` and `COMFY_CLI_PATH` in `.
 
 ## Plugin File Sync
 
-The plugin runs from cached copies, not the source tree. After changing files in `plugin/`:
-- Cache: `~/.claude/plugins/cache/comfyui-mcp/comfy/0.1.0/`
-- Marketplace: `~/.claude/plugins/marketplaces/comfyui-mcp/plugin/`
+The plugin runs from a cached copy, not the source tree. After changing files in `plugin/`:
+- Cache: `~/.claude/plugins/cache/pixelforge-mcp/pixelforge/<version>/`
 
-Copy changed files to both locations, then restart Claude Code for hooks or `/mcp` for MCP tools.
+The marketplace itself is registered as a `directory` source pointing straight at this repo
+(`D:\Dev\pixelforge-mcp`), so there is no separate marketplace clone to sync — only the cache
+copy is stale after an edit. Copy changed files there, then restart Claude Code for hooks or
+`/mcp` for MCP tools.
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->

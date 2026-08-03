@@ -3,11 +3,12 @@
 *.sh text eol=lf
 *.bat text eol=crlf
 
-# Fork maintenance: keep OUR CLAUDE.md ours across upstream syncs.
+# Fork maintenance: keep OUR CLAUDE.md/README.md ours across upstream syncs.
 # The "ours" merge driver makes `git merge upstream/main` always retain the
-# local CLAUDE.md instead of merging upstream's changes into it. Upstream's
-# CLAUDE.md is mirrored separately into CLAUDE_mainrepo.md during a sync.
-# NOTE: this driver only takes effect once `merge.ours.driver` is configured
-# in the clone (`git config merge.ours.driver true`). The "Syncing with
-# upstream" section in CLAUDE.md documents this as step 0 of every sync.
+# local file instead of merging upstream's changes into it. Upstream's copy
+# is mirrored separately into CLAUDE_mainrepo.md / README_mainrepo.md during
+# a sync. NOTE: this driver only takes effect once `merge.ours.driver` is
+# configured in the clone (`git config merge.ours.driver true`). The "Syncing
+# with upstream" section in CLAUDE.md documents this as step 0 of every sync.
 CLAUDE.md merge=ours
+README.md merge=ours
