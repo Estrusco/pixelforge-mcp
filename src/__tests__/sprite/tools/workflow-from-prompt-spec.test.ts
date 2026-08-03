@@ -16,7 +16,7 @@ vi.mock("../../../sprite/spec/spec-job.js", () => ({
       filename: req.filename,
       checkpoint: req.spec.checkpointCandidates[0],
       vae: req.spec.vae,
-      lora: req.spec.lora?.name,
+      loras: req.spec.loras.map((l) => l.name),
       saveMessage: `Workflow saved as "${req.filename}" in the ComfyUI user library.`,
       ...state.result,
     };
@@ -45,7 +45,7 @@ interface ToolBody {
   filename?: string;
   checkpoint?: string;
   vae?: string;
-  lora?: string;
+  loras?: string[];
   downloaded_models?: unknown[];
 }
 
@@ -130,21 +130,30 @@ describe("workflow_from_prompt_spec — spec_text path", () => {
     expect(state.lastRequest?.filename).toBe("custom_name.json");
   });
 
-  it("forwards auto_download_missing and lora_source", async () => {
+  it("forwards auto_download_missing and lora_sources", async () => {
     const handler = await getHandler();
     await handler({
       spec_text: MINIMAL_SPEC_TEXT,
       auto_download_missing: true,
-      lora_source: { huggingface_repo: "nerijs/pixel-art-xl", huggingface_filename: "pixel-art-xl-v1.safetensors" },
+      lora_sources: [
+        {
+          lora_name: "pixel-art-xl-v1.safetensors",
+          huggingface_repo: "nerijs/pixel-art-xl",
+          huggingface_filename: "pixel-art-xl-v1.safetensors",
+        },
+      ],
     });
 
     expect(state.lastRequest?.autoDownloadMissing).toBe(true);
-    expect(state.lastRequest?.loraSource).toEqual({
-      civitaiModelId: undefined,
-      civitaiVersionId: undefined,
-      huggingfaceRepo: "nerijs/pixel-art-xl",
-      huggingfaceFilename: "pixel-art-xl-v1.safetensors",
-    });
+    expect(state.lastRequest?.loraSources).toEqual([
+      {
+        name: "pixel-art-xl-v1.safetensors",
+        civitaiModelId: undefined,
+        civitaiVersionId: undefined,
+        huggingfaceRepo: "nerijs/pixel-art-xl",
+        huggingfaceFilename: "pixel-art-xl-v1.safetensors",
+      },
+    ]);
   });
 
   it("surfaces a validation/save failure as an error result instead of throwing", async () => {

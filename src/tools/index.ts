@@ -65,6 +65,7 @@ import {
   registerGenerateArcadeTopdownSetTool,
   registerExportForEngineTool,
   registerWorkflowFromPromptSpecTool,
+  registerGetWorkflowPromptTemplateTool,
 } from "../sprite/tools/index.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
@@ -160,6 +161,10 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // recorded decision (pixelforge-mcp-n0f), confirmed with the user before
   // adding it. Appended for the same tools/list-order reason as above.
   ["workflow-authoring", registerWorkflowFromPromptSpecTool],
+  // Static-content companion to workflow_from_prompt_spec — returns its
+  // prompt-spec grammar as a fillable template. Appended for the same
+  // tools/list-order reason as above.
+  ["workflow-authoring", registerGetWorkflowPromptTemplateTool],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────

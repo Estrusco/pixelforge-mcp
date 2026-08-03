@@ -29,6 +29,15 @@ export interface LoraSpec {
  * consumed its `model`/`clip` outputs (KSampler, both CLIPTextEncode nodes).
  * The checkpoint's VAE output (index 2) is untouched: `LoraLoader` never sees
  * or passes it through.
+ *
+ * Calling this more than once chains correctly, but re-resolves the
+ * checkpoint node fresh each time rather than tracking "the current end of
+ * the chain" — so a second call rewires whatever still points at the
+ * checkpoint, which by then is only the first LoraLoader's own inputs. Net
+ * effect: each new call is inserted BEFORE the previous one (closer to the
+ * checkpoint), not after. Callers building a chain from an ordered list (see
+ * spec-workflow.ts) must iterate in reverse to get graph order to match
+ * declaration order.
  */
 export function insertLora(workflow: WorkflowJSON, lora: LoraSpec, title = "LoRA"): void {
   const ckptId = findNodeId(workflow, "CheckpointLoaderSimple");

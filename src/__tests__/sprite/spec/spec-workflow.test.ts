@@ -6,6 +6,7 @@ import type { WorkflowJSON, WorkflowNode } from "../../../comfyui/types.js";
 function baseSpec(overrides: Partial<PromptSpec> = {}): PromptSpec {
   return {
     checkpointCandidates: ["pixelArtDiffusionXL_v2.safetensors"],
+    loras: [],
     sampler: "dpmpp_2m_sde",
     scheduler: "karras",
     steps: 35,
@@ -83,7 +84,9 @@ describe("buildWorkflowFromSpec — VAELoader", () => {
 describe("buildWorkflowFromSpec — LoRA (reuses graph-edit.insertLora)", () => {
   it("wires a LoraLoader between the checkpoint and everything downstream", () => {
     const { workflow } = buildWorkflowFromSpec(
-      baseSpec({ lora: { name: "pixel-art-xl-v1.safetensors", strengthModel: 0.9, strengthClip: 0.85, triggerWords: [] } }),
+      baseSpec({
+        loras: [{ name: "pixel-art-xl-v1.safetensors", strengthModel: 0.9, strengthClip: 0.85, triggerWords: [] }],
+      }),
       "ckpt.safetensors",
     );
     const [ckptId] = entry(workflow, "CheckpointLoaderSimple");
@@ -99,6 +102,41 @@ describe("buildWorkflowFromSpec — LoRA (reuses graph-edit.insertLora)", () => 
 
     const vaeDecode = node(workflow, "VAEDecode");
     expect(vaeDecode.inputs.vae).toEqual([ckptId, 2]);
+  });
+
+  it("chains multiple LoraLoaders in declaration order, first LoRA adjacent to the checkpoint", () => {
+    const { workflow } = buildWorkflowFromSpec(
+      baseSpec({
+        loras: [
+          { name: "first.safetensors", strengthModel: 0.9, strengthClip: 0.9, triggerWords: [] },
+          { name: "second.safetensors", strengthModel: 0.6, strengthClip: 0.6, triggerWords: [] },
+        ],
+      }),
+      "ckpt.safetensors",
+    );
+
+    const [ckptId] = entry(workflow, "CheckpointLoaderSimple");
+    const loraLoaders = Object.entries(workflow).filter(([, n]) => n.class_type === "LoraLoader");
+    expect(loraLoaders).toHaveLength(2);
+
+    const first = loraLoaders.find(([, n]) => n.inputs.lora_name === "first.safetensors");
+    const second = loraLoaders.find(([, n]) => n.inputs.lora_name === "second.safetensors");
+    if (!first || !second) throw new Error("expected both LoraLoader nodes to exist");
+    const [firstId, firstNode] = first;
+    const [secondId, secondNode] = second;
+
+    // checkpoint -> first (declared first) -> second (declared second) -> KSampler/CLIP
+    expect(firstNode.inputs.model).toEqual([ckptId, 0]);
+    expect(firstNode.inputs.clip).toEqual([ckptId, 1]);
+    expect(secondNode.inputs.model).toEqual([firstId, 0]);
+    expect(secondNode.inputs.clip).toEqual([firstId, 1]);
+
+    const ksampler = node(workflow, "KSampler");
+    expect(ksampler.inputs.model).toEqual([secondId, 0]);
+    const clipEncoders = Object.values(workflow).filter((n) => n.class_type === "CLIPTextEncode");
+    for (const enc of clipEncoders) {
+      expect(enc.inputs.clip).toEqual([secondId, 1]);
+    }
   });
 });
 
@@ -137,7 +175,7 @@ describe("buildWorkflowFromSpec — pixel-grid post-processing", () => {
     const { workflow } = buildWorkflowFromSpec(
       baseSpec({
         vae: "sdxl_vae.safetensors",
-        lora: { name: "l.safetensors", strengthModel: 1, strengthClip: 1, triggerWords: [] },
+        loras: [{ name: "l.safetensors", strengthModel: 1, strengthClip: 1, triggerWords: [] }],
         postProcess: {
           downscale: { width: 128, height: 128, method: "nearest-exact" },
           upscale: { width: 1024, height: 1024, method: "nearest-exact" },

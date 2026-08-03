@@ -49,6 +49,7 @@ function objectInfoMissingLora(missingName: string, installedName = "installed-l
 function baseSpec(overrides: Partial<PromptSpec> = {}): PromptSpec {
   return {
     checkpointCandidates: ["pixelArtDiffusionXL_v2.safetensors", "sd_xl_base_1.0.safetensors"],
+    loras: [],
     sampler: "dpmpp_2m_sde",
     scheduler: "karras",
     steps: 35,
@@ -118,14 +119,14 @@ describe("buildAndSaveSpecWorkflow — validation and save", () => {
     const { deps, saved } = makeDeps();
     const spec = baseSpec({
       vae: "sdxl_vae.safetensors",
-      lora: { name: "l.safetensors", strengthModel: 0.9, strengthClip: 0.85, triggerWords: [] },
+      loras: [{ name: "l.safetensors", strengthModel: 0.9, strengthClip: 0.85, triggerWords: [] }],
     });
 
     const result = await buildAndSaveSpecWorkflow({ spec, filename: "test.json" }, deps);
 
     expect(result.checkpoint).toBe("pixelArtDiffusionXL_v2.safetensors");
     expect(result.vae).toBe("sdxl_vae.safetensors");
-    expect(result.lora).toBe("l.safetensors");
+    expect(result.loras).toEqual(["l.safetensors"]);
     expect(saved).toHaveLength(1);
     expect(saved[0].filename).toBe("test.json");
   });
@@ -187,7 +188,7 @@ describe("buildAndSaveSpecWorkflow — auto-download (reuses resolveAndDownloadM
     ]);
   });
 
-  it("fetches the spec's LoRA via an explicit loraSource, bypassing search/ranking", async () => {
+  it("fetches the spec's LoRA via an explicit loraSources entry, bypassing search/ranking", async () => {
     const { buildAndSaveSpecWorkflow } = await import("../../../sprite/spec/spec-job.js");
     const loraName = "pixel-art-xl-v1.safetensors";
     const validate = vi
@@ -201,22 +202,23 @@ describe("buildAndSaveSpecWorkflow — auto-download (reuses resolveAndDownloadM
 
     await buildAndSaveSpecWorkflow(
       {
-        spec: baseSpec({ lora: { name: loraName, strengthModel: 0.9, strengthClip: 0.85, triggerWords: [] } }),
+        spec: baseSpec({ loras: [{ name: loraName, strengthModel: 0.9, strengthClip: 0.85, triggerWords: [] }] }),
         filename: "test.json",
         autoDownloadMissing: true,
-        loraSource: { huggingfaceRepo: "nerijs/pixel-art-xl", huggingfaceFilename: loraName },
+        loraSources: [{ name: loraName, huggingfaceRepo: "nerijs/pixel-art-xl", huggingfaceFilename: loraName }],
       },
       deps,
     );
 
     expect(deps.resolveModelCandidates).not.toHaveBeenCalled();
     expect(deps.downloadExplicitSource).toHaveBeenCalledWith("loras", loraName, {
+      name: loraName,
       huggingfaceRepo: "nerijs/pixel-art-xl",
       huggingfaceFilename: loraName,
     });
   });
 
-  it("without a loraSource, never substitutes a 'similar' LoRA — throws instead", async () => {
+  it("without a matching loraSources entry, never substitutes a 'similar' LoRA — throws instead", async () => {
     const { buildAndSaveSpecWorkflow } = await import("../../../sprite/spec/spec-job.js");
     const loraName = "pixel-art-xl-v1.safetensors";
     const validate = vi.fn(async () => missingModelResult("2", "LoraLoader", "lora_name", loraName));
@@ -236,7 +238,7 @@ describe("buildAndSaveSpecWorkflow — auto-download (reuses resolveAndDownloadM
     await expect(
       buildAndSaveSpecWorkflow(
         {
-          spec: baseSpec({ lora: { name: loraName, strengthModel: 1, strengthClip: 1, triggerWords: [] } }),
+          spec: baseSpec({ loras: [{ name: loraName, strengthModel: 1, strengthClip: 1, triggerWords: [] }] }),
           filename: "test.json",
           autoDownloadMissing: true,
         },

@@ -23,25 +23,21 @@ import type { SpecWorkflowRequest } from "../spec/spec-job.js";
 // to actually run it (pixelforge-mcp-n0f, confirmed with the user).
 // ---------------------------------------------------------------------------
 
-const loraSourceSchema = z
-  .object({
-    civitai_model_id: z.number().optional().describe("CivitAI model id (resolves to its primary file)."),
-    civitai_version_id: z
-      .number()
-      .optional()
-      .describe("CivitAI model-VERSION id — preferred over civitai_model_id when both are known."),
-    huggingface_repo: z.string().optional().describe("HuggingFace repo id, e.g. 'nerijs/pixel-art-xl'."),
-    huggingface_filename: z
-      .string()
-      .optional()
-      .describe("Exact filename inside huggingface_repo — not a search term."),
-  })
-  .describe(
-    "Explicit, exact download source for the spec's [LORA], used only when auto_download_missing " +
-      "is true and it isn't installed. Set civitai_version_id (preferred), civitai_model_id, or both " +
-      "huggingface_repo + huggingface_filename to fetch EXACTLY that file — never a keyword search, " +
-      "never a 'similar' substitute. Omit to rely on an exact-filename search match instead.",
-  );
+const loraSourceSchema = z.object({
+  lora_name: z
+    .string()
+    .describe("Must match a `LoRA Name:` value from one of the spec's [LORA] blocks."),
+  civitai_model_id: z.number().optional().describe("CivitAI model id (resolves to its primary file)."),
+  civitai_version_id: z
+    .number()
+    .optional()
+    .describe("CivitAI model-VERSION id — preferred over civitai_model_id when both are known."),
+  huggingface_repo: z.string().optional().describe("HuggingFace repo id, e.g. 'nerijs/pixel-art-xl'."),
+  huggingface_filename: z
+    .string()
+    .optional()
+    .describe("Exact filename inside huggingface_repo — not a search term."),
+});
 
 const workflowFromPromptSpecSchema = {
   spec_path: z
@@ -49,8 +45,9 @@ const workflowFromPromptSpecSchema = {
     .optional()
     .describe(
       "Absolute path to a prompt-spec text file (checkpoint + optional alternate, optional VAE, " +
-        "optional [LORA], [SAMPLER & SCHEDULER SETTINGS], [POSITIVE PROMPT], [NEGATIVE PROMPT], " +
-        "optional [POST-PROCESSING / PIXEL PERFECT GRID]). Exactly one of spec_path / spec_text is required.",
+        "optional [LORA] (repeatable for more than one), [SAMPLER & SCHEDULER SETTINGS], " +
+        "[POSITIVE PROMPT], [NEGATIVE PROMPT], optional [POST-PROCESSING / PIXEL PERFECT GRID]). " +
+        "Exactly one of spec_path / spec_text is required.",
     ),
   spec_text: z
     .string()
@@ -69,14 +66,24 @@ const workflowFromPromptSpecSchema = {
     .optional()
     .describe(
       "Explicit opt-in (default false — NEVER silent): if the resolved checkpoint, the spec's VAE, " +
-        "or its LoRA aren't actually installed, download them before saving instead of saving a " +
-        "workflow ComfyUI will only reject later. Checkpoint/VAE: best-ranked CivitAI/HuggingFace " +
-        "candidate. LoRA: 'lora_source' when given is fetched EXACTLY (no ranking); without a " +
-        "source, only an exact filename match is used — never a 'similar' substitute. Reports what " +
-        "was downloaded in the result. If nothing installable is found, fails with an actionable " +
-        "error instead of saving a broken graph.",
+        "or any of its LoRA(s) aren't actually installed, download them before saving instead of " +
+        "saving a workflow ComfyUI will only reject later. Checkpoint/VAE: best-ranked CivitAI/" +
+        "HuggingFace candidate. Each LoRA: its matching 'lora_sources' entry (by lora_name) when " +
+        "given is fetched EXACTLY (no ranking); without one, only an exact filename match is used — " +
+        "never a 'similar' substitute. Reports what was downloaded in the result. If nothing " +
+        "installable is found, fails with an actionable error instead of saving a broken graph.",
     ),
-  lora_source: loraSourceSchema.optional(),
+  lora_sources: z
+    .array(loraSourceSchema)
+    .optional()
+    .describe(
+      "Explicit, exact download source(s) for the spec's [LORA] block(s), used only when " +
+        "auto_download_missing is true and a named LoRA isn't installed. One entry per LoRA that " +
+        "needs an explicit source (matched by lora_name); set civitai_version_id (preferred), " +
+        "civitai_model_id, or both huggingface_repo + huggingface_filename to fetch EXACTLY that " +
+        "file — never a keyword search, never a 'similar' substitute. LoRAs without a matching " +
+        "entry fall back to an exact-filename search match instead.",
+    ),
 };
 
 type WorkflowFromPromptSpecArgs = {
@@ -84,12 +91,13 @@ type WorkflowFromPromptSpecArgs = {
   spec_text?: string;
   filename?: string;
   auto_download_missing?: boolean;
-  lora_source?: {
+  lora_sources?: Array<{
+    lora_name: string;
     civitai_model_id?: number;
     civitai_version_id?: number;
     huggingface_repo?: string;
     huggingface_filename?: string;
-  };
+  }>;
 };
 
 /** "C:\foo\my spec.txt" -> "my spec.json" */
@@ -104,14 +112,16 @@ export function registerWorkflowFromPromptSpecTool(server: McpServer): void {
     "workflow_from_prompt_spec",
     "Build a complete ComfyUI workflow from a structured plain-text prompt-spec file — the kind a " +
       "human would hand-author for a single generation (checkpoint + optional alternate, optional " +
-      "separate VAE, optional LoRA with weights/trigger words, sampler/scheduler/steps/cfg/" +
-      "resolution, positive/negative prompt, optional pixel-grid post-processing described as " +
-      "downscale-then-upscale ImageScale steps). Wires CheckpointLoaderSimple -> (VAELoader) -> " +
-      "(LoraLoader) -> CLIPTextEncode (positive/negative) -> KSampler -> VAEDecode -> (pixel-grid " +
-      "ImageScale down/up) -> SaveImage, then SAVES it into the connected ComfyUI server's workflow " +
-      "library so it opens in the web UI exactly like a hand-built graph. Does NOT enqueue or run " +
-      "the workflow — use enqueue_workflow separately once you've reviewed it (or load it in the " +
-      "ComfyUI canvas and press Queue). Provide exactly one of spec_path / spec_text.",
+      "separate VAE, optional LoRA(s) with weights/trigger words — repeat the [LORA] block for more " +
+      "than one, sampler/scheduler/steps/cfg/resolution, positive/negative prompt, optional " +
+      "pixel-grid post-processing described as downscale-then-upscale ImageScale steps). Call " +
+      "get_workflow_prompt_template first if you need the exact fillable syntax. Wires " +
+      "CheckpointLoaderSimple -> (VAELoader) -> (LoraLoader)* -> CLIPTextEncode (positive/negative) " +
+      "-> KSampler -> VAEDecode -> (pixel-grid ImageScale down/up) -> SaveImage, then SAVES it into " +
+      "the connected ComfyUI server's workflow library so it opens in the web UI exactly like a " +
+      "hand-built graph. Does NOT enqueue or run the workflow — use enqueue_workflow separately once " +
+      "you've reviewed it (or load it in the ComfyUI canvas and press Queue). Provide exactly one of " +
+      "spec_path / spec_text.",
     workflowFromPromptSpecSchema,
     async (args: WorkflowFromPromptSpecArgs) => {
       try {
@@ -127,14 +137,13 @@ export function registerWorkflowFromPromptSpecTool(server: McpServer): void {
           spec,
           filename,
           autoDownloadMissing: args.auto_download_missing,
-          loraSource: args.lora_source
-            ? {
-                civitaiModelId: args.lora_source.civitai_model_id,
-                civitaiVersionId: args.lora_source.civitai_version_id,
-                huggingfaceRepo: args.lora_source.huggingface_repo,
-                huggingfaceFilename: args.lora_source.huggingface_filename,
-              }
-            : undefined,
+          loraSources: args.lora_sources?.map((s) => ({
+            name: s.lora_name,
+            civitaiModelId: s.civitai_model_id,
+            civitaiVersionId: s.civitai_version_id,
+            huggingfaceRepo: s.huggingface_repo,
+            huggingfaceFilename: s.huggingface_filename,
+          })),
         };
 
         const result = await buildAndSaveSpecWorkflow(request);
@@ -150,7 +159,7 @@ export function registerWorkflowFromPromptSpecTool(server: McpServer): void {
                   filename: result.filename,
                   checkpoint: result.checkpoint,
                   vae: result.vae,
-                  lora: result.lora,
+                  loras: result.loras,
                   sampler: spec.sampler,
                   scheduler: spec.scheduler,
                   steps: spec.steps,

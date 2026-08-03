@@ -8,4 +8,4 @@ export type {
 export { buildWorkflowFromSpec } from "./spec-workflow.js";
 export type { BuiltSpecWorkflow } from "./spec-workflow.js";
 export { buildAndSaveSpecWorkflow } from "./spec-job.js";
-export type { SpecJobDeps, SpecWorkflowRequest, SpecWorkflowResult } from "./spec-job.js";
+export type { SpecJobDeps, SpecLoraSourceOverride, SpecWorkflowRequest, SpecWorkflowResult } from "./spec-job.js";
