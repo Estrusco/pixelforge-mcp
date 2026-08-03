@@ -1,7 +1,7 @@
 import type { WorkflowJSON } from "../../comfyui/types.js";
 import { createWorkflow, getNextNodeId } from "../../services/workflow-composer.js";
 import { WorkflowExecutionError } from "../../utils/errors.js";
-import type { SpriteGenerationMode, SpriteJobRequest } from "../types.js";
+import type { SpriteGenerationMode, SpriteJobRequest, SpriteLoraRequest } from "../types.js";
 import { composeSpritePrompt } from "./sprite-prompt.js";
 import { STYLE_PROFILES } from "./style-profiles.js";
 
@@ -64,6 +64,42 @@ function forceCanvasSize(workflow: WorkflowJSON, width: number, height: number):
   workflow[encodeId].inputs.pixels = [scaleId, 0];
 }
 
+/**
+ * Insert a `LoraLoader` between `CheckpointLoaderSimple` and everything that
+ * consumed its `model`/`clip` outputs (KSampler, both CLIPTextEncode nodes).
+ * Generic over node ids on purpose — it rewires by CONNECTION, not by
+ * hardcoded node id, so it works unchanged whether the template is txt2img
+ * (ids 1-7) or img2img (ids 1-8). The checkpoint's VAE output (index 2) is
+ * untouched: `LoraLoader` never sees or passes it through.
+ */
+function insertLora(workflow: WorkflowJSON, lora: SpriteLoraRequest): void {
+  const ckptId = findNodeId(workflow, "CheckpointLoaderSimple");
+  const loraId = getNextNodeId(workflow);
+  const strengthModel = lora.strengthModel ?? 1.0;
+  const strengthClip = lora.strengthClip ?? strengthModel;
+
+  workflow[loraId] = {
+    class_type: "LoraLoader",
+    inputs: {
+      model: [ckptId, 0],
+      clip: [ckptId, 1],
+      lora_name: lora.name,
+      strength_model: strengthModel,
+      strength_clip: strengthClip,
+    },
+    _meta: { title: "Sprite LoRA" },
+  };
+
+  for (const [nodeId, node] of Object.entries(workflow)) {
+    if (nodeId === loraId) continue;
+    for (const [key, value] of Object.entries(node.inputs)) {
+      if (!Array.isArray(value) || value[0] !== ckptId) continue;
+      if (value[1] === 0) node.inputs[key] = [loraId, 0];
+      else if (value[1] === 1) node.inputs[key] = [loraId, 1];
+    }
+  }
+}
+
 export function buildSpriteWorkflow(
   request: SpriteJobRequest,
   checkpoint: string,
@@ -100,6 +136,10 @@ export function buildSpriteWorkflow(
 
   if (mode === "img2img") {
     forceCanvasSize(workflow, request.width, request.height);
+  }
+
+  if (request.lora) {
+    insertLora(workflow, request.lora);
   }
 
   workflow[findNodeId(workflow, "SaveImage")].inputs.filename_prefix = SPRITE_FILENAME_PREFIX;

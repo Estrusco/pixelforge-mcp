@@ -183,12 +183,54 @@ export interface SpriteJobRequest {
   /**
    * Explicit opt-in (default false — NEVER silent): when the built workflow
    * fails validation because a model it references isn't installed, resolve
-   * and download the best CivitAI/HuggingFace candidate before enqueueing,
-   * instead of enqueueing a graph ComfyUI will only fail on later. See
-   * `enqueueSpriteJob` (sprite-job.ts) for the full resolve/download/re-validate
-   * sequence. Never wired for LoRA (pixelforge-mcp-7dc.1) — checkpoints only.
+   * and download a CivitAI/HuggingFace candidate before enqueueing, instead of
+   * enqueueing a graph ComfyUI will only fail on later. See `enqueueSpriteJob`
+   * (sprite-job.ts) for the full resolve/download/re-validate sequence.
+   * Checkpoint: best-ranked candidate (may be a same-model different-format
+   * fallback). LoRA: `lora.source` when given is fetched VERBATIM (no
+   * ranking); without a source, only an EXACT filename match is accepted —
+   * never a "similar" substitute (pixelforge-mcp-7dc.1).
    */
   readonly autoDownloadMissing?: boolean;
+  /**
+   * Explicit LoRA to apply via a `LoraLoader` node between the checkpoint and
+   * the sampler/CLIP encoders. NEVER inferred from `prompt` — always an
+   * explicit caller choice (pixelforge-mcp-7dc.1's locked design decision).
+   * Omit for no LoRA.
+   */
+  readonly lora?: SpriteLoraRequest;
+}
+
+/**
+ * Explicit, unambiguous download source for a LoRA that isn't installed yet.
+ * When set, `enqueueSpriteJob`'s auto-download path fetches EXACTLY this file
+ * — no keyword search, no candidate ranking, so a "similar" LoRA can never be
+ * substituted for the one actually requested. Resolution order when more than
+ * one field is set: `civitaiVersionId` > `civitaiModelId` > the huggingface
+ * pair.
+ */
+export interface SpriteLoraSource {
+  readonly civitaiModelId?: number;
+  readonly civitaiVersionId?: number;
+  /** e.g. "nerijs/pixel-art-xl". */
+  readonly huggingfaceRepo?: string;
+  /** Exact filename inside `huggingfaceRepo` (not a search term). */
+  readonly huggingfaceFilename?: string;
+}
+
+/**
+ * One LoRA to wire into the sprite workflow. `name` is the exact on-disk
+ * filename it is installed/loaded as (the `LoraLoader.lora_name` widget
+ * value) — never a search term.
+ */
+export interface SpriteLoraRequest {
+  readonly name: string;
+  /** `LoraLoader.strength_model`. Defaults to 1.0. */
+  readonly strengthModel?: number;
+  /** `LoraLoader.strength_clip`. Defaults to `strengthModel`. */
+  readonly strengthClip?: number;
+  /** See `SpriteLoraSource`. Omit to rely on an exact-filename search match. */
+  readonly source?: SpriteLoraSource;
 }
 
 /** One model auto-downloaded during an `enqueueSpriteJob` call. */
@@ -406,6 +448,8 @@ export interface AnimationSetRequest {
   readonly referenceImage?: string;
   /** Forwarded verbatim to every frame's `SpriteJobRequest` — see its doc comment. */
   readonly autoDownloadMissing?: boolean;
+  /** Forwarded verbatim to every frame's `SpriteJobRequest` — see its doc comment. */
+  readonly lora?: SpriteLoraRequest;
   /** Forwarded verbatim to every frame's `SpriteJobRequest` — see its doc comments. */
   readonly stepsOverride?: number;
   readonly cfgOverride?: number;

@@ -183,6 +183,43 @@ const generateAnimationSetSchema = {
     .string()
     .optional()
     .describe("Scheduler override for EVERY frame (e.g. 'normal', 'karras')."),
+  lora: z
+    .object({
+      name: z
+        .string()
+        .describe(
+          "Exact on-disk LoRA filename (the ComfyUI LoraLoader 'lora_name' widget value), applied " +
+            "to EVERY frame. NEVER inferred from the prompt.",
+        ),
+      strength_model: z.number().optional().describe("LoraLoader strength_model. Defaults to 1.0."),
+      strength_clip: z
+        .number()
+        .optional()
+        .describe("LoraLoader strength_clip. Defaults to strength_model."),
+      source: z
+        .object({
+          civitai_model_id: z.number().optional().describe("CivitAI model id (resolves to its primary file)."),
+          civitai_version_id: z
+            .number()
+            .optional()
+            .describe("CivitAI model-VERSION id — preferred over civitai_model_id when both are known."),
+          huggingface_repo: z.string().optional().describe("HuggingFace repo id, e.g. 'nerijs/pixel-art-xl'."),
+          huggingface_filename: z
+            .string()
+            .optional()
+            .describe("Exact filename inside huggingface_repo — not a search term."),
+        })
+        .optional()
+        .describe(
+          "Explicit, exact download source used ONLY when auto_download_missing is true and this " +
+            "LoRA isn't installed yet. Fetches EXACTLY that file — never a keyword search, never a " +
+            "'similar' substitute.",
+        ),
+    })
+    .optional()
+    .describe(
+      "Explicit LoRA applied to EVERY frame via a LoraLoader node. NEVER inferred from the prompt.",
+    ),
 };
 
 type GenerateAnimationSetArgs = {
@@ -205,6 +242,17 @@ type GenerateAnimationSetArgs = {
   cfg?: number;
   sampler?: string;
   scheduler?: string;
+  lora?: {
+    name: string;
+    strength_model?: number;
+    strength_clip?: number;
+    source?: {
+      civitai_model_id?: number;
+      civitai_version_id?: number;
+      huggingface_repo?: string;
+      huggingface_filename?: string;
+    };
+  };
 };
 
 /**
@@ -356,6 +404,9 @@ export function registerGenerateAnimationSetTool(server: McpServer): void {
         if (args.checkpoint !== undefined && args.checkpoint.trim().length === 0) {
           throw new ValidationError("checkpoint, when provided, must be a non-empty filename.");
         }
+        if (args.lora !== undefined && args.lora.name.trim().length === 0) {
+          throw new ValidationError("lora.name, when provided, must be a non-empty filename.");
+        }
 
         const motionStates = assertMotionStates(args.motion_states);
         const framesPerState = assertFramesPerState(args.frames_per_state, motionStates.length);
@@ -388,6 +439,21 @@ export function registerGenerateAnimationSetTool(server: McpServer): void {
           cfgOverride: args.cfg,
           samplerOverride: args.sampler,
           schedulerOverride: args.scheduler,
+          lora: args.lora
+            ? {
+                name: args.lora.name,
+                strengthModel: args.lora.strength_model,
+                strengthClip: args.lora.strength_clip,
+                source: args.lora.source
+                  ? {
+                      civitaiModelId: args.lora.source.civitai_model_id,
+                      civitaiVersionId: args.lora.source.civitai_version_id,
+                      huggingfaceRepo: args.lora.source.huggingface_repo,
+                      huggingfaceFilename: args.lora.source.huggingface_filename,
+                    }
+                  : undefined,
+              }
+            : undefined,
         };
 
         const result = await runAnimationSet(request);

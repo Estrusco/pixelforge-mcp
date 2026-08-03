@@ -127,11 +127,54 @@ const generateSpriteSchema = {
     .boolean()
     .optional()
     .describe(
-      "Explicit opt-in (default false — NEVER silent): if the resolved checkpoint isn't actually " +
-        "installed, download the best-ranked CivitAI/HuggingFace candidate before enqueueing, " +
-        "instead of enqueueing a graph ComfyUI will only reject later. Reports what was downloaded " +
-        "in the result. If no installable candidate is found, fails with an actionable error " +
-        "instead of proceeding with a broken checkpoint.",
+      "Explicit opt-in (default false — NEVER silent): if the resolved checkpoint (or 'lora', when " +
+        "given) isn't actually installed, download it before enqueueing instead of enqueueing a " +
+        "graph ComfyUI will only reject later. Checkpoint: best-ranked CivitAI/HuggingFace " +
+        "candidate. LoRA: 'lora.source' when given is fetched EXACTLY (no ranking); without a " +
+        "source, only an exact filename match is used — never a 'similar' substitute. Reports what " +
+        "was downloaded in the result. If nothing installable is found, fails with an actionable " +
+        "error instead of proceeding with a broken graph.",
+    ),
+  lora: z
+    .object({
+      name: z
+        .string()
+        .describe(
+          "Exact on-disk LoRA filename (the ComfyUI LoraLoader 'lora_name' widget value), e.g. " +
+            "'pixel-art-xl-v1.1.safetensors'. NEVER inferred from the prompt — find it first with " +
+            "search_civitai_models / search_models / list_local_models if you don't already know it.",
+        ),
+      strength_model: z.number().optional().describe("LoraLoader strength_model. Defaults to 1.0."),
+      strength_clip: z
+        .number()
+        .optional()
+        .describe("LoraLoader strength_clip. Defaults to strength_model."),
+      source: z
+        .object({
+          civitai_model_id: z.number().optional().describe("CivitAI model id (resolves to its primary file)."),
+          civitai_version_id: z
+            .number()
+            .optional()
+            .describe("CivitAI model-VERSION id — preferred over civitai_model_id when both are known."),
+          huggingface_repo: z.string().optional().describe("HuggingFace repo id, e.g. 'nerijs/pixel-art-xl'."),
+          huggingface_filename: z
+            .string()
+            .optional()
+            .describe("Exact filename inside huggingface_repo — not a search term."),
+        })
+        .optional()
+        .describe(
+          "Explicit, exact download source used ONLY when auto_download_missing is true and this " +
+            "LoRA isn't installed yet. Set civitai_version_id (preferred), civitai_model_id, or both " +
+            "huggingface_repo + huggingface_filename to fetch EXACTLY that file — never a keyword " +
+            "search, never a 'similar' substitute. Omit to rely on an exact-filename search match " +
+            "instead (still never fuzzy).",
+        ),
+    })
+    .optional()
+    .describe(
+      "Explicit LoRA applied via a LoraLoader node between the checkpoint and the sampler/CLIP " +
+        "encoders. NEVER inferred from the prompt — pass it explicitly. Omit for no LoRA.",
     ),
 };
 
@@ -152,6 +195,17 @@ type GenerateSpriteArgs = {
   sampler?: string;
   scheduler?: string;
   auto_download_missing?: boolean;
+  lora?: {
+    name: string;
+    strength_model?: number;
+    strength_clip?: number;
+    source?: {
+      civitai_model_id?: number;
+      civitai_version_id?: number;
+      huggingface_repo?: string;
+      huggingface_filename?: string;
+    };
+  };
 };
 
 /**
@@ -181,7 +235,10 @@ export function registerGenerateSpriteTool(server: McpServer): void {
       "(steps/cfg/sampler/scheduler) defaults to the style's tuned profile; override any of them " +
       "when the chosen checkpoint needs different sampling (e.g. Flux-schnell: cfg 1.0, 4-8 steps). " +
       "If the resolved checkpoint's base-model family doesn't match the style (nothing better " +
-      "installed), the result carries a checkpoint_warning instead of failing silently. " +
+      "installed), the result carries a checkpoint_warning instead of failing silently. Pass " +
+      "'lora' for an explicit LoRA (never inferred from the prompt) — combine with " +
+      "auto_download_missing + lora.source to fetch an exact, named LoRA (e.g. a pixel-art LoRA " +
+      "found via search_civitai_models) when it isn't installed yet. " +
       "Fire-and-forget: returns prompt_id immediately along with the exact seed used, so the result " +
       "is reproducible and can be extended into an animation set. Retrieve the finished image with " +
       "get_sprite_result (or view_image) once the completion notification arrives. Generate at a " +
@@ -194,6 +251,9 @@ export function registerGenerateSpriteTool(server: McpServer): void {
         }
         if (args.checkpoint !== undefined && args.checkpoint.trim().length === 0) {
           throw new ValidationError("checkpoint, when provided, must be a non-empty filename.");
+        }
+        if (args.lora !== undefined && args.lora.name.trim().length === 0) {
+          throw new ValidationError("lora.name, when provided, must be a non-empty filename.");
         }
 
         const width = assertSpriteDimension(args.width, "width");
@@ -219,6 +279,21 @@ export function registerGenerateSpriteTool(server: McpServer): void {
           samplerOverride: args.sampler,
           schedulerOverride: args.scheduler,
           autoDownloadMissing: args.auto_download_missing,
+          lora: args.lora
+            ? {
+                name: args.lora.name,
+                strengthModel: args.lora.strength_model,
+                strengthClip: args.lora.strength_clip,
+                source: args.lora.source
+                  ? {
+                      civitaiModelId: args.lora.source.civitai_model_id,
+                      civitaiVersionId: args.lora.source.civitai_version_id,
+                      huggingfaceRepo: args.lora.source.huggingface_repo,
+                      huggingfaceFilename: args.lora.source.huggingface_filename,
+                    }
+                  : undefined,
+              }
+            : undefined,
         };
 
         const result: SpriteJobResult = await enqueueSpriteJob(request);
@@ -242,6 +317,13 @@ export function registerGenerateSpriteTool(server: McpServer): void {
                   width,
                   height,
                   reference_image: reference?.source,
+                  lora: args.lora
+                    ? {
+                        name: args.lora.name,
+                        strength_model: args.lora.strength_model ?? 1.0,
+                        strength_clip: args.lora.strength_clip ?? args.lora.strength_model ?? 1.0,
+                      }
+                    : undefined,
                   downloaded_models: result.downloadedModels,
                   note:
                     "Fire-and-forget. The asset_id arrives in the completion notification; pass this " +

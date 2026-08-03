@@ -167,6 +167,7 @@ export async function runAnimationSet(
         // denoise is meaningless for txt2img; only send it with a reference.
         denoise: reference === undefined ? undefined : request.denoise,
         autoDownloadMissing: request.autoDownloadMissing,
+        lora: request.lora,
         stepsOverride: request.stepsOverride,
         cfgOverride: request.cfgOverride,
         samplerOverride: request.samplerOverride,
