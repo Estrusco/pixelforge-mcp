@@ -3,7 +3,7 @@ description: Diff two ComfyUI workflows to see what changed
 argument-hint: "Two file paths or workflow names separated by 'vs' (e.g. workflow_a.json vs workflow_b.json)"
 ---
 
-# /comfy-compare — Compare Two Workflows
+# /pixelforge-compare — Compare Two Workflows
 
 The user wants to see the differences between two ComfyUI workflows — what nodes were added, removed, or changed.
 
@@ -64,7 +64,7 @@ The user wants to see the differences between two ComfyUI workflows — what nod
 
 ## Example
 
-User: `/comfy-compare ~/workflows/v1.json vs ~/workflows/v2.json`
+User: `/pixelforge-compare ~/workflows/v1.json vs ~/workflows/v2.json`
 
 Steps:
 - Read both files

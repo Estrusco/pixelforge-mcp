@@ -1,5 +1,5 @@
 {
-  "comfyui": {
+  "pixelforge": {
     "command": "npx",
     "args": [
       "-y",

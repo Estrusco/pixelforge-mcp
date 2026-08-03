@@ -1,13 +1,13 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "comfyui-mcp",
+  "name": "pixelforge-mcp",
   "description": "ComfyUI integration for Claude Code — workflow execution, visualization, model management, and skill generation",
   "owner": {
     "name": "artokun"
   },
   "plugins": [
     {
-      "name": "comfy",
+      "name": "pixelforge",
       "source": "./plugin",
       "description": "Claude Code plugin for ComfyUI — generate images, visualize workflows, manage models, and explore custom nodes",
       "version": "0.1.0"

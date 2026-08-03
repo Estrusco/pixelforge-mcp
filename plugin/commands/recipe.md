@@ -3,7 +3,7 @@ description: Run a multi-step generation recipe (portrait, hires-fix, style-tran
 argument-hint: "Recipe name and prompt (e.g. 'portrait a woman with red hair')"
 ---
 
-# /comfy-recipe — Multi-Step Generation Recipes
+# /pixelforge-recipe — Multi-Step Generation Recipes
 
 The user wants to run a predefined multi-step image generation pipeline. Each recipe chains multiple workflows together, passing the output of one step as input to the next.
 
@@ -92,7 +92,7 @@ The user wants to run a predefined multi-step image generation pipeline. Each re
 
 ## Example
 
-User: `/comfy-recipe portrait a cyberpunk woman with neon hair and chrome implants`
+User: `/pixelforge-recipe portrait a cyberpunk woman with neon hair and chrome implants`
 
 Steps:
 - Parse recipe: "portrait", prompt: "a cyberpunk woman with neon hair and chrome implants"
@@ -104,7 +104,7 @@ Steps:
 
 ## Morph Example
 
-User: `/comfy-recipe morph a black cat sitting in front of a barn morphs into a woman standing tall`
+User: `/pixelforge-recipe morph a black cat sitting in front of a barn morphs into a woman standing tall`
 
 Steps:
 - Parse recipe: "morph", prompt: "a black cat sitting in front of a barn morphs into a woman standing tall"

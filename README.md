@@ -99,23 +99,23 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 ```bash
 # In Claude Code
 /plugin marketplace add artokun/comfyui-mcp
-/plugin install comfy
+/plugin install pixelforge
 ```
 
 ### Slash commands
 
 | Command | Description |
 |---------|-------------|
-| `/comfy:gen <prompt>` | Generate an image from a text description — auto-selects checkpoint, builds workflow, returns image |
-| `/comfy:viz <workflow>` | Visualize a workflow as a Mermaid diagram with nodes grouped by category |
-| `/comfy:node-skill <pack>` | Generate a Claude skill for a custom node pack from Registry ID or GitHub URL |
-| `/comfy:debug [prompt_id]` | Diagnose why a workflow failed — reads history, logs, traces root cause, suggests fixes |
-| `/comfy:batch <prompt, params>` | Parameter sweep generation across cfg, sampler, steps, seed, etc. |
-| `/comfy:convert <file>` | Convert between UI format and API format workflows |
-| `/comfy:install <pack>` | Install a custom node pack — git clone, pip install, optional restart |
-| `/comfy:gallery [filter]` | Browse generated outputs with metadata — filter by date, count, or filename |
-| `/comfy:compare <a vs b>` | Diff two workflows side by side — shows added/removed nodes and changed parameters |
-| `/comfy:recipe <name> <prompt>` | Multi-step recipes: `portrait`, `hires-fix`, `style-transfer`, `product-shot` |
+| `/pixelforge:gen <prompt>` | Generate an image from a text description — auto-selects checkpoint, builds workflow, returns image |
+| `/pixelforge:viz <workflow>` | Visualize a workflow as a Mermaid diagram with nodes grouped by category |
+| `/pixelforge:node-skill <pack>` | Generate a Claude skill for a custom node pack from Registry ID or GitHub URL |
+| `/pixelforge:debug [prompt_id]` | Diagnose why a workflow failed — reads history, logs, traces root cause, suggests fixes |
+| `/pixelforge:batch <prompt, params>` | Parameter sweep generation across cfg, sampler, steps, seed, etc. |
+| `/pixelforge:convert <file>` | Convert between UI format and API format workflows |
+| `/pixelforge:install <pack>` | Install a custom node pack — git clone, pip install, optional restart |
+| `/pixelforge:gallery [filter]` | Browse generated outputs with metadata — filter by date, count, or filename |
+| `/pixelforge:compare <a vs b>` | Diff two workflows side by side — shows added/removed nodes and changed parameters |
+| `/pixelforge:recipe <name> <prompt>` | Multi-step recipes: `portrait`, `hires-fix`, `style-transfer`, `product-shot` |
 
 ### Built-in skills
 
@@ -410,7 +410,7 @@ Community-maintained preset library (`model-settings.json`) with research-backed
 ### Generate an image
 
 ```
-> /comfy:gen a cyberpunk city at night with neon lights
+> /pixelforge:gen a cyberpunk city at night with neon lights
 ```
 
 Claude will:
@@ -422,7 +422,7 @@ Claude will:
 ### Visualize a workflow
 
 ```
-> /comfy:viz ~/workflows/my-workflow.json
+> /pixelforge:viz ~/workflows/my-workflow.json
 ```
 
 Produces a Mermaid diagram with nodes grouped by category:
@@ -447,13 +447,13 @@ flowchart LR
 ### Debug a failed workflow
 
 ```
-> /comfy:debug
+> /pixelforge:debug
 ```
 
 Automatically reads the last execution history and logs, identifies the failing node, checks for missing models or node packs, and suggests a fix.
 
 ```
-> /comfy:debug abc123-def456
+> /pixelforge:debug abc123-def456
 ```
 
 Diagnose a specific execution by prompt ID.
@@ -461,7 +461,7 @@ Diagnose a specific execution by prompt ID.
 ### Parameter sweep
 
 ```
-> /comfy:batch a cat in a field, cfg:5-10:2, sampler:euler,dpmpp_2m
+> /pixelforge:batch a cat in a field, cfg:5-10:2, sampler:euler,dpmpp_2m
 ```
 
 Generates a grid of images across all parameter combinations and presents a summary table with results.
@@ -471,7 +471,7 @@ Supported sweep parameters: `cfg`, `steps`, `sampler`, `scheduler`, `seed`, `den
 ### Multi-step recipes
 
 ```
-> /comfy:recipe hires-fix a dramatic fantasy landscape with castles
+> /pixelforge:recipe hires-fix a dramatic fantasy landscape with castles
 ```
 
 Runs a two-pass pipeline: txt2img at 512x768, then img2img upscale to 1024x1536 with detail enhancement.
@@ -488,7 +488,7 @@ Available recipes:
 ### Convert workflow format
 
 ```
-> /comfy:convert ~/workflows/my-ui-workflow.json
+> /pixelforge:convert ~/workflows/my-ui-workflow.json
 ```
 
 Converts between ComfyUI's UI format (nodes + links arrays) and API format (node IDs → {class_type, inputs}).
@@ -496,7 +496,7 @@ Converts between ComfyUI's UI format (nodes + links arrays) and API format (node
 ### Install a custom node pack
 
 ```
-> /comfy:install comfyui-impact-pack
+> /pixelforge:install comfyui-impact-pack
 ```
 
 Searches the registry, shows details, clones the repo to `custom_nodes/`, installs dependencies, and offers to restart ComfyUI.
@@ -504,8 +504,8 @@ Searches the registry, shows details, clones the repo to `custom_nodes/`, instal
 ### Browse output gallery
 
 ```
-> /comfy:gallery last 5
-> /comfy:gallery today
+> /pixelforge:gallery last 5
+> /pixelforge:gallery today
 ```
 
 Lists recent outputs with embedded metadata — shows checkpoint, prompt, seed, steps, CFG, sampler for each image.
@@ -513,7 +513,7 @@ Lists recent outputs with embedded metadata — shows checkpoint, prompt, seed, 
 ### Compare workflows
 
 ```
-> /comfy:compare workflow-a.json vs workflow-b.json
+> /pixelforge:compare workflow-a.json vs workflow-b.json
 ```
 
 Shows added/removed nodes, changed parameters (old → new values), and optional Mermaid diagrams for visual comparison.
@@ -552,7 +552,7 @@ Reads the PNG metadata chunks to recover the exact workflow and prompt used to g
 ### Explore custom nodes
 
 ```
-> /comfy:node-skill comfyui-impact-pack
+> /pixelforge:node-skill comfyui-impact-pack
 ```
 
 Generates a comprehensive skill file documenting every node, its inputs/outputs, and usage patterns.
@@ -878,16 +878,16 @@ plugin/
   .claude-plugin/          # Plugin manifest
   .mcp.json                # MCP server config for plugin
   commands/                # Slash commands
-    gen.md                 # /comfy:gen — image generation
-    viz.md                 # /comfy:viz — workflow visualization
-    node-skill.md          # /comfy:node-skill — skill generation
-    debug.md               # /comfy:debug — failure diagnosis
-    batch.md               # /comfy:batch — parameter sweeps
-    convert.md             # /comfy:convert — format conversion
-    install.md             # /comfy:install — node pack installation
-    gallery.md             # /comfy:gallery — output browser
-    compare.md             # /comfy:compare — workflow diff
-    recipe.md              # /comfy:recipe — multi-step pipelines
+    gen.md                 # /pixelforge:gen — image generation
+    viz.md                 # /pixelforge:viz — workflow visualization
+    node-skill.md          # /pixelforge:node-skill — skill generation
+    debug.md               # /pixelforge:debug — failure diagnosis
+    batch.md               # /pixelforge:batch — parameter sweeps
+    convert.md             # /pixelforge:convert — format conversion
+    install.md             # /pixelforge:install — node pack installation
+    gallery.md             # /pixelforge:gallery — output browser
+    compare.md             # /pixelforge:compare — workflow diff
+    recipe.md              # /pixelforge:recipe — multi-step pipelines
   skills/                  # Knowledge bases
     comfyui-core/          # Workflow format, node types, pipeline patterns
     prompt-engineering/    # CLIP syntax, model-specific prompting
@@ -923,13 +923,13 @@ This is informational — the server uses the first one found. Set `COMFYUI_PATH
 For HuggingFace gated models, set `HUGGINGFACE_TOKEN`. For CivitAI, set `CIVITAI_API_TOKEN`.
 
 **Workflow execution errors**
-Use `/comfy:debug` to automatically diagnose failures. Or use `get_history` / `get_logs` directly to see detailed error messages including Python tracebacks from ComfyUI.
+Use `/pixelforge:debug` to automatically diagnose failures. Or use `get_history` / `get_logs` directly to see detailed error messages including Python tracebacks from ComfyUI.
 
 **Out of memory (OOM)**
 Use `clear_vram` to free GPU memory before running large workflows. The VRAM watchdog hook will warn you automatically if memory is critically low. See the **troubleshooting** skill for model-specific VRAM estimates.
 
 **Missing custom nodes**
-Use `/comfy:install <pack>` to install missing node packs from the registry. The debug command will detect and suggest missing packs automatically.
+Use `/pixelforge:install <pack>` to install missing node packs from the registry. The debug command will detect and suggest missing packs automatically.
 
 ---
 

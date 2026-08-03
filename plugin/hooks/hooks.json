@@ -3,7 +3,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__plugin_comfy_comfyui__enqueue_workflow",
+        "matcher": "mcp__plugin_pixelforge_pixelforge__enqueue_workflow",
         "hooks": [
           {
             "type": "command",
@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "mcp__plugin_comfy_comfyui__(stop|restart)_comfyui",
+        "matcher": "mcp__plugin_pixelforge_pixelforge__(stop|restart)_comfyui",
         "hooks": [
           {
             "type": "command",
@@ -23,7 +23,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_comfy_comfyui__.*",
+        "matcher": "mcp__plugin_pixelforge_pixelforge__.*",
         "hooks": [
           {
             "type": "command",

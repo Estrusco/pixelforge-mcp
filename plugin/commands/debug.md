@@ -3,7 +3,7 @@ description: Diagnose why a ComfyUI workflow failed
 argument-hint: prompt_id or "last" to debug the most recent execution
 ---
 
-# /comfy-debug — Diagnose a Failed Workflow
+# /pixelforge-debug — Diagnose a Failed Workflow
 
 The user wants to find out why a ComfyUI workflow execution failed and get a suggested fix.
 
@@ -55,7 +55,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 
 ## Example
 
-User: `/comfy-debug last`
+User: `/pixelforge-debug last`
 
 Steps:
 - Call `get_history` with no prompt_id

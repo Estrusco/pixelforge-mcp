@@ -3,7 +3,7 @@ description: Direct a short film from a story — generates scenes, frames, and 
 argument-hint: "A story or 'resume' to continue a previous project"
 ---
 
-# /comfy-director — Story-to-Video Production Pipeline
+# /pixelforge-director — Story-to-Video Production Pipeline
 
 The user wants to create a short film from a story description. This command orchestrates multiple model families (Z-Image, Qwen Edit, WAN FLF) to generate start frames, end frames, and video clips for each scene, then concatenates them into a final video.
 
@@ -105,7 +105,7 @@ If the user says `resume <project_id>`, look for that specific state file.
 
 ## Example
 
-User: `/comfy-director A woman walks through a garden, discovers a mysterious glowing flower, picks it up and is transformed into a fairy`
+User: `/pixelforge-director A woman walks through a garden, discovers a mysterious glowing flower, picks it up and is transformed into a fairy`
 
 Steps:
 - **Phase 1**: Break into 3 scenes:

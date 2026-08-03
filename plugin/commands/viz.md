@@ -3,7 +3,7 @@ description: Visualize a ComfyUI workflow as a mermaid diagram
 argument-hint: Path to workflow JSON file, or paste JSON inline
 ---
 
-# /comfy-viz — Visualize a Workflow
+# /pixelforge-viz — Visualize a Workflow
 
 The user wants to visualize a ComfyUI workflow as a mermaid flowchart diagram.
 
@@ -25,7 +25,7 @@ The user wants to visualize a ComfyUI workflow as a mermaid flowchart diagram.
 
 ## Example
 
-User: `/comfy-viz ~/workflows/my-workflow.json`
+User: `/pixelforge-viz ~/workflows/my-workflow.json`
 
 Steps:
 - Read the file at `~/workflows/my-workflow.json`

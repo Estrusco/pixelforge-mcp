@@ -3,7 +3,7 @@ description: Generate a Claude skill for a ComfyUI custom node pack
 argument-hint: Registry ID or GitHub URL of the node pack
 ---
 
-# /comfy-skill — Generate a Node Pack Skill
+# /pixelforge-skill — Generate a Node Pack Skill
 
 The user wants to generate a Claude Code skill file for a ComfyUI custom node pack.
 
@@ -25,7 +25,7 @@ The user wants to generate a Claude Code skill file for a ComfyUI custom node pa
 
 ## Example
 
-User: `/comfy-skill comfyui-impact-pack`
+User: `/pixelforge-skill comfyui-impact-pack`
 
 Steps:
 - Call `generate_node_skill` with source `"comfyui-impact-pack"` and `install_in` set to the skills directory

@@ -92,7 +92,7 @@ function selfUpdateOnLoad(): void {
 async function createConfiguredServer(toolMode: ToolMode = "full"): Promise<McpServer> {
   const server = new McpServer(
     {
-      name: "comfyui-mcp",
+      name: "pixelforge-mcp",
       version: "0.1.0",
     },
     {

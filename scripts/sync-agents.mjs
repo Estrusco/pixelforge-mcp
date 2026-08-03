@@ -70,8 +70,8 @@ if (fs.existsSync(agentsDir)) {
     if (file.endsWith('.md')) {
       const agentName = path.basename(file, '.md');
       const srcPath = path.join(agentsDir, file);
-      const destPath = path.join(AGENTS_DIR, 'skills', `comfy-${agentName}`, 'SKILL.md');
-      processSkillOrAgent(srcPath, destPath, `comfy-${agentName}`, true);
+      const destPath = path.join(AGENTS_DIR, 'skills', `pixelforge-${agentName}`, 'SKILL.md');
+      processSkillOrAgent(srcPath, destPath, `pixelforge-${agentName}`, true);
     }
   }
 }
@@ -83,17 +83,17 @@ if (fs.existsSync(commandsDir)) {
     if (file.endsWith('.md')) {
       const commandName = path.basename(file, '.md');
       const srcPath = path.join(commandsDir, file);
-      const destPath = path.join(GEMINI_DIR, `comfy-${commandName}.toml`);
-      
+      const destPath = path.join(GEMINI_DIR, `pixelforge-${commandName}.toml`);
+
       const content = fs.readFileSync(srcPath, 'utf8');
       let { frontmatter, body } = extractFrontmatter(content);
-      
+
       body = body.replace(/\$ARGUMENTS/g, '{{args}}');
       body = body.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, './plugin');
-      
-      const desc = frontmatter.description || `Command comfy-${commandName}`;
-      
-      const tomlContent = `name = "comfy-${commandName}"
+
+      const desc = frontmatter.description || `Command pixelforge-${commandName}`;
+
+      const tomlContent = `name = "pixelforge-${commandName}"
 description = "${desc}"
 
 prompt = """
@@ -111,7 +111,7 @@ const hooksSrc = path.join(PLUGIN_DIR, 'hooks', 'hooks.json');
 const hooksDest = path.join(AGENTS_DIR, 'hooks.json');
 if (fs.existsSync(hooksSrc)) {
   let hooksContent = fs.readFileSync(hooksSrc, 'utf8');
-  hooksContent = hooksContent.replace(/mcp__plugin_comfy_comfyui__/g, 'mcp__comfyui__');
+  hooksContent = hooksContent.replace(/mcp__plugin_pixelforge_pixelforge__/g, 'mcp__comfyui__');
   hooksContent = hooksContent.replace(/\$\{CLAUDE_PLUGIN_ROOT\}\/hooks/g, './plugin/hooks');
   hooksContent = hooksContent.replace(/\$\{CLAUDE_PLUGIN_ROOT\}\/scripts/g, './plugin/scripts');
   fs.writeFileSync(hooksDest, hooksContent, 'utf8');
@@ -122,7 +122,7 @@ if (fs.existsSync(hooksSrc)) {
 const mcpConfigPath = path.join(AGENTS_DIR, 'mcp_config.json');
 const mcpConfig = {
   mcpServers: {
-    comfyui: {
+    pixelforge: {
       command: "npx",
       args: ["-y", "comfyui-mcp"],
       env: {

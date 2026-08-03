@@ -3,13 +3,13 @@ description: Generate an image with ComfyUI from a text prompt
 argument-hint: A text description of the image to generate
 ---
 
-# /comfy-gen — Generate an Image
+# /pixelforge-gen — Generate an Image
 
 The user wants to generate an image using ComfyUI. Their prompt is provided as the argument to this command.
 
 ## Instructions
 
-1. **Parse the user's prompt.** The argument after `/comfy-gen` is the image description: $ARGUMENTS
+1. **Parse the user's prompt.** The argument after `/pixelforge-gen` is the image description: $ARGUMENTS
 
    If no argument was provided, ask the user what they'd like to generate.
 
@@ -91,7 +91,7 @@ Always include the `token` query parameter when downloading.
 
 ## Example
 
-User: `/comfy-gen a beautiful sunset over mountains with golden light`
+User: `/pixelforge-gen a beautiful sunset over mountains with golden light`
 
 Steps:
 - List checkpoints → none found

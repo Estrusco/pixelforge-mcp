@@ -3,7 +3,7 @@ description: Parameter sweep generation across multiple values
 argument-hint: "prompt, param:range (e.g. a cat, cfg:5-10, sampler:euler,dpmpp_2m)"
 ---
 
-# /comfy-batch — Parameter Sweep Generation
+# /pixelforge-batch — Parameter Sweep Generation
 
 The user wants to generate multiple images while sweeping across different parameter values to compare results.
 
@@ -67,7 +67,7 @@ The user wants to generate multiple images while sweeping across different param
 
 ## Example
 
-User: `/comfy-batch a majestic eagle in flight, cfg:5-9:2, sampler:euler,dpmpp_2m`
+User: `/pixelforge-batch a majestic eagle in flight, cfg:5-9:2, sampler:euler,dpmpp_2m`
 
 Parsed:
 - Prompt: "a majestic eagle in flight"

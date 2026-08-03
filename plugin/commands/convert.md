@@ -3,7 +3,7 @@ description: Convert between ComfyUI UI format and API format workflows
 argument-hint: Path to a workflow JSON file
 ---
 
-# /comfy-convert — Convert Workflow Format
+# /pixelforge-convert — Convert Workflow Format
 
 The user wants to convert a ComfyUI workflow between the web UI format and the API format.
 
@@ -60,7 +60,7 @@ The user wants to convert a ComfyUI workflow between the web UI format and the A
 
 ## Example
 
-User: `/comfy-convert ~/workflows/my-ui-workflow.json`
+User: `/pixelforge-convert ~/workflows/my-ui-workflow.json`
 
 Steps:
 - Read the file

@@ -3,7 +3,7 @@ description: Browse and inspect generated ComfyUI outputs
 argument-hint: "Optional filter: 'last N', 'today', 'yesterday', or filename pattern"
 ---
 
-# /comfy-gallery — Browse Generated Outputs
+# /pixelforge-gallery — Browse Generated Outputs
 
 The user wants to browse images that ComfyUI has generated, inspect their metadata, and optionally re-run or modify workflows.
 
@@ -43,7 +43,7 @@ The user wants to browse images that ComfyUI has generated, inspect their metada
 
 ## Example
 
-User: `/comfy-gallery last 5`
+User: `/pixelforge-gallery last 5`
 
 Steps:
 - Find the output directory

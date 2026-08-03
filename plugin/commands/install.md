@@ -3,7 +3,7 @@ description: Install a ComfyUI custom node pack
 argument-hint: Pack name, registry ID, or GitHub URL
 ---
 
-# /comfy-install — Install a Custom Node Pack
+# /pixelforge-install — Install a Custom Node Pack
 
 The user wants to install a ComfyUI custom node pack from the registry or a GitHub repository.
 
@@ -49,7 +49,7 @@ The user wants to install a ComfyUI custom node pack from the registry or a GitH
 
 ## Example
 
-User: `/comfy-install comfyui-impact-pack`
+User: `/pixelforge-install comfyui-impact-pack`
 
 Steps:
 - Search custom nodes for "comfyui-impact-pack"
