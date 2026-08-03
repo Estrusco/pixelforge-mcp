@@ -19,7 +19,8 @@ import type { PromptSpec, SpecImageScaleStep, SpecLora, SpecPostProcess } from "
 // `---`/`===` divider lines are decorative and ignored wherever they appear.
 // Section names are matched case-insensitively and normalized (whitespace
 // collapsed) so "[CHECKPOINT / MODEL]" and "[Checkpoint/Model]" are the same
-// section.
+// section. `[LORA]` is the one section that may repeat: each occurrence in
+// the document becomes one entry in `PromptSpec.loras`.
 // ---------------------------------------------------------------------------
 
 const DIVIDER_RE = /^[-=]{3,}\s*$/;
@@ -61,6 +62,12 @@ function splitSections(text: string): Section[] {
 
 function findSection(sections: readonly Section[], name: string): Section | undefined {
   return sections.find((s) => s.name === name);
+}
+
+/** Like `findSection`, but returns every match in document order — used for
+ *  `[LORA]`, the one section that may repeat. */
+function findAllSections(sections: readonly Section[], name: string): Section[] {
+  return sections.filter((s) => s.name === name);
 }
 
 /** Parse a section's lines as `Key: value` pairs into a normalized-key map. */
@@ -134,21 +141,27 @@ function parsePositiveOrNegativePrompt(sections: readonly Section[], name: strin
   return section.lines.join(" ").replace(/\s+/g, " ").trim();
 }
 
-function parseLora(sections: readonly Section[]): SpecLora | undefined {
-  const section = findSection(sections, "lora");
-  if (!section) return undefined;
-  const kv = parseKeyValues(section);
-  const name = kv.get("lora name");
-  if (!name) return undefined;
+/** Parse every `[LORA]` block in document order; a block with no `LoRA Name:`
+ *  is skipped rather than throwing (mirrors the previous single-LoRA behavior). */
+function parseLoras(sections: readonly Section[]): SpecLora[] {
+  const loras: SpecLora[] = [];
 
-  const strengthModel = kv.has("lora model weight") ? parseNumber(kv.get("lora model weight")!, "LoRA Model Weight") : 1.0;
-  const strengthClip = kv.has("lora clip weight") ? parseNumber(kv.get("lora clip weight")!, "LoRA CLIP Weight") : strengthModel;
-  const triggerWords = (kv.get("trigger words") ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+  for (const section of findAllSections(sections, "lora")) {
+    const kv = parseKeyValues(section);
+    const name = kv.get("lora name");
+    if (!name) continue;
 
-  return { name, strengthModel, strengthClip, triggerWords };
+    const strengthModel = kv.has("lora model weight") ? parseNumber(kv.get("lora model weight")!, "LoRA Model Weight") : 1.0;
+    const strengthClip = kv.has("lora clip weight") ? parseNumber(kv.get("lora clip weight")!, "LoRA CLIP Weight") : strengthModel;
+    const triggerWords = (kv.get("trigger words") ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    loras.push({ name, strengthModel, strengthClip, triggerWords });
+  }
+
+  return loras;
 }
 
 function parsePostProcess(sections: readonly Section[]): SpecPostProcess | undefined {
@@ -173,8 +186,9 @@ function parsePostProcess(sections: readonly Section[]): SpecPostProcess | undef
 /**
  * Parse a prompt-spec text file into a `PromptSpec`. Throws `ValidationError`
  * with an actionable message when a required field is missing or malformed.
- * `[LORA]`, `VAE:`, and `[POST-PROCESSING / PIXEL PERFECT GRID]` are optional;
- * everything else is required.
+ * `[LORA]` (repeatable, zero or more), `VAE:`, and
+ * `[POST-PROCESSING / PIXEL PERFECT GRID]` are optional; everything else is
+ * required.
  */
 export function parsePromptSpec(text: string): PromptSpec {
   const sections = splitSections(text);
@@ -230,7 +244,7 @@ export function parsePromptSpec(text: string): PromptSpec {
   return {
     checkpointCandidates,
     vae,
-    lora: parseLora(sections),
+    loras: parseLoras(sections),
     sampler: stripParenthetical(samplerValue!),
     scheduler: stripParenthetical(schedulerValue!),
     steps: parseNumber(stepsValue!, "Steps"),

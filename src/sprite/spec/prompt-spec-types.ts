@@ -13,7 +13,7 @@ export interface SpecImageScaleStep {
   readonly method: string;
 }
 
-/** The `[LORA]` section, when present. */
+/** One `[LORA]` block — the section is repeatable for more than one LoRA. */
 export interface SpecLora {
   readonly name: string;
   /** `LoraLoader.strength_model`. Defaults to 1.0 when the section omits it. */
@@ -38,7 +38,9 @@ export interface PromptSpec {
   /** Separate VAE filename from the `VAE:` line, when the checkpoint's bundled
    *  VAE should not be used. */
   readonly vae?: string;
-  readonly lora?: SpecLora;
+  /** Zero or more `[LORA]` blocks, in document order. Empty when the spec has
+   *  none — the section header is repeatable for more than one LoRA. */
+  readonly loras: readonly SpecLora[];
   readonly sampler: string;
   readonly scheduler: string;
   readonly steps: number;
