@@ -8,6 +8,7 @@ This documents how **PixelForge MCP** customizes/extends its upstream, **[`artok
 | [`upstream-sync.md`](upstream-sync.md) | How to merge in upstream changes without destroying local commits or losing this repo's `CLAUDE.md` — the `merge=ours` driver setup and step-by-step sync procedure. |
 | [`repo-layout.md`](repo-layout.md) | Directory-by-directory, file-by-file map of `src/`, `src/sprite/`, and `.claude/agents/`, with the reasoning behind each module's boundary. |
 | [`tool-surface.md`](tool-surface.md) | The 8 locked MVP sprite tools — what each does, its implementation status, and the specific guarantees it makes. |
+| [`prompt-spec-workflow.md`](prompt-spec-workflow.md) | The mandatory `get_workflow_prompt_template` → adapt → `workflow_from_prompt_spec` sequence, why the parser is exact-match by design, and the asset-gap judgment call. |
 | [`locked-decisions.md`](locked-decisions.md) | Architectural decisions that must not be silently reversed, with the reasoning and where each is structurally enforced in code. |
 | [`rejected-alternatives.md`](rejected-alternatives.md) | Third-party tools/services evaluated as a substitute for building PixelForge, and why each was rejected — context for "why don't we just use X". |
 | [`subagent-orchestration.md`](subagent-orchestration.md) | The six specialist subagent domains, the `orchestrator` entry point, and the sonnet/opus model-tier heuristic. |

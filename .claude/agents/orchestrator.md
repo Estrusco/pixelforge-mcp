@@ -48,7 +48,11 @@ if you need the canonical wording. Summary:
    one domain (e.g. "add a new consistency mode" touches `mcp-protocol-architect` for the schema
    and `comfyui-integration-specialist` for the workflow logic — and note that `controlnet_pose` is
    explicitly gated behind user confirmation, so that particular request should stop and ask rather
-   than dispatch).
+   than dispatch). A request that hands over raw/free-form prompt-spec-like text (checkpoint/LoRA/
+   sampler/prompt config not already in `workflow_from_prompt_spec`'s exact template grammar — see
+   `prompt-spec-workflow.md`) routes to `comfyui-integration-specialist`: sonnet when every named
+   checkpoint/LoRA already resolves locally (mechanical remap onto the template), opus when asset
+   substitution or download judgment is needed (a named model/LoRA isn't installed).
 2. For each domain touched, apply the model-tier decision above.
 3. If multiple domains are touched, sequence them by dependency (e.g. schema/contract changes in
    `mcp-protocol-architect` before the implementation that consumes them; `typescript-architecture-

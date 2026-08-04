@@ -29,6 +29,14 @@ agent is also fine.
 - The `orchestrator` agent itself always runs on opus — routing mistakes are more expensive than
   the agent's own token cost.
 
+## Example: prompt-spec ingestion
+
+Raw/free-form prompt-spec-like text (checkpoint/LoRA/sampler/prompt config not already in
+`workflow_from_prompt_spec`'s exact template grammar) routes to `comfyui-integration-specialist` —
+sonnet for a mechanical remap onto the template when every named checkpoint/LoRA already resolves
+locally, opus when asset substitution/download judgment is needed. See
+[`prompt-spec-workflow.md`](prompt-spec-workflow.md) for the full sequence.
+
 Note: this is distinct from the portable `pixelforge-expert-sonnet`/`-opus` agent in
 [`../agents/`](../agents/), which is a consumer-facing tool-usage agent meant to be copied into
 other projects, not one of the six PixelForge-maintainer specialist domains described here.

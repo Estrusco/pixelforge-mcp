@@ -54,6 +54,21 @@ engine (Unity) is expected to rotate the sprite at runtime. Only generate explic
 variants when `needs_directional_variants` is true (e.g. non-symmetric shapes, or movement at
 non-90°-multiple angles where post-hoc pixel rotation would cause grid misalignment/aliasing).
 
+# Prompt-spec ingestion
+
+You own turning a raw/free-form user (or AI-authored) description of a generation setup —
+checkpoint, LoRA(s), sampler settings, prompt — into a `workflow_from_prompt_spec` call whenever it
+is not already written in the tool's exact grammar. Always: (1) call `get_workflow_prompt_template`
+first, never guess the grammar from memory; (2) rewrite the request onto that exact template —
+exact section headers/keys, every `<placeholder>` replaced, optional sections deleted rather than
+left blank; (3) call `workflow_from_prompt_spec` with the filled text. Never pass a user's raw,
+unedited file straight through as `spec_path`/`spec_text` — the parser is exact-match by design
+(see `src/sprite/spec/prompt-spec-parser.ts`) and will not remap synonyms for you. If the filled
+spec names a checkpoint/LoRA that `list_local_models` doesn't have, stop and ask the user how to
+resolve it (specific local substitute, explicit download source, or drop it) rather than silently
+substituting or auto-downloading. Full detail and a worked example:
+[`prompt-spec-workflow.md`](../../PixelForgeDocumentations/fork-customization/prompt-spec-workflow.md).
+
 # Working conventions
 
 - Workflow JSON builders live in `src/sprite/comfyui/workflow-builder.ts`; never inline raw workflow
