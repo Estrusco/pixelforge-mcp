@@ -51,6 +51,11 @@
 9. `workflow_from_prompt_spec` **(implemented — pixelforge-mcp-n0f)** — NOT part of the locked
    8-tool MVP surface above; a separate, explicitly-confirmed-with-the-user addition, listed here
    rather than renumbered into it so the "locked" set above stays exactly what it always was.
+   Its required first step is `get_workflow_prompt_template` (read-only, returns the exact fillable
+   grammar) — an agent given a raw/free-form generation request must fetch that template and remap
+   the request onto it before calling this tool; see
+   [`prompt-spec-workflow.md`](prompt-spec-workflow.md) for the full sequence and why the parser
+   deliberately does not do this remapping itself.
    Parses a structured plain-text "prompt spec" file (bracketed `[CHECKPOINT / MODEL]`, `[LORA]`,
    `[SAMPLER & SCHEDULER SETTINGS]`, `[POSITIVE PROMPT]`, `[NEGATIVE PROMPT]`, optional
    `[POST-PROCESSING / PIXEL PERFECT GRID]` sections — see `src/sprite/spec/prompt-spec-parser.ts`)
