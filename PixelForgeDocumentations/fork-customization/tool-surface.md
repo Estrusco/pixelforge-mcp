@@ -75,6 +75,21 @@
    ComfyUI web UI exactly as if a person had built it there by hand; running it afterward is the
    generic `enqueue_workflow` tool's job, not this one's.
 
+10. `get_asset_metadata` `save_dir` **(implemented — pixelforge-mcp-wny)** — not a new tool; an
+    optional param added to the existing (upstream) `get_asset_metadata` (`src/tools/assets.ts`).
+    The asset registry it reads from (`src/services/asset-registry.ts`) is in-memory only, default
+    24h TTL, wiped on server restart — `save_dir` persists the exact workflow snapshot (checkpoint,
+    LoRA, sampler, prompt, seed) that produced a given asset to any local directory as
+    `<image-stem>.workflow.json`, so a liked generation stays reproducible past the registry's
+    lifetime (e.g. written straight into the caller's game project). Mirrors `pixelate_image`'s
+    `save_dir` (`src/sprite/image-io.ts` `resolveSaveDir`) rather than reusing it directly, since
+    `src/tools/` is upstream-inherited and `src/sprite/` is not meant to be a dependency of it (see
+    `repo-layout.md`). Rejects with a clear error for locally-registered assets (e.g. from
+    `pixelate_image`) that have no real workflow behind them. Distinct in scope from
+    `save_workflow`/the `pixelforge-mcp-0vr` epic (`save_workflow_as` on the sprite generation
+    tools, still in progress), which persists into ComfyUI's own server-side library, not the
+    caller's filesystem.
+
 See also: [`../agents/`](../agents/) for a consumer-facing, self-contained tool reference (params,
 constraints, end-to-end recipes) meant to be copied into other projects — this page is the
 maintainer-facing "what's locked and why" contract instead.

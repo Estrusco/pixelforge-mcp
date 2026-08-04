@@ -296,6 +296,19 @@ right):**
   remember these are *prompt conditioning*, not hard constraints — for a stubborn case, an explicit
   `checkpoint` override or added `negative_prompt` terms may do more than rephrasing the main prompt.
 
+**Persisting a generation you like, seed included, into your own project:**
+- Once an `asset_id` from `generate_sprite`/`generate_animation_set`/etc. produces something worth
+  keeping, call `get_asset_metadata(asset_id, save_dir: "<a folder in your project>")` — besides
+  returning the workflow JSON inline, this writes it to disk as `<image-stem>.workflow.json`
+  (checkpoint, LoRA, sampler, prompt, and the exact seed that produced the image). Do this
+  promptly: the in-memory asset registry `get_asset_metadata` reads from expires after
+  `COMFYUI_ASSET_TTL_HOURS` (default 24h) and is wiped on server restart — an unsaved snapshot is
+  gone for good once that happens.
+- To reproduce that exact image later, or vary only the prompt: reload the saved `.json` via
+  `save_workflow` (reopens it in ComfyUI's own canvas for hand-editing) or `enqueue_workflow` (reruns
+  it directly) — or, while the asset is still in the registry, `regenerate(asset_id, overrides:
+  {...}, disable_random_seed: true)` does the same without needing the file at all.
+
 **Batch QA across many generated sprites:** `contact_sheet(asset_ids: [...])` tiles them into one
 preview PNG — one glance instead of N separate `view_image` calls. Defaults to a dark backdrop
 (same reasoning as `view_image`'s `background` param below) so transparent/dark art doesn't look
@@ -426,7 +439,10 @@ batch QA instead of N separate `view_image` calls — frames need not share dime
 centered in a uniform cell; same `background` param, defaults to `"dark"`) ·
 `stage_output_as_input` (promote an output/temp file to a usable input filename) · `upload_output`
 (push to S3/Azure/HTTP/HF) · `upload_image` / `upload_video` / `upload_audio` ·
-`list_output_images` · `list_assets` · `get_asset_metadata`.
+`list_output_images` · `list_assets` · `get_asset_metadata` (`asset_id`; optional `save_dir` — any
+local directory, e.g. inside your game project — writes the exact workflow-with-seed snapshot that
+produced the asset to `<image-stem>.workflow.json`, since the in-memory registry this reads from
+otherwise expires after `COMFYUI_ASSET_TTL_HOURS` (default 24h) or a server restart).
 
 ## Defaults, settings, stats
 

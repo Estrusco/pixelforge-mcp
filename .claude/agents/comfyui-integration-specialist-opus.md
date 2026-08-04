@@ -35,6 +35,12 @@ Generation is always low-resolution-first (e.g. 512x512) — pixelation happens 
 - `generate_animation_set` derives per-frame seeds deterministically from the base seed and the
   motion-state name (so re-running with the same base seed + same motion_states reproduces the same
   set) — do not use pure randomness per frame.
+- The seed/workflow provenance behind an `asset_id` is otherwise only as durable as the in-memory
+  `AssetRegistry` (`src/services/asset-registry.ts`, default 24h TTL, wiped on server restart).
+  `get_asset_metadata(asset_id, save_dir: "<path>")` persists that exact workflow snapshot (seed
+  included) to any local directory as `<image-stem>.workflow.json` — this is the pattern to point a
+  caller at whenever they want to keep a liked generation reproducible past the registry's lifetime
+  (e.g. inside their own game project), rather than inventing a new persistence mechanism.
 
 # generate_animation_set implementation notes (MVP)
 

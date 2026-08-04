@@ -1,9 +1,40 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, extname, join, resolve } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { AssetRegistry, applyOverrides, isLocalAsset } from "../services/asset-registry.js";
+import { AssetRegistry, applyOverrides, isLocalAsset, type AssetRecord } from "../services/asset-registry.js";
 import { enqueueWorkflow } from "../services/workflow-executor.js";
 import { viewAssetImage } from "../services/view-image.js";
 import { ValidationError, errorToToolResult } from "../utils/errors.js";
+
+/**
+ * "<image-stem>.workflow.json" — recognizable next to the image it came from
+ * when both end up in the same project folder.
+ */
+function deriveWorkflowSnapshotFilename(record: AssetRecord): string {
+  const stem = basename(record.filename, extname(record.filename));
+  return `${stem || record.assetId}.workflow.json`;
+}
+
+/**
+ * Write an asset's workflow snapshot to an arbitrary local directory (no
+ * COMFYUI_PATH dependency, no containment check — the caller explicitly
+ * chose this location, e.g. a game project folder). Mirrors pixelate_image's
+ * save_dir (src/sprite/image-io.ts resolveSaveDir).
+ */
+async function saveWorkflowSnapshot(record: AssetRecord, saveDir: string): Promise<string> {
+  if (isLocalAsset(record)) {
+    throw new ValidationError(
+      `Asset "${record.assetId}" was registered from a local file (e.g. pixelate_image), not a ` +
+        "ComfyUI job — there is no workflow to save.",
+    );
+  }
+  const dir = resolve(saveDir);
+  await mkdir(dir, { recursive: true });
+  const savePath = join(dir, deriveWorkflowSnapshotFilename(record));
+  await writeFile(savePath, JSON.stringify(record.workflow, null, 2));
+  return savePath;
+}
 
 function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
   if (!record) return null;
@@ -89,11 +120,20 @@ export function registerAssetTools(server: McpServer): void {
 
   server.tool(
     "get_asset_metadata",
-    "Get full provenance for a registered asset including the workflow snapshot that produced it. Use this to inspect the parameters that generated an image before calling regenerate with overrides.",
+    "Get full provenance for a registered asset including the workflow snapshot that produced it. Use this to inspect the parameters that generated an image before calling regenerate with overrides. The registry this reads from is in-memory only (default 24h TTL, wiped on server restart) — pass save_dir to also persist the workflow snapshot (with its exact seed and parameters) to an arbitrary local directory, e.g. a folder inside your game project, so you can reproduce or vary that image later even after the registry entry is gone.",
     {
       asset_id: z.string().describe("Asset id returned by list_assets or job completion"),
+      save_dir: z
+        .string()
+        .optional()
+        .describe(
+          "Optional local directory (arbitrary path — not required to be under COMFYUI_PATH, e.g. " +
+            "a folder inside your game project) to also write this asset's workflow snapshot to, as " +
+            "'<image-stem>.workflow.json'. Created if missing. Fails if the asset has no real " +
+            "workflow behind it (e.g. registered by pixelate_image).",
+        ),
     },
-    async ({ asset_id }) => {
+    async ({ asset_id, save_dir }) => {
       try {
         const record = AssetRegistry.get(asset_id);
         if (!record) {
@@ -103,6 +143,7 @@ export function registerAssetTools(server: McpServer): void {
             ),
           );
         }
+        const savedTo = save_dir ? await saveWorkflowSnapshot(record, save_dir) : undefined;
         return {
           content: [
             {
@@ -110,6 +151,7 @@ export function registerAssetTools(server: McpServer): void {
               text: JSON.stringify(
                 {
                   ...summarizeRecord(record),
+                  ...(savedTo ? { saved_to: savedTo } : {}),
                   workflow: record.workflow,
                 },
                 null,
