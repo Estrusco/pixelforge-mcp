@@ -124,10 +124,7 @@ const mcpConfig = {
   mcpServers: {
     pixelforge: {
       command: "npx",
-      args: ["-y", "comfyui-mcp"],
-      env: {
-        CIVITAI_API_TOKEN: ""
-      }
+      args: ["-y", "comfyui-mcp"]
     },
     civitai: {
       url: "https://mcp.civitai.com/mcp",

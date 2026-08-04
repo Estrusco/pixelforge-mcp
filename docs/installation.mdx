@@ -93,7 +93,11 @@ Then run `/mcp` in Claude Code to connect.
 
 ## 3. (Optional) Tokens
 
-Some tools use API tokens. Set them in the server's `env` block (see [Configuration](/configuration)):
+Some tools use API tokens. The easiest way to set one is the `set_secret` tool once
+you're connected (e.g. `set_secret {"slot": "civitai", "value": "..."}` — call
+`get_secrets` first to see every slot and its current masked status). Tokens can
+also be set directly in the server's `env` block (see [Configuration](/configuration)),
+or in `~/.comfyui-mcp/.env`:
 
 - `CIVITAI_API_TOKEN` — gated CivitAI downloads
 - `HUGGINGFACE_TOKEN` — higher HuggingFace rate limits

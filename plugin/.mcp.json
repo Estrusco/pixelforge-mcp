@@ -4,9 +4,6 @@
     "args": [
       "-y",
       "comfyui-mcp"
-    ],
-    "env": {
-      "CIVITAI_API_TOKEN": ""
-    }
+    ]
   }
 }

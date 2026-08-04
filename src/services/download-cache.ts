@@ -149,7 +149,7 @@ async function streamUrlToFile(
     // through retries (live E2E), so name the fix.
     const civitaiAuthHint =
       (res.status === 401 || res.status === 403) && /(^|\.)civitai\.com$/i.test(new URL(currentUrl).hostname)
-        ? " — CivitAI requires an API token for downloads. Set CIVITAI_API_TOKEN (panel Settings › “Set CivitAI token…”, or the env var; create one at civitai.com/user/account) and retry. Do NOT retry other model ids — they will all fail the same way until a token is set."
+        ? " — CivitAI requires an API token for downloads. Set it via the set_secret tool (slot: \"civitai\"), the panel Settings › “Set CivitAI token…”, or the CIVITAI_API_TOKEN env var directly; create one at civitai.com/user/account. Then retry. Do NOT retry other model ids — they will all fail the same way until a token is set."
         : "";
     throw new ModelError(
       `Download failed: ${res.status} ${res.statusText}${civitaiAuthHint}`,

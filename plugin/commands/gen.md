@@ -77,7 +77,8 @@ When choosing a checkpoint, consider:
 
 ## CivitAI Integration
 
-If the environment variable `CIVITAI_API_TOKEN` is available, prefer CivitAI for model discovery because it has:
+If `CIVITAI_API_TOKEN` is set (via `set_secret {"slot": "civitai", "value": "..."}` or the
+env var directly), prefer CivitAI for model discovery because it has:
 - A larger selection of fine-tuned models
 - Community ratings and reviews
 - Better categorization (photorealistic, anime, illustration, etc.)
@@ -85,9 +86,8 @@ If the environment variable `CIVITAI_API_TOKEN` is available, prefer CivitAI for
 CivitAI REST API endpoints:
 - **Search**: `GET https://civitai.com/api/v1/models?query={query}&types=Checkpoint&sort=Most+Downloaded&limit=5`
 - **Model details**: `GET https://civitai.com/api/v1/models/{modelId}`
-- **Download**: `GET https://civitai.com/api/download/models/{modelVersionId}?token={token}`
-
-Always include the `token` query parameter when downloading.
+- **Download**: `GET https://civitai.com/api/download/models/{modelVersionId}` — send the
+  token as an `Authorization: Bearer <token>` header, never as a URL/query parameter.
 
 ## Example
 

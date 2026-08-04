@@ -391,6 +391,15 @@ missing) · `list_local_models` · `remove_model` (local-only, jailed to configu
 `model_metadata_read` / `model_metadata_propose` (never writes directly, goes through a diff-review
 UI) / `model_metadata_fetch_civitai`.
 
+**Credentials for gated downloads**: `search_civitai_models`/`download_civitai_model` warn when no
+`CIVITAI_API_TOKEN` is configured (and gated CivitAI/HuggingFace downloads 401 without one). Don't
+tell the user to hand-edit a `.env`/config file — call `get_secrets` to see every credential slot
+(civitai, huggingface, google, runcomfy, runpod, registry, …) with masked status, then
+`set_secret {"slot": "civitai", "value": "<token>"}` to set it (applies immediately, no reconnect
+needed) or `clear_secret {"slot": "..."}` to remove one. The raw value still passes through the
+tool call like any other argument — it's not a masked input channel, just far better than a
+hand-edited config file with no masking on read-back.
+
 Custom nodes: discovery (`search_custom_nodes`, `get_node_pack_details`) · lifecycle
 (`install_custom_node` / `update_custom_node` / `reinstall_custom_node` / `fix_custom_node` —
 prefer official `comfy node` under the hood when comfy-cli ≥1.11.1 is available, else falls back to
@@ -523,6 +532,8 @@ confirmed free of hosted-API cost, check this before running an unfamiliar pack)
 5. `clear_vram` for anything that smells like an out-of-memory failure before retrying the same job.
 6. For missing custom nodes: the tool's own error usually names the exact `install_custom_node`
    call needed — trust it over guessing a package name.
-7. For sprite-pipeline-specific issues, re-check the "Known limitations" list in Part 1 before
+7. For a CivitAI/HuggingFace 401 or a "no token configured" warning: `get_secrets` then
+   `set_secret {"slot": "civitai", "value": "..."}` — don't ask the user to hand-edit a config file.
+8. For sprite-pipeline-specific issues, re-check the "Known limitations" list in Part 1 before
    assuming something is broken — `controlnet_pose` rejection, Unity-only export, and 90°-only
    `symmetric_rotation_safe` are all intentional, not bugs.

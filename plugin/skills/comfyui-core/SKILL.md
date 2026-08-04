@@ -157,10 +157,12 @@ SetLatentNoiseMask (samples, mask) → LATENT → KSampler.latent_image
 2. If missing, search HuggingFace via `search_models` or CivitAI via their REST API
 3. Use `download_model` to install it directly to the correct subfolder
 
-**CivitAI API** (when `CIVITAI_API_TOKEN` env var is available):
+**CivitAI API** (when `CIVITAI_API_TOKEN` is set — via `set_secret {"slot": "civitai", "value": "..."}`
+or the env var directly):
 - Search: `GET https://civitai.com/api/v1/models?query={query}&types=Checkpoint&sort=Most+Downloaded&limit=5`
 - Details: `GET https://civitai.com/api/v1/models/{modelId}`
-- Download: `GET https://civitai.com/api/download/models/{modelVersionId}?token={token}`
+- Download: `GET https://civitai.com/api/download/models/{modelVersionId}` — the token
+  is sent as an `Authorization: Bearer <token>` header, never in the URL/query string.
 
 CivitAI is preferred for fine-tuned models, community-rated checkpoints, and specialized LoRAs.
 HuggingFace is preferred for official/base models (SDXL, Flux, SD 1.5).

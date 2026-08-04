@@ -222,7 +222,7 @@ export function registerModelExtrasTools(server: McpServer): void {
         // BEFORE the model burns rounds on 401s (live E2E failure shape).
         const tokenNote = config.civitaiApiToken
           ? ""
-          : `\nNOTE: no CIVITAI_API_TOKEN is configured — downloads WILL fail with 401 until the user sets one (panel Settings › “Set CivitAI token…”, or the CIVITAI_API_TOKEN env var; created at civitai.com/user/account). Ask them to set it before attempting a download.`;
+          : `\nNOTE: no CIVITAI_API_TOKEN is configured — downloads WILL fail with 401 until the user sets one. Use the set_secret tool (slot: "civitai"), the panel Settings › “Set CivitAI token…”, or the CIVITAI_API_TOKEN env var directly (created at civitai.com/user/account). Ask them to set it before attempting a download.`;
         return {
           content: [
             {

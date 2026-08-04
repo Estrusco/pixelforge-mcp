@@ -56,6 +56,7 @@ import { registerSelfUpdateTools } from "./self-update.js";
 import { registerCalculateTools } from "./calculate.js";
 import { registerComfyUISettingsTools } from "./comfyui-settings.js";
 import { registerNodeDevTools } from "./node-dev.js";
+import { registerSecretsTools } from "./secrets.js";
 import {
   registerPixelateImageTool,
   registerGenerateSpriteTool,
@@ -165,6 +166,11 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // prompt-spec grammar as a fillable template. Appended for the same
   // tools/list-order reason as above.
   ["workflow-authoring", registerGetWorkflowPromptTemplateTool],
+  // get_secrets/set_secret/clear_secret — exposes panel-secrets.ts's
+  // CREDENTIAL_SLOTS engine on the plain MCP surface (previously only
+  // reachable via the orchestrator panel's panel_request_secret). Appended
+  // for the same tools/list-order reason as above.
+  ["server", registerSecretsTools],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────

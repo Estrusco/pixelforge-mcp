@@ -35,7 +35,8 @@ list_local_models  →  panel_add_node loader / generate_image   # use it
 
 **API key (optional).** Search needs none. `CIVITAI_API_TOKEN` (from
 civitai.com/user/account) unlocks **gated/early-access downloads** and gated
-search results — set it once (panel Settings › "Set CivitAI token…" or env).
+search results — set it once with `set_secret {"slot": "civitai", "value": "..."}`
+(panel Settings › "Set CivitAI token…" or `~/.comfyui-mcp/.env` also work).
 
 ## Recipes
 

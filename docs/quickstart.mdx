@@ -21,14 +21,20 @@ icon: "rocket"
       "mcpServers": {
         "comfyui": {
           "command": "npx",
-          "args": ["-y", "comfyui-mcp"],
-          "env": {
-            "CIVITAI_API_TOKEN": ""
-          }
+          "args": ["-y", "comfyui-mcp"]
         }
       }
     }
     ```
+
+    <Note>
+      Don't pre-declare an empty `env` key like `"CIVITAI_API_TOKEN": ""` here — a
+      key set to `""` in this block wins over anything in `~/.comfyui-mcp/.env`
+      (real env vars always take precedence), so it silently blocks the token from
+      ever loading. Leave tokens out of this file and set them with the
+      [`set_secret`](/configuration) tool once connected, or via
+      `~/.comfyui-mcp/.env` directly — see [Configuration](/configuration).
+    </Note>
   </Step>
 
   <Step title="Reconnect">
