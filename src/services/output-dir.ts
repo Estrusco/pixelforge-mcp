@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import {
@@ -76,6 +76,10 @@ export interface LiveServerSnapshot {
  *                      OS reports for the process on our port.
  *  - `base-anchored` — the configured base CORROBORATED by the relative `main.py`
  *                      the live server reported really existing under it.
+ *  - `base-inventory-corroborated` — a non-live-authoritative configured base whose
+ *                                target category inventory fully matches local files.
+ *  - `base-inventory-partial` — the same non-authoritative base under the bounded
+ *                              split-namespace exception; the downstream live check stays on.
  *  - `configured-base` — plain COMFYUI_PATH / default workspace. This is the only
  *                      value a REACHABLE server never vouched for, and the one that
  *                      wrote a 4.88 GB model into a stale install in #369.
@@ -89,6 +93,7 @@ export type ModelsDirSource =
   | "observed-root"
   | "base-anchored"
   | "base-inventory-corroborated"
+  | "base-inventory-partial"
   | "configured-base";
 
 /** True when the models dir was established from the RUNNING server rather than
@@ -379,14 +384,16 @@ function anchorRelativeEntrypointOnBase(base: string, relDir: string): string | 
  *  - it runs ONLY where the alternative is today's hard refusal, so it can convert a
  *    refusal into a corroborated destination but can never redirect a download that
  *    already resolved;
- *  - it requires a NON-EMPTY category that the base explains COMPLETELY. One reported
- *    file missing from disk means the server is reading from somewhere else too, and the
- *    match is not proof;
- *  - anything unreadable, empty, or ambiguous returns a reason and the caller refuses.
+ *  - it requires a NON-EMPTY category that the base explains COMPLETELY, except for the
+ *    narrowly bounded split-namespace case below: at least two listed files are present
+ *    and exactly one listed file is absent;
+ *  - a server-answered EMPTY category is usable only as no contradiction for a first
+ *    download, and keeps the destination non-authoritative;
+ *  - anything unreadable or otherwise ambiguous returns a reason and the caller refuses.
  *
  * Residual, stated rather than hidden: a stale second install holding an identical copy
- * of the same model files would also match. The source is reported as
- * `base-inventory-corroborated` (NOT live-authoritative) precisely so downstream keeps
+ * of the same model files would also match, and the bounded partial has the same filename-
+ * only limitation. These sources are NOT live-authoritative precisely so downstream keeps
  * treating the destination as local configuration that was corroborated, not as a path
  * the server named.
  */
@@ -406,6 +413,42 @@ function containedUnder(root: string, candidate: string): boolean {
   // very Docker download this corroboration exists to allow. Over-strict is the same
   // defect as over-permissive, pointed the other way.
   return rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith("../");
+}
+
+/**
+ * Identity for a server-listed category-relative filename. The bounded partial rescue
+ * counts evidence, so repeated spellings must not manufacture distinct physical files.
+ * Existing entries use the filesystem's own canonical spelling: a case-insensitive volume
+ * resolves `shared.safetensors` and `SHARED.SAFETENSORS` to one identity, while a
+ * case-sensitive volume resolves two physically distinct entries to two identities.
+ * Missing entries conservatively use only normalized lexical identity — collapsing those
+ * without physical evidence could erase genuinely distinct files on a case-sensitive volume.
+ */
+function modelInventoryIdentity(categoryDir: string, name: string): string {
+  const full = join(categoryDir, name);
+  if (containedUnder(categoryDir, full)) {
+    try {
+      return `physical:${realpathSync.native(full)}`;
+    } catch {
+      try {
+        return `physical:${realpathSync(full)}`;
+      } catch {
+        // An absent or unreadable entry has no physical identity to compare.
+      }
+    }
+  }
+  return `lexical:${normalize(name)}`;
+}
+
+/** Preserve the first server spelling while removing aliases before probing/counting. */
+function uniqueModelInventoryFiles(files: string[], categoryDir: string): string[] {
+  const seen = new Set<string>();
+  return files.filter((name) => {
+    const identity = modelInventoryIdentity(categoryDir, name);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
 }
 
 /** What is at this path — keeping "could not look" out of "is not there", and out of
@@ -519,6 +562,13 @@ const MODEL_SCAN_DIR_BUDGET = 512;
 /** Companion cap on link resolutions, for the same reason one level down. */
 const MODEL_SCAN_STAT_BUDGET = 4096;
 
+// A split code/data namespace can make one server-visible entry unavailable to the
+// MCP process. A single shared filename is not enough to distinguish that from a stale
+// clone (#1147/#369), so the bounded rescue requires at least two matches and permits
+// only one unaccounted server entry. Larger or smaller disagreements remain refused.
+const MIN_BOUNDED_NAMESPACE_MATCH_FILES = 2;
+const MAX_BOUNDED_NAMESPACE_ONLY_FILES = 1;
+
 interface ModelScanBudget {
   dirs: number;
   stats: number;
@@ -610,6 +660,12 @@ async function corroborateBaseByModelInventory(
       /** The local model scan gave up at its bound, so "not contradicted" is not a finding
        *  that this base holds nothing of its own. */
       scanTruncated?: boolean;
+      /**
+       * This is still non-authoritative local configuration. The caller may proceed only
+       * for the two explicitly bounded no-contradiction cases, then keeps the downstream
+       * live-visibility guard in force.
+       */
+      safeFallback?: "bounded-server-superset" | "empty-target";
     }
 > {
   // The corroboration must be about the category this download is FOR. A complete match
@@ -649,6 +705,7 @@ async function corroborateBaseByModelInventory(
   // this used to sweep for any category that happened to match.
   let unreadableCategories = 0;
   let lastReason: string | undefined;
+  let emptyTargetListing = false;
   /** Set when the server's own listing shows the base is NOT a root it reads (#1371). */
   let contradictedBase = false;
   /** The local scan hit its bound before answering. See the assignment for why it matters. */
@@ -683,7 +740,10 @@ async function corroborateBaseByModelInventory(
       unreadableCategories += 1;
       continue;
     }
-    if (files.length === 0) continue;
+    if (files.length === 0) {
+      emptyTargetListing = true;
+      continue;
+    }
     const categoryDir = join(modelsDir, category);
     // The CATEGORY name comes from the server too, so it gets the same containment
     // check as the files under it.
@@ -730,6 +790,7 @@ async function corroborateBaseByModelInventory(
         "COMFYUI_PATH at the directory that physically holds the models instead";
       continue;
     }
+    files = uniqueModelInventoryFiles(files, categoryDir);
     for (const name of files) {
       const full = join(categoryDir, name);
       if (!containedUnder(categoryDir, full)) {
@@ -758,7 +819,7 @@ async function corroborateBaseByModelInventory(
       }
       if (!containedUnder(realCategoryDir, realEntry)) escaping.push(name);
     }
-    // A PARTIAL match does NOT corroborate — and my first attempt at this had it
+    // A PARTIAL match does NOT ordinarily corroborate — and my first attempt at this had it
     // backwards (codex gate, twice).
     //
     // The original complaint was real: requiring EVERY listed file to be here
@@ -775,10 +836,11 @@ async function corroborateBaseByModelInventory(
     // harm this whole path exists to prevent. Between an unrecoverable wrong answer
     // and a recoverable refusal, an inconclusive rescue refuses.
     //
-    // So the verdict returns to a full match. What actually needed fixing was the
-    // REASON: the old message said the base "does not explain what the server sees",
-    // which reads as "this base is wrong" when a multi-root layout is the likelier
-    // explanation. It now names that possibility and what to do about it.
+    // So the verdict remains a full match except for the narrow split-namespace shape
+    // reported in #1147. The server listed one entry that is unavailable in this
+    // process's namespace, while at least two of its other entries are physically
+    // present here. This is not proof of the root, so the caller marks it partial and
+    // keeps the downstream live-visibility check in force.
     if (missing.length === 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
       return { ok: true, modelsDir, category, matched: files.length, listed: files.length };
     }
@@ -800,6 +862,24 @@ async function corroborateBaseByModelInventory(
           : "");
     } else if (missing.length > 0) {
       const present = files.length - missing.length;
+      if (
+        missing.length === MAX_BOUNDED_NAMESPACE_ONLY_FILES &&
+        present >= MIN_BOUNDED_NAMESPACE_MATCH_FILES &&
+        unreadable.length === 0 &&
+        notFiles.length === 0 &&
+        escaping.length === 0
+      ) {
+        return {
+          ok: false,
+          reason:
+            `the server lists ${files.length} file(s) under "${category}" and ${present} are ` +
+            `present under "${categoryDir}", while ${missing.length} listed file is only ` +
+            "visible from the server namespace — a bounded split code/data layout is " +
+            "consistent with this one-entry difference, but the destination remains local " +
+            "configuration rather than live-authoritative",
+          safeFallback: "bounded-server-superset",
+        };
+      }
       // CONTRADICTION REQUIRES THIS BASE TO HAVE SOMETHING OF ITS OWN.
       //
       // present === 0 means none of the server's files for this category are here. That is
@@ -918,6 +998,7 @@ async function corroborateBaseByModelInventory(
       unreadableCategories > 0
         ? `the server's "${targetCategory}" listing could not be read, so there was nothing to compare against`
         : `the server lists no files under "${targetCategory}", so there is nothing there to show that this base is the directory it reads that category from`,
+    ...(emptyTargetListing ? { safeFallback: "empty-target" as const } : {}),
   };
 }
 
@@ -1055,8 +1136,9 @@ export async function resolveModelsDirWithBases(opts?: {
       // Before refusing: the code-layout corroboration above needed a `main.py` at or
       // under the base, and a Docker/data-dir deployment genuinely has none — the code
       // lives inside the container (#851). Ask the SERVER what models it can see and
-      // accept the base only if it explains that completely. Runs only here, so it can
-      // rescue a refusal but never redirect a download that already resolved.
+      // accept the base only if it explains that completely, or if the response is one of
+      // the two bounded no-contradiction cases below. Runs only here, so it can rescue a
+      // refusal but never redirect a download that already resolved.
       const inventory = base
         ? await corroborateBaseByModelInventory(base, (opts?.targetCategory ?? "").trim())
         : { ok: false as const, reason: "no COMFYUI_PATH or default workspace is configured" };
@@ -1086,6 +1168,33 @@ export async function resolveModelsDirWithBases(opts?: {
             listed: inventory.listed,
             partial: inventory.matched < inventory.listed,
             basis: "filename-inventory",
+          },
+        );
+        return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
+      }
+      if (inventory.safeFallback) {
+        modelsDir = resolve(base as string, "models");
+        source =
+          inventory.safeFallback === "bounded-server-superset"
+            ? "base-inventory-partial"
+            : "configured-base";
+        baseDirs.add(resolve(base as string));
+        // Neither case proves that this local path is the server's primary root. The
+        // bounded partial is the split-namespace recurrence from #1147; the empty
+        // response is the first-download case. Returning a non-authoritative source is
+        // what keeps resolveModelSubfolderWithLiveRoot's live-visibility gate active.
+        logger.warn(
+          inventory.safeFallback === "bounded-server-superset"
+            ? "Using a bounded partial model-inventory match for the configured base; the " +
+              "server-only entry may be in a namespace this process cannot read"
+            : "Using the configured base for a first download into a server-registered " +
+              "category whose live inventory is empty",
+          {
+            modelsDir,
+            category: opts?.targetCategory?.trim(),
+            reason: inventory.reason,
+            basis: "filename-inventory",
+            authoritative: false,
           },
         );
         return { modelsDir, baseDirs: [...baseDirs], snapshot, source };

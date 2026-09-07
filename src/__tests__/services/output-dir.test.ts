@@ -969,6 +969,62 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     expect(res.baseDirs).toContain(resolve(DATA_DIR));
   });
 
+  it("accepts a one-entry server superset from a split code/data namespace", async () => {
+    dockerServer();
+    const localFiles = Array.from({ length: 160 }, (_, i) => `lora-${i}.safetensors`);
+    serverInventory = {
+      loras: [...localFiles, "server-namespace-only.safetensors"],
+    };
+    onDisk(localFiles.map((file) => join(DATA_DIR, "models", "loras", file)));
+
+    const res = await resolveModelsDirWithBases({ targetCategory: "loras" });
+    expect(res.modelsDir).toBe(resolve(DATA_DIR, "models"));
+    expect(res.source).toBe("base-inventory-partial");
+  });
+
+  it("REFUSES duplicate server listing names from inflating the partial-match count", async () => {
+    dockerServer();
+    serverInventory = {
+      loras: ["shared.safetensors", "shared.safetensors", "server-only.safetensors"],
+    };
+    onDisk([join(DATA_DIR, "models", "loras", "shared.safetensors")]);
+
+    await expect(resolveModelsDirWithBases({ targetCategory: "loras" })).rejects.toThrow(
+      /could not be determined/,
+    );
+  });
+
+  it("REFUSES case aliases that the filesystem resolves to one physical entry", async () => {
+    dockerServer();
+    const caseAliases = ["shared.safetensors", "SHARED.SAFETENSORS"];
+    serverInventory = { loras: [...caseAliases, "server-only.safetensors"] };
+    const sharedPath = resolve(join(DATA_DIR, "models", "loras", caseAliases[0]));
+    const caseInsensitiveIdentity = (path: string): string => resolve(path).toLowerCase();
+    existsFor = (path) => caseInsensitiveIdentity(path) === caseInsensitiveIdentity(sharedPath);
+    realpathFor = (path) => {
+      const identity = caseInsensitiveIdentity(path);
+      return identity === caseInsensitiveIdentity(sharedPath) ? sharedPath : resolve(path);
+    };
+
+    await expect(resolveModelsDirWithBases({ targetCategory: "loras" })).rejects.toThrow(
+      /could not be determined/,
+    );
+  });
+
+  it("keeps distinct case-spelled files distinct on a case-sensitive filesystem", async () => {
+    dockerServer();
+    const caseDistinct = ["shared.safetensors", "SHARED.SAFETENSORS"];
+    serverInventory = { loras: [...caseDistinct, "server-only.safetensors"] };
+    const localPaths = caseDistinct.map((file) => join(DATA_DIR, "models", "loras", file));
+    const present = new Set(localPaths.map((file) => resolve(file)));
+    existsFor = (path) => present.has(resolve(path));
+    realpathFor = (path) => resolve(path);
+
+    await expect(resolveModelsDirWithBases({ targetCategory: "loras" })).resolves.toMatchObject(
+      { source: "base-inventory-partial" },
+    );
+  });
+
   it("REFUSES a PARTIAL match, but names the multi-root possibility instead of blaming the base", async () => {
     // I had this backwards once. Relaxing to "any overlap corroborates" fixed a
     // real false refusal under extra_model_paths — and opened a worse hole: the
@@ -1040,18 +1096,27 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     expect(message).not.toMatch(/NONE of them are under/);
   });
 
-  it("REFUSES when the target category listing is empty", async () => {
-    // Nothing to compare is not a match. An empty listing would otherwise "corroborate"
-    // any directory at all — the emptiest possible false positive. This is also the
-    // honest cost of scoping to the target category: a first-ever download into a
-    // category the server has never listed cannot be corroborated, and says so.
+  it("uses the configured base when the target category is registered but empty", async () => {
+    // Nothing to compare is not a match. The empty response therefore stays
+    // non-authoritative, but a registered empty category must still permit its first
+    // download; the downstream live-visibility guard remains responsible for the write.
     dockerServer();
     serverInventory = { diffusion_models: [], loras: [] };
     onDisk([]);
 
-    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
-      /lists no files under "diffusion_models", so there is nothing there to show/,
-    );
+    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
+    expect(res.modelsDir).toBe(resolve(DATA_DIR, "models"));
+    expect(res.source).toBe("configured-base");
+  });
+
+  it("allows a first download into a registered category whose live listing is empty", async () => {
+    dockerServer();
+    serverInventory = { yolo: [] };
+    onDisk([]);
+
+    const res = await resolveModelsDirWithBases({ targetCategory: "yolo" });
+    expect(res.modelsDir).toBe(resolve(DATA_DIR, "models"));
+    expect(res.source).toBe("configured-base");
   });
 
   it("does NOT authorize the whole models root from a SIBLING category's match", async () => {
