@@ -521,6 +521,39 @@ describe("(d) #851 — the inventory rescue is asked about THIS download's categ
     expect(fetchApi.mock.calls.map((c) => c[0])).toEqual(["/models/loras"]);
   });
 
+  it("resolves a first download for a registered empty category", async () => {
+    // A 200 empty listing is positive evidence that the target category exists, but
+    // not evidence against a configured data root: the first model has not landed yet.
+    // This exercises the actual download-target resolver, including its post-resolution
+    // live-visibility check, rather than only the base-inventory helper.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    h.baseHasEntrypoint = false;
+    fetchApi.mockClear();
+    fetchApi.mockResolvedValue({ ok: true, status: 200, json: async () => [] });
+
+    const resolved = await resolveModelSubfolderPreferServer("yolo");
+    expect(resolved).toBe(resolve(COMFYUI_PATH, "models", "yolo"));
+    expect(fetchApi.mock.calls.map((c) => c[0])).toEqual(["/models/yolo"]);
+  });
+
+  it("keeps a verified model_root usable when its target category is empty", async () => {
+    // The inventory rescue runs before the explicit model_root is applied. A known
+    // extra root must not be rejected merely because this is its first model in the
+    // category; the selector still constrains the destination to a list_paths root.
+    const selectedRoot = resolve("/data/models");
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    h.baseHasEntrypoint = false;
+    fetchApi.mockClear();
+    fetchApi.mockResolvedValue({ ok: true, status: 200, json: async () => [] });
+    getExtraModelRootsMock.mockResolvedValue([
+      { category: "models", dir: selectedRoot, group: "shared" },
+    ]);
+
+    const resolved = await resolveModelSubfolderPreferServer("yolo", selectedRoot);
+    expect(resolved).toBe(resolve(selectedRoot, "yolo"));
+    expect(fetchApi.mock.calls.map((c) => c[0])).toEqual(["/models/yolo"]);
+  });
+
   it("derives the category from the NORMALIZED subfolder, not its first raw segment", async () => {
     // `target_subfolder` accepts equivalent spellings. `loras/../checkpoints` writes to
     // `checkpoints` while its raw first segment is `loras` — so corroborating `loras`
