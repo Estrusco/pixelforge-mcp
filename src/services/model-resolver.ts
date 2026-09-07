@@ -12,10 +12,12 @@ import {
 import { getClient, getLogs, getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { isComfyTransportFailure } from "../comfyui/fetch.js";
 import {
+  PanelComfyUIReadRelayError,
   requestPanelComfyUIRead,
   type PanelComfyUIReadOperation,
   type PanelComfyUIReadSuccess,
 } from "./panel-image-relay.js";
+import { directoryForWidget } from "./missing-models.js";
 import {
   getExtraModelRoots,
   getLaunchStateExtraModelRoots,
@@ -439,17 +441,179 @@ function panelModelsResponse(read: PanelComfyUIReadSuccess): Response {
   return new Response(read.body, { status: 200, headers });
 }
 
-/** Headless `/models` first; on transport failure, the #2283 panel read relay. */
-async function fetchModelsRoute(path: string): Promise<Response> {
+function jsonModelsResponse(payload: unknown): Response {
+  const body = JSON.stringify(payload);
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** Per-listing memo so an allowlist-rejected `models/` op does not retry per category. */
+type ModelsPanelMemo = {
+  modelsOpUnsupported?: boolean;
+  objectInfo?: ParsedObjectInfo;
+  objectInfoFailed?: boolean;
+  /** Categories whose result was synthesized from the memoized object_info fallback. */
+  objectInfoFallbackCategories?: Map<string, string>;
+};
+
+/** A parsed `/object_info` document. Its INTERIOR is walked defensively by the
+ *  helpers below, so only its presence and object-ness are typed here. */
+type ParsedObjectInfo = Record<string, unknown>;
+
+function isObjectInfoDocument(value: unknown): value is ParsedObjectInfo {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isUnsupportedModelsPanelRead(error: unknown): boolean {
+  const parts: string[] = [];
+  if (error instanceof Error) parts.push(error.message);
+  if (error instanceof PanelComfyUIReadRelayError && error.reason) parts.push(error.reason);
+  return /operation must be one of/i.test(parts.join("\n"));
+}
+
+function objectInfoDirsMatching(category: string): Set<string> {
+  const lower = category.toLowerCase();
+  if (lower === "unet" || lower === "diffusion_models") {
+    return new Set(["unet", "diffusion_models"]);
+  }
+  if (lower === "clip" || lower === "text_encoders") {
+    return new Set(["clip", "text_encoders"]);
+  }
+  return new Set([lower]);
+}
+
+/**
+ * object_info exposes the legacy loader aliases (`unet`/`clip`), while the
+ * current model directories are `diffusion_models`/`text_encoders`. This is
+ * deliberately used only for object_info fallback results: an actual REST
+ * response keeps the category the server returned.
+ */
+function canonicalObjectInfoCategory(category: string): string {
+  const lower = category.toLowerCase();
+  if (lower === "unet" || lower === "diffusion_models") return "diffusion_models";
+  if (lower === "clip" || lower === "text_encoders") return "text_encoders";
+  return category;
+}
+
+function walkObjectInfoCombos(
+  info: unknown,
+  visit: (classType: string, widget: string, options: string[]) => void,
+): void {
+  if (!info || typeof info !== "object" || Array.isArray(info)) return;
+  for (const [classType, def] of Object.entries(info as Record<string, unknown>)) {
+    if (!def || typeof def !== "object" || Array.isArray(def)) continue;
+    const input = "input" in def ? def.input : undefined;
+    if (!input || typeof input !== "object" || Array.isArray(input)) continue;
+    const groups: unknown[] = [];
+    if ("required" in input) groups.push(input.required);
+    if ("optional" in input) groups.push(input.optional);
+    for (const group of groups) {
+      if (!group || typeof group !== "object" || Array.isArray(group)) continue;
+      for (const [widget, spec] of Object.entries(group as Record<string, unknown>)) {
+        const options = comboOptionStrings(spec);
+        if (!options) continue;
+        visit(classType, widget, options);
+      }
+    }
+  }
+}
+
+function modelNamesFromObjectInfo(info: unknown, category: string): string[] | undefined {
+  const wanted = objectInfoDirsMatching(category);
+  const names = new Set<string>();
+  let matched = false;
+  walkObjectInfoCombos(info, (classType, widget, options) => {
+    const dir = directoryForWidget(widget, classType);
+    if (!dir || !wanted.has(dir.toLowerCase())) return;
+    matched = true;
+    for (const name of options) {
+      if (WEIGHT_EXTS.has(extname(name).toLowerCase())) names.add(name);
+    }
+  });
+  return matched ? [...names] : undefined;
+}
+
+function modelCategoriesFromObjectInfo(info: unknown): string[] {
+  const cats = new Set<string>();
+  walkObjectInfoCombos(info, (classType, widget) => {
+    const dir = directoryForWidget(widget, classType);
+    if (dir) cats.add(dir);
+  });
+  return [...cats];
+}
+
+async function panelObjectInfo(memo: ModelsPanelMemo): Promise<ParsedObjectInfo | undefined> {
+  if (memo.objectInfoFailed) return undefined;
+  if (memo.objectInfo !== undefined) return memo.objectInfo;
+  try {
+    const relayed = await requestPanelComfyUIRead("object_info");
+    if (!relayed) {
+      memo.objectInfoFailed = true;
+      return undefined;
+    }
+    const parsed: unknown = JSON.parse(relayed.body);
+    // A `null`, an array or a scalar is not an object_info document. Without this
+    // the memo would cache it (`null !== undefined`), the `info === undefined`
+    // guard at the call site would pass, and the walkers would be handed a
+    // non-document — reporting "no categories" as though the panel had answered.
+    if (!isObjectInfoDocument(parsed)) {
+      memo.objectInfoFailed = true;
+      return undefined;
+    }
+    memo.objectInfo = parsed;
+    return memo.objectInfo;
+  } catch {
+    memo.objectInfoFailed = true;
+    return undefined;
+  }
+}
+
+async function fetchModelsViaPanel(
+  path: string,
+  transportErr: unknown,
+  memo: ModelsPanelMemo,
+): Promise<Response> {
+  const operation = modelsReadOperationFor(path);
+  if (!operation) throw transportErr;
+  if (!memo.modelsOpUnsupported) {
+    try {
+      const relayed = await requestPanelComfyUIRead(operation);
+      if (relayed) return panelModelsResponse(relayed);
+    } catch (panelErr) {
+      if (!isUnsupportedModelsPanelRead(panelErr)) throw panelErr;
+      memo.modelsOpUnsupported = true;
+    }
+  }
+  const info = await panelObjectInfo(memo);
+  if (info === undefined) throw transportErr;
+  if (path === "/models") return jsonModelsResponse(modelCategoriesFromObjectInfo(info));
+  const category = path.slice("/models/".length);
+  const names = modelNamesFromObjectInfo(info, category);
+  // A valid object_info document that has no loader combo for this category
+  // did not answer the category. Preserve the original transport failure so
+  // the caller records it as unanswered instead of manufacturing HTTP 200 [].
+  if (names === undefined) throw transportErr;
+  (memo.objectInfoFallbackCategories ??= new Map()).set(
+    category,
+    canonicalObjectInfoCategory(category),
+  );
+  return jsonModelsResponse(names);
+}
+
+/**
+ * Headless `/models` first; on transport failure, the #2283 panel read relay.
+ * Current panels still allowlist only history/system_stats/logs/object_info
+ * (plus workflow_templates on newer builds), so a rejected `models/<folder>`
+ * recovers from panel `object_info` loader combos (#2511 recurrence).
+ */
+async function fetchModelsRoute(path: string, memo: ModelsPanelMemo = {}): Promise<Response> {
   try {
     return await comfyApiFetch(path);
   } catch (err) {
     if (!isModelsTransportFailure(err)) throw err;
-    const operation = modelsReadOperationFor(path);
-    if (!operation) throw err;
-    const relayed = await requestPanelComfyUIRead(operation);
-    if (!relayed) throw err;
-    return panelModelsResponse(relayed);
+    return fetchModelsViaPanel(path, err, memo);
   }
 }
 
@@ -484,9 +648,10 @@ const WEIGHT_EXTS = new Set([
 
 async function discoverExtraCategories(
   client: ReturnType<typeof getClient>,
+  memo: ModelsPanelMemo,
 ): Promise<string[]> {
   try {
-    const res = await fetchModelsRoute("/models");
+    const res = await fetchModelsRoute("/models", memo);
     if (!res.ok) return [];
     const json = (await res.json()) as unknown;
     if (!Array.isArray(json)) return [];
@@ -705,7 +870,8 @@ export async function listLocalModelsWithCoverage(
     absent: [],
     usedFilesystem: false,
   };
-  const models = await collectLocalModels(modelType, coverage, target);
+  const panelMemo: ModelsPanelMemo = {};
+  const models = await collectLocalModels(modelType, coverage, target, panelMemo);
   if (refuseStaleModelListing(target, coverage)) {
     return { models: [], coverage };
   }
@@ -713,7 +879,7 @@ export async function listLocalModelsWithCoverage(
   // does, ask the server what it actually registers. Bounded to this one case,
   // so the common paths pay nothing.
   if (models.length === 0 && modelType !== undefined && coverage.answered.includes(modelType)) {
-    coverage.otherRegisteredCategories = await otherRegisteredCategories(modelType);
+    coverage.otherRegisteredCategories = await otherRegisteredCategories(modelType, panelMemo);
     if (refuseStaleModelListing(target, coverage)) {
       return { models: [], coverage };
     }
@@ -730,9 +896,12 @@ export async function listLocalModelsWithCoverage(
  * Undefined on any failure: "we could not ask" must not render as "there is
  * nowhere else to look", which is the same fold the coverage type exists for.
  */
-async function otherRegisteredCategories(asked: string): Promise<string[] | undefined> {
+async function otherRegisteredCategories(
+  asked: string,
+  memo: ModelsPanelMemo,
+): Promise<string[] | undefined> {
   try {
-    const res = await fetchModelsRoute("/models");
+    const res = await fetchModelsRoute("/models", memo);
     if (!res.ok) return undefined;
     const json = (await res.json()) as unknown;
     if (!Array.isArray(json)) return undefined;
@@ -761,6 +930,7 @@ async function collectLocalModels(
   modelType: string | undefined,
   coverage: ModelListingCoverage,
   target: ModelListingTargetWitness,
+  panelMemo: ModelsPanelMemo,
 ): Promise<LocalModel[]> {
   const dirsToScan: string[] = modelType ? [modelType] : [...MODEL_SUBDIRS];
   const results: LocalModel[] = [];
@@ -785,7 +955,7 @@ async function collectLocalModels(
     //
     // A FILTERED call already names its exact category, so it needs no discovery.
     if (!modelType) {
-      const extraCategories = await discoverExtraCategories(client);
+      const extraCategories = await discoverExtraCategories(client, panelMemo);
       if (refuseStaleModelListing(target, coverage)) return [];
       for (const cat of extraCategories) dirsToScan.push(cat);
     }
@@ -796,7 +966,7 @@ async function collectLocalModels(
     const dedup = makeModelDeduper();
     for (const dir of dirsToScan) {
       try {
-        const res = await fetchModelsRoute(`/models/${dir}`);
+        const res = await fetchModelsRoute(`/models/${dir}`, panelMemo);
         if (refuseStaleModelListing(target, coverage)) return [];
         // A non-OK status or a non-array body means we did NOT learn what this
         // category holds. Recording the reason is the whole point: continuing
@@ -876,14 +1046,15 @@ async function collectLocalModels(
           // is the reason discovery can be widened at all. CORE categories are
           // untouched — their behaviour is unchanged.
           if (!coreDirs.has(dir) && !WEIGHT_EXTS.has(extname(name).toLowerCase())) continue;
-          if (!dedup.add(dir, name)) continue; // same file already surfaced elsewhere
+          const resultDir = panelMemo.objectInfoFallbackCategories?.get(dir) ?? dir;
+          if (!dedup.add(resultDir, name)) continue; // same file already surfaced elsewhere
           httpReturnedAny = true;
           results.push({
             name,
-            path: `${dir}/${name}`, // ComfyUI-relative; absolute path unknown via REST
+            path: `${resultDir}/${name}`, // ComfyUI-relative; absolute path unknown via REST
             size: 0,
             modified: "",
-            type: dir,
+            type: resultDir,
           });
         }
       } catch (err) {

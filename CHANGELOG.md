@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ### MCP
 
 #### Fixed
+- list_local_models recovers remote inventory from panel object_info when fetch_comfyui_read rejects models/<category> as outside the panel allowlist (#2511)
 
 - **`panel_set_widget` writes after `panel_load_workflow` without a manual `panel_set_workflow_target({mode:"current"})` rebind (#2886).** A successful load left leftover subgraph identity and a stale subgraph registry, so `graph_get_subgraph` could not classify a live H3 container or an ordinary root SaveVideo and refused before dispatch. Load now marks that mapping stale, and a mapping-unknown miss retries the subgraph read once after the walk; still unverifiable stays fail-closed.
 
