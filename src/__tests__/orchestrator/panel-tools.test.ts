@@ -2939,6 +2939,64 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     expect(text).toMatch(/orchestrator process must be restarted/);
   });
 
+  it("panel_reload returns the proven current-process restart command (#2890)", async () => {
+    const originalArgv = process.argv;
+    process.argv = [
+      process.execPath,
+      "dist/index.js",
+      "connect",
+      "http://127.0.0.1:8188",
+    ];
+    try {
+      const store = new WorkflowTargetStore();
+      const { bridge } = methodIsHeadlessBridge(["only-live-tab"]);
+      const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+      const res = await defByName("panel_reload").handler({}, ctx);
+      const text = res.content
+        .filter((content) => content.type === "text")
+        .map((content) => content.text)
+        .join("\n");
+      const executable = process.platform === "win32" ? `"${process.execPath}"` : process.execPath;
+      const expected = `${executable} dist/index.js connect http://127.0.0.1:8188`;
+
+      expect(res.isError).toBeUndefined();
+      expect(res.structuredContent).toMatchObject({
+        manual_restart: {
+          command: expected,
+          evidence: "current_process_argv",
+        },
+      });
+      expect(text).toContain(`The exact restart command observed from this process's launch argv is: ${expected}.`);
+      expect(text).not.toContain("npx -y comfyui-mcp@latest connect");
+    } finally {
+      process.argv = originalArgv;
+    }
+  });
+
+  it("panel_reload gives launcher fallback and no command when launch evidence is missing (#2890)", async () => {
+    const originalArgv = process.argv;
+    process.argv = [process.execPath];
+    try {
+      const store = new WorkflowTargetStore();
+      const { bridge } = methodIsHeadlessBridge(["only-live-tab"]);
+      const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+      const res = await defByName("panel_reload").handler({}, ctx);
+      const text = res.content
+        .filter((content) => content.type === "text")
+        .map((content) => content.text)
+        .join("\n");
+
+      expect(res.isError).toBeUndefined();
+      expect(text).toMatch(/exact restart command could not be recovered/i);
+      expect(text).toMatch(/terminal or launcher that owns this orchestrator/i);
+      expect(text).not.toMatch(/panel shows the exact restart command/i);
+      expect(text).not.toContain("npx -y comfyui-mcp@latest connect");
+      expect(res.structuredContent?.manual_restart).toBeUndefined();
+    } finally {
+      process.argv = originalArgv;
+    }
+  });
+
   it("panel_reload (frontend scope) does NOT append the orchestrator disclosure", async () => {
     // A frontend reload leaves the agent process untouched, so the "your agent
     // restarts fresh" framing would be wrong there.

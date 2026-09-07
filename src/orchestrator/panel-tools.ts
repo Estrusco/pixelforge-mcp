@@ -612,6 +612,50 @@ export type ToolResult = {
   structuredContent?: Record<string, unknown>;
 };
 
+type RestartCommandEvidence = {
+  command: string;
+  evidence: "current_process_argv";
+};
+
+/**
+ * Recover only the command this process can prove it was launched with. The
+ * self-restart path uses this same `execPath` + `argv.slice(1)` pair; a panel
+ * route's package-manager suggestion is not evidence about this process.
+ */
+function currentOrchestratorRestartEvidence(): RestartCommandEvidence | undefined {
+  const executable = process.execPath;
+  const argv = process.argv;
+  if (!executable || !Array.isArray(argv) || argv.length < 2) return undefined;
+
+  const launchArgs = argv.slice(1);
+  if (
+    [executable, ...launchArgs].some(
+      (token) => typeof token !== "string" || /[\u0000\r\n]/.test(token),
+    )
+  ) {
+    return undefined;
+  }
+  // Never copy a shared secret from a launch command into an MCP reply.
+  if (launchArgs.some((token) => token === "--token" || token.startsWith("--token="))) {
+    return undefined;
+  }
+
+  return {
+    command: [executable, ...launchArgs].map(quoteRestartArg).join(" "),
+    evidence: "current_process_argv",
+  };
+}
+
+/** Quote one observed argv token without inventing or dropping its boundaries. */
+function quoteRestartArg(token: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(token)) return token;
+  if (process.platform === "win32") {
+    // CommandLineToArgvW-compatible escaping for quotes and trailing slashes.
+    return `"${token.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/g, "$1$1")}"`;
+  }
+  return `'${token.replace(/'/g, "'\\''")}'`;
+}
+
 function ok(value: unknown): ToolResult {
   return {
     content: [
@@ -24418,7 +24462,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_reload",
-      "Soft-reload yourself to pick up code changes WITHOUT restarting ComfyUI — your chat session resumes automatically and you'll be nudged to continue. This ENDS the current turn. What each scope actually reloads: 'orchestrator' (default) respawns your agent and its comfyui tool server, so agent config, MCP servers (panel_add_mcp/panel_remove_mcp), the system prompt, and the code behind the comfyui server's tools all reload from the comfyui-mcp build on disk; 'frontend' re-fetches the panel UI (web JS/CSS). What it does NOT reload: the long-lived orchestrator process that serves every panel_* tool (including this one) and the services those tools use — that process keeps the code it started with, and only the user can restart it (the panel prints the exact restart command when this runs). So after editing orchestrator/panel-tool code, do NOT claim the change is live after this call — say the orchestrator process must be restarted. For custom-node or model changes that need a full ComfyUI restart, use panel_restart_comfyui instead. Only call this when code has actually changed and needs to take effect now.",
+      "Soft-reload yourself to pick up code changes WITHOUT restarting ComfyUI — your chat session resumes automatically and you'll be nudged to continue. This ENDS the current turn. What each scope actually reloads: 'orchestrator' (default) respawns your agent and its comfyui tool server, so agent config, MCP servers (panel_add_mcp/panel_remove_mcp), the system prompt, and the code behind the comfyui server's tools all reload from the comfyui-mcp build on disk; 'frontend' re-fetches the panel UI (web JS/CSS). What it does NOT reload: the long-lived orchestrator process that serves every panel_* tool (including this one) and the services those tools use — that process keeps the code it started with, and only the user can restart it. The result includes this process's exact launch command when it can be recovered, otherwise it gives launcher-specific fallback guidance. So after editing orchestrator/panel-tool code, do NOT claim the change is live after this call — say the orchestrator process must be restarted. For custom-node or model changes that need a full ComfyUI restart, use panel_restart_comfyui instead. Only call this when code has actually changed and needs to take effect now.",
       {
         scope: z
           .enum(["orchestrator", "frontend"])
@@ -24508,8 +24552,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               "started with. If the change you were picking up touched " +
               "orchestrator/panel-tool code (e.g. a service a panel_* tool " +
               "imports), it is NOT in effect: tell the user the orchestrator " +
-              "process must be restarted (the panel shows the exact restart " +
-              "command).";
+              "process must be restarted. ";
+            const restart = currentOrchestratorRestartEvidence();
+            if (restart) {
+              text.text +=
+                "The exact restart command observed from this process's launch " +
+                `argv is: ${restart.command}.`;
+              res.structuredContent = {
+                ...(res.structuredContent ?? {}),
+                manual_restart: {
+                  command: restart.command,
+                  evidence: restart.evidence,
+                },
+              };
+            } else {
+              text.text +=
+                "The exact restart command could not be recovered from this " +
+                "process's launch argv. Stop and restart the terminal or launcher " +
+                "that owns this orchestrator using its existing command; do not " +
+                "substitute a package-manager command.";
+            }
           }
         }
         return res;
