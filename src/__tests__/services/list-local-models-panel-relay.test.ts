@@ -254,6 +254,158 @@ describe("#2511: list_local_models relays inventory through the connected panel"
     expect(panelRead.mock.calls.map(([operation]) => operation)).toContain("models/loras");
     expect(panelRead.mock.calls.map(([operation]) => operation)).toContain("models/diffusion_models");
   });
+
+  it("deduplicates object_info alias expansion in an unfiltered fallback", async () => {
+    fetchApi.mockImplementation(async (path: string) => {
+      throw hostUnreachable(path);
+    });
+    panelRead.mockImplementation(async (operation: string) => {
+      if (operation === "models" || operation.startsWith("models/")) {
+        throw new Error(
+          "fetch_comfyui_read rejected the operation: operation must be one of history, system_stats, logs, object_info",
+        );
+      }
+      if (operation === "object_info") {
+        return panelBody(operation, {
+          CLIPLoader: {
+            input: { required: { clip_name: [["clip.safetensors"], {}] } },
+          },
+          UNETLoader: {
+            input: { required: { unet_name: [["unet.safetensors"], {}] } },
+          },
+        });
+      }
+      return undefined;
+    });
+
+    const models = await listLocalModels();
+
+    expect(models.filter((model) => model.name === "clip.safetensors")).toHaveLength(1);
+    expect(models.filter((model) => model.name === "unet.safetensors")).toHaveLength(1);
+    expect(models).toEqual(
+      expect.arrayContaining([
+        {
+          name: "clip.safetensors",
+          path: "text_encoders/clip.safetensors",
+          size: 0,
+          modified: "",
+          type: "text_encoders",
+        },
+        {
+          name: "unet.safetensors",
+          path: "diffusion_models/unet.safetensors",
+          size: 0,
+          modified: "",
+          type: "diffusion_models",
+        },
+      ]),
+    );
+    expect(models.some((model) => ["clip", "unet"].includes(model.type))).toBe(false);
+    expect(panelRead).toHaveBeenCalledTimes(2);
+    expect(panelRead.mock.calls.map(([operation]) => operation)).toEqual(["models", "object_info"]);
+  });
+
+  it("filters combo sentinels and non-weight values from an object_info fallback", async () => {
+    fetchApi.mockImplementation(async (path: string) => {
+      throw hostUnreachable(path);
+    });
+    panelRead.mockImplementation(async (operation: string) => {
+      if (operation === "models/loras") {
+        throw new Error(
+          "fetch_comfyui_read rejected the operation: operation must be one of history, system_stats, logs, object_info",
+        );
+      }
+      if (operation === "object_info") {
+        return panelBody(operation, {
+          LoraLoader: {
+            input: {
+              required: {
+                lora_name: [["None", "remote-lora.safetensors", "choose-a-lora"], {}],
+              },
+            },
+          },
+        });
+      }
+      return undefined;
+    });
+
+    const { models } = await listLocalModelsWithCoverage("loras");
+
+    expect(models).toEqual([
+      {
+        name: "remote-lora.safetensors",
+        path: "loras/remote-lora.safetensors",
+        size: 0,
+        modified: "",
+        type: "loras",
+      },
+    ]);
+    expect(models.some((model) => model.name === "None")).toBe(false);
+  });
+
+  it("leaves a valid object_info with no mapped category unanswered", async () => {
+    fetchApi.mockImplementation(async (path: string) => {
+      throw hostUnreachable(path);
+    });
+    panelRead.mockImplementation(async (operation: string) => {
+      if (operation === "models/loras") {
+        throw new Error(
+          "fetch_comfyui_read rejected the operation: operation must be one of history, system_stats, logs, object_info",
+        );
+      }
+      if (operation === "object_info") {
+        return panelBody(operation, {
+          CheckpointLoaderSimple: {
+            input: { required: { ckpt_name: [["remote-checkpoint.safetensors"], {}] } },
+          },
+        });
+      }
+      return undefined;
+    });
+
+    const { models, coverage } = await listLocalModelsWithCoverage("loras");
+
+    expect(models).toEqual([]);
+    expect(coverage.answered).not.toContain("loras");
+    expect(coverage.unanswered).toEqual([
+      expect.objectContaining({ dir: "loras", reason: "fetch failed" }),
+    ]);
+    expect(coverage.noSourceAvailable).toBe(true);
+  });
+
+  it("reuses one relay memo for a filtered-empty follow-up category read", async () => {
+    fetchApi.mockImplementation(async (path: string) => {
+      throw hostUnreachable(path);
+    });
+    panelRead.mockImplementation(async (operation: string) => {
+      if (operation === "models/loras") {
+        throw new Error(
+          "fetch_comfyui_read rejected the operation: operation must be one of history, system_stats, logs, object_info",
+        );
+      }
+      if (operation === "object_info") {
+        return panelBody(operation, {
+          LoraLoader: { input: { required: { lora_name: [[], {}] } } },
+        });
+      }
+      if (operation === "models") {
+        throw new Error("models relay must use the existing memo");
+      }
+      return undefined;
+    });
+
+    const { models, coverage } = await listLocalModelsWithCoverage("loras");
+
+    expect(models).toEqual([]);
+    expect(coverage.answered).toEqual(["loras"]);
+    expect(coverage.otherRegisteredCategories).toEqual([]);
+    expect(panelRead).toHaveBeenCalledTimes(2);
+    expect(panelRead.mock.calls.map(([operation]) => operation)).toEqual([
+      "models/loras",
+      "object_info",
+    ]);
+  });
+
   it("a non-document object_info body is a FAILED read, not an empty inventory", async () => {
     // The relay hands back whatever the panel sent. `null` parses fine, and the
     // memo keyed on `!== undefined` used to cache it — so the call site's

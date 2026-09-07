@@ -454,6 +454,8 @@ type ModelsPanelMemo = {
   modelsOpUnsupported?: boolean;
   objectInfo?: ParsedObjectInfo;
   objectInfoFailed?: boolean;
+  /** Categories whose result was synthesized from the memoized object_info fallback. */
+  objectInfoFallbackCategories?: Map<string, string>;
 };
 
 /** A parsed `/object_info` document. Its INTERIOR is walked defensively by the
@@ -482,6 +484,19 @@ function objectInfoDirsMatching(category: string): Set<string> {
   return new Set([lower]);
 }
 
+/**
+ * object_info exposes the legacy loader aliases (`unet`/`clip`), while the
+ * current model directories are `diffusion_models`/`text_encoders`. This is
+ * deliberately used only for object_info fallback results: an actual REST
+ * response keeps the category the server returned.
+ */
+function canonicalObjectInfoCategory(category: string): string {
+  const lower = category.toLowerCase();
+  if (lower === "unet" || lower === "diffusion_models") return "diffusion_models";
+  if (lower === "clip" || lower === "text_encoders") return "text_encoders";
+  return category;
+}
+
 function walkObjectInfoCombos(
   info: unknown,
   visit: (classType: string, widget: string, options: string[]) => void,
@@ -498,22 +513,26 @@ function walkObjectInfoCombos(
       if (!group || typeof group !== "object" || Array.isArray(group)) continue;
       for (const [widget, spec] of Object.entries(group as Record<string, unknown>)) {
         const options = comboOptionStrings(spec);
-        if (!options || options.length === 0) continue;
+        if (!options) continue;
         visit(classType, widget, options);
       }
     }
   }
 }
 
-function modelNamesFromObjectInfo(info: unknown, category: string): string[] {
+function modelNamesFromObjectInfo(info: unknown, category: string): string[] | undefined {
   const wanted = objectInfoDirsMatching(category);
   const names = new Set<string>();
+  let matched = false;
   walkObjectInfoCombos(info, (classType, widget, options) => {
     const dir = directoryForWidget(widget, classType);
     if (!dir || !wanted.has(dir.toLowerCase())) return;
-    for (const name of options) names.add(name);
+    matched = true;
+    for (const name of options) {
+      if (WEIGHT_EXTS.has(extname(name).toLowerCase())) names.add(name);
+    }
   });
-  return [...names];
+  return matched ? [...names] : undefined;
 }
 
 function modelCategoriesFromObjectInfo(info: unknown): string[] {
@@ -570,7 +589,17 @@ async function fetchModelsViaPanel(
   const info = await panelObjectInfo(memo);
   if (info === undefined) throw transportErr;
   if (path === "/models") return jsonModelsResponse(modelCategoriesFromObjectInfo(info));
-  return jsonModelsResponse(modelNamesFromObjectInfo(info, path.slice("/models/".length)));
+  const category = path.slice("/models/".length);
+  const names = modelNamesFromObjectInfo(info, category);
+  // A valid object_info document that has no loader combo for this category
+  // did not answer the category. Preserve the original transport failure so
+  // the caller records it as unanswered instead of manufacturing HTTP 200 [].
+  if (names === undefined) throw transportErr;
+  (memo.objectInfoFallbackCategories ??= new Map()).set(
+    category,
+    canonicalObjectInfoCategory(category),
+  );
+  return jsonModelsResponse(names);
 }
 
 /**
@@ -841,7 +870,8 @@ export async function listLocalModelsWithCoverage(
     absent: [],
     usedFilesystem: false,
   };
-  const models = await collectLocalModels(modelType, coverage, target);
+  const panelMemo: ModelsPanelMemo = {};
+  const models = await collectLocalModels(modelType, coverage, target, panelMemo);
   if (refuseStaleModelListing(target, coverage)) {
     return { models: [], coverage };
   }
@@ -849,7 +879,7 @@ export async function listLocalModelsWithCoverage(
   // does, ask the server what it actually registers. Bounded to this one case,
   // so the common paths pay nothing.
   if (models.length === 0 && modelType !== undefined && coverage.answered.includes(modelType)) {
-    coverage.otherRegisteredCategories = await otherRegisteredCategories(modelType);
+    coverage.otherRegisteredCategories = await otherRegisteredCategories(modelType, panelMemo);
     if (refuseStaleModelListing(target, coverage)) {
       return { models: [], coverage };
     }
@@ -866,9 +896,12 @@ export async function listLocalModelsWithCoverage(
  * Undefined on any failure: "we could not ask" must not render as "there is
  * nowhere else to look", which is the same fold the coverage type exists for.
  */
-async function otherRegisteredCategories(asked: string): Promise<string[] | undefined> {
+async function otherRegisteredCategories(
+  asked: string,
+  memo: ModelsPanelMemo,
+): Promise<string[] | undefined> {
   try {
-    const res = await fetchModelsRoute("/models");
+    const res = await fetchModelsRoute("/models", memo);
     if (!res.ok) return undefined;
     const json = (await res.json()) as unknown;
     if (!Array.isArray(json)) return undefined;
@@ -897,6 +930,7 @@ async function collectLocalModels(
   modelType: string | undefined,
   coverage: ModelListingCoverage,
   target: ModelListingTargetWitness,
+  panelMemo: ModelsPanelMemo,
 ): Promise<LocalModel[]> {
   const dirsToScan: string[] = modelType ? [modelType] : [...MODEL_SUBDIRS];
   const results: LocalModel[] = [];
@@ -909,7 +943,6 @@ async function collectLocalModels(
   // joaolvivas/comfyui-mcp-byjlucas@e2ae39c8 (2026-05-12).
   const coreDirs = new Set<string>(MODEL_SUBDIRS);
   let httpReturnedAny = false;
-  const panelMemo: ModelsPanelMemo = {};
   try {
     const client = getClient(); // throws CLOUD_UNSUPPORTED in cloud mode
     // For an unfiltered listing, scan every category the server REGISTERS that
@@ -1013,14 +1046,15 @@ async function collectLocalModels(
           // is the reason discovery can be widened at all. CORE categories are
           // untouched — their behaviour is unchanged.
           if (!coreDirs.has(dir) && !WEIGHT_EXTS.has(extname(name).toLowerCase())) continue;
-          if (!dedup.add(dir, name)) continue; // same file already surfaced elsewhere
+          const resultDir = panelMemo.objectInfoFallbackCategories?.get(dir) ?? dir;
+          if (!dedup.add(resultDir, name)) continue; // same file already surfaced elsewhere
           httpReturnedAny = true;
           results.push({
             name,
-            path: `${dir}/${name}`, // ComfyUI-relative; absolute path unknown via REST
+            path: `${resultDir}/${name}`, // ComfyUI-relative; absolute path unknown via REST
             size: 0,
             modified: "",
-            type: dir,
+            type: resultDir,
           });
         }
       } catch (err) {
