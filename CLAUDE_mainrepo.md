@@ -7,11 +7,18 @@
   │  upstream project's CLAUDE.md, kept here so upstream's fork-tooling        │
   │  guidance stays visible without letting it flow into our own CLAUDE.md.   │
   │                                                                           │
-  │  DO NOT hand-edit. It is refreshed automatically during an upstream sync  │
-  │  via:  git show upstream/main:CLAUDE.md > CLAUDE_mainrepo.md              │
+  │  DO NOT hand-edit. It was refreshed automatically during an upstream      │
+  │  sync via:  git show upstream/main:CLAUDE.md > CLAUDE_mainrepo.md         │
   │  (see the "Syncing with upstream" section in CLAUDE.md).                  │
   │                                                                           │
-  │  Snapshot source: upstream/main : CLAUDE.md                               │
+  │  FROZEN as of the 2026-09-09 sync: upstream commit 46d4caa1               │
+  │  ("chore: untrack dev-only docs (CLAUDE/AGENTS/GEMINI/TODO/design/blog)", │
+  │  2026-07-21) removed CLAUDE.md from upstream's git tracking entirely     │
+  │  (kept locally by maintainers, gitignored). There is no upstream         │
+  │  CLAUDE.md left to mirror, so this snapshot no longer refreshes and      │
+  │  reflects the last tracked upstream content before that commit.          │
+  │                                                                           │
+  │  Snapshot source: upstream/main : CLAUDE.md (pre-46d4caa1, 2026-07-21)    │
   └─────────────────────────────────────────────────────────────────────────┘
 -->
 
