@@ -26,6 +26,14 @@ export interface GenerateAudioArgs {
   musical_key?: string;
   shift?: number;
   guidance_scale?: number;
+  bpm?: number;
+  timesignature?: string;
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  min_p?: number;
+  generate_audio_codes?: boolean;
+  audio_quality?: string;
 
   // Stable Audio 3 specific
   checkpoint?: string;
@@ -35,12 +43,18 @@ export interface GenerateAudioArgs {
 
 export interface GenerateAudioDeps {
   resolveFirstModel: (type: string) => Promise<string | undefined>;
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface GenerateAudioResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   model_family: string;
 }
 
@@ -60,6 +74,14 @@ const DEFAULTABLE_KEYS = [
   "musical_key",
   "shift",
   "guidance_scale",
+  "bpm",
+  "timesignature",
+  "temperature",
+  "top_p",
+  "top_k",
+  "min_p",
+  "generate_audio_codes",
+  "audio_quality",
   "checkpoint",
   "clip",
   "negative_prompt",
@@ -76,10 +98,9 @@ export async function generateAudio(
     throw new ValidationError("duration must be a positive number (in seconds)");
   }
 
-  const argsRecord = args as unknown as Record<string, unknown>;
   const seed: Record<string, unknown> = {};
   for (const key of DEFAULTABLE_KEYS) {
-    const v = argsRecord[key];
+    const v = args[key];
     if (v !== undefined) seed[key] = v;
   }
   const resolved = DefaultsManager.apply(seed);
@@ -120,11 +141,19 @@ export async function generateAudio(
       language: resolved.language as string | undefined,
       musical_key: resolved.musical_key as string | undefined,
       guidance_scale: resolved.guidance_scale as number | undefined,
+      bpm: resolved.bpm as number | undefined,
+      timesignature: resolved.timesignature as string | undefined,
+      temperature: resolved.temperature as number | undefined,
+      top_p: resolved.top_p as number | undefined,
+      top_k: resolved.top_k as number | undefined,
+      min_p: resolved.min_p as number | undefined,
+      generate_audio_codes: resolved.generate_audio_codes as boolean | undefined,
+      audio_quality: resolved.audio_quality as string | undefined,
       filename_prefix: resolved.filename_prefix as string | undefined,
     });
 
-    const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-    return { prompt_id, queue_remaining, model_family: "ace_step_1.5" };
+    const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+    return { prompt_id, queue_remaining, rejectedOutputs, model_family: "ace_step_1.5" };
   }
 
   // Stable Audio 3
@@ -152,8 +181,11 @@ export async function generateAudio(
     sampler_name: resolved.sampler as string | undefined,
     scheduler: resolved.scheduler as string | undefined,
     filename_prefix: resolved.filename_prefix as string | undefined,
+    // #1458 — passed through like the ace_step path. The audio generation tool
+    // ACCEPTS audio_quality; this family dropped it on the floor.
+    audio_quality: resolved.audio_quality as string | undefined,
   });
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-  return { prompt_id, queue_remaining, model_family: "stable_audio_3" };
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+  return { prompt_id, queue_remaining, rejectedOutputs, model_family: "stable_audio_3" };
 }

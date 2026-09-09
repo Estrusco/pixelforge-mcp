@@ -72,6 +72,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
+import { errorText, promptText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -80,11 +81,12 @@ import {
   type ModelChoice,
   type NeutralTurn,
   ANTIGRAVITY_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /** Kill an entire process tree (identical posture to gemini/codex-backend):
@@ -164,8 +166,7 @@ export function parseGoDurationMs(s: string): number | null {
 
 /** Strip ANSI escape sequences (agy's TUI heritage may color even -p output). */
 function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\[[0-9;?]*[ -/]*[@-~]/g, "");
+  return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
 /**
@@ -342,7 +343,7 @@ function writeFileAtomic(file: string, text: string): void {
  *  the workspace `.agents/mcp_config.json` and `~/.gemini/antigravity-cli/mcp/`
  *  paths circulating in third-party docs are IGNORED by the CLI; only the
  *  global shared `~/.gemini/config/mcp_config.json` attaches servers to a
- *  `-p` session (health_check round-trip confirmed against a live ComfyUI). */
+ *  `-p` session (get_system_stats (action:"health") round-trip confirmed against a live ComfyUI). */
 export function agyMcpConfigPath(home: string = homedir()): string {
   return join(home, ".gemini", "config", "mcp_config.json");
 }
@@ -550,8 +551,9 @@ export class AntigravityBackend implements AgentBackend {
       ...(this.model ? { model: this.model } : {}),
     };
 
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runTurn(turn, cwd, opts.onActivity);
+      yield* stampTurn(this.runTurn(turn, cwd, opts.onActivity), ++turnSeq);
     }
   }
 
@@ -564,11 +566,11 @@ export class AntigravityBackend implements AgentBackend {
     cwd: string,
     onActivity?: () => void,
   ): AsyncGenerator<AgentEvent> {
-    let text = turn.text;
+    let text = promptText(turn.text);
     if (this.needsSystemPreamble && this.deps.systemAppend) {
       text =
         `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${turn.text}`;
+        `The user's first message follows.\n\n${text}`;
       this.needsSystemPreamble = false;
     }
     // Image refs: no documented -p image input — the refs are already named in

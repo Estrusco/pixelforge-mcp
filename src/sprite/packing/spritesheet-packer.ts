@@ -1,4 +1,4 @@
-import sharp from "sharp";
+import { requireSharp } from "../../services/sharp-loader.js";
 import { ValidationError } from "../../utils/errors.js";
 import { buildSpritesheetMetadata } from "./metadata-builder.js";
 import type { Dimensions, PackedSpritesheet, RawImage, SpritesheetPackOptions } from "../types.js";
@@ -22,6 +22,7 @@ import type { Dimensions, PackedSpritesheet, RawImage, SpritesheetPackOptions } 
  * fixes.
  */
 export async function decodeFrameImage(bytes: Buffer): Promise<RawImage> {
+  const sharp = await requireSharp("pack_spritesheet");
   const { data, info } = await sharp(bytes, { limitInputPixels: 100_000_000 })
     .ensureAlpha()
     .raw()
@@ -37,6 +38,7 @@ export async function decodeFrameImage(bytes: Buffer): Promise<RawImage> {
  * multi-hundred-MB raw buffer for a sheet at the packing size cap.
  */
 export async function probeImageDimensions(bytes: Buffer): Promise<Dimensions> {
+  const sharp = await requireSharp("pack_spritesheet");
   const { width, height } = await sharp(bytes, { limitInputPixels: 100_000_000 }).metadata();
   if (width === undefined || height === undefined) {
     throw new ValidationError("Could not read image dimensions: the file is not a decodable image.");
@@ -90,6 +92,7 @@ export async function packSpritesheet(
   const frameSize = assertUniformFrameSize(frames);
   const metadata = buildSpritesheetMetadata(frames.length, frameSize, options);
 
+  const sharp = await requireSharp("pack_spritesheet");
   const png = await sharp({
     create: {
       width: metadata.sheet_width,

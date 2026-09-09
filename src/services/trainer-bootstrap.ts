@@ -10,13 +10,14 @@
 import childProcess from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import {
   AI_TOOLKIT_REF,
   AI_TOOLKIT_REPO,
   nativeToolkitReady,
   resolveAiToolkitDir,
   resolveAiToolkitPython,
+  TRAINER_COMMAND,
   type TrainerEnvelope,
 } from "./ai-toolkit.js";
 
@@ -80,6 +81,49 @@ function basePython(): string {
 }
 
 /**
+ * Resolve the git executable to spawn. PATH first, then — on Windows — the
+ * standard Git for Windows install roots. The fallback exists because a
+ * long-lived orchestrator started BEFORE Git was installed keeps its
+ * pre-install PATH: panel_reload rebuilds the server but the parent's
+ * environment is inherited, so `spawn("git")` dies with ENOENT even though
+ * Git is on the machine (issue #1640). Returns the ABSOLUTE path so the
+ * spawn below never depends on the stale PATH again.
+ */
+export function resolveGitExecutable(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const name = platform === "win32" ? "git.exe" : "git";
+  for (const dir of (env.PATH ?? "").split(delimiter).filter(Boolean)) {
+    const candidate = join(dir.replace(/^"|"$/g, ""), name);
+    if (existsSync(candidate)) return candidate;
+  }
+  if (platform !== "win32") return undefined;
+  const roots = [
+    env["ProgramFiles"] ?? "C:\\Program Files",
+    env["ProgramFiles(x86)"],
+    env.LOCALAPPDATA ? join(env.LOCALAPPDATA, "Programs") : undefined,
+  ];
+  for (const root of roots) {
+    if (!root) continue;
+    const candidate = join(root, "Git", "cmd", "git.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** Why no git could be found — spelled out with the remedy (issue #1640). */
+function gitNotFoundMessage(): string {
+  return process.platform === "win32"
+    ? "git is not on this process's PATH and was not found under the standard Git for Windows roots " +
+      "(Program Files\\Git, %LOCALAPPDATA%\\Programs\\Git). If Git was installed AFTER the orchestrator " +
+      "started, panel_reload is not enough — the long-lived parent keeps its pre-install PATH. Fully " +
+      "restart the orchestrator (or reboot), then re-run bootstrap."
+    : "git is not on this process's PATH. If git was installed after the orchestrator started, restart " +
+      "the orchestrator so it inherits the new PATH, then re-run bootstrap.";
+}
+
+/**
  * Bootstrap the native trainer. Steps (each idempotent):
  *  1. clone ai-toolkit @ AI_TOOLKIT_REF (or `git fetch + checkout` an existing clone)
  *  2. create the venv
@@ -92,30 +136,34 @@ export async function bootstrapToolkit(opts: { onLog?: (line: string) => void } 
   const dir = resolveAiToolkitDir();
   const log = opts.onLog;
   try {
+    const git = resolveGitExecutable();
+    if (!git) {
+      return fail(TRAINER_COMMAND.bootstrap, "git_not_found", gitNotFoundMessage());
+    }
     mkdirSync(dir, { recursive: true });
 
     if (!existsSync(join(dir, ".git"))) {
       // Clone into a temp sibling then move in, so a failed clone doesn't leave
       // a half repo at the real path.
       const tmp = `${dir}.clone-${process.pid}`;
-      const r = await stream("git", ["clone", "--recurse-submodules", AI_TOOLKIT_REPO, tmp], undefined, log);
+      const r = await stream(git, ["clone", "--recurse-submodules", AI_TOOLKIT_REPO, tmp], undefined, log);
       if (r.code !== 0) {
         // Clean the failed clone so a retry isn't blocked by its leftovers
         // (codex finding: the stale temp dir made every retry fail instantly).
         const { rmSync: rmTmp } = await import("node:fs");
         rmTmp(tmp, { recursive: true, force: true });
-        return fail("train_bootstrap", "clone_failed", `git clone exited ${r.code}`, r.tail);
+        return fail(TRAINER_COMMAND.bootstrap, "clone_failed", `git clone exited ${r.code}`, r.tail);
       }
       const { renameSync, rmSync } = await import("node:fs");
       rmSync(dir, { recursive: true, force: true });
       renameSync(tmp, dir);
     }
-    let r = await stream("git", ["fetch", "--all"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "fetch_failed", `git fetch exited ${r.code}`, r.tail);
-    r = await stream("git", ["checkout", AI_TOOLKIT_REF], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "checkout_failed", `git checkout ${AI_TOOLKIT_REF} exited ${r.code}`, r.tail);
-    r = await stream("git", ["submodule", "update", "--init", "--recursive"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "submodule_failed", `submodule update exited ${r.code}`, r.tail);
+    let r = await stream(git, ["fetch", "--all"], dir, log);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "fetch_failed", `git fetch exited ${r.code}`, r.tail);
+    r = await stream(git, ["checkout", AI_TOOLKIT_REF], dir, log);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "checkout_failed", `git checkout ${AI_TOOLKIT_REF} exited ${r.code}`, r.tail);
+    r = await stream(git, ["submodule", "update", "--init", "--recursive"], dir, log);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "submodule_failed", `submodule update exited ${r.code}`, r.tail);
 
     // Invalidate any previous completion marker BEFORE the install steps: a
     // recreated venv whose pip steps now fail must NOT inherit the old env's
@@ -126,28 +174,28 @@ export async function bootstrapToolkit(opts: { onLog?: (line: string) => void } 
 
     if (!existsSync(resolveAiToolkitPython())) {
       r = await stream(basePython(), ["-m", "venv", "venv"], dir, log);
-      if (r.code !== 0) return fail("train_bootstrap", "venv_failed", `venv creation exited ${r.code}`, r.tail);
+      if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "venv_failed", `venv creation exited ${r.code}`, r.tail);
     }
 
     const pip = [resolveAiToolkitPython(), "-m", "pip", "install", "--no-cache-dir"];
     r = await stream(pip[0], [...pip.slice(1), ...TORCH_PACKAGES, "--index-url", TORCH_INDEX], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "torch_failed", `torch install exited ${r.code} (index ${TORCH_INDEX})`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "torch_failed", `torch install exited ${r.code} (index ${TORCH_INDEX})`, r.tail);
     r = await stream(pip[0], [...pip.slice(1), "hf_transfer"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "hf_transfer_failed", `hf_transfer install exited ${r.code}`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "hf_transfer_failed", `hf_transfer install exited ${r.code}`, r.tail);
     r = await stream(pip[0], [...pip.slice(1), "-r", "requirements.txt"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "requirements_failed", `requirements install exited ${r.code}`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "requirements_failed", `requirements install exited ${r.code}`, r.tail);
 
     const status = await bootstrapStatus();
     if (!status.ready) {
-      return fail("train_bootstrap", "verify_failed", "bootstrap finished but run.py/venv python are still missing");
+      return fail(TRAINER_COMMAND.bootstrap, "verify_failed", "bootstrap finished but run.py/venv python are still missing");
     }
     // Completion marker: every pip step exited 0 to get here. nativeToolkitReady
     // requires it (or a torch presence check for pre-marker envs) so a checkout
     // whose dependency install FAILED is never selected as "ready" (codex).
     writeFileSync(join(dir, ".bootstrap-ok"), `${AI_TOOLKIT_REF} ${new Date().toISOString()}\n`);
-    return ok("train_bootstrap", status);
+    return ok(TRAINER_COMMAND.bootstrap, status);
   } catch (err) {
-    return fail("train_bootstrap", "error", err instanceof Error ? err.message : String(err));
+    return fail(TRAINER_COMMAND.bootstrap, "error", err instanceof Error ? err.message : String(err));
   }
 }
 

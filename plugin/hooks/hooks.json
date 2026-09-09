@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "mcp__plugin_pixelforge_pixelforge__(stop|restart)_comfyui",
+        "matcher": "mcp__plugin_pixelforge_pixelforge__restart_comfyui",
         "hooks": [
           {
             "type": "command",

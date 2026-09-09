@@ -1,4 +1,4 @@
-// The query engine behind query_workflow (headless) — and the SEMANTIC SPEC for
+// The query engine behind get_workflow (action:"query") (headless) — and the SEMANTIC SPEC for
 // the panel's graph_query executor twin (comfyui-mcp-panel), which mirrors it
 // by hand in live-graph JS. If a behavior changes here, port it there.
 
@@ -127,5 +127,374 @@ describe("queryApiGraph", () => {
     expect(r.truncated).toBe(true);
     expect(r.shown).toBeLessThan(8);
     expect(r.text).toContain("truncated");
+  });
+
+  // ---- #609: a single node's detail must never truncate to shown:0 -----------
+  describe("#609: budget never starves the node you asked for", () => {
+    // A node whose ONE widget is a pathological blob (ResolutionMaster presets JSON,
+    // LTXDirector.timeline_data, VHS videopreview…). Raw, its detail line alone
+    // exceeds the default single-node budget → the old loop returned shown:0.
+    const BLOB = "x".repeat(20000);
+    const Gblob = {
+      "164": { class_type: "ResolutionMaster", inputs: { auto_detect_presets_json: BLOB, width: 1024 } },
+      "165": { class_type: "KSampler", inputs: { steps: 20, cfg: 7 } },
+    };
+
+    it("one requested huge-blob node renders (shown:1, not shown:0)", () => {
+      const r = queryApiGraph(Gblob, { ids: [164], fields: "detail", max_chars: 7000 });
+      expect(r.matched).toBe(1);
+      expect(r.shown).toBe(1); // FAIL-BEFORE: was 0
+    });
+
+    it("the oversized widget value is capped, not dropped silently", () => {
+      const r = queryApiGraph(Gblob, { ids: [164], fields: "detail" });
+      expect(r.text).toContain("per-widget cap"); // #809: the per-value cap marker, naming the cap
+      expect(r.text.length).toBeLessThan(BLOB.length); // blob no longer flooding
+      expect(r.text).toContain('"width":1024'); // the small sibling value survives intact
+    });
+
+    it("one node's blob no longer starves its siblings", () => {
+      // Query both nodes; the blob node sorts first. Before the cap+protection it
+      // rendered alone and truncated node 165 away.
+      const r = queryApiGraph(Gblob, { fields: "detail", max_chars: 7000 });
+      expect(r.shown).toBe(2);
+      expect(r.text).toContain("KSampler");
+    });
+
+    it("explicit-ids truncation stays token-bounded and gives followable advice", () => {
+      // Three capped blobs, all requested by id, tiny budget. Only the first renders
+      // (the token bound is preserved — we do NOT wholesale-exempt every id), and the
+      // tail must advise raising max_chars, NOT the dead-end 'narrow with ids'.
+      const G2 = {
+        "1": { class_type: "A", inputs: { blob: "a".repeat(5000) } },
+        "2": { class_type: "B", inputs: { blob: "b".repeat(5000) } },
+        "3": { class_type: "C", inputs: { blob: "c".repeat(5000) } },
+      };
+      const r = queryApiGraph(G2, { ids: [1, 2, 3], fields: "detail", max_chars: 600 });
+      expect(r.matched).toBe(3);
+      expect(r.shown).toBe(1); // first renders, rest budget-truncated (bounded output)
+      expect(r.truncated).toBe(true);
+      expect(r.text).toContain("raise `max_chars`");
+      expect(r.text).not.toContain("narrow with"); // no dead-end advice for explicit ids
+      // #809: the char budget did the cutting, so `limit` must NOT be offered as the fix.
+      expect(r.truncated_by).toBe("max_chars");
+      expect(r.text).not.toContain("raise `limit`");
+    });
+
+    it("even the protected first node's detail stays token-bounded (many oversized widgets)", () => {
+      // A pathological node: 40 independently oversized widgets. Per-value capping
+      // alone would still yield ~40×2KB; the total-widgets cap must keep the ONE
+      // protected first line near max_chars, not blow it.
+      const widgets: Record<string, unknown> = {};
+      for (let i = 0; i < 40; i++) widgets[`w${i}`] = "z".repeat(5000);
+      const Gwide = { "1": { class_type: "Pathological", inputs: widgets } };
+      const maxChars = 3000;
+      const r = queryApiGraph(Gwide, { ids: [1], fields: "detail", max_chars: maxChars });
+      expect(r.shown).toBe(1); // still renders the requested node
+      // Bounded: the single line must not be an order of magnitude over the budget.
+      expect(r.text.length).toBeLessThan(maxChars * 2);
+      expect(r.text).toContain("cut by the `max_chars` budget"); // #809: elision marker names its lever
+    });
+
+    it("detail bound holds for a SMALL budget, even with ESCAPE-HEAVY content", () => {
+      // max_chars 600 < WIDGET_VALUE_CAP AND every char JSON-escapes to two ("→\").
+      // The retained widget must be tightened accounting for escaping, so the line
+      // stays near the budget rather than doubling past it.
+      const Gsmall = { "1": { class_type: "X", inputs: { blob: '"'.repeat(5000) } } };
+      const r = queryApiGraph(Gsmall, { ids: [1], fields: "detail", max_chars: 600 });
+      expect(r.shown).toBe(1);
+      expect(r.text.length).toBeLessThan(600 * 2);
+    });
+
+    it("an escape-heavy OBJECT that fits keeps its type — measured by its real serialization (review nit)", () => {
+      // capWidgetValue re-serialized the ALREADY-serialized JSON text of a non-string
+      // to measure it, double-counting every escape: an array whose real size fits the
+      // per-value cap (2048) but whose double-escaped size exceeds it was type-changed
+      // into a truncated string. Measure once: it stays an array, unmarked.
+      const arr = Array.from({ length: 300 }, () => "ab");
+      const realSize = JSON.stringify(arr).length; // single stringify, as emitted
+      expect(realSize).toBeLessThanOrEqual(2048); // fits WIDGET_VALUE_CAP for real
+      expect(JSON.stringify(JSON.stringify(arr)).length).toBeGreaterThan(2048); // old mis-measure
+      const Gfit = { "1": { class_type: "Presets", inputs: { presets: arr } } };
+      const r = queryApiGraph(Gfit, { ids: [1], fields: "detail", max_chars: 6000 });
+      expect(r.shown).toBe(1);
+      const parsed = JSON.parse(r.text.split("\n")[1]);
+      expect(Array.isArray(parsed.widgets.presets)).toBe(true); // FAIL-BEFORE: was a string
+      expect(parsed.widgets.presets).toHaveLength(300);
+      expect(r.text).not.toContain("per-widget cap");
+    });
+
+    it("a genuinely oversize OBJECT still truncates with the per-value cap marker", () => {
+      // Real serialized size ≫ the cap: the value degrades to a truncated string of the
+      // JSON head, with the same marker semantics as an oversized string.
+      const arr = Array.from({ length: 5000 }, (_, i) => `item-${i}`);
+      const Gover = { "1": { class_type: "Presets", inputs: { presets: arr } } };
+      const r = queryApiGraph(Gover, { ids: [1], fields: "detail", max_chars: 6000 });
+      expect(r.shown).toBe(1);
+      expect(r.text).toContain("per-widget cap"); // #809
+      expect(r.text.length).toBeLessThan(JSON.stringify(arr).length); // capped, not flooding
+    });
+
+    it("detail bounds a fan-out node's downstream consumer list (#609)", () => {
+      // A source feeding 500 consumers would otherwise emit a 500-id downstream array
+      // in the protected first line. Cap it with a "+N more" tail.
+      const G3: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {
+        "1": { class_type: "Source", inputs: {} },
+      };
+      for (let i = 2; i < 502; i++) G3[String(i)] = { class_type: "Sink", inputs: { x: ["1", 0] } };
+      const r = queryApiGraph(G3, { ids: [1], fields: "detail", max_chars: 2000 });
+      expect(r.shown).toBe(1);
+      expect(r.text).toContain("more"); // "+N more" downstream tail
+      expect(r.text.length).toBeLessThan(2000 * 2);
+    });
+
+    it("compact projection is bounded by widget COUNT for the protected first line", () => {
+      // 5000 tiny widgets: each clips to ~60 chars in compact, but the protected first
+      // line would be ~5000×small without the line clip. Must stay near max_chars.
+      const widgets: Record<string, unknown> = {};
+      for (let i = 0; i < 5000; i++) widgets[`k${i}`] = i;
+      const Gmany = { "1": { class_type: "Wide", inputs: widgets } };
+      const maxChars = 2000;
+      const r = queryApiGraph(Gmany, { ids: [1], fields: "compact", max_chars: maxChars });
+      expect(r.shown).toBe(1);
+      expect(r.text.length).toBeLessThan(maxChars * 2);
+    });
+
+    it("detail bounds pathological KEYS and a wide upstream fan-in (#609)", () => {
+      // A 10k-char widget key and 300 ref-inputs would each blow the line via a field
+      // the widget-value cap doesn't touch. Keys are clipped, upstream count is capped.
+      const inputs: Record<string, unknown> = { ["k".repeat(10000)]: "v" };
+      for (let i = 0; i < 300; i++) inputs[`in${i}`] = [String(i + 1000), 0];
+      const G4 = { "1": { class_type: "Wide", inputs } };
+      const r = queryApiGraph(G4, { ids: [1], fields: "detail", max_chars: 2000 });
+      expect(r.shown).toBe(1);
+      expect(r.text.length).toBeLessThan(2000 * 2);
+    });
+
+    it("the protected detail line NEVER exceeds max_chars — degrades to a bounded stub (#609)", () => {
+      // Extreme high-fan-in: 500 ref inputs with long names + 500 consumers + big widget,
+      // at a tiny budget. Even after every per-field cap the row can exceed max_chars, so
+      // it must degrade to a valid-JSON stub. Assert the single line body is ≤ max_chars.
+      const inputs: Record<string, unknown> = { blob: "z".repeat(9000) };
+      for (let i = 0; i < 500; i++) inputs[`input_slot_name_${i}`] = [String(i + 2000), 3];
+      const Gbig: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {
+        "1": { class_type: "Hub", inputs },
+      };
+      for (let i = 0; i < 500; i++) Gbig[String(i + 2000)] = { class_type: "Src", inputs: {} };
+      // make node 1 feed 500 consumers
+      for (let i = 0; i < 500; i++) Gbig[`c${i}`] = { class_type: "Sink", inputs: { x: ["1", 0] } };
+      const maxChars = 800;
+      const r = queryApiGraph(Gbig, { ids: [1], fields: "detail", max_chars: maxChars });
+      expect(r.shown).toBe(1);
+      const body = r.text.split("\n").slice(1).join("\n"); // drop header
+      expect(body.length).toBeLessThanOrEqual(maxChars); // the one detail line ≤ budget
+      expect(r.text).toContain("detail_omitted"); // valid-JSON stub marker
+      expect(() => JSON.parse(body)).not.toThrow(); // still valid JSON
+    });
+
+    it("the degraded stub itself stays ≤ max_chars even for a pathologically long node id (#609)", () => {
+      // A 5000-char node id + overflowing detail: the stub must clip its OWN id/type,
+      // so even the fallback row respects the budget.
+      const longId = "n".repeat(5000);
+      const inputs: Record<string, unknown> = { blob: "z".repeat(9000) };
+      const G5: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {
+        [longId]: { class_type: "T".repeat(5000), inputs },
+      };
+      const maxChars = 600;
+      const r = queryApiGraph(G5, { ids: [longId], fields: "detail", max_chars: maxChars });
+      expect(r.shown).toBe(1);
+      const body = r.text.split("\n").slice(1).join("\n");
+      expect(body.length).toBeLessThanOrEqual(maxChars);
+      expect(() => JSON.parse(body)).not.toThrow();
+    });
+
+    it("error/diagnostic paths clip an oversized caller-supplied seed/predicate (#609)", () => {
+      const bigSeed = "z".repeat(1_000_000);
+      const rSeed = queryApiGraph(G, { upstream_of: bigSeed });
+      expect(rSeed.text.length).toBeLessThan(500); // not ~1MB
+      expect(rSeed.text).toContain("not found");
+      // Bad predicate error message is likewise clipped.
+      expect(() => queryApiGraph(G, { where: [`cfg==${"9".repeat(1_000_000)}`] })).toThrow(/Bad predicate/);
+      try {
+        queryApiGraph(G, { where: [`cfg==${"9".repeat(1_000_000)}`] });
+      } catch (e) {
+        expect((e as Error).message.length).toBeLessThan(500);
+      }
+    });
+
+    it("group_by:'type' aggregate is char-bounded too (#609)", () => {
+      const G7: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {};
+      for (let i = 0; i < 2000; i++) G7[String(i)] = { class_type: `VeryLongNodeTypeName_${i}`, inputs: {} };
+      const maxChars = 1000;
+      const r = queryApiGraph(G7, { group_by: "type", max_chars: maxChars });
+      expect(r.text.length).toBeLessThan(maxChars * 2);
+      expect(r.truncated).toBe(true);
+      expect(r.text).toContain("more type(s) cut by `max_chars`");
+    });
+
+    it("fields:'ids' also bounds a pathologically long node id (#609)", () => {
+      const longId = "n".repeat(5000);
+      const G6 = { [longId]: { class_type: "X", inputs: {} } };
+      const maxChars = 500;
+      const r = queryApiGraph(G6, { ids: [longId], fields: "ids", max_chars: maxChars });
+      expect(r.shown).toBe(1);
+      const body = r.text.split("\n").slice(1).join("\n");
+      expect(body.length).toBeLessThanOrEqual(maxChars);
+    });
+
+    it("without explicit ids the advice still points at narrowing", () => {
+      const many: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {};
+      for (let i = 0; i < 30; i++) many[String(i)] = { class_type: "KSampler", inputs: { note: "y".repeat(400) } };
+      const r = queryApiGraph(many, { fields: "detail", max_chars: 800 });
+      expect(r.truncated).toBe(true);
+      expect(r.text).toContain("narrow with `types`/`where`/`ids`/`depth`");
+    });
+  });
+
+  // #1634: a Discord reporter kept getting a CUT-OFF positive prompt back from the agent.
+  // It was not the outline ladder degrading on a big graph (the filed hypothesis) — it
+  // reproduces on a 4-node graph, because the compact projection's 60-char clip is a
+  // SURVEY cap and it also applied to a read that named the node explicitly by `ids`.
+  describe("#1634 — an explicit `ids` read is a PINPOINT read, not a survey", () => {
+    const PROMPT =
+      "masterpiece, best quality, ultra detailed, a lone astronaut standing on a windswept " +
+      "red dune at golden hour, visor reflecting twin suns, volumetric god rays, fine sand " +
+      "particles drifting, cinematic composition, 85mm lens, shallow depth of field, " +
+      "photorealistic, 8k, sharp focus, dramatic rim lighting";
+    const Gp = {
+      "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sdxl.safetensors" } },
+      "2": { class_type: "CLIPTextEncode", _meta: { title: "Positive Prompt" }, inputs: { text: PROMPT, clip: ["1", 1] } },
+      "3": { class_type: "KSampler", inputs: { seed: 1, model: ["1", 0], positive: ["2", 0] } },
+    };
+
+    it("returns the node's FULL widget value on a small graph, without fields:'detail'", () => {
+      expect(PROMPT.length).toBeGreaterThan(60);
+      const r = queryApiGraph(Gp, { ids: ["2"] });
+      // The whole reply is ~400 chars against a 12000 budget: the clip was never
+      // protecting anything here, it was starving the value that was asked for.
+      expect(r.text).toContain(PROMPT);
+      expect(r.text.length).toBeLessThan(1000);
+    });
+
+    it("does NOT emit a clip note when nothing was clipped", () => {
+      const r = queryApiGraph(Gp, { ids: ["2"] });
+      expect(r.text).not.toContain("widget value(s) clipped");
+    });
+
+    it("a SURVEY read (no ids) still clips at the fixed 60 and names fields:'detail'", () => {
+      const r = queryApiGraph(Gp, {});
+      expect(r.text).not.toContain(PROMPT);
+      expect(r.text).toContain('clipped to 60 chars by `fields`:"compact"');
+      expect(r.text).toContain('read fuller values with `fields`:"detail"');
+    });
+
+    it("a `where`/`types` filter is still a survey — only explicit ids are a pinpoint", () => {
+      const r = queryApiGraph(Gp, { types: ["CLIPTextEncode"] });
+      expect(r.text).not.toContain(PROMPT);
+      expect(r.text).toContain('clipped to 60 chars by `fields`:"compact"');
+    });
+
+    it("max_chars still bounds a large ids list — the token guard is intact", () => {
+      const big: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {};
+      for (let i = 1; i <= 60; i++) big[String(i)] = { class_type: "CLIPTextEncode", inputs: { text: "z".repeat(900) } };
+      const ids = Object.keys(big);
+      // The FIRST row is protected from the budget and can never be dropped, so its
+      // per-value cap has to respect max_chars: an unreserved 2048 cap returned 740
+      // chars against max_chars=500 while main returned 465.
+      for (const maxChars of [500, 800, 1500, 2000, 4000, 12000, 60000]) {
+        const r = queryApiGraph(big, { ids, max_chars: maxChars });
+        expect(r.text.length).toBeLessThanOrEqual(maxChars);
+      }
+    });
+
+    it("a value past the fixed 2048 cap is still capped, and the note names no dead lever", () => {
+      const G7 = { "7": { class_type: "Note", inputs: { text: "b".repeat(5000) } } };
+      const r = queryApiGraph(G7, { ids: ["7"], max_chars: 60000 });
+      expect(r.text.length).toBeLessThan(5000);
+      expect(r.text).toContain("clipped to 2048 chars");
+      // `fields`:"detail" applies the SAME 2048 cap, so pointing there would be the dead
+      // retry #809 exists to remove.
+      expect(r.text).not.toContain('read fuller values with `fields`:"detail"');
+    });
+
+    it("a pinpoint row that does NOT fit falls back to main's rendering and main's note", () => {
+      // The cap is raised only when the generous row demonstrably fits. Arithmetic
+      // reserves leaked: a per-widget floor still grows without bound across many
+      // widgets, so a 24-widget node breached max_chars on DEFAULT parameters while
+      // reporting truncated:false. A fit test cannot leak.
+      const G8 = { "8": { class_type: "Note", inputs: { text: "c".repeat(4000) } } };
+      const r = queryApiGraph(G8, { ids: ["8"], max_chars: 2000 });
+      expect(r.text.length).toBeLessThanOrEqual(2000);
+      // Fell back, so the note is main's: it names 60 and the lever that genuinely helps.
+      expect(r.text).toContain('clipped to 60 chars by `fields`:"compact"');
+      expect(r.text).toContain('read fuller values with `fields`:"detail"');
+    });
+    // Both found by the review gate on the first version of this fix, which capped each
+    // value at 2048 INDEPENDENTLY and dropped the fields:"detail" pointer outright.
+    describe("#1634 gate findings", () => {
+      const wide = (count: number, len: number) => {
+        const inputs: Record<string, unknown> = {};
+        for (let i = 0; i < count; i++) inputs[`w${i}`] = "x".repeat(len);
+        return { "2": { class_type: "Efficient Loader", inputs } };
+      };
+
+      it("a MULTI-widget pinpoint row respects max_chars — a per-value cap does not bound the row", () => {
+        // N widgets at the cap sum to N x cap, and the #609-protected first row can never
+        // be dropped to recover. The first version breached on DEFAULT parameters: 12169
+        // of 12000 with six long widgets, and 2700 of 2500 with an ordinary
+        // positive+negative pair.
+        const shapes: Array<[Record<string, unknown>, number]> = [
+          [wide(6, 2100), 12000],
+          [wide(4, 3000), 2000],
+          [wide(2, 3000), 2500],
+          [wide(1, 9000), 600],
+        ];
+        for (const [g, maxChars] of shapes) {
+          const r = queryApiGraph(g as never, { ids: ["2"], max_chars: maxChars });
+          expect(r.text.length, `max_chars=${maxChars}`).toBeLessThanOrEqual(maxChars);
+        }
+      });
+
+      it("the note never names a cap that was in force for NO widget", () => {
+        // A budget-derived per-widget cap rendered values at 2048, 736 and 60 and reported
+        // them all as "clipped to 2048 … which no parameter raises", while raising
+        // max_chars demonstrably lifted them — the #809 wrong-lever defect verbatim. The
+        // cap is uniform across the row now, so the note has exactly two honest forms.
+        for (const [count, len, maxChars] of [[10, 3000, 12000], [40, 200, 2000], [24, 1200, 12000]] as const) {
+          const r = queryApiGraph(wide(count, len) as never, { ids: ["2"], max_chars: maxChars });
+          const note = r.text.slice(r.text.lastIndexOf("\n("));
+          const named = /clipped to (\d+) chars/.exec(note)?.[1];
+          expect([undefined, "60", "2048"], `cap named for ${count}x${len}@${maxChars}`).toContain(named);
+          if (named === "60") expect(note).toContain('`fields`:"detail"');
+        }
+      });
+
+      it("the fit test RESERVES budget for the framing that rides outside the row", () => {
+        // Gate class 4: mutating the reserve to 0 survived all 103 tests, so the constant
+        // was unpinned. The reserve is what the row does NOT get to spend: header, the
+        // row's own prefix and ref lists, the truncation tail and the clip note. Pin it by
+        // asserting the raise is DECLINED where the widgets alone would eat the budget.
+        const near = { "2": { class_type: "T", inputs: { w: "x".repeat(1500) } } };
+        // 1500 chars of value + framing against a 2000 budget: without a reserve the fit
+        // test says yes and the reply has no room left for its own tail and note.
+        const declined = queryApiGraph(near, { ids: ["2"], max_chars: 2000 });
+        expect(declined.text).toContain('clipped to 60 chars by `fields`:"compact"');
+        expect(declined.text.length).toBeLessThanOrEqual(2000);
+        // Raise the budget past the reserve and the SAME node renders in full.
+        const granted = queryApiGraph(near, { ids: ["2"], max_chars: 4000 });
+        expect(granted.text).toContain("x".repeat(1500));
+        expect(granted.text.length).toBeLessThanOrEqual(4000);
+      });
+
+      it("only a SINGLE id is a pinpoint — a multi-id read keeps every row main returned", () => {
+        // Treating any ids list as a pinpoint cost rows the caller explicitly asked for:
+        // 20 ordinary 600-char prompts at the default budget went 20/20 -> 18/20.
+        const many: Record<string, unknown> = {};
+        for (let i = 1; i <= 30; i++) many[String(i)] = { class_type: "CLIPTextEncode", inputs: { text: "p".repeat(600) } };
+        const r = queryApiGraph(many as never, { ids: Object.keys(many) });
+        expect(r.shown).toBe(30);
+        expect(r.truncated).toBe(false);
+      });
+    });
   });
 });

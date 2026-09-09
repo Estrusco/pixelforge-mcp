@@ -1,4 +1,699 @@
 import { getComfyUIAuthHeaders } from "../config.js";
+import { describeFetchFailure, isBareFetchFailure } from "../utils/errors.js";
+import { sameOrigin } from "../utils/origin.js";
+import { readPublishedPanelOrigins } from "../services/panel-origin-channel.js";
+import { formatComfyUIUrl } from "../transport/comfyui-url.js";
+
+/** The request target, for the diagnostic. Never throws on an odd input. */
+export function targetOf(input: string | URL | Request): string {
+  try {
+    if (typeof input === "string") return input;
+    if (input instanceof URL) return input.href;
+    return (input as Request).url ?? String(input);
+  } catch {
+    return String(input);
+  }
+}
+
+/** The request's HTTP method, uppercased. `init.method` wins over a Request's own,
+ *  matching what fetch itself does when both are supplied. */
+function methodOf(input: string | URL | Request, init: RequestInit): string {
+  return String(init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+}
+
+/**
+ * What the CONNECTED panels front, for the drift comparison below (#952).
+ *
+ * Injected by the orchestrator at startup rather than imported: this module is
+ * the bottom of the stack and must not depend on the bridge. Unset (the plain
+ * MCP server, tests, any process with no bridge) simply means the comparison is
+ * skipped — never that there is no drift.
+ *
+ * Origins here are diagnostic data. They must be the SERVER-OBSERVED handshake
+ * Origin (UiBridge's `tabServerOrigin`), not the client-supplied
+ * `hello.comfyui_url`, because the latter is page-controlled. This source is
+ * deliberately separate from the direct /view fallback authorization below:
+ * a tokenless local WebSocket client can forge HTTP headers, so neither this
+ * source nor the published channel is permission to contact an origin.
+ */
+let connectedPanelOrigins: (() => string[]) | null = null;
+
+/**
+ * Direct /view fallback authorization. This is intentionally a separate,
+ * fail-closed seam from the diagnostic origin source and the published channel.
+ * Production installs no source: a tokenless loopback WebSocket has no
+ * browser-only provenance that could authorize MCP to make a new HTTP request.
+ * Keep this injectable only for an explicitly authenticated integration in the
+ * future and for focused tests of the already-hardened fallback mechanics.
+ */
+let connectedPanelFallbackOrigins: (() => string[]) | null = null;
+
+/**
+ * #1415 — WHERE THESE CALLS ACTUALLY RUN.
+ *
+ * Injection covers the orchestrator process, and almost nothing that fails this
+ * way lives there: every headless comfyui tool runs in the SPAWNED stdio child,
+ * which never loads orchestrator/index.js and has no bridge to inject from. So
+ * the comparison #952 built was silently skipped in exactly the sessions it was
+ * written for — the reporter's panel worked, `list_packs (action:"list_templates")`
+ * failed against a dead COMFYUI_URL, and the error made no comparison at all.
+ *
+ * The child reads the set the orchestrator publishes into the progress dir it
+ * already shares with it (services/panel-origin-channel.ts). Still a leaf
+ * dependency — a file read, not the bridge. An INJECTED source always wins: where
+ * the bridge is in the same process it is both fresher and authoritative.
+ */
+function panelOrigins(): string[] {
+  return connectedPanelOrigins ? connectedPanelOrigins() : readPublishedPanelOrigins();
+}
+
+/** Install the panel-origin source. Pass null to clear (tests, shutdown). */
+export function setConnectedPanelOrigins(fn: (() => string[]) | null): void {
+  connectedPanelOrigins = fn;
+}
+
+/** Install the direct-fallback source. Null is the production-safe default. */
+export function setConnectedPanelFallbackOrigins(fn: (() => string[]) | null): void {
+  connectedPanelFallbackOrigins = fn;
+}
+
+/** Read the current panel origins without allowing a stale channel read to abort a request. */
+export function connectedPanelOriginsNow(): string[] {
+  try {
+    return panelOrigins();
+  } catch {
+    return [];
+  }
+}
+
+/** Read direct-fallback candidates. Never falls back to diagnostic/channel data. */
+export function connectedPanelFallbackOriginsNow(): string[] {
+  try {
+    return connectedPanelFallbackOrigins ? connectedPanelFallbackOrigins() : [];
+  } catch {
+    return [];
+  }
+}
+
+/** True when the request failed at the network layer, rather than returning an HTTP status. */
+export function isComfyTransportFailure(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current instanceof Error && !seen.has(current)) {
+    if (isTimeoutAbort(current)) return false;
+    if (isBareFetchFailure(current)) return true;
+    seen.add(current);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** Origin (scheme://host:port) of a request target, or undefined if unparsable.
+ *  Exported because a message that names the target should name the ORIGIN:
+ *  `URL.origin` drops userinfo, path and query, so a COMFYUI_URL carrying a
+ *  credential cannot leak through a diagnostic string. */
+export function originOf(target: string): string | undefined {
+  try {
+    const origin = new URL(target).origin;
+    // An OPAQUE origin (file:, data:, blob:) serialises to the literal string
+    // "null", which is truthy and would sail through every caller as if it were
+    // an address — printing "a connected panel is on null" (gate, round 4). It is
+    // not an address, so it is not an origin as far as this module is concerned.
+    return origin === "null" ? undefined : origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Name the drift instead of asking the reader to go and check for it (#952).
+ *
+ * The shipped message told the user a connected panel "does not imply this
+ * address is reachable" and pointed them at install_comfyui(action:"environment")
+ * to compare the two by hand. We can usually just do the comparison — the bridge
+ * knows what each connected tab fronts — and saying which of the three cases
+ * holds is worth far more than the instruction to go and find out:
+ *
+ *   - DIFFERENT   → that is very likely the whole answer.
+ *   - THE SAME    → drift is RULED OUT. Worth stating plainly, because it stops
+ *                   the reader chasing the explanation the old text volunteered.
+ *                   The panel reaches it from the browser; this process does not
+ *                   (a firewall, a container boundary, a bound interface).
+ *   - UNKNOWN     → no panel connected, no origin source installed AND nothing
+ *                   published on the channel, or the handshake carried no usable
+ *                   Origin. Say nothing about drift; an absent comparison is not
+ *                   a negative result.
+ */
+export function describeTargetDrift(target: string): string {
+  return classifyTargetDrift(target).text;
+}
+
+/**
+ * What the comparison ESTABLISHED, alongside the sentence describing it (#1896).
+ *
+ * The sentence alone was enough while only one caller existed. It is not enough
+ * for the advice that follows it: "confirm the server is up" is sound guidance
+ * after a DIFFERENT or an UNKNOWN verdict and actively wrong after a SAME one,
+ * where a browser is connected to that very origin. Callers need the verdict to
+ * pick a tail, and re-deriving it by matching the prose would be a predicate on
+ * a message — the thing that breaks the moment the wording moves.
+ *
+ * Computed ONCE per failure and shared, so formatting an error costs a single
+ * channel read rather than one per consumer.
+ */
+export type TargetDriftVerdict = "different" | "same" | "unknown";
+
+/** A caller-specific diagnostic context. Keep this narrow so generic ComfyUI
+ * failures retain their existing next-step advice. */
+export type ComfyFetchDiagnosticContext =
+  | "get_system_stats_health"
+  | "install_comfyui_environment";
+
+/**
+ * The comparison's RAW facts alongside its sentence.
+ *
+ * `text` is worded for a request that never CONNECTED. #2673 needs the same
+ * verdict for one the server ANSWERED and refused, where that wording would be
+ * false ("the browser can reach it and this process cannot" — this process
+ * reached it and got a 400). So the origins and the alias parenthetical come
+ * back too, and the second caller writes its own sentence from them rather than
+ * re-deriving the comparison or editing the first caller's prose.
+ */
+interface TargetDriftClassification {
+  verdict: TargetDriftVerdict;
+  text: string;
+  /** Distinct connected-panel origins; empty when the verdict is "unknown". */
+  origins: string[];
+  /** Parenthetical naming both spellings on a "same" verdict; "" otherwise. */
+  alias: string;
+  /**
+   * Connected-panel origins that do NOT match the target. Non-empty alongside a
+   * "same" verdict when tabs are open on more than one ComfyUI (gate finding).
+   *
+   * `describeTargetDrift` does not need this — "a panel can reach this address"
+   * is established by ONE match. #2673's question is different and stronger
+   * ("could the file have come from a panel on another server?"), and one match
+   * does not settle it.
+   */
+  others: string[];
+}
+
+function classifyTargetDrift(target: string): TargetDriftClassification {
+  const origins = (() => {
+    try {
+      return panelOrigins();
+    } catch {
+      return []; // a broken source must never replace the real network error
+    }
+  })();
+  if (origins.length === 0)
+    return { verdict: "unknown", text: "", origins: [], alias: "", others: [] };
+  const want = originOf(target);
+  if (!want) return { verdict: "unknown", text: "", origins: [], alias: "", others: [] };
+  // WHY THESE ARE NOT PUT THROUGH #1191's SCRUB, asked three times by the gate.
+  //
+  // `scrubSecretShapedText`'s third pass redacts any unbroken run of >=24
+  // credential-alphabet characters. A cloudflared quick-tunnel hostname IS one —
+  // `http://abcdef0123456789abcdef0123456789.trycloudflare.com` has a 32-char
+  // label — and that is the most common remote-ComfyUI setup this project sees.
+  // Scrubbing would therefore redact exactly the origins a reader most needs
+  // named, on the one message whose entire job is to say WHICH server. A
+  // hostname is public routing information, not a credential; the credential
+  // risk in a URL lives in userinfo, path and query, and `originOf` drops all
+  // three. So the protection here is NORMALISATION, not redaction:
+  //
+  // Only a well-formed `scheme://host[:port]` may ever reach a message (gate,
+  // round 3). These values are server-observed handshake Origins, not client
+  // prose — but "not attacker prose today" is a property of a call site three
+  // modules away, and this string lands in an agent's context. Normalising
+  // through `originOf` cannot mangle a legitimate origin (it is idempotent on
+  // one) and cannot echo anything that is not one. An unparsable entry is
+  // dropped rather than scrubbed: it could not have matched the target anyway,
+  // and a scrub-by-shape here would redact real long hostnames.
+  const distinct = [...new Set(origins)].flatMap((o) => {
+    const normalised = originOf(o);
+    return normalised ? [normalised] : [];
+  });
+  if (distinct.length === 0) return { verdict: "unknown", text: "", origins: [], alias: "", others: [] };
+  // #1175 — `includes` compares spellings, not servers. A panel on
+  // http://127.0.0.1:8188 against a target of http://localhost:8188 is ONE
+  // ComfyUI, and reporting it as "a DIFFERENT address" sent a reporter to point
+  // COMFYUI_URL at the origin it was already pointed at.
+  const match = distinct.find((o) => sameOrigin(o, want));
+  if (match !== undefined) {
+    // Name BOTH spellings when they differ textually. "This same origin" reads
+    // as a contradiction next to two visibly different strings, and the reader
+    // has no way to know the comparison was alias-aware — which is what sent the
+    // #1175 reporter looking for a target mismatch that did not exist.
+    const alias =
+      match === want
+        ? ""
+        : ` (spelled ${match} there and ${want} here — the same host, so this is not a mismatch)`;
+    return {
+      verdict: "same",
+      origins: distinct,
+      others: distinct.filter((o) => !sameOrigin(o, want)),
+      alias,
+      text:
+        ` A connected panel is on this same origin${alias}, so this is NOT a wrong-address problem: ` +
+        `the browser can reach ${want} and this process cannot (a firewall, a container ` +
+        `boundary, or a server bound to one interface).`,
+    };
+  }
+  return {
+    verdict: "different",
+    origins: distinct,
+    others: distinct,
+    alias: "",
+    text:
+      ` A connected panel is on ${distinct.join(", ")} — a DIFFERENT address, which is why ` +
+      `the panel works while this call does not. Point COMFYUI_URL at that origin if it is the ` +
+      `server you meant.`,
+  };
+}
+
+/**
+ * The same comparison, for a loader input naming a media file the server does
+ * not have (#2673).
+ *
+ * A chat attachment is uploaded by the BROWSER, to whichever ComfyUI the panel
+ * tab is on; `enqueue_workflow` posts to COMFYUI_URL. When those are two servers
+ * the file lands on one and the render reads the other, and ComfyUI answers
+ * "Invalid image file: <name>" — a rejection that says nothing about the split
+ * and that re-submitting the same workflow can never clear. This is the drift
+ * #952 already detects, reached through a 400 instead of a socket error, and it
+ * is the case the detector was NOT wired into.
+ *
+ * The SAME-origin answer earns its place too: it rules the split out, so the
+ * reader stops hunting for a second server and treats the file as genuinely
+ * absent from the one they have.
+ */
+export function describeMissingInputMediaDrift(target: string): string {
+  const { verdict, origins, alias, others } = classifyTargetDrift(target);
+  if (verdict === "unknown") return "";
+  if (verdict === "same") {
+    // ONE matching tab does not rule the split out when OTHER tabs are open
+    // elsewhere: the attachment could have come from any of them, and "RULED
+    // OUT" would then suppress the very guidance the reader needs (gate finding).
+    if (others.length > 0) {
+      return (
+        ` A connected panel is on this same ComfyUI${alias} — but others are on ` +
+        `${others.join(", ")}, so a file attached in one of THOSE tabs is on that server and ` +
+        `not on this one. Rule that out before treating the file as simply missing.`
+      );
+    }
+    return (
+      ` A connected panel is on this same ComfyUI${alias}, and no OTHER tab is open on a ` +
+      `different one, so that split is RULED OUT for every panel visible right now — a tab that ` +
+      `has since closed or navigated away would not appear here.`
+    );
+  }
+  return (
+    ` A connected panel is on ${origins.join(", ")} — a DIFFERENT ComfyUI from this target, so ` +
+    `that is very likely where the file is, and very likely the whole answer: run the graph on ` +
+    `the panel instead (panel_run), or point COMFYUI_URL at that origin.`
+  );
+}
+
+/**
+ * The "now go and check" tail, chosen by what the comparison established (#1896).
+ *
+ * On a SAME verdict the standing advice asks a question that is already
+ * answered: "confirm the server is up" invites precisely the conclusion the
+ * comparison just ruled out, since a browser is connected to that origin right
+ * now. The reporter of #1896 was told a panel was connected and then sent to
+ * find out whether the server was running.
+ *
+ * The health check is therefore RE-AIMED rather than dropped — see the note at
+ * the SAME branch for why suppressing it would have been an overclaim.
+ *
+ * The generic and direct-health paths keep `install_comfyui (action:"environment")`
+ * explicit and do NOT describe it as failing: its `/system_stats` read sits
+ * inside a try (see services/workspace-env.ts getEnvironment), so it still
+ * reports the resolved target on an unreachable server. The environment probe
+ * itself uses the separate context below, where naming that action again would
+ * recurse through its stored `running_instance.error`.
+ *
+ * `budget` is the timeout path's extra option. It stays offered even on a SAME
+ * verdict: a connected browser proves something answers that origin, never that
+ * it would answer THIS process quickly, so "the server is simply slow" is still
+ * live and ruling it out here would be an overclaim.
+ */
+function nextStepsFor(
+  verdict: TargetDriftVerdict,
+  target: string,
+  budget: boolean,
+  context?: ComfyFetchDiagnosticContext,
+): string {
+  if (context === "install_comfyui_environment") {
+    if (verdict === "same") {
+      const want = originOf(target) ?? target;
+      return (
+        ` The connected panel is already on ${want}, so the browser can reach this ` +
+        `origin while this process cannot. Check the route or firewall between them, ` +
+        `the server's bound interface, and any COMFYUI_AUTH_* credentials required ` +
+        `from this process.`
+      );
+    }
+    if (verdict === "different") {
+      return (
+        ` Check COMFYUI_URL and point it at the intended server. If this target is ` +
+        `the intended one, check its route or firewall and any COMFYUI_AUTH_* ` +
+        `credentials required from this process.`
+      );
+    }
+    return (
+      ` Check COMFYUI_URL from this process, the route or firewall, and any ` +
+      `COMFYUI_AUTH_* credentials required by the target. The transport details ` +
+      `above are the available readiness evidence.`
+    );
+  }
+  if (context === "get_system_stats_health") {
+    const environment = 'install_comfyui (action:"environment")';
+    const independentProbe =
+      ` Run ${environment} as an independent readiness probe from this MCP process; ` +
+      `inspect its running_instance.reachable and running_instance.error instead of ` +
+      `repeating this failing request.`;
+    if (verdict === "same") {
+      const want = originOf(target) ?? target;
+      return (
+        independentProbe +
+        ` The connected panel is already on ${want}, so if the probe is unreachable, ` +
+        `fix the route or firewall between this process and that origin. If it is ` +
+        `reachable, keep the transport and any COMFYUI_AUTH_* details above in view; ` +
+        `the browser session may have different access.`
+      );
+    }
+    if (verdict === "different") {
+      return (
+        independentProbe +
+        ` The panel is on a different origin, so point COMFYUI_URL at the server you ` +
+        `meant; if the probe still cannot reach that target, check its route/firewall ` +
+        `and any required COMFYUI_AUTH_* credentials.`
+      );
+    }
+    return (
+      independentProbe +
+      ` If the probe is unreachable, check COMFYUI_URL, the route/firewall, and any ` +
+      `required COMFYUI_AUTH_* credentials; if it is reachable, retry the health ` +
+      `check once while keeping the transport details above.`
+    );
+  }
+  if (verdict !== "same") {
+    return budget
+      ? ` Confirm it is up with get_system_stats (action:"health"), and raise ` +
+          `COMFYUI_MCP_HTTP_TIMEOUT_S if this server is simply slow.`
+      : ` Check the target with install_comfyui (action:"environment"), and confirm the server ` +
+          `is up with get_system_stats (action:"health").`;
+  }
+  const want = originOf(target) ?? target;
+  // REPURPOSED, not suppressed. An earlier draft of this said the health check
+  // "will NOT add anything here: it runs in this same process against this same
+  // address, so it fails the same way". That is an overclaim: a SAME verdict
+  // compares ORIGINS, and an origin is not an endpoint. A ComfyUI that is up and
+  // answering the browser can still stall one route — `/object_info` mid-decode
+  // is the documented case (comfyui/client.ts) — in which case /system_stats
+  // answers perfectly well and is the single most informative call available.
+  // So the health check keeps its place; what changes is the QUESTION it is sent
+  // to settle. "Is the server up" is already answered, and answered yes.
+  return (
+    ` The address itself is not what is wrong — a browser is connected to that origin. Use ` +
+    `get_system_stats (action:"health") to tell the two remaining cases apart: if it fails from ` +
+    `here too, the route from this process to ${want} is what needs fixing; if it succeeds, the ` +
+    `problem is specific to this request rather than to the target` +
+    (budget
+      ? `, and COMFYUI_MCP_HTTP_TIMEOUT_S may simply be too low for it.`
+      : `. install_comfyui (action:"environment") reports the resolved target either way.`)
+  );
+}
+
+/**
+ * Turn a network-layer throw into a diagnostic that says WHAT was attempted.
+ *
+ * `TypeError: fetch failed` was reaching tool results verbatim: #954 saw it from
+ * the workflow-templates listing (now `list_packs` action:"list_templates") and
+ * could not tell which host was tried, and #952 saw it from the readonly tools
+ * while the panel bridge was working fine — reading it, reasonably, as "the tool
+ * is broken" when the headless target was simply a different (unreachable)
+ * address than the one the panel is bound to.
+ *
+ * The two ARE separate targets by design: the panel talks to whichever ComfyUI
+ * the browser is on, while these calls go to the configured COMFYUI_URL. That is
+ * not a bug, but it is invisible unless the failure names the address — and,
+ * where the bridge can tell us, says whether the two actually differ.
+ *
+ * Header for the three pieces below: the never-delivered code set, the delivery
+ * doubt it gates, and describeComfyFetchFailure itself.
+ */
+/**
+ * Failure codes that prove the request was NEVER DELIVERED.
+ *
+ * Each one fires before any byte of the request could reach the application: the
+ * connection was refused, the name never resolved, the TLS handshake failed, or
+ * the URL was rejected locally. On these the server cannot have acted, so saying
+ * so is accurate and a retry is safe.
+ *
+ * Everything else is deliberately NOT listed. ECONNRESET, EPIPE, "socket hang up"
+ * and UND_ERR_SOCKET all fire on an ESTABLISHED connection, which is precisely the
+ * case where ComfyUI may have received and acted on the request before the socket
+ * died. The default for an unrecognised code is therefore "may have been
+ * delivered": a spurious "verify first" costs one extra read, while a spurious
+ * "it never arrived" costs a duplicate render.
+ */
+const NEVER_DELIVERED_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ERR_INVALID_URL",
+  "ERR_UNSUPPORTED_PROTOCOL",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "CERT_HAS_EXPIRED",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
+
+/**
+ * The transport-failure twin of describeComfyTimeout's OUTCOME UNKNOWN.
+ *
+ * A timeout on a POST already warned that /prompt may have queued the render
+ * before the reply was lost. A CONNECTION ERROR on that same POST carries the
+ * identical risk — an ECONNRESET after the server accepted and enqueued the
+ * prompt is indistinguishable, at this layer, from one before it — yet the
+ * message said only "confirm the server is up", which reads as "it never got
+ * there". The caller retries and the render is queued twice, on the single most
+ * expensive operation this client makes.
+ *
+ * Only suppressed when the code POSITIVELY proves non-delivery, or the method is
+ * a read. See NEVER_DELIVERED_CODES for why the default runs the other way.
+ */
+export function deliveryDoubt(code: string | undefined, method: string): string {
+  if (method === "GET" || method === "HEAD") return "";
+  if (code !== undefined && NEVER_DELIVERED_CODES.has(code)) return "";
+  // Says only what is known. Claiming "the connection was established" would be an
+  // overclaim for an unrecognised code — the same folding this function exists to
+  // undo, merely pointed the other way.
+  return (
+    ` This ${method} may already have been received and acted on: a transport failure ` +
+    `does not establish that the request never arrived. Do NOT blindly re-issue it; ` +
+    `check the server's state first (for a queued prompt, queue (action:"list") and ` +
+    `get_history (action:"list")).`
+  );
+}
+
+function describeComfyFetchFailure(
+  err: unknown,
+  target: string,
+  method: string,
+  context?: ComfyFetchDiagnosticContext,
+): Error {
+  const { message, code } = describeFetchFailure(err);
+  // ONE classification, used for both the sentence and the tail it governs
+  // (#1896) — two calls would read the channel twice and could, across a
+  // republish, disagree with each other inside a single message.
+  const drift = classifyTargetDrift(target);
+  const wrapped = new Error(
+    `${message} — while requesting ${target} (${method}).` +
+      deliveryDoubt(code, method) +
+      ` ` +
+      `That is the headless ComfyUI target (COMFYUI_URL); a CONNECTED sidebar panel does not imply this address is reachable, ` +
+      `because the panel talks to whichever ComfyUI its browser tab is on.` +
+      drift.text +
+      nextStepsFor(drift.verdict, target, false, context),
+    { cause: err },
+  );
+  if (code) (wrapped as { code?: string }).code = code;
+  return wrapped;
+}
+
+/**
+ * A last-resort ceiling on a ComfyUI HTTP call that brought no budget of its own.
+ *
+ * `comfyuiFetch` passed `init` straight to `fetch`, so a call with no signal had
+ * NO time limit at all: a host that accepts the connection and then never
+ * answers — a stalled reverse proxy, a black-holed route, a ComfyUI wedged
+ * mid-request — left it pending forever. Thirteen of the twenty-five call sites
+ * were in that state, including `/prompt`, `/queue`, `/object_info` and the
+ * Manager API. This is the same defect #1026 hit in the skill generator; that
+ * fix bounded three calls, and this bounds the rest.
+ *
+ * DELIBERATELY GENEROUS. Every caller that knows its own budget already passes a
+ * signal and keeps it — `init.signal` always wins. This value only has to be
+ * shorter than "forever" and longer than
+ * any healthy request: `/object_info` on a large custom-node install is
+ * legitimately slow, and a ceiling that fires on a working server would be a
+ * worse bug than the one being fixed.
+ *
+ * SAFE TO APPLY BROADLY because of what does NOT come through here: uploads and
+ * `/view` go through the client library's own `fetchApi`, and model downloads
+ * have their own streaming path. Every comfyuiFetch site is a small JSON API
+ * request.
+ */
+const DEFAULT_COMFY_HTTP_TIMEOUT_S = 120;
+
+export function comfyHttpTimeoutSeconds(): number {
+  const raw = Number(process.env.COMFYUI_MCP_HTTP_TIMEOUT_S);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_COMFY_HTTP_TIMEOUT_S;
+}
+
+export function defaultComfyTimeoutSignal(): AbortSignal {
+  return AbortSignal.timeout(Math.round(comfyHttpTimeoutSeconds() * 1000));
+}
+
+/** True for an abort raised by AbortSignal.timeout (not a caller's own abort). */
+export function isTimeoutAbort(err: unknown): boolean {
+  return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+}
+
+function abortReasonOf(signal: AbortSignal): unknown {
+  return (
+    signal.reason ??
+    Object.assign(new Error("The operation was aborted"), { name: "AbortError" })
+  );
+}
+
+/**
+ * Reject as soon as `signal` aborts, even if `work` is still running.
+ *
+ * Bounds an enclosing promise whose inner work may not settle. On supported
+ * Node (`engines` is >=22) undici errors the response body stream when the
+ * `fetch` signal fires, so a pending `Response.text()` rejects at the deadline
+ * — the quoted "headers-only" story is false here. `raceAbort` still earns its
+ * place by bounding everything ELSE in `work`: a test double that ignores abort,
+ * a consumer that does not pass the signal through, or the enclosing `call_tool`
+ * cell. #1672's inner read DID reject ("The operation was aborted due to
+ * timeout"); the outer cell is what stayed pending. `JSON.parse` is genuinely
+ * unabortable, and racing it cannot preempt it because it blocks the same thread.
+ *
+ * The inner promise is attached so a late rejection cannot become an
+ * unhandledRejection after we already settled.
+ */
+export function raceAbort<T>(signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> {
+  if (!signal) return work();
+  if (signal.aborted) return Promise.reject(abortReasonOf(signal));
+  const workPromise = work();
+  workPromise.catch(() => {
+    /* settled via abort, or the then-path below already observed this */
+  });
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortReasonOf(signal));
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    workPromise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (err) => {
+        cleanup();
+        reject(err);
+      },
+    );
+  });
+}
+
+/** GET/HEAD learned nothing; a mutation that timed out is OUTCOME UNKNOWN. */
+function timeoutRetryClause(method: string): string {
+  if (method === "GET" || method === "HEAD") {
+    return (
+      `Nothing was learned about the server from this — a timeout is not a refusal and not a ` +
+      `"not found". `
+    );
+  }
+  return (
+    `OUTCOME UNKNOWN: this request may already have been received and acted on, so do NOT ` +
+    `blindly re-issue it — check the server's state first (for a queued prompt, queue ` +
+    `(action:"list") and get_history (action:"list")). `
+  );
+}
+
+/**
+ * Named diagnosis for a stall AFTER headers: `comfyuiFetch` has already returned,
+ * so its transport rewrite never runs and a raw `TimeoutError` would escape with
+ * no URL and no method (#2773). Distinct from the transport-timeout formatter:
+ * the connection DID happen; only the body failed to finish.
+ */
+export function describeComfyBodyTimeout(target: string, method: string): Error {
+  const seconds = comfyHttpTimeoutSeconds();
+  const err = new Error(
+    `No reply from ComfyUI within ${seconds}s — while reading the response body of ${target} (${method}). ` +
+      `Headers had already arrived; the body did not finish. ` +
+      timeoutRetryClause(method),
+  );
+  (err as { code?: string }).code = "COMFYUI_HTTP_BODY_TIMEOUT";
+  return err;
+}
+
+/**
+ * Say what the ceiling did and did NOT establish.
+ *
+ * The critical distinction is the METHOD. A GET that times out learned nothing
+ * about the server's state. A POST that times out is OUTCOME UNKNOWN — `/prompt`
+ * may well have queued the render before the reply was lost — and reporting that
+ * as a failure would invite a retry that queues it twice. Neither may be
+ * described as "the server is down".
+ */
+function describeComfyTimeout(input: string | URL | Request, init: RequestInit): Error {
+  const target = targetOf(input);
+  const method = methodOf(input, init);
+  const seconds = comfyHttpTimeoutSeconds();
+  // #1896 — the comparison the TRANSPORT path has made since #1553, on the path
+  // that shares its cause.
+  //
+  // The defect is simply that THIS FORMATTER NEVER ASKED. Same child, same
+  // readable channel, same connected panel as the refusal path, and it said
+  // nothing at all — `list_packs (action:"list_templates")` sits on this ceiling
+  // since #1795 removed its hard-coded 8s signal, so it is a first-class
+  // consumer of a message that was silent about a working panel.
+  //
+  // How a call GETS here is deliberately not overstated (review, finding 1). A
+  // target this process cannot route to may expire on the ceiling — a DROPped
+  // SYN black-holes it — or fail fast with EHOSTUNREACH/ENETUNREACH, which is a
+  // bare fetch failure and takes describeComfyFetchFailure instead. Both were
+  // measured; only the first reaches this line. The fix does not depend on which
+  // is more common, and a slow server that never answers lands here too.
+  const drift = classifyTargetDrift(target);
+  const err = new Error(
+    `No reply from ComfyUI within ${seconds}s — while requesting ${target} (${method}). ` +
+      timeoutRetryClause(method) +
+      // #1896 — this asserted "The connection was accepted but no answer arrived
+      // in time". The ceiling covers the WHOLE exchange, connecting included, so
+      // a black-holed SYN times out here having established no connection at all
+      // — and on the read path the sentence immediately before already said
+      // nothing was learned. Say only what a timeout actually proves.
+      `Whether a connection was ever established is NOT known from this: the budget covers ` +
+      `connecting, the request and the reply alike, so a black-holed or filtered route expires ` +
+      `here exactly as a slow server does. That points at the server, or at something between it ` +
+      `and here, rather than at the request.` +
+      drift.text +
+      nextStepsFor(drift.verdict, target, true),
+  );
+  (err as { code?: string }).code = "COMFYUI_HTTP_TIMEOUT";
+  return err;
+}
 
 /**
  * `fetch` wrapper for ComfyUI HTTP requests that injects the configured generic
@@ -10,15 +705,89 @@ import { getComfyUIAuthHeaders } from "../config.js";
  * server. Non-ComfyUI requests (HuggingFace, Civitai, Comfy Cloud) keep using
  * plain `fetch` — Comfy Cloud has its own X-API-Key path in cloud-client.ts.
  */
-export function comfyuiFetch(
+export async function comfyuiFetch(
   input: string | URL | Request,
   init: RequestInit = {},
+  context?: ComfyFetchDiagnosticContext,
 ): Promise<Response> {
   const auth = getComfyUIAuthHeaders();
-  if (Object.keys(auth).length === 0) return fetch(input, init);
-  const headers = new Headers(init.headers);
-  for (const [name, value] of Object.entries(auth)) {
-    if (!headers.has(name)) headers.set(name, value);
+  // A CEILING, not a policy. Callers that know their own budget pass a signal
+  // and it always wins — this only covers the ones that passed none, which
+  // otherwise wait forever.
+  const signal = init.signal ?? defaultComfyTimeoutSignal();
+  // Keep a pristine body for a Request input. A failed network fetch may have
+  // disturbed the original Request body before the refusal is surfaced, while
+  // ECONNREFUSED still permits the one safe retry.
+  let retrySource: Request | undefined;
+  if (input instanceof Request) {
+    try {
+      retrySource = input.clone();
+    } catch {
+      // A caller may pass an already-disturbed Request. The literal attempt
+      // still runs; without a replayable body there is no safe retry.
+    }
   }
-  return fetch(input, { ...init, headers });
+  let firstInit: RequestInit = { ...init, signal };
+  let retryInit: RequestInit = firstInit;
+  if (typeof ReadableStream !== "undefined" && init.body instanceof ReadableStream) {
+    const [firstBody, retryBody] = init.body.tee();
+    firstInit = { ...firstInit, body: firstBody };
+    retryInit = { ...firstInit, body: retryBody };
+  }
+  const request = (
+    target: string | URL | Request,
+    requestInit: RequestInit,
+  ): Promise<Response> => {
+    if (Object.keys(auth).length === 0) return fetch(target, requestInit);
+    const headers = new Headers(requestInit.headers);
+    for (const [name, value] of Object.entries(auth)) {
+      if (!headers.has(name)) headers.set(name, value);
+    }
+    return fetch(target, { ...requestInit, headers });
+  };
+  try {
+    return await request(input, firstInit);
+  } catch (err) {
+    // Preserve the configured literal as the primary target. Only a refused
+    // exact IPv4 loopback connection is safe to retry: ECONNREFUSED proves no
+    // request reached the server, while reset/timeout errors can follow a
+    // delivered mutation. `localhost` lets Node select an IPv6-only listener
+    // without changing the configured target or any identity comparison.
+    const inputUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const retryUrl =
+      typeof input === "string"
+        ? formatComfyUIUrl(input)
+        : input instanceof URL
+          ? new URL(formatComfyUIUrl(input.href))
+          : input instanceof Request
+            ? formatComfyUIUrl(input.url)
+            : undefined;
+    const retryInput =
+      input instanceof Request && retryUrl && retrySource
+        ? new Request(retryUrl, retrySource)
+        : retryUrl;
+    if (
+      retryInput &&
+      String(retryUrl) !== inputUrl &&
+      isBareFetchFailure(err) &&
+      describeFetchFailure(err).code === "ECONNREFUSED"
+    ) {
+      try {
+        return await request(retryInput, retryInit);
+      } catch (retryError) {
+        err = retryError;
+      }
+    }
+    // Our own ceiling firing is not the same event as a caller's abort, and it
+    // must not be reported as one. Only rewrite when WE supplied the signal.
+    if (init.signal === undefined && isTimeoutAbort(err)) {
+      throw describeComfyTimeout(input, init);
+    }
+    // ONLY the opaque undici failure is rewritten. An AbortError, a timeout with
+    // its own message, or anything else already says what happened, and
+    // replacing that text would be a downgrade.
+    if (!isBareFetchFailure(err)) throw err;
+    throw describeComfyFetchFailure(err, targetOf(input), methodOf(input, init), context);
+  }
 }

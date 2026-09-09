@@ -1,9 +1,15 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import {
+  MANAGED_SECRET_KEYS_ENV,
+  loadEnvFileIntoProcess,
+  resetEnvFileProvenanceForTests,
+} from "../../env-file.js";
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildComfyuiMcpEnv,
+  buildAgentSpawnEnv,
   comfyuiSecretKeys,
   isAllowedComfyuiSecretKey,
   loadComfyuiSecretEnv,
@@ -24,6 +30,7 @@ const ALL_KEYS = [...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_E
 let dir: string;
 let envPath: string;
 let savedEnv: Record<string, string | undefined>;
+let savedManagedKeys: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cmcp-secrets-"));
@@ -34,10 +41,28 @@ beforeEach(() => {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
+  // The FILE-DERIVED marker leaks between tests, and it is load-bearing: a key
+  // marked file-derived is deliberately revoked when the file no longer carries
+  // it. A previous test that saved a secret therefore left the next one starting
+  // with that key "owned by a file" that its own fresh temp dir does not have —
+  // so a shell-provided value was silently dropped, for a reason belonging to a
+  // different test. Each test gets a clean store AND a clean provenance record.
+  savedManagedKeys = process.env[MANAGED_SECRET_KEYS_ENV];
+  delete process.env[MANAGED_SECRET_KEYS_ENV];
+  // …and the IN-MEMORY half of the same record, which is the one that actually
+  // decides. `resetEnvFileProvenanceForTests` exists for exactly this and was
+  // simply not being called here: a test that saved a secret left the module
+  // believing that key belongs to a file, and the NEXT test then started with a
+  // fresh temp store that has no such file. Before, an absent file read as
+  // "unknown" and the stale belief was harmless; now that an absent file
+  // correctly revokes a file-derived value, the leak became visible.
+  resetEnvFileProvenanceForTests();
 });
 
 afterEach(() => {
   delete process.env.COMFYUI_MCP_ENV_FILE;
+  if (savedManagedKeys === undefined) delete process.env[MANAGED_SECRET_KEYS_ENV];
+  else process.env[MANAGED_SECRET_KEYS_ENV] = savedManagedKeys;
   for (const k of ALL_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
@@ -93,6 +118,65 @@ describe("panel-secrets (canonical .env store)", () => {
     expect((base as Record<string, string>).CIVITAI_API_TOKEN).toBeUndefined();
   });
 
+  it("forwards COMFYUI_CODE_PATH to every panel-spawned comfyui MCP child", () => {
+    const previous = process.env.COMFYUI_CODE_PATH;
+    try {
+      process.env.COMFYUI_CODE_PATH = "/runtime/ComfyUI-code";
+      expect(buildComfyuiMcpEnv({ COMFYUI_URL: "http://127.0.0.1:8188" }))
+        .toMatchObject({ COMFYUI_CODE_PATH: "/runtime/ComfyUI-code" });
+      expect(buildComfyuiMcpEnv({ COMFYUI_CODE_PATH: "/call-scoped/code" }))
+        .toMatchObject({ COMFYUI_CODE_PATH: "/call-scoped/code" });
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_CODE_PATH;
+      else process.env.COMFYUI_CODE_PATH = previous;
+    }
+  });
+
+  it("forwards a cache path added to the canonical env into the panel-spawned child", () => {
+    const previous = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    try {
+      delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      writeFileSync(envPath, "COMFYUI_DOWNLOAD_CACHE_DIR=E:\\comfy-cache\\models\n");
+
+      const env = buildComfyuiMcpEnv({
+        COMFYUI_URL: "http://127.0.0.1:8188",
+        COMFYUI_MCP_PROGRESS_DIR: "/tmp/p",
+      });
+
+      expect(env.COMFYUI_DOWNLOAD_CACHE_DIR).toBe("E:\\comfy-cache\\models");
+      expect(env.COMFYUI_MCP_ENV_FILE).toBe(envPath);
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = previous;
+    }
+  });
+
+  it("uses a rotated canonical cache path instead of the value loaded at orchestrator boot", () => {
+    const previous = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    try {
+      writeFileSync(envPath, "COMFYUI_DOWNLOAD_CACHE_DIR=E:\\old-cache\n");
+      expect(loadEnvFileIntoProcess()).toContain("COMFYUI_DOWNLOAD_CACHE_DIR");
+
+      writeFileSync(envPath, "COMFYUI_DOWNLOAD_CACHE_DIR=E:\\new-cache\n");
+
+      expect(buildComfyuiMcpEnv({}).COMFYUI_DOWNLOAD_CACHE_DIR).toBe("E:\\new-cache");
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = previous;
+    }
+  });
+
+  it("forwards even an empty action policy so the child refuses it instead of opening up", () => {
+    const previous = process.env.COMFYUI_MCP_TOOL_ACTION_ALLOW;
+    try {
+      process.env.COMFYUI_MCP_TOOL_ACTION_ALLOW = "";
+      expect(buildComfyuiMcpEnv({}).COMFYUI_MCP_TOOL_ACTION_ALLOW).toBe("");
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_MCP_TOOL_ACTION_ALLOW;
+      else process.env.COMFYUI_MCP_TOOL_ACTION_ALLOW = previous;
+    }
+  });
+
   it("lets a saved secret OVERRIDE a base env default of the same key", () => {
     const base = { CIVITAI_API_TOKEN: "from-process-env" };
     setComfyuiSecret("CIVITAI_API_TOKEN", "from-panel");
@@ -115,13 +199,64 @@ describe("panel-secrets (canonical .env store)", () => {
     expect(cb).toHaveBeenCalledTimes(1);
   });
 
+  // #164 — the "token is now active, retry the action" nudge must be gated on an
+  // OUTSTANDING panel_request_secret. The correlation rides the change event as
+  // `requested`: only an agent-driven request (panel_request_secret) sets it; a
+  // Settings-panel slot save, a background reload, or a revoke leaves it false.
+  describe("change event carries request correlation (#164)", () => {
+    it("marks a Settings-style save (no opts) as NOT requested → no retry nudge", () => {
+      const cb = vi.fn();
+      const off = onComfyuiSecretsChanged(cb);
+      setComfyuiSecret("CIVITAI_API_TOKEN", "tok"); // Settings slot path omits opts
+      off();
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false }));
+    });
+
+    it("marks a panel_request_secret save (requested:true) as requested → nudge eligible", () => {
+      const cb = vi.fn();
+      const off = onComfyuiSecretsChanged(cb);
+      setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true });
+      off();
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: true }));
+    });
+
+    it("carries the requesting tabId so ONLY that tab is nudged (never a broadcast)", () => {
+      const cb = vi.fn();
+      const off = onComfyuiSecretsChanged(cb);
+      setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true, tabId: "tab-xyz" });
+      off();
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: true, tabId: "tab-xyz" }));
+    });
+
+    it("drops tabId for a NON-requested change (a stray tabId can't smuggle a nudge)", () => {
+      const cb = vi.fn();
+      const off = onComfyuiSecretsChanged(cb);
+      // Not requested, but a tabId is present on the raw event — must be ignored.
+      setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { tabId: "tab-xyz" });
+      off();
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false, tabId: undefined }));
+    });
+
+    it("marks a REVOKE as NOT requested → a removed token never nudges 'retry'", () => {
+      setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true });
+      const cb = vi.fn();
+      const off = onComfyuiSecretsChanged(cb);
+      expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
+      off();
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false }));
+    });
+  });
+
   it("removes a secret from .env + process.env and reports absence", () => {
     setComfyuiSecret("CIVITAI_API_TOKEN", "tok");
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
     expect(loadComfyuiSecretEnv()).toEqual({});
     expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
     expect(readFileSync(envPath, "utf-8")).not.toMatch(/CIVITAI_API_TOKEN/);
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(false);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(false);
   });
 
   it("rejects an invalid env var name without writing", () => {
@@ -134,8 +269,45 @@ describe("panel-secrets (canonical .env store)", () => {
       expect(isAllowedComfyuiSecretKey("CIVITAI_API_TOKEN")).toBe(true);
       expect(isAllowedComfyuiSecretKey("HUGGINGFACE_TOKEN")).toBe(true);
       expect(isAllowedComfyuiSecretKey("HF_TOKEN")).toBe(true);
+      for (const key of [
+        "COMFYUI_AUTH_TOKEN",
+        "COMFYUI_AUTH_HEADER",
+        "COMFYUI_AUTH_SCHEME",
+        "CF_ACCESS_CLIENT_ID",
+        "CF_ACCESS_CLIENT_SECRET",
+      ]) {
+        expect(isAllowedComfyuiSecretKey(key)).toBe(true);
+      }
       expect(isAllowedComfyuiSecretKey("NODE_OPTIONS")).toBe(false);
       expect(isAllowedComfyuiSecretKey("PATH")).toBe(false);
+    });
+
+    it("routes gateway credentials to the tool child, never an agent provider", () => {
+      setComfyuiSecret("COMFYUI_AUTH_TOKEN", "proxy-token");
+      setComfyuiSecret("COMFYUI_AUTH_HEADER", "X-Proxy-Token");
+      setComfyuiSecret("COMFYUI_AUTH_SCHEME", "Token");
+      setComfyuiSecret("CF_ACCESS_CLIENT_ID", "access-id");
+      setComfyuiSecret("CF_ACCESS_CLIENT_SECRET", "access-secret");
+
+      const toolEnv = buildComfyuiMcpEnv({});
+      expect(toolEnv).toMatchObject({
+        COMFYUI_AUTH_TOKEN: "proxy-token",
+        COMFYUI_AUTH_HEADER: "X-Proxy-Token",
+        COMFYUI_AUTH_SCHEME: "Token",
+        CF_ACCESS_CLIENT_ID: "access-id",
+        CF_ACCESS_CLIENT_SECRET: "access-secret",
+      });
+
+      const agentEnv = buildAgentSpawnEnv();
+      for (const key of [
+        "COMFYUI_AUTH_TOKEN",
+        "COMFYUI_AUTH_HEADER",
+        "COMFYUI_AUTH_SCHEME",
+        "CF_ACCESS_CLIENT_ID",
+        "CF_ACCESS_CLIENT_SECRET",
+      ]) {
+        expect(agentEnv[key]).toBeUndefined();
+      }
     });
 
     it("REJECTS a non-allowlisted key on save and writes nothing", () => {
@@ -205,7 +377,7 @@ describe("panel-secrets (canonical .env store)", () => {
       process.env.CIVITAI_API_TOKEN = "civ-legacy";
 
       const { removeEnvSecret, migrateSecretsToEnv } = await import("../../services/panel-secrets.js");
-      expect(removeEnvSecret("CIVITAI_API_TOKEN")).toBe(true);
+      expect(removeEnvSecret("CIVITAI_API_TOKEN").changed).toBe(true);
       // Gone from .env AND from the JSON map.
       expect(readFileSync(envPath, "utf-8")).not.toMatch(/CIVITAI_API_TOKEN/);
       const json = JSON.parse(readFileSync(jsonPath, "utf-8"));

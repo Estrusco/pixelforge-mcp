@@ -1,14 +1,15 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { config, getComfyUIBaseUrl } from "../config.js";
+import { getComfyUIBaseUrl } from "../config.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { restartComfyUI } from "./process-control.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
 // ---------------------------------------------------------------------------
-// verify_custom_node — the "test" step of the custom-node author loop.
+// node_pack action:"verify" — the "test" step of the custom-node author loop.
 //
 // Restarts the local ComfyUI (reusing the bounded readiness wait), then checks
 // that the pack's node class_types actually registered in /object_info. This
@@ -26,6 +27,14 @@ export interface VerifyOptions {
   classTypes?: string[];
   /** Restart ComfyUI before checking (default true). Set false to check the live server as-is. */
   restart?: boolean;
+  /**
+   * The caller's ASYNC, live-aware scan root (resolveCustomNodesScanBaseLive,
+   * #1715/#2031). AUTHORITATIVE when given: it already encodes the full
+   * precedence — the running runtime's --base-directory when set, else the live
+   * main.py checkout on a split install that has no --base-directory — so
+   * verify reads the pack from the same root scaffold wrote to.
+   */
+  resolvedBase?: string;
 }
 
 export interface VerifyResult {
@@ -60,7 +69,7 @@ export interface VerifyDeps {
   inferPackClassTypes?: (packName: string) => Promise<string[]>;
 }
 
-const defaultDeps: VerifyDeps = {
+const makeDefaultDeps = (resolvedBase?: string): VerifyDeps => ({
   restart: async () => {
     const result = await restartComfyUI();
     return { ready: result.readiness?.ready ?? false, message: result.message };
@@ -84,8 +93,9 @@ const defaultDeps: VerifyDeps = {
     return Object.keys(data as Record<string, unknown>);
   },
   readPackInit: (packName: string) => {
-    if (!config.comfyuiPath) return undefined;
-    const initPath = join(config.comfyuiPath, "custom_nodes", packName, "__init__.py");
+    const base = resolvedBase ?? resolveEffectiveComfyUIBase();
+    if (!base) return undefined;
+    const initPath = join(base, "custom_nodes", packName, "__init__.py");
     if (!existsSync(initPath)) return undefined;
     try {
       return readFileSync(initPath, "utf-8");
@@ -94,8 +104,9 @@ const defaultDeps: VerifyDeps = {
     }
   },
   readPackSources: (packName: string) => {
-    if (!config.comfyuiPath) return [];
-    const packDir = join(config.comfyuiPath, "custom_nodes", packName);
+    const base = resolvedBase ?? resolveEffectiveComfyUIBase();
+    if (!base) return [];
+    const packDir = join(base, "custom_nodes", packName);
     if (!existsSync(packDir)) return [];
     const sources: string[] = [];
     const MAX_FILES = 200;
@@ -144,7 +155,7 @@ const defaultDeps: VerifyDeps = {
     }
     return classTypesForPack(data as Record<string, unknown>, packName);
   },
-};
+});
 
 /**
  * Given a parsed /object_info map, return the class_types whose `python_module`
@@ -202,12 +213,20 @@ export function parseClassMappingKeys(initPy: string): string[] {
 
 export async function verifyCustomNode(
   options: VerifyOptions,
-  deps: VerifyDeps = defaultDeps,
+  deps: VerifyDeps = makeDefaultDeps(options.resolvedBase),
 ): Promise<VerifyResult> {
-  if (!config.comfyuiPath) {
+  // Classify LOCAL vs remote by the EFFECTIVE local base (COMFYUI_PATH, else the
+  // saved default workspace when not targeting a remote ComfyUI), not by
+  // COMFYUI_PATH alone — otherwise a local instance backed only by a default
+  // workspace was wrongly rejected as remote when COMFYUI_PATH was unset
+  // (#386/#409). Only a genuinely remote target (or no local base at all) is
+  // unsupported here. A threaded resolvedBase (#1715) IS the local-base answer
+  // — the live-aware resolver already ran it through the same gates.
+  if (!(options.resolvedBase ?? resolveEffectiveComfyUIBase())) {
     throw new ProcessControlError(
-      "verify_custom_node is local-only: it restarts and inspects a local ComfyUI " +
-        "install and needs COMFYUI_PATH. It cannot verify a remote --comfyui-url target.",
+      'node_pack (action:"verify") is local-only: it restarts and inspects a local ComfyUI ' +
+        "install. It cannot verify a remote --comfyui-url target. Set the COMFYUI_PATH " +
+        "environment variable, or save a default workspace with workspace (action:\"set_default\").",
     );
   }
 

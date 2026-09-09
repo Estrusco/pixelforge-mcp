@@ -5,7 +5,7 @@ import { searchHuggingFaceModels } from "./model-resolver.js";
 // Missing-model resolution: figure out which model files a workflow wants but
 // this ComfyUI doesn't have, then find installable candidates for them.
 //
-// WHY THIS EXISTS: `extract_workflow_dependencies` / `install_workflow_dependencies`
+// WHY THIS EXISTS: `list_packs` action:"extract_deps" / action:"install_deps"
 // resolve the custom NODE PACKS a workflow needs — they never touch the missing
 // MODEL side of the same problem. So "open this Template and make it runnable"
 // took two manual hops: the agent had to infer which checkpoint/VAE/LoRA was
@@ -47,6 +47,18 @@ const DIR_BY_WIDGET: Record<string, string> = {
   hypernetwork_name: "hypernetworks",
   ipadapter_file: "ipadapter",
 };
+
+/** DonutLoRAStack / LoRA Stacker V2 / similar: `lora_name_1`, `lora_name_2`, … */
+const NUMBERED_LORA_WIDGET = /^lora_name_\d+$/i;
+
+export function directoryForWidget(widget: string, classType: string): string | undefined {
+  // CLIPVisionLoader shares `clip_name` with text-encoder loaders, but its
+  // object-info combo is sourced from ComfyUI's `clip_vision` directory.
+  if (classType === "CLIPVisionLoader" && widget === "clip_name") return "clip_vision";
+  if (Object.prototype.hasOwnProperty.call(DIR_BY_WIDGET, widget)) return DIR_BY_WIDGET[widget];
+  if (NUMBERED_LORA_WIDGET.test(widget)) return DIR_BY_WIDGET.lora_name;
+  return undefined;
+}
 
 export type Precision = "fp32" | "fp16" | "bf16" | "fp8" | "gguf" | "nf4" | "unknown";
 
@@ -177,12 +189,33 @@ interface ApiNode {
   inputs?: Record<string, unknown>;
 }
 
-/** The combo option list for an input spec, or null when it isn't a combo. */
+/**
+ * The option list for an input spec, in either schema form, or null when this
+ * pass has no authority over it.
+ *
+ * ComfyUI serialises a V1 combo as `[[...allowed], {cfg}]` and a V3 one as
+ * `["COMBO", {options: [...], ...}]` (`add_to_dict_v1` writes
+ * `(io_type, as_dict())`). Both are the live inventory `panel_get_errors`
+ * already reads. The V1-only parser skipped every V3 custom-node combo — so
+ * DonutLoRAStack `lora_name_N` values absent from /object_info were reported
+ * as "No missing models" (#2068). A MULTISELECT combo is refused: its stored
+ * value is a selection of several options, so membership in the list is the
+ * wrong question.
+ */
 function comboOptions(spec: unknown): string[] | null {
   if (!Array.isArray(spec) || spec.length === 0) return null;
-  const first = spec[0];
-  if (!Array.isArray(first)) return null;
-  return first.filter((o): o is string => typeof o === "string");
+  const cfg =
+    spec[1] && typeof spec[1] === "object" && !Array.isArray(spec[1])
+      ? (spec[1] as Record<string, unknown>)
+      : null;
+  if (cfg?.multiselect) return null;
+  const type = spec[0];
+  if (Array.isArray(type)) return type.filter((v): v is string => typeof v === "string");
+  if (typeof type !== "string" || !/COMBO/i.test(type) || /DYNAMIC/i.test(type)) return null;
+  const opts = cfg?.options;
+  if (!Array.isArray(opts)) return null;
+  const strings = opts.filter((v): v is string => typeof v === "string");
+  return strings.length === opts.length ? strings : null;
 }
 
 /**
@@ -235,7 +268,7 @@ export function findMissingModels(
         node_type: classType,
         widget,
         name: value,
-        directory: DIR_BY_WIDGET[widget],
+        directory: directoryForWidget(widget, classType),
       });
     }
   }
@@ -289,27 +322,47 @@ const CIVITAI_TYPE_BY_DIR: Record<string, string[]> = {
 
 const MB = 1024 * 1024;
 
+export interface CandidateLookup {
+  candidates: ModelCandidate[];
+  /**
+   * Providers whose LOOKUP FAILED — distinct from "answered with nothing".
+   * An empty `candidates` with failures here is "could not look", and saying
+   * "no candidates found" for it is the confident-wrong-negative fold.
+   */
+  failedProviders: string[];
+}
+
 /**
  * Find installable candidates for ONE missing model, annotated with precision,
- * size and whether it fits this GPU, best first.
+ * size and whether it fits this GPU, best first — AND which providers failed
+ * to answer at all.
  *
  * Deliberately does NOT auto-pick: the same filename ships across quants and
  * base models, so we return a ranked, annotated list and let the caller decide.
  * Network failures degrade to fewer candidates rather than failing the lookup —
- * a partial answer beats none when one provider is down.
+ * a partial answer beats none when one provider is down — but the failures are
+ * REPORTED, so an empty list is never read as "nothing exists" when the search
+ * itself failed.
  */
-export async function resolveCandidates(
+export async function resolveCandidatesDetailed(
   missing: MissingModel,
   deps: ResolveDeps,
   opts: { limit?: number } = {},
-): Promise<ModelCandidate[]> {
+): Promise<CandidateLookup> {
   const limit = opts.limit ?? 8;
   const query = fileStem(missing.name);
+  // unknown-ok: undefined means "VRAM unknown" and is carried as such — it never
+  // becomes a zero that would filter every candidate out. Compare the CivitAI call
+  // immediately below, which records its failure in failedProviders for the same reason.
   const vram = await deps.vramBytes().catch(() => undefined);
   const out: ModelCandidate[] = [];
+  const failedProviders: string[] = [];
 
   const civitaiTypes = missing.directory ? CIVITAI_TYPE_BY_DIR[missing.directory] : undefined;
-  const hits = await deps.searchCivitai(query, civitaiTypes).catch(() => []);
+  const hits = await deps.searchCivitai(query, civitaiTypes).catch(() => {
+    failedProviders.push("CivitAI");
+    return [];
+  });
   for (const h of hits) {
     const size = typeof h.size_mb === "number" ? Math.round(h.size_mb * MB) : undefined;
     const p = classifyPrecision(h.name);
@@ -331,9 +384,15 @@ export async function resolveCandidates(
   // routinely ranked below the official one, and on a constrained GPU it is the
   // only candidate that actually helps — slicing too tightly drops exactly the
   // answer the user needs.
-  const repos = await deps.searchHf(query).catch(() => []);
+  const repos = await deps.searchHf(query).catch(() => {
+    failedProviders.push("HuggingFace");
+    return [];
+  });
   for (const repo of repos.slice(0, 6)) {
-    const files = await deps.hfRepoFiles(repo.id).catch(() => []);
+    const files = await deps.hfRepoFiles(repo.id).catch(() => {
+      failedProviders.push(`HuggingFace repo ${repo.id}`);
+      return [];
+    });
     for (const f of files) {
       const p = classifyPrecision(f.filename);
       out.push({
@@ -349,7 +408,19 @@ export async function resolveCandidates(
     }
   }
 
-  return rankCandidates(missing.name, dedupeCandidates(out)).slice(0, limit);
+  return {
+    candidates: rankCandidates(missing.name, dedupeCandidates(out)).slice(0, limit),
+    failedProviders,
+  };
+}
+
+/** The candidate list alone — see `resolveCandidatesDetailed` for the contract. */
+export async function resolveCandidates(
+  missing: MissingModel,
+  deps: ResolveDeps,
+  opts: { limit?: number } = {},
+): Promise<ModelCandidate[]> {
+  return (await resolveCandidatesDetailed(missing, deps, opts)).candidates;
 }
 
 /**

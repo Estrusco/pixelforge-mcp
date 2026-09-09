@@ -15,7 +15,6 @@ if not exist "%PY%" set "PY=python"
 echo using python: %PY%
 
 echo -------- custom nodes --------
-call :clone "ComfyUI-Manager" "https://github.com/ltdrdata/ComfyUI-Manager.git"
 call :clone "ComfyUI-WanVideoWrapper" "https://github.com/kijai/ComfyUI-WanVideoWrapper"
 call :clone "ComfyUI-WanAnimatePreprocess" "https://github.com/kijai/ComfyUI-WanAnimatePreprocess"
 call :clone "ComfyUI-KJNodes" "https://github.com/kijai/ComfyUI-KJNodes"
@@ -38,6 +37,7 @@ call :grab "models\detection\vitpose_h_wholebody_data.bin" "https://huggingface.
 call :grab "models\detection\yolov10m.onnx" "https://huggingface.co/onnx-community/yolov10m/resolve/main/onnx/model.onnx"
 call :grab "models\insightface\inswapper_128.onnx" "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx"
 call :grab "models\facerestore_models\GPEN-BFR-512.onnx" "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/facerestore_models/GPEN-BFR-512.onnx"
+call :grab "models\checkpoints\sam3.1_multiplex_fp16.safetensors" "https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam3.1_multiplex_fp16.safetensors"
 
 echo DONE. Restart ComfyUI, then load workflow.json.
 pause

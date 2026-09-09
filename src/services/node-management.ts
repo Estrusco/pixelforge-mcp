@@ -1,13 +1,68 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
-import { config, getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch } from "../comfyui/fetch.js";
+import {
+  config,
+  getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
+  isRemoteMode,
+} from "../config.js";
+import {
+  comfyuiFetch,
+  describeComfyBodyTimeout,
+  raceAbort,
+} from "../comfyui/fetch.js";
+import { resetObjectInfoCache } from "../comfyui/client.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
-import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
+import { parsePyproject } from "./node-authoring.js";
+import { getNodePackDetails } from "./registry-client.js";
+import {
+  type ManagerApi,
+  cacheManagerApi,
+  dialectRecheckSuppressed,
+  getCachedManagerApi,
+  managerApiCacheStamp,
+  managerApiEpoch,
+  resetManagerApiCache,
+  setManagerApiCacheForTests,
+  suppressDialectRecheck,
+} from "./manager-api-cache.js";
+export type { ManagerApi } from "./manager-api-cache.js";
+import {
+  type LocalWriteTargetMismatch,
+  detectLocalWriteTargetMismatch,
+  resolveEffectiveComfyUIBase,
+  resolveEffectiveComfyUICodeBase,
+  resolveCustomNodesScanBaseLiveStrict,
+  resolveInstallInterpreter,
+} from "./workspace-env.js";
+import {
+  assertComfyCliOk,
+  getComfyCliVersion,
+  isComfyCliUsable,
+  isSupportedComfyCliVersion,
+  resolveComfyCliExecutable,
+  runComfyCliSync,
+} from "./comfy-cli.js";
+import { withPanelMutationLock, withPanelPinGuard } from "./panel-pin-guard.js";
+import {
+  ambiguousBareNameRefusal,
+  ambiguousBareNameWarning,
+  bareNameAmbiguity,
+  isFromSourceSpec,
+  registryVersionAmbiguity,
+  registryVersionRefusal,
+  rekeyedRegistryVersionAmbiguity,
+  rekeyedRegistryVersionRefusal,
+  rekeyedRepoAmbiguity,
+  rekeyedRepoRefusal,
+  rekeyedRepoWarning,
+} from "./manager-bare-name-collisions.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { managerBodyClause } from "./manager-error-body.js";
+import { MANAGER_VERSION_ROUTES, parseManagerMajor } from "./manager-version.js";
 
 // ---------------------------------------------------------------------------
 // Custom-node management — ports `comfy-cli node install|update|reinstall|fix|
@@ -23,9 +78,10 @@ import { logger } from "../utils/logger.js";
 //          then poll /v2/manager/queue/status until the queue drains.
 //        • RELEASED Manager 3.x (`main`, the registry default): same queue
 //          engine under /manager/queue/* with PER-OPERATION routes
-//          (install/uninstall/update/fix/disable/install_model/update_all)
+//          (install/uninstall/update/fix/disable/install_model/update-all)
 //          and different body shapes — see legacyTaskRequest().
-//   2. Fall back to the cm-cli.py subprocess (against config.comfyuiPath) for
+//   2. Fall back to the cm-cli.py subprocess (against the resolved code
+//      workspace) for
 //      anything the HTTP API can't do, or when the user forces it (local
 //      installs only — cm-cli needs the filesystem).
 //
@@ -64,6 +120,17 @@ export class NodeManagementError extends ComfyUIError {
   }
 }
 
+class GitRefProbeError extends NodeManagementError {
+  constructor(operation: string, cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(`Git ref probe failed during ${operation}: ${message}`, {
+      kind: "git-ref-probe",
+      operation,
+    });
+    this.name = "GitRefProbeError";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -74,23 +141,54 @@ export type ManagerMode = "remote" | "local" | "cache";
 export interface InstalledNode {
   /** Custom-node module/folder name (the key Manager uses internally). */
   module: string;
+  /**
+   * The module/folder KEY the payload actually stated, when it stated one.
+   *
+   * `module` above is a DISPLAY-or-identity blend: the array shape prefers the
+   * entry's human `title`, so a value there may be prose. Anything that reads a
+   * module as a PATH — the #2714 on-disk corroboration of a git install — must
+   * use this field instead, and treat `undefined` as "the payload named no
+   * folder key", not as a name to go looking for.
+   */
+  moduleKey?: string;
   /** ComfyUI Node Registry id, if the pack is CNR-registered. */
   cnrId?: string;
   /** GitHub/aux id for git-based packs. */
   auxId?: string;
   /** Installed version (semver, commit hash, "nightly", or "unknown"). */
   version?: string;
-  /** Whether the pack is currently enabled. */
-  enabled: boolean;
+  /**
+   * Whether the pack is currently enabled. UNDEFINED when Manager reported no
+   * enabled/is_disabled flag at all — an unreported state is unknown, NOT
+   * enabled: collapsing it to a definite value lets a verification claim a
+   * state nobody observed (codex gate on #775).
+   */
+  enabled?: boolean;
 }
 
 export interface NodeOpResult {
   /** Which mechanism handled the request. */
-  mechanism: "manager-http" | "comfy-cli" | "git-clone";
+  mechanism: "manager-http" | "comfy-cli" | "filesystem" | "git-clone";
   /** Human-readable summary. */
   message: string;
   /** Raw queue status (HTTP path) or subprocess output (cm-cli path). */
   details?: unknown;
+  /**
+   * The ComfyUI-Manager base the op targeted (manager-http path), captured at
+   * invocation — post-op verification (e.g. the #724 dialect probe) must aim
+   * at the SAME server even if the global target was retargeted in between.
+   */
+  managerBase?: string;
+  /**
+   * #1999 — the `ui_id` the Manager task was ACTUALLY enqueued under, when this
+   * result came from the unified task queue. It is the ONLY key that correlates
+   * a drained queue back to what our specific task did: Manager v4 keeps the
+   * per-task record at `/v2/manager/queue/history?ui_id=…` while the queue-wide
+   * counts say nothing about it (see readQueueCounts / fetchManagerTaskHistoryEntry).
+   * Absent on the cm-cli and git-clone mechanisms, and on paths that never
+   * enqueued a single correlatable task.
+   */
+  taskUiId?: string;
 }
 
 export interface ParsedGitUrl {
@@ -108,7 +206,7 @@ interface QueueStatus {
 }
 
 /** OperationType values accepted by /v2/manager/queue/task. */
-type ManagerTaskKind =
+export type ManagerTaskKind =
   | "install"
   | "uninstall"
   | "update"
@@ -128,20 +226,151 @@ function managerBaseUrl(): string {
 interface ManagerFetchOptions {
   method?: "GET" | "POST";
   body?: unknown;
+  /**
+   * Call-scoped ComfyUI target. Manager mutations capture this before their first
+   * await so a concurrent panel retarget cannot send a retry/drain to a different
+   * ComfyUI instance.
+   */
+  base?: string;
   /** Treat a non-2xx response as a soft failure (return undefined) instead of throwing. */
   soft?: boolean;
+  /** Preserve the status class that a soft capability probe observed. */
+  onSoftFailure?: (status: number | undefined) => void;
+  /** Preserve a transport failure separately from an empty/malformed 2xx body. */
+  onSoftTransportFailure?: () => void;
+  /** Observe the parsed body of a successful soft probe, including an empty body. */
+  onSoftResponse?: (body: unknown) => void;
+}
+
+/**
+ * #1089 — a Manager 403 already SAYS why; we were dropping it.
+ *
+ * ComfyUI-Manager gates privileged routes behind its own security level and
+ * answers with a machine-readable body (glob/manager_server.py):
+ *
+ *     def security_403_response(flag_token=None):
+ *         if not manager_migration.has_system_user_api():
+ *             return web.json_response({"error": "comfyui_outdated"}, status=403)
+ *         if flag_token is not None:
+ *             return web.json_response({"error": flag_token}, status=403)
+ *         return web.json_response({"error": "security_level"}, status=403)
+ *
+ * Three causes, three different remedies — and the caller saw only
+ * "ComfyUI-Manager API 403 Forbidden for /v2/manager/queue/update_all". The
+ * reporter had to ask which permission was even involved.
+ *
+ * install_comfyui (action:"update_all") specifically needs is_allowed_security_level("middle"), which passes
+ * only for security_level in weak / normal / normal-. That is a Manager SETTING,
+ * not a credential and not a consequence of being remote.
+ *
+ * NAMES NO REMEDY IT CANNOT SUPPORT. An unrecognised token is reported as the
+ * flag Manager named, with no invented advice — a specific install flag denied it
+ * and only that flag can say more. Guessing here would be the same defect as the
+ * status blaming the filename in a userdata 400.
+ */
+export function explainManagerForbidden(status: number, body: string): string {
+  if (status !== 403) return "";
+  let reason: string | null = null;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    const e = (parsed as { error?: unknown } | null)?.error;
+    if (typeof e === "string" && e.trim()) reason = e.trim();
+  } catch {
+    // Not JSON — Manager always sends JSON here, so an unparseable body means
+    // something else answered (a proxy, an auth gate). Say nothing rather than
+    // attribute a Manager reason to a response Manager may not have sent.
+    return "";
+  }
+  if (reason === "security_level") {
+    return (
+      " — ComfyUI-Manager REFUSED this on its own security level, not on credentials and not" +
+      " because the server is remote. Privileged Manager routes (its update-all, install and" +
+      " snapshot-removal endpoints)" +
+      " require Manager config security_level to be weak, normal or normal-; anything stricter" +
+      " refuses. Change it in ComfyUI-Manager settings (or its config.ini) and restart ComfyUI." +
+      " Loosening it decides who may reach that server, so it is a deliberate choice: the" +
+      " alternative is to run the update from a shell on the machine itself."
+    );
+  }
+  if (reason === "comfyui_outdated") {
+    return (
+      " — ComfyUI-Manager reports this ComfyUI as too OLD for the route: it predates the" +
+      " system-user API that Manager checks first, before it ever consults security_level." +
+      " Update ComfyUI itself; changing Manager settings will not clear this."
+    );
+  }
+  if (reason) {
+    return (
+      ` — ComfyUI-Manager denied this via a specific install flag it names as "${reason}".` +
+      " That flag, not the general security level, is what governs this route; consult" +
+      " ComfyUI-Manager for what it controls."
+    );
+  }
+  return "";
+}
+
+/**
+ * A Manager capability probe can be answered by the authentication layer in
+ * front of ComfyUI. Treating a 401/407 as an absent Manager loses the one fact
+ * the caller can act on, especially when the browser is authenticated but the
+ * MCP process is not carrying that browser session.
+ */
+export function explainManagerAuthenticationRequired(status: number): string {
+  if (status !== 401 && status !== 407) return "";
+  const gate = status === 407 ? "proxy authentication layer" : "ComfyUI or an authentication proxy";
+  const credentialHint =
+    "Configure the gateway credentials for this MCP process (COMFYUI_AUTH_TOKEN / " +
+    "COMFYUI_AUTH_HEADER, or the CF-Access client-id/client-secret pair); browser cookies " +
+    "and panel login sessions are not forwarded automatically.";
+  return (
+    ` — the ${gate} rejected the Manager probe with HTTP ${status}. This is an ` +
+    "authentication failure, not evidence that ComfyUI-Manager is missing. " +
+    credentialHint
+  );
+}
+
+/** Same 120s ceiling as fetch.ts, minted locally so tests that mock
+ *  `comfyui/fetch.js` without `defaultComfyTimeoutSignal` still load. */
+export function managerBodyTimeoutSeconds(): number {
+  const raw = Number(process.env.COMFYUI_MCP_HTTP_TIMEOUT_S);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120;
+}
+
+function managerBodyTimeoutSignal(): AbortSignal {
+  const seconds = managerBodyTimeoutSeconds();
+  return AbortSignal.timeout(Math.round(seconds * 1000));
+}
+
+function isManagerTimeoutAbort(err: unknown): boolean {
+  return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
 }
 
 async function managerFetch<T>(
   path: string,
   options: ManagerFetchOptions = {},
 ): Promise<T | undefined> {
-  const { method = "GET", body, soft = false } = options;
-  const url = `${managerBaseUrl()}${path}`;
+  const {
+    method = "GET",
+    body,
+    base = managerBaseUrl(),
+    soft = false,
+    onSoftFailure,
+    onSoftTransportFailure,
+    onSoftResponse,
+  } = options;
+  const url = `${base}${path}`;
   logger.debug("Manager API request", { url, method });
 
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  // Mint the ceiling HERE and race only the body reads. Do NOT pass it into
+  // comfyuiFetch: that helper rewrites a timeout into describeComfyTimeout only
+  // when init.signal is undefined, so threading a signal through would silently
+  // drop the transport-timeout diagnosis for every Manager call (#2773).
+  // Local AbortSignal — do not import defaultComfyTimeoutSignal from fetch.js;
+  // tests mock that module without this export.
+  const budget = managerBodyTimeoutSignal();
 
   let res: Response;
   try {
@@ -151,7 +380,11 @@ async function managerFetch<T>(
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (err) {
-    if (soft) return undefined;
+    if (soft) {
+      onSoftFailure?.(undefined);
+      onSoftTransportFailure?.();
+      return undefined;
+    }
     throw new NodeManagementError(
       `ComfyUI-Manager API unreachable at ${url}. Is ComfyUI running with ComfyUI-Manager installed? (${
         err instanceof Error ? err.message : String(err)
@@ -159,27 +392,131 @@ async function managerFetch<T>(
     );
   }
 
+  const readBody = (): Promise<string> => raceAbort(budget, () => res.text());
+
   if (!res.ok) {
-    if (soft) return undefined;
-    const text = await res.text().catch(() => "");
+    // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+    // HTTP status is reported either way, so an unreadable body costs detail in the
+    // text, never a wrong conclusion. Verified there is no branch on this value.
+    const text = await readBody().catch(() => "");
+    if (soft) {
+      onSoftFailure?.(res.status);
+      // A soft probe may ignore an absent route or a transient server error, but
+      // authentication is actionable evidence. Returning undefined here made
+      // detectManagerApi() fall through to its false "Manager is missing"
+      // conclusion when an authenticated reverse proxy answered 401 (#2085).
+      const auth = explainManagerAuthenticationRequired(res.status);
+      if (auth) {
+        throw new NodeManagementError(
+          `ComfyUI-Manager probe at ${url} was rejected` + auth + managerBodyClause(text),
+          { url, status: res.status, body: text },
+        );
+      }
+      return undefined;
+    }
     throw new NodeManagementError(
-      `ComfyUI-Manager API ${res.status} ${res.statusText} for ${path}`,
+      `ComfyUI-Manager API ${res.status} ${res.statusText} for ${path}` +
+        explainManagerForbidden(res.status, text) +
+        explainManagerAuthenticationRequired(res.status) +
+        // #1397 — SHOW THE BODY. It was already being captured into `details` below
+        // and only surfaced for 403, so a task-queue failure reported a bare status
+        // line while the serialized exception naming the cause sat one layer down.
+        // Bounded and truncation-marked; see manager-error-body.ts for why a
+        // passthrough is not an option here.
+        managerBodyClause(text),
       { url, status: res.status, body: text },
     );
   }
 
   // Some endpoints return empty bodies (e.g. queue ops). Parse defensively.
-  const raw = await res.text();
-  if (!raw) return undefined;
+  // Headers already arrived, so comfyuiFetch's describeComfyTimeout rewrite
+  // cannot run. A stall here used to escape as a bare TimeoutError (#2773).
+  let raw: string;
   try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return raw as unknown as T;
+    raw = await readBody();
+  } catch (err) {
+    if (isManagerTimeoutAbort(err)) {
+      if (soft) {
+        onSoftFailure?.(undefined);
+        onSoftTransportFailure?.();
+        return undefined;
+      }
+      const timeout = describeComfyBodyTimeout(url, method);
+      throw new NodeManagementError(timeout.message, {
+        url,
+        kind: "manager-body-timeout",
+      });
+    }
+    throw err;
   }
+  if (!raw.trim()) {
+    if (soft) onSoftResponse?.(undefined);
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = raw;
+  }
+  if (soft) onSoftResponse?.(parsed);
+  return parsed as T;
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The HTTP status carried on a NodeManagementError from a non-2xx Manager
+ *  response (managerFetch stores { url, status, body } in `details`). */
+function errorStatus(err: unknown): number | undefined {
+  if (err instanceof NodeManagementError && err.details && typeof err.details === "object") {
+    const s = (err.details as { status?: unknown }).status;
+    return typeof s === "number" ? s : undefined;
+  }
+  return undefined;
+}
+
+/** Does a fetched body look like ComfyUI's SPA catchall page (an HTML document)
+ *  rather than a real Manager response? The frontend catchall answers an
+ *  UNREGISTERED GET path with 200 + a page of HTML, so a 200 alone is not proof a
+ *  route exists. A genuine queue-control GET returns an empty (or small non-HTML)
+ *  body. */
+function looksLikeHtml(body: unknown): boolean {
+  return typeof body === "string" && /^\s*<(?:!doctype\b|html\b|!--)/i.test(body);
+}
+
+/**
+ * POST to a Manager queue CONTROL route (e.g. `${prefix}/start`), negotiating the
+ * HTTP method on a 405.
+ *
+ * Some legacy Manager 3.x builds register `/manager/queue/start` (and peers) as
+ * GET-only, so our POST comes back HTTP 405 Method Not Allowed (#551). On a
+ * Manager route a 405 means "wrong method for THIS endpoint on THIS build" — NOT
+ * "the Manager is unreachable" and NOT "this is a different Manager generation".
+ * So retry the SAME path once with GET before giving up; a GET-only build then
+ * starts its queue instead of failing the whole install.
+ *
+ * The GET retry is itself guarded against ComfyUI's frontend catchall: an
+ * UNREGISTERED start path 405s the POST but 200s the GET with a page of HTML, and
+ * that HTML must NOT be mistaken for a successful queue start (codex review). If
+ * the GET yields a catchall HTML page, the route genuinely doesn't accept our
+ * request — surface the original method error. Any non-405 error, or a
+ * non-2xx GET, propagates unchanged.
+ */
+async function managerQueueControl(path: string, base: string): Promise<void> {
+  try {
+    await managerFetch(path, { method: "POST", base });
+  } catch (err) {
+    if (errorStatus(err) === 405) {
+      // GET-only legacy build — negotiate the method rather than declare failure.
+      logger.debug("Manager queue control 405 on POST; retrying as GET", { path });
+      const body = await managerFetch<unknown>(path, { base }); // throws on a non-2xx GET
+      if (looksLikeHtml(body)) throw err; // catchall page — not a real GET-only start
+      return;
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,63 +542,600 @@ function sleep(ms: number): Promise<void> {
 //              an unregistered POST returns 405 (never 404) — the exact
 //              symptom of #235.
 //   "legacy"   the 3.x custom-node Manager: per-operation /manager/queue/*.
-type ManagerApi = "v2" | "v2-batch" | "legacy";
-
-let managerApiCache: { base: string; api: ManagerApi } | null = null;
+//
+// The detected dialect is cached by ./manager-api-cache.ts — URL-keyed AND
+// TTL-bounded, and invalidated by the restart lifecycle, so a ComfyUI restart at
+// the SAME URL (a Manager 3.x→4.x upgrade, dropping --enable-manager-legacy-ui)
+// can no longer pin the pre-restart dialect forever (#646).
 
 /** @internal — test hook so suites can pin/clear the detected generation. */
 export function resetManagerApiCacheForTests(api?: ManagerApi): void {
-  managerApiCache = api ? { base: managerBaseUrl(), api } : null;
+  setManagerApiCacheForTests(managerBaseUrl(), api);
+}
+
+/**
+ * Re-classify the cached Manager dialect to "v2-batch" after the unified
+ * /v2/manager/queue/task route answered 405 AND a batch retry then SUCCEEDED.
+ * The /v2 queue surface is real (it answered a status during detection), so the
+ * build is the bundled 3.x server under /v2 whose `is_legacy_manager_ui` probe
+ * didn't identify it (#464). Pin the corrected dialect so subsequent operations
+ * skip the dead task route. Caller must only invoke this once the batch enqueue
+ * has actually succeeded, so a transient/proxy 405 can't poison the cache.
+ *
+ * `startEpoch` is the invalidation epoch from before the operation began: if
+ * ComfyUI restarted while the enqueue was in flight, this conclusion describes
+ * the OLD server and must not be pinned over the fresh invalidation (#646).
+ */
+function demoteManagerApiToV2Batch(base: string, startEpoch: number): void {
+  // Guarded on the invalidation epoch ONLY (not the write counter): this verdict
+  // is backed by an enqueue that actually SUCCEEDED, so it legitimately
+  // supersedes a probe-derived classification that landed during the operation.
+  cacheManagerApi(base, "v2-batch", { epoch: startEpoch });
 }
 
 /** A real queue/status payload — guards detection against servers that answer
- *  200 with HTML/junk for unknown GETs (SPA fallbacks, index catchalls). */
+ *  200 with HTML/junk for unknown GETs (SPA fallbacks, index catchalls). Accepts
+ *  any of the queue-count fields the Manager reports: `total_count`/`is_processing`
+ *  (both generations) plus `pending_count` (the v4-style field, issue #555) — so a
+ *  v4 status shape is recognized authoritatively rather than falling through to a
+ *  legacy conclusion. HTML/SPA bodies carry none of these, so they still fail. */
 function looksLikeQueueStatus(s: unknown): boolean {
+  if (!s || typeof s !== "object") return false;
+  const q = s as QueueStatus;
   return (
-    !!s &&
-    typeof s === "object" &&
-    (typeof (s as QueueStatus).total_count === "number" ||
-      typeof (s as QueueStatus).is_processing === "boolean")
+    typeof q.total_count === "number" ||
+    typeof q.is_processing === "boolean" ||
+    typeof q.pending_count === "number" ||
+    typeof q.done_count === "number"
   );
 }
 
-async function detectManagerApi(): Promise<ManagerApi> {
-  const base = managerBaseUrl();
-  if (managerApiCache?.base === base) return managerApiCache.api;
-  const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", { soft: true });
-  if (looksLikeQueueStatus(v2)) {
-    // Same /v2 surface, two servers: the pip package in legacy-UI mode swaps
-    // in its bundled 3.x server (no task route). Both register
-    // GET /v2/manager/is_legacy_manager_ui and answer truthfully; a missing
-    // route (older pip) means the normal v4 server → task dialect.
-    const legacyUi = await managerFetch<{ is_legacy_manager_ui?: boolean }>(
-      "/v2/manager/is_legacy_manager_ui",
-      { soft: true },
+function managerQueueStatusKind(status: number): ManagerQueueStatusKind {
+  if (status === 404) return "not-found";
+  if (status === 405) return "method-not-allowed";
+  if (status >= 500) return "server-error";
+  return "http-error";
+}
+
+/**
+ * Some local ComfyUI Desktop builds leave the Manager queue/status endpoints
+ * registered as successful routes but return no body (or an explicit Manager
+ * unavailable error). That is different from the frontend HTML catchall: the
+ * former is a stable, positive answer that no queue/status surface is
+ * available, while the latter is merely an unrecognized route response.
+ */
+function looksLikeManagerUnavailableResponse(body: unknown): boolean {
+  if (looksLikeHtml(body)) return false;
+  const text =
+    typeof body === "string"
+      ? body
+      : body && typeof body === "object"
+        ? Object.values(body as Record<string, unknown>)
+            .filter((value): value is string => typeof value === "string")
+            .join(" ")
+        : "";
+  return /(?:comfyui[-\s]?manager|manager).{0,80}(?:not\s+reachable|unavailable|not\s+enabled|not\s+installed)/i.test(
+    text,
+  );
+}
+
+function managerQueueResponseKind(body: unknown): ManagerQueueStatusKind {
+  if (looksLikeQueueStatus(body)) return "queue";
+  // A successful JSON `null` is the same absence of queue evidence as a 200
+  // with no body. Treat both as empty so a warm cached dialect cannot poll
+  // until timeout and then invite a re-issue (#1129).
+  if (body === undefined || body === null) return "empty";
+  if (looksLikeManagerUnavailableResponse(body)) return "unavailable";
+  return "malformed";
+}
+
+/**
+ * What the two Manager queue/status routes established for ONE connected
+ * ComfyUI. A 404 on only one route is not enough: the other route may be the
+ * dialect this host serves, and a timeout/5xx/HTML response is not evidence
+ * that Manager is absent.
+ */
+export type ManagerQueueAvailability = "available" | "absent" | "unreadable";
+
+/** The evidence captured for each queue/status dialect during generation
+ * detection. Only `empty` / `unavailable` (and an already-shipped 404) can
+ * authorize the local git fallback; a timeout, HTML catchall, 405, 5xx, or
+ * authentication response is deliberately not absence evidence. */
+type ManagerQueueStatusKind =
+  | "queue"
+  | "not-found"
+  | "empty"
+  | "unavailable"
+  | "malformed"
+  | "method-not-allowed"
+  | "server-error"
+  | "http-error"
+  | "transport"
+  | "hard-error";
+
+/** Internal marker carried by the all-soft queue-generation probe. */
+const MANAGER_QUEUE_DETECTION_FAILURE = "manager-queue-detection";
+
+/**
+ * Probe both queue/status dialects while preserving their HTTP status. This is
+ * intentionally separate from `managerFetch(..., { soft: true })`, whose
+ * contract is to erase non-authentication failures for ordinary callers.
+ *
+ * `absent` is deliberately narrow: BOTH routes must answer HTTP 404 on the
+ * SAME captured base. Everything else that is not a recognizable queue payload
+ * is `unreadable`, including network errors, 5xx, auth/permission failures,
+ * malformed 2xx bodies, and a mixed 404/non-404 result.
+ */
+export async function probeManagerQueueAvailability(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueAvailability> {
+  const statuses: number[] = [];
+  for (const path of ["/v2/manager/queue/status", "/manager/queue/status"]) {
+    let res: Response;
+    try {
+      res = await comfyuiFetch(`${base}${path}`, { method: "GET" });
+    } catch {
+      return "unreadable";
+    }
+    statuses.push(res.status);
+    if (res.ok) {
+      let raw: string;
+      try {
+        raw = await res.text();
+      } catch {
+        return "unreadable";
+      }
+      if (!raw) continue;
+      try {
+        if (looksLikeQueueStatus(JSON.parse(raw))) return "available";
+      } catch {
+        // A malformed response is not absence; continue so the other dialect
+        // still gets a chance to establish a real queue surface.
+      }
+    }
+  }
+  return statuses.length === 2 && statuses.every((status) => status === 404)
+    ? "absent"
+    : "unreadable";
+}
+
+/**
+ * Repeat the queue/status probe with the response class preserved. The public
+ * availability helper intentionally exposes only its conservative three-state
+ * result; the install fallback needs the extra distinction between a stable
+ * empty/unavailable response and a timeout or malformed catchall.
+ */
+async function probeManagerQueueStatusKinds(
+  base: string,
+): Promise<ManagerQueueStatusKind[]> {
+  const kinds: ManagerQueueStatusKind[] = [];
+  for (const path of ["/v2/manager/queue/status", "/manager/queue/status"]) {
+    let kind: ManagerQueueStatusKind = "hard-error";
+    try {
+      await managerFetch<unknown>(path, {
+        base,
+        soft: true,
+        onSoftFailure: (status) => {
+          kind = status === undefined ? "transport" : managerQueueStatusKind(status);
+        },
+        onSoftTransportFailure: () => {
+          kind = "transport";
+        },
+        onSoftResponse: (body) => {
+          kind = managerQueueResponseKind(body);
+        },
+      });
+    } catch {
+      // Authentication and other hard probe failures must not become local
+      // clone authorization, even though managerFetch had already observed a
+      // status before throwing.
+      kind = "hard-error";
+    }
+    kinds.push(kind);
+  }
+  return kinds;
+}
+
+function isManagerUnavailableQueueKinds(kinds: unknown): kinds is ManagerQueueStatusKind[] {
+  if (!Array.isArray(kinds) || kinds.length !== 2) return false;
+  const allowed = new Set<ManagerQueueStatusKind>(["not-found", "empty", "unavailable"]);
+  if (!kinds.every((kind): kind is ManagerQueueStatusKind => allowed.has(kind as ManagerQueueStatusKind))) {
+    return false;
+  }
+  // Both 404s have their own already-shipped, stronger absence contract. This
+  // branch is for the new unavailable surface and therefore needs at least one
+  // positive empty/unavailable response rather than re-labelling 404 absence.
+  return kinds.some((kind) => kind === "empty" || kind === "unavailable");
+}
+
+async function probeManagerMajor(base: string): Promise<number | undefined> {
+  // v4's /v2/manager/version is the strongest signal; check it first.
+  const v4 = parseManagerMajor(
+    await managerFetch<string>("/v2/manager/version", { base, soft: true }),
+  );
+  if (v4 !== undefined) return v4;
+  return parseManagerMajor(
+    await managerFetch<string>("/manager/version", { base, soft: true }),
+  );
+}
+
+/**
+ * What the version routes established, for the queue-detection FAILURE branch.
+ *
+ *   • `version` — a route answered a parseable version string, so ComfyUI-Manager
+ *     is demonstrably serving HTTP on this base.
+ *   • `refused` — a route answered an AUTHENTICATION status. `managerFetch` throws
+ *     on 401/407 even in soft mode, deliberately (#2085), and that is the whole
+ *     point: a credential rejection tells us nothing about whether Manager is
+ *     installed, so it must not be spent as absence evidence — which is exactly
+ *     what a bare `catch → undefined` here would do (codex gate, #2754).
+ *   • `absent` — BOTH routes answered HTTP 404. Deliberately narrow, and narrow for
+ *     the same reason `probeManagerQueueAvailability` is: only a 404 is a server
+ *     saying "no such route".
+ *   • `unreadable` — anything else. A 5xx, a 403, a proxy error page, a timeout or
+ *     an HTML catchall is a route we could not READ, and reading nothing is not the
+ *     same as being told nothing is there (codex gate round 2, #2754). Collapsing
+ *     these into absence is how a momentarily sick ComfyUI gets a Manager migration
+ *     recommended to it.
+ */
+type ManagerVersionEvidence =
+  | { kind: "version"; major: number }
+  | { kind: "refused"; status: number | undefined }
+  | { kind: "absent" }
+  | { kind: "unreadable"; kinds: ManagerQueueStatusKind[] };
+
+async function probeManagerVersionEvidence(base: string): Promise<ManagerVersionEvidence> {
+  let refusedStatus: number | undefined;
+  let refused = false;
+  // Same response vocabulary the queue probes use — these two surfaces answer the
+  // same question about the same host, and a second private taxonomy is how the
+  // two drift into disagreeing about what "absent" means.
+  const kinds: ManagerQueueStatusKind[] = [];
+  // ONE budget for the whole diagnosis, not one per route.
+  //
+  // managerFetch now races its own body reads (#2773). raceAbort still wraps
+  // these two probes so a late inner settlement cannot hold the diagnosis open
+  // after this budget fires — this is the diagnosis a caller reached after
+  // everything else had already failed.
+  const budget = managerBodyTimeoutSignal();
+  for (const path of MANAGER_VERSION_ROUTES) {
+    let kind: ManagerQueueStatusKind = "hard-error";
+    // This route's own status. Recorded per-iteration, and promoted to
+    // `refusedStatus` ONLY from the catch below: a 404 on the first route must not
+    // be mistaken for the status that refused us on the second.
+    let statusSeen: number | undefined;
+    try {
+      const major = parseManagerMajor(
+        await raceAbort(budget, () =>
+          managerFetch<string>(path, {
+            base,
+            soft: true,
+            onSoftFailure: (status) => {
+              statusSeen = status;
+              kind = status === undefined ? "transport" : managerQueueStatusKind(status);
+            },
+            onSoftTransportFailure: () => {
+              kind = "transport";
+            },
+            // A 2xx that is not a version string — ComfyUI's SPA catchall, most of
+            // all — is malformed, never absence.
+            onSoftResponse: (body) => {
+              kind = body === undefined || body === null ? "empty" : "malformed";
+            },
+          }),
+        ),
+      );
+      if (major !== undefined) return { kind: "version", major };
+    } catch {
+      // Swallow the throw — it must not replace the reader's queue-detection
+      // error with a secondary probe's — but classify it before moving on.
+      //
+      // NOT every throw here is an authentication refusal (codex gate round 3).
+      // Soft mode throws for 401/407, and a body-read rejection on a 2xx is not
+      // an auth status — a `refused = true` in every catch would answer a broken
+      // pipe with "configure your gateway credentials". managerFetch runs
+      // onSoftFailure BEFORE the auth throw, and never runs it on a 2xx — so a
+      // status is here exactly when the response was a real, non-ok answer we
+      // can classify.
+      if (statusSeen !== undefined && explainManagerAuthenticationRequired(statusSeen) !== "") {
+        refused = true;
+        refusedStatus ??= statusSeen;
+      }
+      // Anything else keeps `kind` at its "hard-error" seed and lands in
+      // `unreadable`, which claims nothing about whether Manager is there.
+    }
+    kinds.push(kind);
+  }
+  if (refused) return { kind: "refused", status: refusedStatus };
+  return kinds.every((k) => k === "not-found") ? { kind: "absent" } : { kind: "unreadable", kinds };
+}
+
+/** The one sentence in this failure that is allowed to speak with certainty. */
+const MANAGER_QUEUE_UNREACHABLE_LEDE =
+  "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status nor " +
+  "/manager/queue/status answered with a queue status)";
+
+/**
+ * Choose the diagnosis the observations actually support (#2754).
+ *
+ * The old message had one arm and made the strongest available claim from the
+ * weakest available evidence. There are four states here because the host really
+ * can be in four of them, and three of them have fixes that the fourth's advice
+ * would send the reader away from.
+ */
+function managerQueueDetectionMessage(
+  base: string,
+  queueStatusKinds: ManagerQueueStatusKind[],
+  version: ManagerVersionEvidence,
+): string {
+  if (version.kind === "version") {
+    const lede =
+      `ComfyUI-Manager IS answering on ${base} — its version route reports generation ` +
+      `${version.major}.x — so this is NOT a missing or disabled Manager, and neither ` +
+      "installing the pip comfyui_manager package nor adding --enable-manager will fix it. ";
+    // The queue side deserves the same care as the version side (codex gate round
+    // 6). Two 404s mean the queue routes are genuinely not registered; a 503, a
+    // 405 or a timeout means we could not READ them, and a Manager that is merely
+    // busy or briefly sick must not be told its queue module failed to register.
+    return queueStatusKinds.every((kind) => kind === "not-found")
+      ? lede +
+          "It serves NO queue API: both /v2/manager/queue/status and /manager/queue/status " +
+          "answered 404. What fits that is a Manager whose queue routes specifically are " +
+          "absent — a partial or older Manager server build, a queue module that failed to " +
+          "register, or a proxy in front of ComfyUI forwarding only some /manager routes. " +
+          "Check the ComfyUI log around Manager's startup, and retry once it serves a queue " +
+          "surface."
+      : lede +
+          "Its queue routes did not answer with a queue status either, but they did not say " +
+          `they are absent: /v2/manager/queue/status and /manager/queue/status came back ` +
+          `"${queueStatusKinds.join(", ")}". That is a queue surface we could not READ — a ` +
+          "5xx, a wrong-method reply, a timeout — not a Manager that lacks one, so this may " +
+          "well clear on its own. Check that ComfyUI is healthy and retry before concluding " +
+          "anything about Manager's queue API.";
+  }
+  if (version.kind === "refused") {
+    return (
+      `${MANAGER_QUEUE_UNREACHABLE_LEDE}, and the version routes that would establish ` +
+      "whether Manager is present at all were REJECTED" +
+      (version.status !== undefined
+        ? explainManagerAuthenticationRequired(version.status)
+        : " — an authentication failure, not evidence that ComfyUI-Manager is missing.") +
+      ` Whether ComfyUI-Manager is installed on ${base} is therefore UNKNOWN from here; ` +
+      "clear the credential/proxy rejection and retry before concluding anything about " +
+      "Manager itself."
     );
-    const api: ManagerApi =
-      legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
-        ? "v2-batch"
-        : "v2";
-    managerApiCache = { base, api };
+  }
+  // Absence is claimable only when all four probes were TOLD there is no such
+  // route. A 404 is a server answering; a 503, a proxy error page, a timeout or an
+  // HTML catchall is a route we could not read, and this branch used to spend
+  // those as absence too (codex gate round 2).
+  const provenAbsent =
+    version.kind === "absent" && queueStatusKinds.every((kind) => kind === "not-found");
+  if (!provenAbsent) {
+    const seen =
+      version.kind === "unreadable"
+        ? version.kinds.join(", ")
+        : queueStatusKinds.join(", ");
+    return (
+      `${MANAGER_QUEUE_UNREACHABLE_LEDE}, and whether ComfyUI-Manager is present could not ` +
+      `be established either: the probes came back "${seen}" rather than a clean 404. An ` +
+      "unreadable response — a 5xx, a proxy or gateway error page, a timeout, an HTML " +
+      "catchall — is NOT evidence that ComfyUI-Manager is absent, so do not reinstall or " +
+      "migrate Manager on the strength of this message. Check that the ComfyUI at " +
+      `${base} is healthy and reachable, then retry.`
+    );
+  }
+  return (
+    `${MANAGER_QUEUE_UNREACHABLE_LEDE}, and neither /v2/manager/version nor /manager/version ` +
+    `answered with a version either — every probe 404'd, so nothing at ${base} is serving ` +
+    "ComfyUI-Manager routes at all. Is ComfyUI-Manager installed and enabled on the " +
+    "connected ComfyUI? The pip comfyui_manager package only activates when ComfyUI is " +
+    "started with --enable-manager. NOTE: a custom_nodes/ComfyUI-Manager clone can import " +
+    "cleanly and still register no routes — ComfyUI logs `Blocked by policy: <path>` and " +
+    "skips the clone entirely when --enable-manager is set and the pip package shadows it " +
+    "(with --disable-manager-ui on top, that leaves no Manager routes at all), and the " +
+    "clone starts in CLI-only mode, serving nothing, when its .enable-cli-only-mode marker " +
+    "file is present."
+  );
+}
+
+/**
+ * Given that the /v2 queue surface answered, decide between the two pip-Manager
+ * (v4) dialects. Both normal-v4 and legacy-UI mode register
+ * GET /v2/manager/is_legacy_manager_ui and answer truthfully; a missing route
+ * (older pip) means the normal v4 server → unified task dialect.
+ */
+async function resolveV2SubDialect(base: string): Promise<ManagerApi> {
+  const legacyUi = await managerFetch<{ is_legacy_manager_ui?: boolean }>(
+    "/v2/manager/is_legacy_manager_ui",
+    { base, soft: true },
+  );
+  return legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
+    ? "v2-batch"
+    : "v2";
+}
+
+/**
+ * In-flight detection, shared by every caller that misses the cache for the same
+ * base under the same epoch. Without this, N operations arriving just after the
+ * window lapses each fire their own probe round — a thundering herd against a
+ * server that is often exactly the one that just restarted (#646 review).
+ *
+ * The EPOCH is part of the join key: a detection that started before an
+ * invalidation is probing the pre-restart server, so a caller arriving after the
+ * reset must start its own rather than inherit that reading.
+ */
+let detectInflight: { base: string; epoch: number; promise: Promise<ManagerApi> } | null = null;
+
+/** How many times a detection will re-probe when it is invalidated mid-probe
+ *  before giving the caller its latest reading anyway. A restart storm must not
+ *  spin here; three readings is far past any real restart. */
+const DETECT_INVALIDATION_RETRIES = 2;
+
+export async function detectManagerApi(base = managerBaseUrl()): Promise<ManagerApi> {
+  for (let attempt = 0; ; attempt++) {
+    const cached = getCachedManagerApi(base);
+    if (cached !== undefined) return cached;
+
+    const epochAtStart = managerApiEpoch();
+    let entry = detectInflight;
+    let created = false;
+    if (!(entry && entry.base === base && entry.epoch === epochAtStart)) {
+      entry = { base, epoch: epochAtStart, promise: probeManagerApi(base) };
+      detectInflight = entry;
+      created = true;
+    }
+    let api: ManagerApi;
+    try {
+      api = await entry.promise;
+    } finally {
+      // Only the caller that STARTED this probe clears the slot, and only if it
+      // is still ours — a joiner finishing early must not free the slot out from
+      // under a probe others could still share.
+      if (created && detectInflight === entry) detectInflight = null;
+    }
+
+    // The commit was already dropped if something invalidated the cache while we
+    // probed — but the VALUE is just as stale, and returning it would route the
+    // caller's mutation at the server that just went away (#646 review). Probe
+    // again against whatever is there now.
+    if (managerApiEpoch() === epochAtStart) return api;
+    if (attempt >= DETECT_INVALIDATION_RETRIES) {
+      // Every reading so far described a server that was already gone. Handing
+      // the last one back would send a mutation on a dialect we KNOW is stale, so
+      // refuse instead — nothing has been sent at this point, which makes this the
+      // one moment where failing is completely free.
+      throw new NodeManagementError(
+        "ComfyUI-Manager's API generation could not be determined: the connected ComfyUI kept " +
+          "being restarted (or retargeted) while comfyui-mcp was probing it, so every reading " +
+          "described a server that was already gone. NOTHING was sent to the Manager. Wait for " +
+          "ComfyUI to settle, then retry.",
+      );
+    }
+    logger.debug("Manager dialect detection invalidated mid-probe — re-probing", {
+      base,
+      dropped: api,
+      attempt,
+    });
+  }
+}
+
+async function probeManagerApi(base: string): Promise<ManagerApi> {
+  // Stamp the cache state BEFORE probing: if ComfyUI is restarted — or another
+  // probe commits a fresher verdict — while these probes are in flight, this
+  // conclusion describes a server that may be gone and must not be pinned over
+  // the newer state (#646).
+  const stamp = managerApiCacheStamp();
+  const queueStatusCodes: Array<number | undefined> = [undefined, undefined];
+  const queueStatusKinds: ManagerQueueStatusKind[] = ["hard-error", "hard-error"];
+  const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", {
+    base,
+    soft: true,
+    onSoftFailure: (status) => {
+      queueStatusCodes[0] = status;
+      queueStatusKinds[0] =
+        status === undefined ? "transport" : managerQueueStatusKind(status);
+    },
+    onSoftTransportFailure: () => {
+      queueStatusKinds[0] = "transport";
+    },
+    onSoftResponse: (body) => {
+      queueStatusKinds[0] = managerQueueResponseKind(body);
+    },
+  });
+  if (looksLikeQueueStatus(v2)) {
+    const api = await resolveV2SubDialect(base);
+    cacheManagerApi(base, api, stamp);
     return api;
   }
-  const legacy = await managerFetch<QueueStatus>("/manager/queue/status", { soft: true });
+  const legacy = await managerFetch<QueueStatus>("/manager/queue/status", {
+    base,
+    soft: true,
+    onSoftFailure: (status) => {
+      queueStatusCodes[1] = status;
+      queueStatusKinds[1] =
+        status === undefined ? "transport" : managerQueueStatusKind(status);
+    },
+    onSoftTransportFailure: () => {
+      queueStatusKinds[1] = "transport";
+    },
+    onSoftResponse: (body) => {
+      queueStatusKinds[1] = managerQueueResponseKind(body);
+    },
+  });
   if (looksLikeQueueStatus(legacy)) {
-    managerApiCache = { base, api: "legacy" };
+    // /manager/queue/status answering ALMOST always means the released 3.x
+    // custom-node Manager — but do NOT brand it "legacy 3.x" (and speak 3.x
+    // grammar, and tell the user to upgrade) on the route shape alone (#555). A
+    // v4 host reached only through a proxy/back-compat shim could also answer
+    // here; CONFIRM the generation with the authoritative version string first.
+    // A 405/route-shape is NEVER the version signal — /v2/manager/version ("V4.x")
+    // vs /manager/version ("V3.x") is.
+    const major = await probeManagerMajor(base);
+    if (major !== undefined && major >= 4) {
+      // Version says v4 — but only speak v4 if its queue surface ACTUALLY
+      // validates now (re-probe): routing to v2 when /v2/manager/queue/status is
+      // unreachable would enqueue work we then can't poll → a false timeout and a
+      // duplicate on retry (codex review). If the v4 surface still doesn't answer,
+      // keep the proven, WORKING legacy classification (we hold a validated
+      // /manager queue endpoint) rather than route to a dead v4 surface.
+      const v2Retry = await managerFetch<QueueStatus>("/v2/manager/queue/status", {
+        base,
+        soft: true,
+      });
+      if (looksLikeQueueStatus(v2Retry)) {
+        const api = await resolveV2SubDialect(base);
+        cacheManagerApi(base, api, stamp);
+        return api;
+      }
+    }
+    cacheManagerApi(base, "legacy", stamp);
     return "legacy";
   }
+  // #2754 — the queue routes answered nothing. That is evidence about the QUEUE
+  // API, and the sentence below used to spend it on a much bigger claim: "is
+  // ComfyUI-Manager installed and enabled?", plus a --enable-manager pointer. The
+  // reporter's Manager was installed AND had imported cleanly (ComfyUI appends
+  // " (IMPORT FAILED)" to its `N seconds: <path>` line, and theirs had no suffix),
+  // so the one instruction we gave was the one thing that could not help.
+  //
+  // Same defect class as #2085, where an authenticating proxy's 401 was translated
+  // into "Manager is missing". The fix is the same shape: consult the AUTHORITATIVE
+  // version routes before absence may be claimed. They are the right witness here
+  // because they are disjoint from the queue surface — /v2/manager/version is
+  // registered only by v4 and /manager/version only by 3.x — so an answer on either
+  // proves Manager is serving HTTP on this base even when its queue routes 404.
+  const versionEvidence = await probeManagerVersionEvidence(base);
+  const managerVersionMajor =
+    versionEvidence.kind === "version" ? versionEvidence.major : undefined;
   throw new NodeManagementError(
-    "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
-      "nor /manager/queue/status answered with a queue status). Is ComfyUI-Manager " +
-      "installed and enabled on the connected ComfyUI? The pip comfyui_manager " +
-      "package only activates when ComfyUI is started with --enable-manager.",
+    managerQueueDetectionMessage(base, queueStatusKinds, versionEvidence),
+    {
+      kind: MANAGER_QUEUE_DETECTION_FAILURE,
+      base,
+      queueStatusCodes,
+      queueStatusKinds,
+      // The evidence the message was earned on, so a report carries it too.
+      // `managerVersionMajor` is undefined unless a version actually parsed;
+      // `managerVersionEvidence` is what distinguishes "the version routes said
+      // nothing" from "the version routes refused to answer".
+      managerVersionMajor,
+      managerVersionEvidence: versionEvidence.kind,
+    },
   );
 }
 
-/** Queue route prefix for the detected generation ("v2-batch" serves
- *  status/start under the /v2 prefix too — only the mutation routes differ). */
-async function managerQueuePrefix(): Promise<string> {
-  return (await detectManagerApi()) === "legacy" ? "/manager/queue" : "/v2/manager/queue";
+/** Queue route prefix for a dialect ("v2-batch" serves status/start under the
+ *  /v2 prefix too — only the mutation routes differ). */
+function managerQueuePrefixFor(api: ManagerApi): string {
+  return api === "legacy" ? "/manager/queue" : "/v2/manager/queue";
+}
+
+/** Prefix for non-queue Manager routes.  The two pip-Manager dialects both
+ * serve their custom-node/config surface under /v2; only the standalone 3.x
+ * Manager uses unprefixed paths. */
+export function managerApiPrefixFor(api: ManagerApi): string {
+  return api === "legacy" ? "" : "/v2";
 }
 
 /** Appended to every legacy-Manager operation failure so users know they're on
@@ -269,9 +1143,12 @@ async function managerQueuePrefix(): Promise<string> {
 const MANAGER_UPGRADE_HINT =
   "NOTE: this ComfyUI runs the LEGACY ComfyUI-Manager 3.x. comfyui-mcp is optimized " +
   "for Manager v4+ — on 3.x some operations degrade or are unavailable (notably " +
-  "arbitrary-URL model downloads, which 3.x whitelist-gates). Recommend upgrading: " +
-  "`pip install -U comfyui_manager` in the ComfyUI python env, then disable the old " +
-  "custom_nodes/ComfyUI-Manager clone and restart. " +
+  "arbitrary-URL model downloads, which 3.x whitelist-gates). RECOVERY — migrate to " +
+  "Manager v4 (one time, on the ComfyUI host): " +
+  "1) in ComfyUI's python env run `pip install -U comfyui_manager`; " +
+  "2) disable the old custom_nodes/ComfyUI-Manager clone so it no longer shadows the " +
+  "pip package (rename it to ComfyUI-Manager.disabled, or delete it); " +
+  "3) restart ComfyUI with --enable-manager, then retry the operation. " +
   "See https://comfyui-mcp.artokun.io/docs/troubleshooting";
 
 /** Appended to v2-batch (pip Manager in legacy-UI mode) failures. */
@@ -283,6 +1160,147 @@ const MANAGER_LEGACY_UI_HINT =
   "yanwk/comfyui-boot images that flag is hardcoded in the entrypoint). " +
   "See https://comfyui-mcp.artokun.io/docs/troubleshooting";
 
+/**
+ * #1326 — what an install-model failure on legacy Manager is allowed to CLAIM.
+ *
+ * The sentence below used to be appended to every `install-model` failure on 3.x,
+ * unconditionally: "Arbitrary-URL model installs REQUIRE Manager v4+". For the URL
+ * whitelist that is right, and it is the common case. For a security_level refusal, a
+ * 404 URL, a full disk or a Manager bug it is a confident answer to a question nobody
+ * asked — and it sends the reader through a Manager migration that will not fix it.
+ *
+ * The reporter of #1326 saw exactly the ambiguous form: a bare
+ * `ComfyUI-Manager API 500 Internal Server Error for /manager/queue/install_model`,
+ * with our v4 sentence attached. Manager's own response body — the one thing that
+ * would have said which it was — was captured in `details.body` and never shown.
+ *
+ * So: three states, not two (#796). Say WHICH when the evidence decides it, offer the
+ * candidates when it does not, and show Manager's own words either way.
+ */
+function whitelistVerdict(details: unknown): "proven" | "excluded" | "unknown" {
+  const d = details as { status?: unknown; body?: unknown } | undefined;
+  const status = typeof d?.status === "number" ? d.status : undefined;
+  const body = typeof d?.body === "string" ? d.body : "";
+  // A security_level refusal is a DIFFERENT fault with a different fix (a Manager
+  // config setting, not a migration), and explainManagerForbidden already spells it
+  // out. Offering the whitelist beside it would give two causes for one failure.
+  //
+  // Keyed on the marker, not on the bare 403: a proxy or auth gate in front of ComfyUI
+  // also answers 403, and that is not Manager speaking at all.
+  if (status === 403 && /"error"\s*:\s*"security_level"/.test(body)) return "excluded";
+  // Manager 3.x names the model-list check when it rejects one. Only these positively
+  // establish it — anything else stays "unknown" rather than defaulting to the guess.
+  //
+  // Not applied to an HTML page: a proxy error or a framework traceback can contain the
+  // words "model list" without being Manager's rejection, and "proven" is the one branch
+  // that speaks with certainty. Manager answers JSON/plain text here.
+  if (/^\s*<|<html/i.test(body)) return "unknown";
+  if (/model[- _]?list|whitelist|not (?:in|found in) the model list|invalid model/i.test(body))
+    return "proven";
+  return "unknown";
+}
+
+/**
+ * Strip credentials out of text that is about to be shown to a user.
+ *
+ * Redacting only the values from `details.url` is NOT enough here, and getting that
+ * wrong would have leaked a token. `details.url` is the Manager ENDPOINT
+ * (`…/manager/queue/install_model`) — the MODEL url, which is the one carrying a
+ * Hugging Face / CivitAI token, travels in the POST BODY. Manager echoes that url back
+ * when the download fails ("failed fetching <url>"), so the secret arrives through a
+ * path an endpoint-only redaction never sees.
+ *
+ * So every url found in the text has its query VALUES redacted, whatever its origin,
+ * plus a few token shapes that travel outside a query string. Keys are kept: the reader
+ * still needs to see that a token was present.
+ */
+function redactCredentialsForDisplay(text: string, endpointUrl?: string): string {
+  let out = text;
+  const redactUrlValues = (raw: string): void => {
+    let url: URL;
+    try {
+      url = new URL(raw);
+    } catch {
+      return; // not a parseable url — nothing known to redact
+    }
+    for (const value of url.searchParams.values()) {
+      // Short values are structural (page=2, type=vae), not secrets.
+      if (!value || value.length < 12) continue;
+      for (const form of new Set([value, encodeURIComponent(value)])) {
+        out = out.split(form).join("«redacted»");
+      }
+    }
+  };
+  if (endpointUrl) redactUrlValues(endpointUrl);
+  for (const found of text.match(/https?:\/\/[^\s"'<>)\\]+/gi) ?? []) redactUrlValues(found);
+  // Token shapes that are not query values (an Authorization header echoed into a
+  // traceback, a bare token in a message).
+  out = out
+    .replace(/\b(hf_|sk-|ghp_|gho_|github_pat_)[A-Za-z0-9_-]{8,}/g, "«redacted»")
+    .replace(/\b([Bb]earer\s+)[A-Za-z0-9._~+/-]{12,}=*/g, "$1«redacted»");
+  return out;
+}
+
+/** Manager's own response body, bounded and stripped of credentials. This is the
+ *  evidence #1326 lost. */
+function managerBodyExcerpt(details: unknown): string {
+  const d = details as { body?: unknown; url?: unknown } | undefined;
+  const raw = typeof d?.body === "string" ? d.body.trim() : "";
+  if (!raw) return "";
+  const body = redactCredentialsForDisplay(raw, typeof d?.url === "string" ? d.url : undefined);
+  const MAX = 600;
+  const clipped = body.length > MAX ? `${body.slice(0, MAX)}… (truncated)` : body;
+  return ` ComfyUI-Manager said: ${clipped}`;
+}
+
+/** A bounded, credential-stripped per-task result from Manager queue history. */
+function managerTaskResultExcerpt(result: unknown): string {
+  const raw = typeof result === "string" ? result.replace(/\s+/g, " ").trim() : "";
+  if (!raw) return "";
+  const body = redactCredentialsForDisplay(raw);
+  const MAX = 600;
+  return body.length > MAX ? `${body.slice(0, MAX)}… (truncated)` : body;
+}
+
+function safeManagerTaskDetails(
+  record: ManagerTaskHistoryEntry,
+  result: string,
+): ManagerTaskHistoryEntry {
+  return {
+    uiId: record.uiId,
+    kind: record.kind,
+    statusStr: record.statusStr,
+    ...(result ? { result } : {}),
+  };
+}
+
+/**
+ * #2490 — a drained Manager queue is not a successful repair. On v4 the
+ * queue-wide counts are identical for a task that succeeded and one that
+ * errored; the per-task history record is the structured verdict.
+ *
+ * `unified_fix` fails with `not found: <id>@<ver>` and the worker logs
+ * `An error occurred while fixing '…'`. Those two strings are Manager's own
+ * proven-negative literals, so they are treated as failure even when
+ * `status_str` is omitted — inferring failure from any other prose is still
+ * refused (#1999).
+ */
+function managerTaskLooksFailed(
+  record: ManagerTaskHistoryEntry | null | undefined,
+): { status: string; excerpt: string } | undefined {
+  if (!record) return undefined;
+  const status = record.statusStr?.trim().toLowerCase();
+  const excerpt = managerTaskResultExcerpt(record.result);
+  if (status === "failed" || status === "error") {
+    return { status, excerpt };
+  }
+  const result = typeof record.result === "string" ? record.result : "";
+  if (/\bnot found\s*:/i.test(result) || /an error occurred while fixing/i.test(result)) {
+    return { status: status || "error", excerpt };
+  }
+  return undefined;
+}
+
 /** Wrap a legacy-Manager failure with the upgrade guidance (keeps details). */
 function annotateLegacyError(
   err: unknown,
@@ -290,15 +1308,47 @@ function annotateLegacyError(
   hint: string = MANAGER_UPGRADE_HINT,
 ): NodeManagementError {
   const base = err instanceof Error ? err.message : String(err);
-  const extra =
-    kind === "install-model"
-      ? " Arbitrary-URL model installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models)."
-      : "";
-  return new NodeManagementError(
-    `${base}${extra}\n${hint}`,
-    err instanceof NodeManagementError ? err.details : undefined,
-  );
+  const details = err instanceof NodeManagementError ? err.details : undefined;
+  let extra = "";
+  if (kind === "install-model") {
+    switch (whitelistVerdict(details)) {
+      case "proven":
+        extra =
+          " Arbitrary-URL model installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models).";
+        break;
+      case "excluded":
+        // Deliberately silent: the 403 explanation is the answer, and adding the
+        // whitelist sentence beside it would offer a second, wrong cause.
+        break;
+      case "unknown":
+        // Still LEADS with the whitelist and keeps the upgrade path: on 3.x that is the
+        // usual cause and the migration below is the fix, which is real value (#553) and
+        // must not be hedged away. What changes is only the certainty — Manager did not
+        // say so here, and three other faults fail identically. Naming them costs a
+        // sentence; omitting them cost the reporter of #1326 a diagnosis.
+        extra =
+          " On Manager 3.x the usual cause is its model-list whitelist: arbitrary-URL model" +
+          " installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models), and" +
+          " the recovery below is that upgrade. Manager did NOT say so explicitly here," +
+          " though — a security_level refusal, an unreachable URL, or no space on the host" +
+          " fail the same way. If the upgrade does not resolve it, the ComfyUI server log" +
+          " names which.";
+        break;
+    }
+    extra += managerBodyExcerpt(details);
+  }
+  return new NodeManagementError(`${base}${extra}\n${hint}`, details);
 }
+
+/** #1326 — the cause-attribution above is the whole user-visible product of a failed
+ *  install-model, and it is reached only through a live Manager. Exposed so it can be
+ *  asserted against real error shapes rather than through a mocked HTTP stack. */
+export const __managerCauseTestHooks = {
+  annotateLegacyError,
+  whitelistVerdict,
+  managerBodyExcerpt,
+  NodeManagementError,
+};
 
 /**
  * Translate one unified-task call into the legacy per-operation route + body.
@@ -386,8 +1436,42 @@ const queueTiming = {
   // counts queued items). Give the worker a grace window to spin up before
   // treating an idle-looking status as "done".
   startupGraceMs: 8000,
+  // Budget for node installs/updates/fixes: bounded by how long `pip install`
+  // and a git clone plausibly take.
   timeoutMs: 600_000,
+  /**
+   * Budget for an `install-model` task (#817). A model download is NOT the same
+   * shape of work as a node install: 600s is a hard guarantee of failure for any
+   * multi-GB file on a normal link (a 15 GB file at 25 MB/s needs 600s just for
+   * the bytes, before any CDN slowness), and #817 is exactly that — the queue
+   * timing out at 600s every time.
+   *
+   * We cannot make the REMOTE transfer resumable — ComfyUI-Manager fetches
+   * server-side and exposes no per-task progress or byte count — so unlike the
+   * local path (#470) there is nothing here to bound an attempt AGAINST. All we
+   * can honestly do is stop declaring failure while the host is still working.
+   * The value is deliberately generous rather than tuned; the timeout's job is to
+   * stop us waiting forever, not to police the download.
+   */
+  modelTimeoutMs: 4 * 60 * 60_000,
 };
+
+/** Per-kind queue budget. Only `install-model` gets the large one — a node
+ *  install that hangs for four hours is a real failure worth reporting. */
+function queueTimeoutFor(kind?: ManagerTaskKind): number {
+  if (kind !== "install-model") return queueTiming.timeoutMs;
+  const raw = process.env.COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S;
+  if (raw !== undefined && raw.trim() !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) {
+      return Math.min(24 * 60 * 60_000, Math.max(60_000, Math.round(n) * 1000));
+    }
+    logger.warn(
+      `Ignoring COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S="${raw}" — not a positive number of seconds.`,
+    );
+  }
+  return queueTiming.modelTimeoutMs;
+}
 
 /** @internal — test hook to shrink polling timings; not part of the tool API. */
 export function setQueueTimingForTests(
@@ -396,23 +1480,214 @@ export function setQueueTimingForTests(
   Object.assign(queueTiming, overrides);
 }
 
+/** Queue counts for honest before/after reporting around a queue reset. */
+export interface ManagerQueueCounts {
+  /** Tasks still WAITING to run — v4's `pending_count` directly, else the 3.x
+   *  arithmetic total−done−in_progress (3.x defines total that way exactly). */
+  pending: number;
+  /** Tasks already dequeued by the worker — these a queue reset CANNOT stop. */
+  inProgress: number;
+  /** Manager's worker-alive flag (falls back to inProgress > 0 when absent). */
+  processing: boolean;
+}
+
+/**
+ * Extract counts from a queue/status payload. Returns undefined when required
+ * fields are missing or the counts are incoherent (negative pending — the
+ * #639 stale-3.x signature), so callers report "could not verify" instead of
+ * guessing.
+ */
+function countsFromStatus(status: unknown): ManagerQueueCounts | undefined {
+  if (!status || typeof status !== "object") return undefined;
+  const s = status as QueueStatus;
+  const inProgress = typeof s.in_progress_count === "number" ? s.in_progress_count : undefined;
+  if (inProgress === undefined) return undefined;
+  let pending: number;
+  if (typeof s.pending_count === "number") {
+    pending = s.pending_count; // v4 reports it directly
+  } else {
+    // 3.x: total_count = done + in_progress + queued exactly.
+    if (typeof s.total_count !== "number" || typeof s.done_count !== "number") {
+      return undefined;
+    }
+    pending = s.total_count - s.done_count - inProgress;
+    if (pending < 0) return undefined; // incoherent counts — cannot verify anything
+  }
+  return {
+    pending,
+    inProgress,
+    processing: typeof s.is_processing === "boolean" ? s.is_processing : inProgress > 0,
+  };
+}
+
+/**
+ * Read the Manager queue counts ONCE, in the detected dialect — the measuring
+ * stick for the pin-write cancellation path (#689), which must report what a
+ * queue reset actually dropped rather than claim the panel was saved.
+ *
+ * These are SHARED, queue-wide counts: they can never say whether OUR task is
+ * among the pending ones (that needs fetchManagerClientQueueCounts /
+ * fetchManagerTaskHistoryEntry on v4).
+ *
+ * Returns undefined whenever the state cannot be PROVEN: detection failed,
+ * the status endpoint did not answer with queue counts, required fields are
+ * missing, or the counts are incoherent. The caller reports "could not
+ * verify" and keeps the pending-op marker rather than guessing in either
+ * direction.
+ */
+export async function fetchManagerQueueCounts(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueCounts | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  const status = await managerFetch<QueueStatus>(`${managerQueuePrefixFor(api)}/status`, {
+    base,
+    soft: true,
+  });
+  return countsFromStatus(status);
+}
+
+/**
+ * v4-only: queue counts for tasks THIS orchestrator enqueued (every enqueue
+ * carries client_id "comfyui-mcp"). This is what separates "the update-all is
+ * still queued" from "UNRELATED tasks are queued" on a shared Manager — the
+ * distinction a proven cancel needs (#689 round 3).
+ *
+ * Returns undefined on any non-v4 dialect: the 3.x and legacy-UI (v2-batch)
+ * status handlers IGNORE the client_id parameter and answer GLOBAL counts,
+ * which would impersonate our tasks. Also undefined when unreadable or
+ * incoherent.
+ */
+export async function fetchManagerClientQueueCounts(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueCounts | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  if (api !== "v2") return undefined;
+  const status = await managerFetch<QueueStatus>(
+    `/v2/manager/queue/status?client_id=${encodeURIComponent(MANAGER_CLIENT_ID)}`,
+    { base, soft: true },
+  );
+  return countsFromStatus(status);
+}
+
+export interface ManagerTaskHistoryEntry {
+  uiId: string;
+  kind?: string;
+  result?: string;
+  /**
+   * `status.status_str` — Manager's own STRUCTURED verdict for the task, one of
+   * success/failed/skipped/error/skip (OperationResult in its data models). This
+   * is the field to classify on; `result` is free prose whose only stable values
+   * are the literals "success"/"skip" (measured against Manager 4.2.2).
+   */
+  statusStr?: string;
+}
+
+/**
+ * v4-only: look up ONE completed task in the Manager's queue history by exact
+ * ui_id (GET /v2/manager/queue/history?ui_id=…). Returns the entry when found,
+ * null when the Manager provably has NO such completed task ({}), and
+ * undefined when the answer cannot be trusted — non-v4 dialect (the legacy-UI
+ * history route knows only the file-based ?id= form, so it would not answer
+ * the question asked) or an unreadable response.
+ */
+export async function fetchManagerTaskHistoryEntry(
+  uiId: string,
+  base = managerBaseUrl(),
+): Promise<ManagerTaskHistoryEntry | null | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  if (api !== "v2") return undefined;
+  const res = await managerFetch<{ history?: unknown }>(
+    `/v2/manager/queue/history?ui_id=${encodeURIComponent(uiId)}`,
+    { base, soft: true },
+  );
+  if (!res || typeof res !== "object" || !("history" in res)) return undefined;
+  const history = (res as { history: unknown }).history;
+  if (!history || typeof history !== "object" || Array.isArray(history)) return undefined;
+  const h = history as Record<string, unknown>;
+  if (typeof h.ui_id !== "string") {
+    // {"history": {}} is the provable "no such completed task". Anything else
+    // shaped wrong is not an answer we can act on.
+    return Object.keys(h).length === 0 ? null : undefined;
+  }
+  // STRICT id check: an entry for a DIFFERENT task (a rewriting proxy, a
+  // Manager variant that ignores ui_id and answers with something else's
+  // history) must never prove anything about OUR task — least of all clear
+  // its marker as already-drained (#689 round 4).
+  if (h.ui_id !== uiId) return undefined;
+  const status = h.status;
+  const statusStr =
+    status && typeof status === "object" &&
+    typeof (status as Record<string, unknown>).status_str === "string"
+      ? ((status as Record<string, unknown>).status_str as string)
+      : undefined;
+  return {
+    uiId: h.ui_id,
+    kind: typeof h.kind === "string" ? h.kind : undefined,
+    result: typeof h.result === "string" ? h.result : undefined,
+    statusStr,
+  };
+}
+
 /**
  * Kick off the Manager queue worker and poll until it drains.
  * Returns the final queue status.
+ *
+ * `api` is REQUIRED and must be the dialect the caller ACTUALLY enqueued with.
+ * Re-deriving the prefix from the cache here could start and poll a different
+ * generation's queue than the one holding our task (after a self-heal retry, or
+ * when a concurrent detection lands mid-operation), reporting a false failure for
+ * work that is really running — and inviting a caller retry that double-executes
+ * it (#646).
  */
-async function runManagerQueue(): Promise<QueueStatus> {
-  const prefix = await managerQueuePrefix();
+async function runManagerQueue(
+  api: ManagerApi,
+  base: string,
+  /** Selects the queue budget — a model download gets a far larger one than a
+   *  node install (#817). Omitted ⇒ the node-install budget. */
+  kind?: ManagerTaskKind,
+): Promise<QueueStatus> {
+  const prefix = managerQueuePrefixFor(api);
+  const timeoutMs = queueTimeoutFor(kind);
   // queue/start returns 200 (worker started) or 201 (already running) — both
-  // are 2xx, so managerFetch accepts either. Same on both generations.
-  await managerFetch(`${prefix}/start`, { method: "POST" });
+  // are 2xx, so managerFetch accepts either. Same on both generations. Some
+  // legacy 3.x builds expose start as GET-only, so negotiate POST→GET on a 405
+  // (#551) rather than failing the queue on a method mismatch.
+  await managerQueueControl(`${prefix}/start`, base);
 
   const start = Date.now();
   let lastStatus: QueueStatus | undefined;
-  while (Date.now() - start < queueTiming.timeoutMs) {
+  while (Date.now() - start < timeoutMs) {
     await sleep(queueTiming.pollIntervalMs);
+    let emptyStatusResponse = false;
     const status = await managerFetch<QueueStatus>(`${prefix}/status`, {
+      base,
       soft: true,
+      onSoftResponse: (body) => {
+        // managerFetch preserves JSON null, so it must be fail-closed exactly
+        // like an empty successful body. Otherwise a stale warm-cache install
+        // waits for the full queue budget instead of being classified as an
+        // ambiguous outcome immediately.
+        emptyStatusResponse = body === undefined || body === null;
+      },
     });
+    if (emptyStatusResponse) {
+      await reclassifyAfterEmptyQueueStatus(api, kind, base);
+    }
     if (status) {
       lastStatus = status;
       // Manager defines total_count = done + in_progress + queued. The queue
@@ -426,9 +1701,119 @@ async function runManagerQueue(): Promise<QueueStatus> {
       }
     }
   }
+  // TIMED OUT. Be precise about what that does and does NOT mean (#817): we
+  // stopped WAITING; the ComfyUI host's queue worker was never told to stop and,
+  // for a model download, is very likely still streaming. Reporting this as a
+  // plain failure is what led #817's reporter to re-issue — starting a SECOND
+  // server-side fetch of the same file, which is how the destination ended up
+  // truncated and failing safetensors shape checks. There is no Manager API to
+  // recall a queued task, so the only honest remedy is: look, don't re-issue.
   throw new NodeManagementError(
-    `ComfyUI-Manager queue did not finish within ${queueTiming.timeoutMs / 1000}s`,
+    `ComfyUI-Manager queue did not finish within ${Math.round(timeoutMs / 1000)}s. ` +
+      (kind === "install-model"
+        ? `This is the WAIT giving up, NOT proof the download failed — ComfyUI-Manager fetches the file ` +
+          `server-side and there is no API to stop or inspect an individual task, so the host is probably ` +
+          `still downloading. Do NOT re-issue the download: a second server-side fetch writes the SAME ` +
+          `destination file concurrently, and the interleaved result is a corrupt model (that is the ` +
+          `"shape is invalid for input of size N" failure). Instead, wait and check list_local_models on ` +
+          `the connected server until the file appears and its size stops changing. If your files are ` +
+          `genuinely larger than this budget, raise COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S (seconds), or ` +
+          `download to a LOCAL ComfyUI, where the transfer is streamed here — resumable, retried ` +
+          `automatically, and size-verified before anything is reported as landed.`
+        : `The Manager worker may still be running the task on the host; check its state before retrying.`),
     lastStatus,
+  );
+}
+
+/**
+ * A warm dialect cache can send an enqueue and queue-start request to a local
+ * ComfyUI whose Manager surface has since disappeared. Those routes may answer
+ * 2xx with empty bodies, so there is no enqueue HTTP error for the existing
+ * dialect self-heal to see. An empty queue/status response is the first
+ * production-path signal that the cached classification may be stale: clear it
+ * and classify the live server before waiting for the queue timeout.
+ *
+ * If a different usable dialect is found, the earlier empty enqueue is
+ * ambiguous and must not be re-sent. If both dialects remain empty/unavailable,
+ * detectManagerApi() preserves the queue-status evidence that the git-install
+ * fallback is allowed to re-check. Every other probe failure remains fail-closed.
+ */
+async function reclassifyAfterEmptyQueueStatus(
+  used: ManagerApi,
+  kind: ManagerTaskKind | undefined,
+  base: string,
+): Promise<never> {
+  // Do not discard a newer classification another operation may have committed
+  // after this operation captured `used`. If the cache is already absent, the
+  // detector below will perform the needed fresh probe without another epoch
+  // bump; if it names another dialect, it is already the reclassification we
+  // need to observe.
+  if (getCachedManagerApi(base) === used) {
+    resetManagerApiCache(
+      `Manager queue/status returned an empty successful response on the cached "${used}" dialect`,
+    );
+  }
+  let fresh: ManagerApi | undefined;
+  try {
+    fresh = await detectManagerApi(base);
+  } catch {
+    // Re-detection can itself conclude that both queue surfaces are empty or
+    // unavailable. That is useful classification evidence, but it is NOT proof
+    // that the enqueue already observed by this operation did not submit a task.
+    // Keep the post-enqueue ambiguity distinct so the local git fallback cannot
+    // race an accepted Manager task.
+  }
+  throw new NodeManagementError(
+    `ComfyUI-Manager queue/status returned an empty successful response while the cached ` +
+      `"${used}" dialect was in use. The live server ` +
+      (fresh ? `reclassified as "${fresh}"` : `could not be reclassified`) +
+      `, but the ${kind ?? "Manager"} enqueue may already have submitted a task. Its ` +
+      `outcome is UNKNOWN; it was NOT retried automatically and no local fallback is ` +
+      `authorized. Verify whether it took effect before reissuing it.`,
+    { kind: "manager-queue-empty-status", base, used, fresh },
+  );
+}
+
+interface ManagerEnqueueOptions {
+  /** Callers may reject an empty 2xx when they cannot safely verify afterward. */
+  rejectEmptyEnqueue?: boolean;
+  /** Allow an empty v4 unified enqueue to proceed to drain/verification. */
+  allowEmptyV2Enqueue?: boolean;
+  /** Observe the normal v4 empty-ack path without changing its outcome. */
+  onEmptyV2Enqueue?: () => void;
+}
+
+type ManagerEnqueueResponse = Record<string, unknown> | string | null | undefined;
+
+function assertManagerEnqueueResponse(
+  response: unknown,
+  options: ManagerEnqueueOptions,
+  kind: ManagerTaskKind,
+  api: ManagerApi,
+  path: string,
+  base: string,
+): void {
+  const empty = response === undefined || response === null;
+  if (empty && api === "v2" && options.allowEmptyV2Enqueue) {
+    options.onEmptyV2Enqueue?.();
+    return;
+  }
+  if (
+    !options.rejectEmptyEnqueue ||
+    !empty
+  ) return;
+  throw new NodeManagementError(
+    `ComfyUI-Manager returned a successful but empty response for the ${kind} enqueue ` +
+      `on the "${api}" dialect. The task may have been submitted, so its outcome is ` +
+      `UNKNOWN; the queue was not started and no local fallback is authorized. ` +
+      `Verify whether it took effect before reissuing it.`,
+    {
+      kind: "manager-enqueue-empty-success",
+      operation: kind,
+      api,
+      path,
+      base,
+    },
   );
 }
 
@@ -441,64 +1826,445 @@ async function runManagerQueue(): Promise<QueueStatus> {
  */
 async function queueManagerTask(
   kind: ManagerTaskKind,
-  params: Record<string, unknown>,
+  params: ManagerTaskParams,
+  base = managerBaseUrl(),
+  options: ManagerEnqueueOptions = {},
 ): Promise<QueueStatus> {
-  const uiId = randomUUID();
-  const api = await detectManagerApi();
-  if (api === "legacy") {
-    // Released Manager 3.x: per-operation routes + different body shapes
-    // (issue #116 — the unified /v2 task route 405s there).
-    const { path, body } = legacyTaskRequest(kind, params, uiId);
-    try {
-      await managerFetch(path, { method: "POST", body });
-    } catch (err) {
-      throw annotateLegacyError(err, kind);
+  return (await queueManagerTaskTracked(kind, params, base, options)).status;
+}
+
+/**
+ * #1999 — the same enqueue+drain, but it also HANDS BACK the `ui_id` the task
+ * was enqueued under. A drained queue's counts are queue-wide and, on Manager
+ * v4, identical for a task that succeeded and one that errored (measured: an
+ * idle v4 answers `total_count:0` with a `done_count` that is the CUMULATIVE
+ * session history length). The ui_id is the only handle that can ask Manager
+ * what OUR task actually did — see fetchManagerTaskHistoryEntry.
+ *
+ * Callers that don't correlate keep using queueManagerTask above; nothing about
+ * the enqueue, drain, dialect self-heal or timeout behaviour differs.
+ */
+async function queueManagerTaskTracked(
+  kind: ManagerTaskKind,
+  params: ManagerTaskParams,
+  base = managerBaseUrl(),
+  options: ManagerEnqueueOptions = {},
+): Promise<{ status: QueueStatus; uiId: string }> {
+  // Normalize to a resolver so every attempt builds its body for the dialect it
+  // is about to speak — a few operations (git installs) have dialect-specific
+  // params, and a self-heal retry must rebuild them, not just re-route them.
+  const resolve: ManagerParamsResolver =
+    typeof params === "function" ? params : () => params;
+  // The id is minted PER ATTEMPT, exactly as before. A self-heal retry is a
+  // genuinely second enqueue, so it gets its own id; the one recorded here is
+  // therefore the id of the attempt that LANDED (a failed attempt throws, so it
+  // never reaches the drain, and a v2→v2-batch downgrade inside a single attempt
+  // reuses that attempt's id).
+  let uiId = "";
+  // This is a mutation transaction, so freeze its target before the first await.
+  // A later setComfyuiTarget() selects where NEW calls go; it must not redirect a
+  // retry, queue start, or verification of a request the user already made.
+  const used = await enqueueWithDialectSelfHeal(kind, (api, epoch) => {
+    uiId = randomUUID();
+    return enqueueManagerTask(api, kind, resolve, uiId, base, epoch, options);
+  }, base);
+  // Thread the kind so a model download gets the model budget, not the node one (#817).
+  const status = await runManagerQueue(used, base, kind);
+  return { status, uiId };
+}
+
+/** Params for a Manager task: a fixed body, or a resolver invoked with the
+ *  dialect the request is about to be sent in (for dialect-specific bodies). */
+type ManagerParamsResolver = (api: ManagerApi) => Record<string, unknown>;
+type ManagerTaskParams = Record<string, unknown> | ManagerParamsResolver;
+
+/**
+ * Run ONE enqueue against the detected Manager dialect, healing a stale
+ * classification (#646). `enqueue` must only ENQUEUE — never drain — because a
+ * re-send is sound only while nothing has been queued yet; it is handed the
+ * dialect to speak and the invalidation epoch the operation started under.
+ *
+ * EVERY operation routed through here is a MUTATION (install, uninstall, update,
+ * fix, enable/disable, install-model, update-all, Manager self-update) and Manager
+ * has no idempotency key, so a re-sent request is a genuinely second operation.
+ * The enqueue is therefore re-sent ONLY when the failure PROVES nothing ran — a
+ * 404/405 route rejection — and only when a fresh probe shows the dialect really
+ * changed. It is called at most twice, never recursively.
+ *
+ * On an AMBIGUOUS failure that also indicates a dialect change (a 400: possibly a
+ * validation rejection, possibly a handler that already acted) the classification
+ * is still refreshed, but the operation is NOT re-sent — the caller gets an
+ * actionable error and decides. See AMBIGUOUS_MISMATCH_STATUSES.
+ */
+async function enqueueWithDialectSelfHeal(
+  label: string,
+  enqueue: (api: ManagerApi, startEpoch: number) => Promise<ManagerApi | void>,
+  base = managerBaseUrl(),
+): Promise<ManagerApi> {
+  const api = await detectManagerApi(base);
+  // Epoch snapshot taken AFTER detection, i.e. spanning exactly the enqueue whose
+  // outcome a conclusion would be based on. Taking it earlier would also cover the
+  // detection — and since a detection invalidated mid-probe now re-probes and
+  // returns a POST-restart dialect, that stale epoch would then veto a perfectly
+  // good conclusion drawn from it (the #464 v2→v2-batch demotion would never
+  // re-pin, leaving every later op to 405 on /queue/task first — #646 review).
+  const startEpoch = managerApiEpoch();
+  try {
+    return (await enqueue(api, startEpoch)) ?? api;
+  } catch (err) {
+    const fresh = await redetectAfterDialectMismatch(api, label, err, base);
+    if (fresh === undefined) throw err;
+    if (!ROUTE_MISMATCH_STATUSES.has(errorStatus(err) as number)) {
+      // The dialect DID change, but this failure doesn't prove the request went
+      // unexecuted, so re-sending it could run the mutation twice. Refuse, and
+      // hand the user everything needed to decide (#646 review).
+      throw dialectChangedError(label, api, fresh, err);
     }
-    return runManagerQueue();
+    // A route-level rejection: no handler ran, so nothing was enqueued —
+    // re-enqueue ONCE in the dialect the live server actually speaks.
+    return (await enqueue(fresh, managerApiEpoch())) ?? fresh;
+  }
+}
+
+/**
+ * Enqueue a task without draining the Manager queue.  This is the small shared
+ * seam for tools that deliberately batch several mutations before starting the
+ * worker.  It retains the same cached-dialect self-heal as queueManagerTask:
+ * only a 404/405 route rejection is re-sent, never an ambiguous handler error.
+ */
+export async function enqueueManagerTaskForExternal(
+  kind: ManagerTaskKind,
+  params: Record<string, unknown> | ((api: ManagerApi) => Record<string, unknown>),
+  base = managerBaseUrl(),
+): Promise<ManagerApi> {
+  return enqueueWithDialectSelfHeal(
+    kind,
+    (api, epoch) => enqueueManagerTask(
+      api,
+      kind,
+      typeof params === "function" ? params : () => params,
+      randomUUID(),
+      base,
+      epoch,
+    ),
+    base,
+  );
+}
+
+/** Start the queue that received an externally enqueued task. */
+export async function startManagerQueueForExternal(api: ManagerApi, base = managerBaseUrl()): Promise<void> {
+  await managerQueueControl(`${managerQueuePrefixFor(api)}/start`, base);
+}
+
+/**
+ * The classification was stale AND the failure can't be proven pre-execution, so
+ * the operation was deliberately not re-sent. Say exactly that: which dialect we
+ * spoke, which one the server actually speaks now, that the classification is
+ * already corrected, and that the previous attempt's effect is UNKNOWN — so the
+ * user verifies before reissuing rather than blindly repeating a mutation.
+ */
+function dialectChangedError(
+  label: string,
+  was: ManagerApi,
+  now: ManagerApi,
+  cause: unknown,
+): NodeManagementError {
+  const base = cause instanceof Error ? cause.message : String(cause);
+  return new NodeManagementError(
+    `${base}\nThe ComfyUI-Manager API dialect CHANGED under this connection: the request ` +
+      `was sent as "${was}", but the live server now answers as "${now}" (ComfyUI was ` +
+      `restarted with a different Manager generation at the same URL). comfyui-mcp has ` +
+      `re-detected the dialect, so the next call routes correctly. The "${label}" request ` +
+      `was NOT retried automatically: this failure does not prove the server left it ` +
+      `unexecuted, and Manager offers no idempotency key, so an automatic retry could run ` +
+      `it TWICE. VERIFY whether it took effect (install_custom_node (action:"list") / list_local_models, ` +
+      `or the ComfyUI server log), then reissue it if it did not.`,
+    cause instanceof NodeManagementError ? cause.details : undefined,
+  );
+}
+
+/**
+ * ROUTE-level rejections: the request never reached a handler, so the operation
+ * PROVABLY did not run and re-sending it cannot double-execute anything. On a
+ * Manager route this is exactly 404/405 — ComfyUI's frontend catchall answers an
+ * unregistered POST with 405 (never 404), and both mean "no such route on this
+ * build", never "the Manager is unreachable". These are the ONLY statuses that
+ * may trigger an automatic re-enqueue.
+ */
+const ROUTE_MISMATCH_STATUSES = new Set([404, 405]);
+
+/**
+ * A 400 is AMBIGUOUS. It can mean a stale dialect — a v4 Manager rejecting a
+ * 3.x-shaped install_model body is the #646 report itself — but it can equally
+ * come from a handler that already did the work and failed afterwards, or from a
+ * proxy on the response path. Manager exposes no idempotency key, so a re-sent
+ * mutation is a genuinely SECOND operation; there is no way to make that safe.
+ *
+ * So a 400 refreshes the CLASSIFICATION but never re-sends the request: if the
+ * re-probe shows the dialect really did change, the caller gets an actionable
+ * error naming both dialects and is left to decide whether to reissue. Refusing
+ * is always correct here; guessing is not.
+ *
+ * Everything else (403 security_level gating, 5xx, transport failures, queue-drain
+ * timeouts) is not a dialect signal at all and triggers neither.
+ */
+const AMBIGUOUS_MISMATCH_STATUSES = new Set([400]);
+
+/**
+ * Decide whether a failed enqueue was the CACHED DIALECT being stale, and if so
+ * return the dialect the live server actually speaks now (undefined = no dialect
+ * news; the caller surfaces its original failure).
+ *
+ * A restart at the same URL can swap the Manager generation underneath a cached
+ * classification (#646). The explicit restart-lifecycle invalidation and the TTL
+ * cover the common paths; this is the per-call backstop so ONE stale entry heals
+ * itself instead of failing every subsequent Manager operation. It only reports
+ * the change — whether the operation may be re-sent is the caller's decision,
+ * made from the STATUS (see ROUTE_MISMATCH_STATUSES vs AMBIGUOUS_*).
+ *
+ * Three guards keep this cheap and non-looping:
+ *   • only the two mismatch-capable status classes get here at all; 403/5xx and
+ *     transport failures never cost a probe;
+ *   • a verdict of "unchanged" (or an unreachable Manager) ARMS A COOLDOWN, so an
+ *     endpoint that fails the same way on every call cannot buy a probe per call —
+ *     without it, each re-check resets the entry the previous one repopulated;
+ *   • the cooldown is cleared by any resetManagerApiCache(), i.e. by every real
+ *     lifecycle event, so it can never delay reacting to an actual restart.
+ */
+/**
+ * In-flight "reset + re-detect" transaction, shared per base URL. The re-check is
+ * NOT just a detection: it resets the cache first, which bumps the epoch — so
+ * without sharing, N concurrent failures would each reset (invalidating each
+ * other's in-flight probe, since the detector joins only on a matching epoch) and
+ * each run a full probe round. One transaction serves them all (#646 review).
+ */
+let recheckInflight: {
+  base: string;
+  promise: Promise<{ fresh: ManagerApi | undefined; epoch: number }>;
+} | null = null;
+
+async function sharedDialectRecheck(
+  base: string,
+  label: string,
+  status: number,
+  used: ManagerApi,
+): Promise<{ fresh: ManagerApi | undefined; epoch: number }> {
+  const joined = recheckInflight;
+  if (joined?.base === base) return joined.promise;
+
+  const run = async (): Promise<{ fresh: ManagerApi | undefined; epoch: number }> => {
+    resetManagerApiCache(`manager ${label} enqueue failed ${status} on the "${used}" dialect`);
+    const epoch = managerApiEpoch();
+    try {
+      return { fresh: await detectManagerApi(base), epoch };
+    } catch {
+      // Manager isn't answering at all — that's not a dialect mismatch; the
+      // caller surfaces its own (more informative) failure. Don't re-probe on
+      // every subsequent call while it stays down, unless a lifecycle event has
+      // since told us something new.
+      if (managerApiEpoch() === epoch) {
+        suppressDialectRecheck(base, "manager unreachable during re-check");
+      }
+      return { fresh: undefined, epoch };
+    }
+  };
+
+  const entry = { base, promise: run() };
+  recheckInflight = entry;
+  try {
+    return await entry.promise;
+  } finally {
+    if (recheckInflight === entry) recheckInflight = null;
+  }
+}
+
+async function redetectAfterDialectMismatch(
+  used: ManagerApi,
+  label: string,
+  err: unknown,
+  base = managerBaseUrl(),
+): Promise<ManagerApi | undefined> {
+  const status = errorStatus(err);
+  if (
+    status === undefined ||
+    !(ROUTE_MISMATCH_STATUSES.has(status) || AMBIGUOUS_MISMATCH_STATUSES.has(status))
+  ) {
+    return undefined;
+  }
+  if (dialectRecheckSuppressed(base)) {
+    logger.debug("Skipping Manager dialect re-check (cooldown)", { op: label, status });
+    return undefined;
+  }
+  const { fresh, epoch: epochAfterReset } = await sharedDialectRecheck(base, label, status, used);
+  if (fresh === undefined) return undefined;
+  if (fresh === used) {
+    // Nothing changed, so this failure was never about the dialect. Arm the
+    // cooldown — but only if no lifecycle event landed since the re-check began,
+    // otherwise a stale continuation would suppress re-checks against a server
+    // we now know nothing about (#646 review).
+    if (managerApiEpoch() === epochAfterReset) {
+      suppressDialectRecheck(base, `dialect confirmed unchanged ("${used}") after a ${status}`);
+    }
+    return undefined;
+  }
+  logger.info("Manager API dialect changed under a cached classification", {
+    op: label,
+    was: used,
+    now: fresh,
+    status,
+    // A route-level rejection proves nothing ran, so the caller re-sends once;
+    // anything else is refused rather than risking a double-execute.
+    resend: ROUTE_MISMATCH_STATUSES.has(status),
+  });
+  return fresh;
+}
+
+/**
+ * ENQUEUE one operation in the given dialect, WITHOUT draining the queue.
+ *
+ * The split matters twice over. For #424, it lets a caller tell an ENQUEUE
+ * failure apart from a later queue-control/drain failure: a 405 raised by
+ * `${prefix}/start` inside runManagerQueue says nothing about whether the
+ * OPERATION's own route exists, so it must never be read as "this build doesn't
+ * register that route". For #646, it is what makes the dialect self-heal sound:
+ * queueManagerTask retries this step and only this step, and a retry is only safe
+ * while nothing has been queued yet. Draining happens once, afterwards.
+ *
+ * Returns the dialect the enqueue ACTUALLY spoke, so the drain polls the queue
+ * that holds the task.
+ */
+async function enqueueManagerTask(
+  api: ManagerApi,
+  kind: ManagerTaskKind,
+  resolveParams: ManagerParamsResolver,
+  uiId: string,
+  base: string,
+  startEpoch: number,
+  options: ManagerEnqueueOptions = {},
+): Promise<ManagerApi> {
+  if (api === "legacy") {
+    const response = await enqueueLegacyTask(kind, resolveParams("legacy"), uiId, base);
+    assertManagerEnqueueResponse(response, options, kind, api, "/manager/queue/install", base);
+    return "legacy";
   }
   if (api === "v2-batch") {
-    // pip Manager in legacy-UI mode (issue #235): the /v2 prefix serves the
-    // BUNDLED 3.x server — no task route (POST there 405s via the frontend
-    // catchall). Mutations take 3.x body shapes, wrapped in the batch
-    // envelope {<op>: [body, ...]}; the batch runs its items synchronously
-    // and reports failures as {failed: [id, ...]}. install-model keeps its
-    // dedicated route (same path as v4, 3.x whitelist semantics).
-    const { path, body } = legacyTaskRequest(kind, params, uiId);
-    try {
-      if (kind === "install-model") {
-        await managerFetch("/v2/manager/queue/install_model", { method: "POST", body });
-      } else {
-        // legacyTaskRequest's path is "/manager/queue/<op>"; the batch key is
-        // that trailing op ("enable" maps to an install body → key "install").
-        const op = path.split("/").pop() as string;
-        const res = await managerFetch<{ failed?: unknown[] }>("/v2/manager/queue/batch", {
-          method: "POST",
-          body: { [op]: [body] },
-        });
-        const failed = Array.isArray(res?.failed) ? res.failed : [];
-        if (failed.length && (body.id === undefined || failed.includes(body.id))) {
-          throw new NodeManagementError(
-            `ComfyUI-Manager batch reported the ${op} of "${String(body.id ?? "?")}" as failed ` +
-              "(check the ComfyUI server log for the underlying error — security_level " +
-              "gating is a common cause).",
-          );
-        }
-      }
-    } catch (err) {
-      throw annotateLegacyError(err, kind, MANAGER_LEGACY_UI_HINT);
-    }
-    return runManagerQueue();
+    const response = await enqueueV2BatchTask(kind, resolveParams("v2-batch"), uiId, base);
+    assertManagerEnqueueResponse(response, options, kind, api, "/v2/manager/queue/batch", base);
+    return "v2-batch";
   }
-  await managerFetch("/v2/manager/queue/task", {
-    method: "POST",
-    body: {
-      ui_id: uiId,
-      client_id: MANAGER_CLIENT_ID,
-      kind,
-      params: { ...params, ui_id: uiId },
-    },
-  });
-  return runManagerQueue();
+  // v2 unified task envelope (normal-mode pip Manager v4).
+  try {
+    const response = await managerFetch("/v2/manager/queue/task", {
+      method: "POST",
+      base,
+      body: {
+        ui_id: uiId,
+        client_id: MANAGER_CLIENT_ID,
+        kind,
+        params: { ...resolveParams("v2"), ui_id: uiId },
+      },
+    });
+    assertManagerEnqueueResponse(response, options, kind, api, "/v2/manager/queue/task", base);
+  } catch (err) {
+    if (errorStatus(err) === 405) {
+      // Detection chose the unified /v2 task dialect (the /v2 queue surface
+      // answered a real status during detectManagerApi), yet THIS build 405s a
+      // POST to /v2/manager/queue/task. That is the bundled 3.x server served
+      // under /v2 — a legacy-UI pip Manager whose `is_legacy_manager_ui` probe
+      // did NOT answer truthfully, so resolveV2SubDialect defaulted to "v2"
+      // (#464: panel_update_node → "Manager …/queue/task: HTTP 405" on a
+      // legacy-dialect Manager). A 405 on a Manager route is a method/route
+      // signal, never "unreachable" — mirror the queue/start POST→GET
+      // negotiation (#551/#586) by retrying via the v2-batch envelope instead
+      // of surfacing the raw 405.
+      logger.debug(
+        "Manager /v2/manager/queue/task 405 — retrying via the v2-batch envelope",
+        { kind },
+      );
+      // Rebuild the body for the dialect we are downgrading TO: this build runs
+      // the 3.x handlers under /v2, so a dialect-specific body (a git install)
+      // must be its 3.x shape, not the v2 one we just tried.
+      const response = await enqueueV2BatchTask(kind, resolveParams("v2-batch"), uiId, base);
+      assertManagerEnqueueResponse(
+        response,
+        options,
+        kind,
+        "v2-batch",
+        kind === "install-model" ? "/v2/manager/queue/install_model" : "/v2/manager/queue/batch",
+        base,
+      );
+      // Pin the corrected dialect ONLY after the batch enqueue actually
+      // succeeded, so a transient/proxy 405 on a genuine v4 host (task 405 but
+      // batch also unavailable) never poisons the cache: enqueueV2BatchTask
+      // throws on a batch failure, leaving the cache as "v2" so the next op
+      // re-probes the unified task route (codex review).
+      demoteManagerApiToV2Batch(base, startEpoch);
+      return "v2-batch";
+    }
+    throw err;
+  }
+  return "v2";
+}
+
+/**
+ * Enqueue one operation on the released Manager 3.x per-operation routes
+ * (issue #116 — the unified /v2 task route 405s there). Does NOT drain.
+ */
+async function enqueueLegacyTask(
+  kind: ManagerTaskKind,
+  params: Record<string, unknown>,
+  uiId: string,
+  base: string,
+): Promise<ManagerEnqueueResponse> {
+  const { path, body } = legacyTaskRequest(kind, params, uiId);
+  try {
+    return await managerFetch<Record<string, unknown> | string>(path, { method: "POST", body, base });
+  } catch (err) {
+    throw annotateLegacyError(err, kind);
+  }
+}
+
+/**
+ * Enqueue one operation on the v2-batch dialect — pip Manager in legacy-UI mode
+ * (issue #235): the /v2 prefix serves the BUNDLED 3.x server, which has no
+ * unified task route (a POST there 405s via the frontend catchall). Mutations
+ * take 3.x body shapes wrapped in the batch envelope {<op>: [body, ...]}; the
+ * batch runs its items synchronously and reports failures as {failed: [id, ...]}.
+ * install-model keeps its dedicated route (same path as v4, 3.x whitelist
+ * semantics). Does NOT drain.
+ */
+async function enqueueV2BatchTask(
+  kind: ManagerTaskKind,
+  params: Record<string, unknown>,
+  uiId: string,
+  base: string,
+): Promise<ManagerEnqueueResponse> {
+  const { path, body } = legacyTaskRequest(kind, params, uiId);
+  try {
+    if (kind === "install-model") {
+      return await managerFetch<Record<string, unknown> | string>("/v2/manager/queue/install_model", { method: "POST", body, base });
+    } else {
+      // legacyTaskRequest's path is "/manager/queue/<op>"; the batch key is
+      // that trailing op ("enable" maps to an install body → key "install").
+      const op = path.split("/").pop() as string;
+      const res = await managerFetch<{ failed?: unknown[] }>("/v2/manager/queue/batch", {
+        method: "POST",
+        body: { [op]: [body] },
+        base,
+      });
+      const failed = Array.isArray(res?.failed) ? res.failed : [];
+      if (failed.length && (body.id === undefined || failed.includes(body.id))) {
+        throw new NodeManagementError(
+          `ComfyUI-Manager batch reported the ${op} of "${String(body.id ?? "?")}" as failed ` +
+            "(check the ComfyUI server log for the underlying error — security_level " +
+            "gating is a common cause).",
+        );
+      }
+      return res;
+    }
+  } catch (err) {
+    throw annotateLegacyError(err, kind, MANAGER_LEGACY_UI_HINT);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -527,19 +2293,46 @@ export function nonInteractiveGitEnv(): NodeJS.ProcessEnv {
 
 /**
  * Run an official `comfy node` subcommand. Returns normalized JSON data.
- * Throws ProcessControlError if comfyuiPath is undefined (remote mode).
+ * Throws ProcessControlError when no local workspace is available (remote
+ * mode). `workspace` is the CALL-SCOPED local ComfyUI root, captured by the
+ * caller BEFORE its first await — a retarget mid-operation must not send the
+ * CLI at a different install than the pre/post checks described.
  */
-function runCmCli(args: string[]): string {
-  if (!config.comfyuiPath) {
+function runCmCli(args: string[], workspace?: string): string {
+  // THE CHOKE-POINT (codex gate P0). An earlier fix put this guard in
+  // `comfyCliUnavailableReason`, which install/enable/disable/uninstall consult —
+  // but `update`, `reinstall`, `fix all` and dependency sync call the CLI without
+  // going through it, so a stale local COMFYUI_PATH was still mutable in remote
+  // mode by four other routes. Every comfy-cli invocation passes through HERE, so
+  // this is where the refusal belongs. Nothing has run yet at this point, which is
+  // what makes refusing the right shape.
+  const resolvedWorkspace = workspace ?? resolveEffectiveComfyUIBase();
+  if (isRemoteMode()) {
     throw new ProcessControlError(
-      "This operation requires a local ComfyUI install. Set COMFYUI_PATH or use the Manager HTTP API.",
+      "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+        "LOCAL install" +
+        (workspace ?? config.comfyuiPath ?? config.comfyuiCodePath
+          ? ` — running it would modify ${workspace ?? config.comfyuiPath ?? config.comfyuiCodePath}, which is NOT the ` +
+            `server you are connected to`
+          : "") +
+        ". Nothing was run. Use the ComfyUI-Manager HTTP path, which addresses the server you " +
+        "are actually connected to, or run comfy-cli on the machine the install lives on.",
+    );
+  }
+  const ws = resolvedWorkspace;
+  if (!ws) {
+    throw new ProcessControlError(
+      "This operation requires a local ComfyUI install. Set COMFYUI_PATH, " +
+        "a default workspace (workspace action 'set_default'), or use the Manager HTTP API. " +
+        "On --base-directory deployments this is the data/base directory the runtime scans, " +
+        "not COMFYUI_CODE_PATH.",
     );
   }
   logger.info("Running comfy-cli", { args: ["node", ...args].join(" ") });
   try {
     const envelope = assertComfyCliOk(
       runComfyCliSync(["node", ...args], {
-        workspace: config.comfyuiPath,
+        workspace: ws,
         timeoutMs: COMFY_CLI_TIMEOUT,
         env: config.githubToken ? { GITHUB_TOKEN: config.githubToken } : undefined,
       }),
@@ -572,21 +2365,27 @@ function runCmCli(args: string[]): string {
 function parseInstalled(raw: unknown): InstalledNode[] {
   if (!raw || typeof raw !== "object") return [];
 
-  const toNode = (module: string, v: Record<string, unknown>): InstalledNode => ({
+  const toNode = (
+    module: string,
+    v: Record<string, unknown>,
+    moduleKey?: string,
+  ): InstalledNode => ({
     module,
+    ...(moduleKey ? { moduleKey } : {}),
     cnrId:
       typeof v.cnr_id === "string" && v.cnr_id.length > 0 ? v.cnr_id : undefined,
     auxId:
       typeof v.aux_id === "string" && v.aux_id.length > 0 ? v.aux_id : undefined,
     version: typeof v.ver === "string" ? v.ver : undefined,
-    // `enabled` may be absent on some builds; treat missing as enabled,
-    // but honor an explicit is_disabled flag if present.
+    // `enabled` is reported as a boolean on current builds; an explicit
+    // is_disabled flag is honored too. When NEITHER is present the state is
+    // UNKNOWN — left undefined, never defaulted to a definite value.
     enabled:
       typeof v.enabled === "boolean"
         ? v.enabled
-        : v.is_disabled === true
-          ? false
-          : true,
+        : typeof v.is_disabled === "boolean"
+          ? !v.is_disabled
+          : undefined,
   });
 
   if (Array.isArray(raw)) {
@@ -600,17 +2399,202 @@ function parseInstalled(raw: unknown): InstalledNode[] {
           (typeof entry.module === "string" && entry.module) ||
           (typeof entry.cnr_id === "string" && entry.cnr_id) ||
           "unknown";
-        return toNode(module, entry);
+        // #2714 — `module` above may be a human TITLE, so it is NOT safe to read as
+        // a directory name. Carry the key the payload actually stated separately;
+        // `module`'s own precedence is left exactly as it was, because it is what
+        // Manager is sent back as `node_name` and what this list displays.
+        return toNode(module, entry, typeof entry.module === "string" ? entry.module : undefined);
       });
   }
 
   return Object.entries(raw as Record<string, unknown>)
     .filter(([, v]) => Boolean(v && typeof v === "object"))
-    .map(([module, v]) => toNode(module, v as Record<string, unknown>));
+    .map(([module, v]) => toNode(module, v as Record<string, unknown>, module));
 }
 
 function stripUrlSuffix(value: string): string {
   return value.replace(/[?#].*$/, "").replace(/\/+$/, "");
+}
+
+/**
+ * Is this version string the "newest, whatever that is" SENTINEL (#1254)?
+ *
+ * Exported for the registry path's own translation of the same word, so the two
+ * cannot drift into disagreeing about what "latest" means. Case- and
+ * whitespace-insensitive because it arrives from a tool argument, not from git.
+ */
+export function isLatestSentinel(version: unknown): boolean {
+  return typeof version === "string" && version.trim().toLowerCase() === "latest";
+}
+
+/**
+ * #1470 — is this the CHANNEL word "nightly" rather than a git ref?
+ *
+ * The word is overloaded in our own surface, which is what made the bug: for a Manager
+ * install it names the git-HEAD channel — one of our paths even MINTS it, rewriting an
+ * absent/"latest" version to "nightly" because the Manager rejects a registry "latest" for
+ * a repository-style entry — while for a from-source git install `version` is documented as
+ * a git ref. A user who types `version:"nightly"` may mean either.
+ *
+ * So this does NOT decide the meaning on its own (codex): collapsing it to "no ref" would
+ * silently install the DEFAULT branch of a repository that genuinely has a `nightly` branch,
+ * and a quietly-wrong version is worse than the loud failure being fixed. It is used only to
+ * choose what happens when the checkout FAILS — see the clone path, which keeps the clone at
+ * HEAD and says so instead of deleting it.
+ */
+export function isGitHeadChannel(version: unknown): boolean {
+  return typeof version === "string" && version.trim().toLowerCase() === "nightly";
+}
+
+/**
+ * #1470 — what to do with a ref the freshly-cloned repository does NOT have.
+ *
+ * Decided from a rev-parse BEFORE the checkout, never by catching its failure (codex r2).
+ * Catching was wrong twice over: it swallowed unrelated failures — a corrupt repo, a
+ * permissions error — as "no such branch", and it claimed the clone was left at a usable
+ * HEAD after a checkout that had just failed in an unknown way. Asking first means a real
+ * checkout error still throws, and the skip path never runs a command at all, so the clone
+ * is exactly as `git clone` left it.
+ *
+ * Only a ref that came from `version` may be skipped. An explicit `ref:` is the caller
+ * naming a git ref, and quietly installing something else because the name happens to spell
+ * a channel word would be the wrong-version bug in a new place.
+ */
+export function checkoutPlanForMissingRef(opts: {
+  ref: string;
+  /** True when the ref came from the `version` selector rather than an explicit `ref`. */
+  fromVersion: boolean;
+}): "skip-at-head" | "fail" {
+  return opts.fromVersion && isGitHeadChannel(opts.ref) ? "skip-at-head" : "fail";
+}
+
+
+/**
+ * Which git ref an install should check out, or undefined for "leave the clone
+ * where it landed" (#1254).
+ *
+ * "latest" IS NOT A GIT REF. It is this tool's own word for "whatever is
+ * newest", and `version` defaults to it — so a plain
+ * install_custom_node(source:"git", version:"latest") fell straight through to
+ * `git checkout --detach --end-of-options latest` and failed. Worse than a
+ * failed command: the checkout failure discards the clone as a husk, so a clone
+ * that had already succeeded left a partially installed node behind.
+ *
+ * A fresh clone is ALREADY on the default branch, which is exactly what "latest"
+ * means for a git source, so the answer is to check out nothing. That also
+ * restores the shallow clone — the full history is fetched only because a
+ * concrete ref might need it.
+ *
+ * AN EXPLICIT ref is honoured LITERALLY, sentinel word or not. `ref` and a
+ * `#ref` in the URL are the caller naming a ref, and repositories do carry tags
+ * called `latest`; ignoring one would check out a different commit than the one
+ * asked for — a wrong answer, where the bug this fixes was only a failure.
+ *
+ * A separate exported function rather than an expression inline, so the rule can
+ * be tested as behaviour instead of asserted against source text.
+ */
+export function gitRefForInstall(opts: {
+  /** An explicitly requested ref. */
+  ref?: string;
+  /** A `#ref` parsed out of the repository URL. `null` is how parseGitUrl
+   *  reports "no fragment", and it must read as absent, not as a ref. */
+  urlRef?: string | null;
+  /** The version selector, which defaults to the "latest" sentinel. */
+  version?: string;
+}): string | undefined {
+  // `??` already collapses parseGitUrl's `null` "no fragment" into undefined, so
+  // there is no separate null check here — one would read as load-bearing and
+  // never fire.
+  const explicit = opts.ref ?? opts.urlRef ?? undefined;
+  if (explicit !== undefined) return explicit;
+  // "latest" is collapsed because it is NEVER a ref anyone means (#1254). "nightly" is
+  // deliberately NOT (#1470): it is overloaded — this tool's git-HEAD channel AND a plausible
+  // branch name — so it is offered to git as a ref, and the clone path decides what a FAILED
+  // checkout of it means. Collapsing it here would silently install the default branch of a
+  // repository that genuinely has one (codex).
+  return isLatestSentinel(opts.version) ? undefined : opts.version;
+}
+
+/**
+ * #1470 — does the cloned repository actually have this ref? Asked BEFORE the checkout so a
+ * missing ref is distinguishable from a checkout that failed for any other reason.
+ *
+ * A missing ref is proven with `show-ref`'s status 1. Any other failure is a probe error:
+ * a missing directory, unreadable/corrupt repository, or failed fetch must not be mistaken
+ * for a missing channel ref.
+ */
+function gitFetchAllTags(nodeDir: string, cwd: string): void {
+  // The SAME fetch runGitCheckout performs, hoisted so the existence probe below sees
+  // everything a checkout would (codex r3). A clone does not necessarily bring down every
+  // tag, so probing first would report an orphan/unreachable `nightly` TAG as missing and
+  // silently leave the clone at HEAD — while the original checkout would have fetched it and
+  // succeeded. That is the silent-wrong-version failure this whole change exists to avoid,
+  // reintroduced by the probe meant to prevent it.
+  //
+  try {
+    execFileSync("git", ["-C", nodeDir, "fetch", "--all", "--tags"], {
+      cwd,
+      encoding: "utf-8",
+      timeout: GIT_CLONE_TIMEOUT,
+      env: nonInteractiveGitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    throw new GitRefProbeError("git fetch --all --tags", err);
+  }
+}
+
+function gitShowRefExists(nodeDir: string, refPath: string, cwd: string): boolean {
+  try {
+    // refPath is always constructed with a refs/* prefix; no user string is
+    // passed as an option, and --verify requires an exact ref path.
+    execFileSync("git", ["-C", nodeDir, "show-ref", "--verify", "--quiet", refPath], {
+      cwd,
+      encoding: "utf-8",
+      timeout: GIT_CLONE_TIMEOUT,
+      env: nonInteractiveGitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return true;
+  } catch (err) {
+    const status = (err as { status?: unknown })?.status;
+    if (status === 1) return false;
+    throw new GitRefProbeError(`git show-ref --verify ${refPath}`, err);
+  }
+}
+
+function gitRemoteRefFor(nodeDir: string, ref: string, cwd: string): string | undefined {
+  let output: string;
+  try {
+    output = execFileSync(
+      "git",
+      ["-C", nodeDir, "for-each-ref", "--format=%(refname)", "refs/remotes"],
+      {
+        cwd,
+        encoding: "utf-8",
+        timeout: GIT_CLONE_TIMEOUT,
+        env: nonInteractiveGitEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch (err) {
+    throw new GitRefProbeError("git for-each-ref refs/remotes", err);
+  }
+
+  const canonicalRemoteRef = `refs/remotes/origin/${ref}`;
+  const matches = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line === canonicalRemoteRef);
+  return matches[0];
+}
+
+function resolveGitHeadRef(nodeDir: string, ref: string, cwd: string): string | undefined {
+  for (const prefix of ["refs/heads/", "refs/tags/"]) {
+    const refPath = `${prefix}${ref}`;
+    if (gitShowRefExists(nodeDir, refPath, cwd)) return refPath;
+  }
+  return gitRemoteRefFor(nodeDir, ref, cwd);
 }
 
 function validateGitRef(ref: string): string {
@@ -703,11 +2687,20 @@ function gitCheckoutDir(baseUrl: string): string {
   return basename(clean).replace(/\.git$/i, "");
 }
 
-function runGitCheckout(baseUrl: string, ref: string): void {
-  if (!config.comfyuiPath) {
+function runGitCheckout(
+  baseUrl: string,
+  ref: string,
+  basePath?: string,
+  opts: { refFromVersion?: boolean } = {},
+): string | undefined {
+  // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
+  // adopted saved-default/live root WITHOUT mutating global config); fall back to
+  // the shared data/base resolver. Either may be unset in remote mode → clear error.
+  const comfyuiBase = basePath ?? resolveEffectiveComfyUIBase();
+  if (!comfyuiBase) {
     throw new ProcessControlError(
       "Checking out a custom-node git ref requires a local ComfyUI install, " +
-        "but config.comfyuiPath is not set.",
+        "but no ComfyUI path is set.",
     );
   }
 
@@ -718,7 +2711,7 @@ function runGitCheckout(baseUrl: string, ref: string): void {
   assertSafeGitUrl(baseUrl);
   const repoName = gitCheckoutDir(baseUrl);
   assertSafeRepoName(repoName);
-  const customNodesRoot = resolve(config.comfyuiPath, "custom_nodes");
+  const customNodesRoot = resolve(comfyuiBase, "custom_nodes");
   const nodeDir = resolve(customNodesRoot, repoName);
   const rel = relative(customNodesRoot, nodeDir);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
@@ -726,21 +2719,45 @@ function runGitCheckout(baseUrl: string, ref: string): void {
       `Refusing to check out: resolved path "${nodeDir}" escapes ${customNodesRoot}.`,
     );
   }
+
+  // #1470 — `nightly` is overloaded: a version-derived value can mean the
+  // repository's default HEAD, while an explicit ref must remain literal. The
+  // direct-clone fallback already used this probe; keep comfy-cli on the same
+  // provenance-aware path so it does not unconditionally checkout a missing
+  // channel word after `comfy node install`.
+  let checkoutRef = ref;
+  if (opts.refFromVersion === true && isGitHeadChannel(ref)) {
+    gitFetchAllTags(nodeDir, comfyuiBase);
+    const resolved = resolveGitHeadRef(nodeDir, ref, comfyuiBase);
+    if (!resolved && checkoutPlanForMissingRef({ ref, fromVersion: true }) === "skip-at-head") {
+      return (
+        `"${ref}" is not a branch or tag in ${baseUrl}, so the clone was left at the ` +
+        `repository's default HEAD — which is what "nightly" means as a channel here. ` +
+        `If you meant a ref by that name, this repository does not have one; pass ` +
+        `ref:<branch-or-tag> for an exact checkout.`
+      );
+    }
+    checkoutRef = resolved ?? ref;
+  }
+
   logger.info("Checking out custom-node git ref", {
     repository: baseUrl,
-    ref,
+    ref: checkoutRef,
     nodeDir,
   });
 
   try {
     execFileSync("git", ["-C", nodeDir, "fetch", "--all", "--tags"], {
-      cwd: config.comfyuiPath,
+      cwd: comfyuiBase,
       encoding: "utf-8",
       timeout: GIT_CLONE_TIMEOUT,
       env: nonInteractiveGitEnv(),
     });
-    execFileSync("git", ["-C", nodeDir, "checkout", "--detach", "--end-of-options", ref], {
-      cwd: config.comfyuiPath,
+    // `--end-of-options` is not a portable `git checkout` argument.
+    // checkoutRef has already passed validateGitRef(), which rejects leading
+    // dashes and control/whitespace characters before it reaches argv.
+    execFileSync("git", ["-C", nodeDir, "checkout", "--detach", checkoutRef], {
+      cwd: comfyuiBase,
       encoding: "utf-8",
       timeout: GIT_CLONE_TIMEOUT,
       env: nonInteractiveGitEnv(),
@@ -748,13 +2765,14 @@ function runGitCheckout(baseUrl: string, ref: string): void {
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
     throw new NodeManagementError(
-      `Failed to check out git ref "${ref}" for custom node "${baseUrl}": ${e.message}`,
+      `Failed to check out git ref "${checkoutRef}" for custom node "${baseUrl}": ${e.message}`,
       {
         stdout: e.stdout ? e.stdout.toString() : "",
         stderr: e.stderr ? e.stderr.toString() : "",
       },
     );
   }
+  return undefined;
 }
 
 /**
@@ -770,11 +2788,24 @@ function nodeInstalledMatches(
   idOrUrl: string,
   installed: InstalledNode[],
 ): boolean {
+  return findInstalledNode(idOrUrl, installed) !== undefined;
+}
+
+/**
+ * The installed-list entry matching the wanted id/url, if any — the same
+ * matching nodeInstalledMatches applies, but returning the node so callers can
+ * also inspect its enabled flag / version (disable/uninstall post-state
+ * verification, #775).
+ */
+function findInstalledNode(
+  idOrUrl: string,
+  installed: InstalledNode[],
+): InstalledNode | undefined {
   const wanted = idOrUrl.trim().toLowerCase();
   const repoName = looksLikeGitUrl(idOrUrl)
     ? gitCheckoutDir(parseGitUrl(idOrUrl).baseUrl).toLowerCase()
     : wanted;
-  return installed.some((node) => {
+  return installed.find((node) => {
     const candidates: string[] = [];
     for (const v of [node.module, node.cnrId, node.auxId]) {
       if (!v) continue;
@@ -786,19 +2817,526 @@ function nodeInstalledMatches(
   });
 }
 
+// ---------------------------------------------------------------------------
+// On-disk presence evidence (#797)
+//
+// The Manager installed-list is keyed on what the MANAGER tracks. A pack
+// installed as a Comfy Registry zip (no .git) or copied into custom_nodes by
+// hand is present on disk while the list says nothing about it — and a gate
+// that only asks the list has no basis for asserting "not installed locally".
+// The disk check below answers the SAME question the list was asked ("is this
+// pack here?") against the filesystem, keeping the three outcomes distinct:
+// found / scanned-and-not-there / could-not-look.
+// ---------------------------------------------------------------------------
+
+/** Directory names a pack could plausibly be installed under for `id`. */
+function packDirNameCandidates(id: string): Set<string> {
+  const wanted = id.trim().toLowerCase();
+  // A path-shaped enable/disable id must never be reduced to its basename:
+  // doing that would let `../pack` vouch for `custom_nodes/pack` and could
+  // hand an untrusted id to a local mutation path. Git URLs are the one
+  // deliberate exception because their checkout directory is derived from
+  // the URL after it has already passed git-URL validation.
+  const names = new Set<string>();
+  if (!/[/\\]/.test(wanted)) names.add(wanted);
+  if (looksLikeGitUrl(id)) {
+    names.add(gitCheckoutDir(parseGitUrl(id).baseUrl).toLowerCase());
+  }
+  return names;
+}
+
+export type DiskPackPresence =
+  | { state: "found"; dir: string }
+  /** custom_nodes was enumerated and the pack is not in it. */
+  | { state: "not-found"; scanned: string }
+  /** The disk could not answer (no dir, unreadable, …) — NOT absence. */
+  | { state: "unreadable"; reason: string };
+
+/**
+ * Look for a pack on disk under <comfyuiBase>/custom_nodes. A directory counts
+ * when its name matches (a Manager-disabled "<name>.disabled" suffix is still
+ * the pack — disabled is not uninstalled) or its pyproject.toml [project].name
+ * matches (the registry-id identity a zip install keeps even when the folder
+ * was renamed). An unrelated pack's unreadable pyproject simply does not vouch
+ * for that directory; it never turns the whole scan into a failure.
+ */
+export function findPackOnDisk(id: string, comfyuiBase: string): DiskPackPresence {
+  const customNodes = join(comfyuiBase, "custom_nodes");
+  let entries: import("node:fs").Dirent[];
+  try {
+    if (!existsSync(customNodes)) {
+      return {
+        state: "unreadable",
+        reason: `${customNodes} does not exist (is ${comfyuiBase} a ComfyUI install root?)`,
+      };
+    }
+    entries = readdirSync(customNodes, { withFileTypes: true });
+  } catch (err) {
+    return {
+      state: "unreadable",
+      reason: `could not enumerate ${customNodes}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  const wanted = packDirNameCandidates(id);
+  for (const entry of entries) {
+    if (!(entry.isDirectory() || entry.isSymbolicLink())) continue;
+    if (entry.name.startsWith(".")) continue;
+    const dirName = entry.name.toLowerCase().replace(/\.disabled$/, "");
+    let pyprojectName: string | undefined;
+    const pyproject = join(customNodes, entry.name, "pyproject.toml");
+    try {
+      if (existsSync(pyproject)) {
+        pyprojectName = parsePyproject(readFileSync(pyproject, "utf-8"))
+          .projectName?.trim()
+          .toLowerCase();
+      }
+    } catch {
+      // An unreadable/corrupt pyproject means THIS directory cannot vouch by
+      // identity — it does not make the whole scan unreadable.
+    }
+    if (wanted.has(dirName) || (pyprojectName !== undefined && wanted.has(pyprojectName))) {
+      return { state: "found", dir: join(customNodes, entry.name) };
+    }
+  }
+  return { state: "not-found", scanned: customNodes };
+}
+
+interface DisabledPackOnDisk {
+  disabledDir: string;
+  enabledDir: string;
+  /** The directory name passed to comfy-cli, never the caller's raw id. */
+  cliId: string;
+}
+
+/**
+ * Validate the id before it can participate in a local filesystem mutation or
+ * become a comfy-cli argument. Installed-pack ids are single directory names;
+ * URLs, separators, option-like names, and control characters are not valid
+ * targets for this recovery path.
+ */
+function assertSafeLocalPackId(id: string): string {
+  const trimmed = id.trim();
+  if (
+    trimmed.length === 0 ||
+    trimmed !== id ||
+    trimmed === "." ||
+    trimmed === ".." ||
+    trimmed.startsWith("-") ||
+    /[/\\]/.test(trimmed) ||
+    /[\x00-\x1F\x7F]/.test(trimmed)
+  ) {
+    throw new ValidationError(
+      `Refusing to enable local custom node "${id}": expected a single installed ` +
+        `pack id without path separators, control characters, or a leading '-'.`,
+    );
+  }
+  return trimmed;
+}
+
+/**
+ * Find a real directory named `<pack>.disabled` under the selected
+ * custom_nodes root. This intentionally does not follow symlink entries and
+ * refuses duplicate active/disabled identities; otherwise a rename could
+ * enable a different pack than the caller named or make ComfyUI load an
+ * arbitrary external tree after restart.
+ */
+function findDisabledPackOnDisk(
+  id: string,
+  comfyuiBase: string,
+): DisabledPackOnDisk | undefined {
+  const customNodes = join(comfyuiBase, "custom_nodes");
+  let entries: import("node:fs").Dirent[];
+  try {
+    if (!existsSync(customNodes)) return undefined;
+    entries = readdirSync(customNodes, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+
+  const wanted = new Set([id.toLowerCase()]);
+  let disabled: DisabledPackOnDisk | undefined;
+  let activeDir: string | undefined;
+  for (const entry of entries) {
+    const name = entry.name;
+    if (name.startsWith(".")) continue;
+    const lower = name.toLowerCase();
+    const isDisabled = lower.endsWith(".disabled");
+    const canonical = isDisabled ? name.slice(0, -".disabled".length) : name;
+    const canonicalLower = canonical.toLowerCase();
+    if (
+      !wanted.has(canonicalLower) &&
+      !(isManagerSelfTarget(id) && isManagerSelfTarget(canonical))
+    ) {
+      continue;
+    }
+
+    if (entry.isSymbolicLink()) {
+      if (isDisabled) {
+        throw new NodeManagementError(
+          `Refusing to enable "${id}": ${join(customNodes, name)} is a symlink; ` +
+            `the local recovery path only renames a real custom-node directory.`,
+        );
+      }
+      throw new NodeManagementError(
+        `Refusing to enable "${id}": the active destination ${join(customNodes, name)} ` +
+          `is a symlink. Remove the collision before retrying.`,
+      );
+    }
+
+    const dir = join(customNodes, name);
+    if (isDisabled) {
+      if (!entry.isDirectory()) {
+        throw new NodeManagementError(
+          `Refusing to enable "${id}": ${dir} is not a real directory.`,
+        );
+      }
+      if (disabled) {
+        throw new NodeManagementError(
+          `Refusing to enable "${id}": multiple matching .disabled directories ` +
+            `exist under ${customNodes}.`,
+        );
+      }
+      disabled = {
+        disabledDir: dir,
+        enabledDir: join(customNodes, canonical),
+        cliId: canonical,
+      };
+    } else {
+      // Any existing active-name entry is a collision, including a file. A
+      // POSIX rename could otherwise replace it, and a symlink could redirect
+      // what ComfyUI loads after restart.
+      activeDir = dir;
+    }
+  }
+
+  if (disabled && activeDir) {
+    throw new NodeManagementError(
+      `Refusing to enable "${id}": both ${activeDir} and ${disabled.disabledDir} ` +
+        `exist. Remove the duplicate before retrying.`,
+    );
+  }
+  return disabled;
+}
+
+function verifyLocalEnable(
+  id: string,
+  comfyuiBase: string,
+  enabledDir: string,
+): void {
+  const disabled = findDisabledPackOnDisk(id, comfyuiBase);
+  if (disabled) {
+    throw new NodeManagementError(
+      `The local enable of "${id}" did NOT take effect: ${disabled.disabledDir} ` +
+        `is still disabled.`,
+    );
+  }
+  const after = findPackOnDisk(id, comfyuiBase);
+  if (
+    after.state !== "found" ||
+    resolve(after.dir) !== resolve(enabledDir) ||
+    basename(after.dir).toLowerCase().endsWith(".disabled")
+  ) {
+    throw new NodeManagementError(
+      `The local enable of "${id}" could NOT be verified under ${join(comfyuiBase, "custom_nodes")}.`,
+    );
+  }
+}
+
+function revalidateLocalEnableTarget(
+  id: string,
+  comfyuiBase: string,
+  expected: DisabledPackOnDisk,
+): DisabledPackOnDisk {
+  const current = findDisabledPackOnDisk(id, comfyuiBase);
+  if (
+    !current ||
+    resolve(current.disabledDir) !== resolve(expected.disabledDir) ||
+    resolve(current.enabledDir) !== resolve(expected.enabledDir)
+  ) {
+    throw new NodeManagementError(
+      `Refusing to enable "${id}": the validated source or destination changed ` +
+        `before the local rename. NOTHING was changed by this tool.`,
+    );
+  }
+  return current;
+}
+
+/** Return undefined on a verified rollback, otherwise a safe refusal reason. */
+function rollbackLocalEnable(
+  id: string,
+  comfyuiBase: string,
+  disabled: DisabledPackOnDisk,
+): string | undefined {
+  try {
+    // Do not move a destination that appeared or changed while verification
+    // was running. A rollback is only safe when the original source is absent
+    // and the exact destination is still the directory we created.
+    if (findDisabledPackOnDisk(id, comfyuiBase)) {
+      return "the original .disabled source is still present or a collision appeared";
+    }
+    const active = findPackOnDisk(id, comfyuiBase);
+    if (
+      active.state !== "found" ||
+      resolve(active.dir) !== resolve(disabled.enabledDir) ||
+      basename(active.dir).toLowerCase().endsWith(".disabled")
+    ) {
+      return "the destination no longer matches the directory this call renamed";
+    }
+    renameSync(disabled.enabledDir, disabled.disabledDir);
+    const restored = findDisabledPackOnDisk(id, comfyuiBase);
+    if (
+      !restored ||
+      resolve(restored.disabledDir) !== resolve(disabled.disabledDir) ||
+      resolve(restored.enabledDir) !== resolve(disabled.enabledDir)
+    ) {
+      return "the rollback rename landed but its .disabled post-state could not be verified";
+    }
+    return undefined;
+  } catch (err) {
+    return `rollback failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+function enablePackFromDisk(
+  id: string,
+  comfyuiBase: string,
+  disabled: DisabledPackOnDisk,
+): NodeOpResult {
+  const target = revalidateLocalEnableTarget(id, comfyuiBase, disabled);
+  try {
+    renameSync(target.disabledDir, target.enabledDir);
+  } catch (err) {
+    throw new NodeManagementError(
+      `Could not enable "${id}" by renaming ${target.disabledDir}: ` +
+        `${err instanceof Error ? err.message : String(err)}. NOTHING was changed by this tool.`,
+    );
+  }
+  try {
+    verifyLocalEnable(id, comfyuiBase, target.enabledDir);
+  } catch (err) {
+    const rollbackError = rollbackLocalEnable(id, comfyuiBase, target);
+    const verification = err instanceof Error ? err.message : String(err);
+    throw new NodeManagementError(
+      `The local enable of "${id}" could NOT be verified: ${verification}. ` +
+        (rollbackError === undefined
+          ? "The rename was rolled back."
+          : `The rename could NOT be rolled back safely: ${rollbackError}.`),
+    );
+  }
+  return {
+    mechanism: "filesystem",
+    message:
+      `Enabled "${id}" by renaming its validated local directory to ` +
+      `${target.enabledDir} (verified on disk). A ComfyUI restart is required ` +
+      `for the change to take effect.`,
+    details: { from: target.disabledDir, to: target.enabledDir },
+  };
+}
+
+function enablePackViaComfyCliFromDisk(
+  id: string,
+  comfyuiBase: string,
+  disabled: DisabledPackOnDisk,
+): NodeOpResult {
+  const out = runCmCli(["enable", disabled.cliId], comfyuiBase);
+  try {
+    verifyLocalEnable(id, comfyuiBase, disabled.enabledDir);
+  } catch (err) {
+    if (err instanceof NodeManagementError) {
+      return {
+        mechanism: "comfy-cli",
+        message: err.message + " comfy-cli reported success, but the local post-state disagrees.",
+        details: out.trim(),
+      };
+    }
+    throw err;
+  }
+  return {
+    mechanism: "comfy-cli",
+    message:
+      `Enabled "${id}" via official comfy-cli (verified on disk at ` +
+      `${disabled.enabledDir}). A ComfyUI restart is required for the change to take effect.`,
+    details: out.trim(),
+  };
+}
+
+export type PackPresence =
+  | { state: "manager-listed"; node?: InstalledNode }
+  /**
+   * On disk, and a READABLE Manager list does not track it (registry zip /
+   * manual copy). When the list could not be read (managerListReadable false)
+   * the tracking claim is unknown — callers must not assert "Manager does not
+   * track it" or that a queued op resolved to nothing.
+   */
+  | { state: "on-disk"; dir: string; managerListReadable: boolean; listError?: string }
+  /** Every source that could be consulted agrees the pack is not there. */
+  | { state: "absent"; evidence: "manager-only" | "manager+disk"; scanned?: string }
+  /** No consulted source could answer — never reported as absence. */
+  | { state: "unverifiable"; reason: string };
+
+/**
+ * The disk half of a presence answer, captured at OPERATION ENTRY. Every
+ * presence check of one logical operation (pre-resolve, post-verify) must use
+ * the SAME context: computing it later from mutable global mode/config lets a
+ * mid-op retarget pair Manager A's answer with disk B (or no disk at all) —
+ * false "present on disk", false absence, false REMOVED (codex gate round 11).
+ */
+export interface PackPresenceContext {
+  /** The remote/local classification at entry. */
+  remote: boolean;
+  /** The local root captured at entry (undefined when remote or none exists). */
+  diskRoot?: string;
+}
+
+/** Capture the presence context for one operation, before its first await. */
+export interface PackPresenceCaptureOptions {
+  /** Do not consult the shared configured/saved root when no call-scoped root exists. */
+  allowConfiguredFallback?: boolean;
+}
+
+export function capturePackPresenceContext(
+  diskRoot?: string,
+  options: PackPresenceCaptureOptions = {},
+): PackPresenceContext {
+  const remote = isRemoteMode();
+  return {
+    remote,
+    diskRoot:
+      remote || (diskRoot === undefined && options.allowConfiguredFallback === false)
+        ? undefined
+        : (diskRoot ?? resolveEffectiveComfyUIBase()),
+  };
+}
+
+/**
+ * Answer "is this pack present?" across BOTH sources of truth, keeping
+ * "could not determine" distinct from "determined absent" (#797, #796's
+ * defect class):
+ *   1. ComfyUI-Manager's installed list (works remotely, covers tracked packs);
+ *   2. the on-disk custom_nodes scan — LOCAL sessions only. In remote mode the
+ *      disk we could read is not the server's, so it is never consulted.
+ * The Manager list matching always wins; disk evidence is what keeps a
+ * Manager-untracked zip install from reading as "not installed".
+ *
+ * `ctx` is the operation's entry-captured context (capturePackPresenceContext).
+ * When omitted it is captured here — still before this call's first await, so
+ * single-shot callers stay correct.
+ */
+export async function resolvePackPresence(
+  id: string,
+  base: string,
+  ctx?: PackPresenceContext,
+): Promise<PackPresence> {
+  const context = ctx ?? capturePackPresenceContext();
+  const diskBase = context.remote ? undefined : context.diskRoot;
+
+  let installed: InstalledNode[] | undefined;
+  let listError: string | undefined;
+  try {
+    installed = await listInstalledNodesAt(base);
+  } catch (err) {
+    listError = err instanceof Error ? err.message : String(err);
+  }
+  if (installed) {
+    const node = findInstalledNode(id, installed);
+    if (node) return { state: "manager-listed", node };
+  }
+
+  const disk = diskBase ? findPackOnDisk(id, diskBase) : undefined;
+  if (disk?.state === "found") {
+    return {
+      state: "on-disk",
+      dir: disk.dir,
+      managerListReadable: installed !== undefined,
+      listError,
+    };
+  }
+
+  if (!installed) {
+    // The Manager list could not be read — "absent" is off the table no matter
+    // what the disk says: a pack Manager tracks but the disk missed (an
+    // adopted/extra-paths root) would be falsely condemned.
+    const diskNote =
+      disk?.state === "not-found"
+        ? ` The disk check found no matching pack under ${disk.scanned} either, but with the Manager list unreadable that still does not prove absence.`
+        : disk?.state === "unreadable"
+          ? ` The disk check was inconclusive too (${disk.reason}).`
+          : " No local disk check was possible in this session.";
+    return {
+      state: "unverifiable",
+      reason:
+        `ComfyUI-Manager's installed-pack list could not be read (${listError}).` + diskNote,
+    };
+  }
+  if (disk?.state === "not-found") {
+    return { state: "absent", evidence: "manager+disk", scanned: disk.scanned };
+  }
+  if (disk?.state === "unreadable") {
+    return {
+      state: "unverifiable",
+      reason:
+        `"${id}" is not in ComfyUI-Manager's installed-pack list, and the on-disk ` +
+        `check could not answer (${disk.reason}).`,
+    };
+  }
+  // Remote session: only the Manager list could be consulted at all.
+  return { state: "absent", evidence: "manager-only" };
+}
+
+/**
+ * #2530 — clone succeeded, but the dependency interpreter is unproven. Never
+ * recommend `python -m pip install` against the interpreter we just refused;
+ * that is the Stability Matrix base-python command that PEP 668 already rejected.
+ */
+function depsSkippedUnknownInterpreterWarning(reason: string, packId: string): string {
+  return (
+    `Python dependencies were NOT installed. ${reason} ` +
+    `The pack was cloned but this is a PARTIAL install: the dependency interpreter is unknown. ` +
+    `Do not run pip against an untrusted interpreter. ` +
+    `Use install_custom_node(action:"fix", id:"${packId}") so ComfyUI-Manager can restore/repair ` +
+    `dependencies in the connected environment, or set COMFYUI_PYTHON to the interpreter ` +
+    `ComfyUI actually imports from and retry.`
+  );
+}
+
+function isExternallyManagedPipError(text: string): boolean {
+  return (
+    /^\s*error: externally-managed-environment/im.test(text) ||
+    /interpreter at .+ is externally managed/i.test(text)
+  );
+}
+
+function depsPipFailedWarning(err: unknown, python: string, packId: string): string {
+  const e = err as Error & { stdout?: string | Buffer; stderr?: string | Buffer };
+  const output = `${e.stderr?.toString() ?? ""}\n${e.stdout?.toString() ?? ""}\n${e.message}`;
+  if (isExternallyManagedPipError(output)) {
+    return (
+      `Python dependencies (requirements.txt) failed to install: "${python}" is EXTERNALLY MANAGED ` +
+      `(PEP 668) and must not be modified. Do not re-run pip against that interpreter. ` +
+      `Use install_custom_node(action:"fix", id:"${packId}") so ComfyUI-Manager can restore/repair ` +
+      `the connected environment.`
+    );
+  }
+  return (
+    `Python dependencies (requirements.txt) failed to install (${e.message}); ` +
+    `install them manually with "${python} -m pip install -r requirements.txt".`
+  );
+}
+
 /**
  * Resolve the ComfyUI venv python for installing a cloned node's deps. Prefers
  * the install's own `.venv` (Windows Scripts/ or POSIX bin/), falling back to a
- * bare "python" on PATH.
+ * bare "python" on PATH. `basePath` is the CALL-SCOPED install root (apply_manifest
+ * threads an adopted saved-default/live root without mutating global config); when
+ * omitted it falls back to the code checkout (pip/venv live under main.py), then
+ * the pack/data root for a conventional single-root install. Passing the pack
+ * root still matters as that last fallback: otherwise a cloned node's
+ * requirements.txt / install.py would run under a BARE system python for an
+ * adopted workspace (#463). The code root wins on a split install so Desktop
+ * `--base-directory` pack writes do not pick the data tree's missing .venv.
  */
-function resolveVenvPython(): string {
-  if (config.comfyuiPath) {
-    const winPy = join(config.comfyuiPath, ".venv", "Scripts", "python.exe");
-    if (existsSync(winPy)) return winPy;
-    const posixPy = join(config.comfyuiPath, ".venv", "bin", "python");
-    if (existsSync(posixPy)) return posixPy;
-  }
-  return "python";
+async function resolveVenvPython(basePath?: string) {
+  return resolveInstallInterpreter(resolveEffectiveComfyUICodeBase() ?? basePath);
 }
 
 /**
@@ -853,18 +3391,592 @@ export function assertSafeRepoName(repoName: string): void {
  * Dep failures DON'T fail the install (clone succeeded) — they're surfaced as
  * warnings. A clone failure throws NodeManagementError.
  */
-function cloneCustomNodeFallback(
+/**
+ * Filename that is an install/VCS marker, not pack code. A Comfy Registry zip
+ * that extracted nothing still leaves `.tracking`; a timed-out git clone leaves
+ * `.git`. ComfyUI loads DIRECTORIES, so either husk is imported on every start
+ * and fails — forever, silently (#900, #1816). Hidden files and `__pycache__`
+ * are the same class: they are not `__init__.py` / `pyproject.toml` / `*.py`.
+ */
+function isPackMarkerName(name: string): boolean {
+  const n = name.toLowerCase();
+  return n.startsWith(".") || n === "__pycache__";
+}
+
+function readdirEntryName(entry: string | { name: string }): string {
+  return typeof entry === "string" ? entry : entry.name;
+}
+
+function isLoadablePackFileName(name: string): boolean {
+  const n = name.toLowerCase();
+  return n === "pyproject.toml" || n === "__init__.py" || n.endsWith(".py");
+}
+
+/**
+ * Does this directory hold something ComfyUI could actually load?
+ *
+ * A clone that git created and then abandoned leaves a directory containing only
+ * `.git`. A Comfy Registry zip that downloaded nothing leaves only `.tracking`.
+ * ComfyUI loads DIRECTORIES, so it will try to import that on every start and
+ * fail — forever, silently, long after whoever ran the install has forgotten
+ * about it (#900, #1816). "The directory exists" was never the question.
+ *
+ * An empty listing is inconclusive (callers/tests may only have enumerated
+ * `custom_nodes/`): fall through to the two files every loadable pack has.
+ * Unreadable is not a finding either way.
+ */
+function looksLikeAPack(dir: string): boolean {
+  try {
+    const names = readdirSync(dir).map((entry) =>
+      readdirEntryName(entry as string | { name: string }),
+    );
+    if (names.length === 0) {
+      return existsSync(join(dir, "__init__.py")) || existsSync(join(dir, "pyproject.toml"));
+    }
+    return names.some((name) => !isPackMarkerName(name) && isLoadablePackFileName(name));
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * #2714 — DOES THE DISK CORROBORATE THE MANAGER'S "IT IS INSTALLED"?
+ *
+ * The git branch of installCustomNodeImpl used to accept ComfyUI-Manager's
+ * installed-pack list as the whole proof: queue drained, `nodeInstalledMatches`
+ * true, report `Installed "<repo>" via ComfyUI-Manager`. On Manager 4.2.2 a
+ * reporter got exactly that string (done_count 2) for
+ * `https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes` while
+ * `custom_nodes/ComfyUI-DaSiWa-Nodes` did not exist at all. The list is
+ * Manager's OWN bookkeeping — for a pack it previously tracked it keeps
+ * answering after the directory is gone, and a v4 task that resolves nothing is
+ * still marked done. Neither the list nor done_count observes the filesystem.
+ *
+ * The registry branch below already crosses the list with a disk scan
+ * (`resolvePackPresence`) and already refuses a marker-only husk
+ * (`looksLikeAPack`, #900/#1816). The git branch had neither. This is that same
+ * evidence, applied to the git route.
+ *
+ * CORROBORATION IS PER-IDENTITY, NOT PER-NAME. Manager may hold the pack under
+ * its CNR id, its own module key, or the repo half of its aux id rather than the
+ * repo name we derived from the URL, so every identity the matched entry offers
+ * that could be a DIRECTORY (see packDirAliases) gets to vouch for the pack; ONE
+ * hit is enough. Only when they ALL scan clean is the claim uncorroborated — an
+ * "absent" that has to survive every spelling before it can retract a success.
+ *
+ * NOT the `.git`-must-exist check the report proposed: the v4 route is
+ * registry-first by construction, so a pack it resolved and unpacked from the
+ * registry has no `.git` and is working exactly as designed. What matters is
+ * whether ComfyUI can import the directory, which is what `looksLikeAPack` asks.
+ */
+type ManagerClaimCorroboration =
+  | { state: "corroborated"; dir: string }
+  /** The directory is there but holds no importable pack (#900's husk). */
+  | { state: "husk"; dir: string }
+  /** Every identity was scanned for and none is on disk. */
+  | { state: "absent"; scanned: string }
+  /** The disk could not answer — never treated as absence. */
+  | { state: "unreadable" };
+
+/**
+ * The alias identities a matched Manager entry offers, reduced to values that
+ * could actually BE a directory under custom_nodes.
+ *
+ * `aux_id` is "owner/repo" — the repo half is what Manager checks the pack out
+ * as, and `packDirNameCandidates` deliberately drops any path-shaped id, so the
+ * raw value would silently vouch for nothing. Take its basename.
+ *
+ * It reads `moduleKey`, NEVER `module`: the array payload puts a human `title` in
+ * the latter whenever the entry has one, so a Manager record of
+ * `{title:"Friendly Label", cnr_id:"owner/repo"}` would send this scan looking for
+ * a directory called "Friendly Label" — and an unrelated pack that happens to be
+ * named that would then certify an install that never happened (gate round 3).
+ *
+ * NO NAME-SHAPE HEURISTIC BEYOND THAT. Round 1 of the gate rejected values with
+ * whitespace here on the reasoning that ComfyUI imports a pack directory as a
+ * Python module name so it cannot contain a space. That reasoning is FALSE —
+ * ComfyUI loads packs through `importlib.util.spec_from_file_location`, which
+ * takes any string as the module name — and the filter it justified would have
+ * dropped a real `custom_nodes/Foo Bar` and cloned a duplicate beside it (round 2).
+ * The contamination it was actually defending against is the title-in-`module`
+ * problem above, which `moduleKey` removes outright — so the heuristic bought
+ * nothing that reading the right field does not already give.
+ */
+function packDirAliases(node: InstalledNode): string[] {
+  const aliases: string[] = [];
+  for (const raw of [node.moduleKey, node.cnrId, node.auxId]) {
+    if (typeof raw !== "string") continue;
+    const name = basename(raw.trim().replace(/[\\/]+$/, ""));
+    if (name.length === 0 || name === "." || name === "..") continue;
+    if (/[\x00-\x1F\x7F]/.test(name)) continue;
+    aliases.push(name);
+  }
+  return aliases;
+}
+
+function diskCorroboratesManagerInstall(
+  gitId: string,
+  node: InstalledNode,
+  diskRoot: string,
+): ManagerClaimCorroboration {
+  const identities = [gitId, ...packDirAliases(node)];
+  let husk: string | undefined;
+  let scanned: string | undefined;
+  let unreadable = false;
+  for (const identity of identities) {
+    const found = findPackOnDisk(identity, diskRoot);
+    if (found.state === "found") {
+      if (looksLikeAPack(found.dir)) return { state: "corroborated", dir: found.dir };
+      husk ??= found.dir;
+      continue;
+    }
+    if (found.state === "not-found") scanned ??= found.scanned;
+    else unreadable = true;
+  }
+  // A husk is a POSITIVE observation of a real directory. A scan that could not
+  // answer cannot explain it away, so it is reported first — and it only ever
+  // produces a refusal, never a write.
+  if (husk !== undefined) return { state: "husk", dir: husk };
+  // UNREADABLE OUTRANKS ABSENT, and this ordering is the whole point (codex gate,
+  // round 1): "absent" is the one verdict here that retracts a success AND
+  // authorizes a filesystem write, so it may only be reached when EVERY identity
+  // was conclusively scanned. One `not-found` beside one unanswerable scan is not
+  // proof of absence — it is the #796/#797 fold this file exists to avoid.
+  if (unreadable) return { state: "unreadable" };
+  if (scanned !== undefined) return { state: "absent", scanned };
+  return { state: "unreadable" };
+}
+
+/**
+ * Registry-zip post-verify: the target directory exists but holds no pack code.
+ * Look up the registry entry's repository so the error can name the git-clone
+ * fallback that actually works; a lookup failure must not hide the empty dir.
+ */
+async function refuseEmptyRegistryPack(
+  id: string,
+  dir: string,
+  status: unknown,
+  createdThisCall: boolean,
+): Promise<NodeManagementError> {
+  let leftover = "";
+  if (createdThisCall) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch (rmErr) {
+      leftover =
+        ` NOTE: the empty pack directory at ${dir} could NOT be removed ` +
+        `(${rmErr instanceof Error ? rmErr.message : String(rmErr)}). Delete it by hand ` +
+        `before cloning.`;
+    }
+  }
+  let cloneHint =
+    `search_custom_nodes (action:"details", id:"${id}") reports the repository URL; ` +
+    `then install_custom_node (action:"install", source:"git") with that URL`;
+  try {
+    const details = await getNodePackDetails(id);
+    const repo = typeof details.repository === "string" ? details.repository.trim() : "";
+    if (repo) {
+      cloneHint =
+        `install_custom_node (action:"install", id:"${repo}", source:"git") ` +
+        `— or \`git clone --depth 1 ${repo}\` into custom_nodes/ after removing any empty leftover`;
+    }
+  } catch {
+    // The empty directory is the finding; the URL is additive.
+  }
+  const createdNote = createdThisCall
+    ? leftover ||
+      ` The empty directory at ${dir} was removed so a git clone can use that path.`
+    : ` This call did not create ${dir}, so it was left untouched. Delete it by hand before retrying.`;
+  return new NodeManagementError(
+    `"${id}" was queued as a Comfy Registry zip install, but ${dir} holds no loadable pack ` +
+      `— only install markers (e.g. .tracking), with no __init__.py, pyproject.toml, or *.py. ` +
+      `NOT reporting this as installed: ComfyUI cannot import an empty directory.` +
+      createdNote +
+      ` The registry zip is empty or broken; install from the pack's git repository instead: ` +
+      `${cloneHint}. Then restart ComfyUI to load it.`,
+    status,
+  );
+}
+
+/**
+ * Kill a TIMED-OUT git clone's whole process tree, not just the direct child.
+ *
+ * execFileSync's timeout signals only the `git` it spawned. Git's descendants —
+ * `git-remote-https`, `index-pack` — keep running, and on Windows they hold open
+ * locks on `.git/objects/pack/tmp_pack_*`, so the removal below fails EBUSY and
+ * the husk stays put (#900 recurrence, observed 2026-08-05: `spawnSync git
+ * ETIMEDOUT` with the pack tmpfiles still locked). Mirrors the house pattern
+ * (orchestrator/index.ts killProcessTreeCrossPlatform): Windows `taskkill /T /F`
+ * (tree + force); POSIX a best-effort children sweep around the direct signal.
+ */
+function killGitProcessTree(pid: number): void {
+  if (process.platform === "win32") {
+    // No graceful tree-signal exists on Windows; /T /F is the reliable path.
+    execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  try {
+    execFileSync("pkill", ["-TERM", "-P", String(pid)], { stdio: "ignore" });
+  } catch {
+    // no children / pkill absent — the direct signal below still applies
+  }
+  process.kill(pid, "SIGTERM");
+}
+
+/** Sync sleep for the settle window after a process-tree kill: this cleanup runs
+ *  inside a synchronous catch, so it may not await. Same Atomics.wait idiom as
+ *  download-progress.ts / lora-catalog.ts. */
+function sleepSyncMs(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Atomics.wait disallowed here — the retry below just runs a touch early.
+  }
+}
+
+/**
+ * Remove a clone directory THIS call created, after the clone failed.
+ *
+ * Returns a sentence to append to the error — a leftover nobody was told about
+ * is how the husk in #900 survived a month.
+ *
+ * `settlingProcesses` says a process-tree kill just ran (the clone timed out):
+ * the OS releases the killed processes' file handles asynchronously, so a
+ * removal that would EBUSY on the spot succeeds a moment later. Retry briefly
+ * before concluding the directory cannot be removed.
+ *
+ * `alreadyPresent` is a PRECONDITION, not live logic: every call site today sits
+ * inside `if (!alreadyPresent)`, so it is always false here and the guard below
+ * cannot fire. It is kept, and named, because the rule it encodes is the one that
+ * would do real damage if a later caller broke it — an existing pack is the
+ * user's, and a failed operation must never take it away. Being explicit about
+ * its unreachability is deliberate: an unreachable check that reads like live
+ * protection is worse than one that says what it is.
+ */
+function discardFailedClone(
+  nodeDir: string,
+  alreadyPresent: boolean,
+  settlingProcesses = false,
+): string {
+  if (alreadyPresent) return ""; // precondition — see above; unreachable today
+  if (!existsSync(nodeDir)) return ""; // git cleaned up after itself
+  const attempts = settlingProcesses ? 4 : 1;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) sleepSyncMs(250 * attempt);
+    try {
+      rmSync(nodeDir, { recursive: true, force: true });
+      return "";
+    } catch (rmErr) {
+      lastErr = rmErr;
+    }
+  }
+  return (
+    ` NOTE: the partial clone at ${nodeDir} could NOT be removed ` +
+    `(${lastErr instanceof Error ? lastErr.message : String(lastErr)}). ComfyUI will try to ` +
+    `import it on every start and log an error — delete that directory by hand.`
+  );
+}
+
+/**
+ * Did ComfyUI-Manager reject the route outright, before queueing anything?
+ *
+ * A legacy 3.x git-URL route can be absent, and a Manager-native install can be
+ * refused before queueing by its `security_level` / `allow_git_url_install`
+ * policy. Both arrive as a status on the POST itself:
+ *
+ *   404 — the route is not registered on this build. Git installs use
+ *   `/manager/queue/install`, `/v2/manager/queue/task`, or the legacy-UI
+ *   `/v2/manager/queue/batch` envelope.
+ *
+ * 403 is admitted only when Manager's authoritative JSON error shape names its
+ * own policy gate, or when one of the exact legacy Manager policy responses is
+ * present. A bare 403 may be an authentication/permission layer and stays
+ * fail-closed. 405 is deliberately
+ * NOT here. On this API it is the DIALECT-MISMATCH signal
+ * (ComfyUI's frontend catchall answering a route registered under the other
+ * generation), and the self-heal retry in #646 already owns it — diverting to a
+ * clone would pre-empt a Manager install that is about to succeed on the right
+ * route.
+ *
+ * What matters is not which one, but that the response describes the REQUEST
+ * rather than a task: nothing was queued, so nothing is running, so a direct
+ * clone afterwards cannot race a Manager install writing to the same directory.
+ * That is the whole warrant for continuing — and it is why 5xx is excluded, where
+ * a task may well have been accepted before the handler fell over.
+ *
+ * Returns 404, or the explicitly Manager-owned policy 403, or undefined when the
+ * failure is anything else (including 401, bare 403, 407, a transport error, a
+ * timeout, or a 500) and must keep propagating.
+ */
+const LEGACY_MANAGER_SECURITY_ERROR =
+  "A security error has occurred. Please check the terminal logs";
+
+/**
+ * Keep the old plain-text Manager response working without treating arbitrary
+ * response text as proof of Manager ownership. JSON is the current authoritative
+ * Manager shape; the two exact strings are retained for the legacy response and
+ * the existing local compatibility fixture.
+ */
+function isManagerOwnedGitPolicy403(body: unknown): boolean {
+  if (typeof body !== "string") return false;
+  const text = body.trim();
+  if (
+    text === LEGACY_MANAGER_SECURITY_ERROR ||
+    text === "gated by security_level"
+  ) {
+    return true;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const reason = (parsed as { error?: unknown }).error;
+    return reason === "security_level" || reason === "allow_git_url_install";
+  } catch {
+    return false;
+  }
+}
+
+function managerEnqueueRefusal(err: unknown): number | undefined {
+  if (!(err instanceof NodeManagementError)) return undefined;
+  const details = err.details as { status?: unknown; body?: unknown; url?: unknown } | undefined;
+  const status = details?.status;
+  const url = details?.url;
+  if (typeof status !== "number") return undefined;
+  if (
+    typeof url !== "string" ||
+    !/\/manager\/queue\/(?:task|install|batch)(?:[?#]|$)/.test(url)
+  ) {
+    return undefined;
+  }
+  if (status === 404) return status;
+  if (
+    status === 403 &&
+    isManagerOwnedGitPolicy403(details?.body)
+  ) {
+    return status;
+  }
+  return undefined;
+}
+
+function isManagerQueueDetectionFailure(err: unknown): boolean {
+  if (!(err instanceof NodeManagementError) || !err.details || typeof err.details !== "object") {
+    return false;
+  }
+  return (err.details as { kind?: unknown }).kind === MANAGER_QUEUE_DETECTION_FAILURE;
+}
+
+function initialManagerQueueAbsenceWasProven(err: unknown): boolean {
+  if (!(err instanceof NodeManagementError) || !err.details || typeof err.details !== "object") {
+    return false;
+  }
+  const codes = (err.details as { queueStatusCodes?: unknown }).queueStatusCodes;
+  return (
+    Array.isArray(codes) &&
+    codes.length === 2 &&
+    codes.every((status) => status === 404)
+  );
+}
+
+/**
+ * #2754 — did the SAME detection failure also observe ComfyUI-Manager serving?
+ *
+ * The queue-detection error now carries what the version routes said, and only
+ * ONE of those readings leaves the word "absent" standing. `version` means a
+ * Manager answered with its generation; `refused` means an authentication layer
+ * stopped us before anything could be established; `unreadable` means the message
+ * in the same object already says presence is UNKNOWN. Reporting `manager_absent: true` off the
+ * back of an error object that says either one is a claim refuted by its own
+ * details (codex gate round 5).
+ *
+ * Read for LABELLING only. Whether the git fallback is allowed to run stays with
+ * managerAbsenceAllowsGitFallback and its fresh re-probe — the queue routes really
+ * did 404 twice, so nothing was queued and the clone is still safe. This corrects
+ * what we CALL that clone, not whether it happens.
+ */
+function managerAbsenceUnprovenDuringDetection(err: unknown): boolean {
+  if (!(err instanceof NodeManagementError) || !err.details || typeof err.details !== "object") {
+    return false;
+  }
+  const evidence = (err.details as { managerVersionEvidence?: unknown }).managerVersionEvidence;
+  // `absent` is the ONLY reading that leaves "Manager is absent" standing, and an
+  // error that predates this field (undefined) keeps the old behaviour. Everything
+  // else contradicts it: `version` and `refused` positively, and `unreadable`
+  // because the diagnostic in the very same object says presence is UNKNOWN
+  // (codex gate round 7).
+  return evidence !== undefined && evidence !== "absent";
+}
+
+/**
+ * A direct clone is safe after either a Manager-native policy refusal whose body
+ * explicitly proves no task was queued, a direct enqueue route-level 404, a
+ * detection failure followed by a fresh probe proving BOTH queue dialects are
+ * 404 on the same captured ComfyUI base, or the new local Manager-unavailable
+ * surface: both dialects repeatedly answer with an empty/explicitly-unavailable
+ * response before any enqueue route is attempted.
+ *
+ * A bare 401/403/407, timeout, 5xx, 405, malformed/HTML response, or unrelated
+ * reachability error remains fail-closed. This keeps a response that could be a
+ * live Manager or an accepted background task from being raced by the clone.
+ */
+async function managerAbsenceAllowsGitFallback(
+  err: unknown,
+  base: string,
+): Promise<boolean> {
+  const status = errorStatus(err);
+  const preQueueRefusal = managerEnqueueRefusal(err);
+  // The enqueue route's own 404 is already a pre-queue refusal. Preserve the
+  // legacy contract that authorized a direct clone on that route-level fact;
+  // the fresh status probes are required only for the new detection-failure
+  // path, where the enqueue error carries no route-level refusal.
+  if (preQueueRefusal === 403 || preQueueRefusal === 404) return true;
+  if (status !== undefined) return false;
+  if (
+    status === undefined &&
+    !isManagerQueueDetectionFailure(err)
+  ) {
+    return false;
+  }
+
+  if (initialManagerQueueAbsenceWasProven(err)) {
+    try {
+      return (await probeManagerQueueAvailability(base)) === "absent";
+    } catch {
+      return false;
+    }
+  }
+
+  const details = err instanceof NodeManagementError && err.details && typeof err.details === "object"
+    ? (err.details as { queueStatusKinds?: unknown })
+    : undefined;
+  const initialKinds = details?.queueStatusKinds;
+  if (!isManagerUnavailableQueueKinds(initialKinds)) return false;
+
+  // Re-read the same two endpoints. A single empty response can be a transient
+  // proxy/server failure; two identical no-queue observations are the minimum
+  // evidence this pre-enqueue fallback can safely act on. The direct probe keeps
+  // 405/5xx/auth/transport/malformed responses distinct instead of collapsing
+  // them into the public "unreadable" state.
+  try {
+    const freshKinds = await probeManagerQueueStatusKinds(base);
+    return (
+      isManagerUnavailableQueueKinds(freshKinds) &&
+      freshKinds.every((kind, index) => kind === initialKinds[index])
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #1765 (recurrence on 0.52.35) — the write was aimed at the wrong ComfyUI.
+ *
+ * The reporter ran six installs on one machine, pointed the MCP at
+ * `http://127.0.0.1:8189`, and got a `git-clone` SUCCESS whose `nodeDir` named a
+ * different install entirely; the connected server never received the pack. The
+ * refusal below is what replaces that success. It names both roots, says which
+ * selector produced each, and gives the one-step remedy — because the failure
+ * this class produces is not an error the user can see, it is a report of work
+ * that was done somewhere else.
+ *
+ * Deliberately a REFUSAL and not a retarget: on a `--base-directory` split
+ * install the configured root IS the pack root (#1715/#1770/#1766), so silently
+ * preferring the live `main.py` root would trade this bug for that one. A
+ * `--base-directory` the server actually reports is honored FIRST, so that
+ * deployment never reaches this refusal in the first place.
+ *
+ * A `COMFYUI_PATH` that disagrees with the running server IS refused, and that
+ * is deliberate — see `detectLocalWriteTargetMismatch` for why the env var
+ * cannot be read as the user naming this install (the panel orchestrator
+ * forwards an auto-detected path under exactly that name).
+ */
+function wrongInstallRefusal(
+  m: LocalWriteTargetMismatch,
+  what: string,
+  /** The target CAPTURED for this operation — not `getComfyUIBaseUrl()` read at
+   *  throw time, which a panel retarget mid-call would have already moved. */
+  target: string,
+): string {
+  const chosenBy =
+    m.baseSource === "comfyui-path"
+      ? "COMFYUI_PATH"
+      : m.baseSource === "saved-default-workspace"
+        ? 'the SAVED DEFAULT WORKSPACE (workspace action:"set_default")'
+        : "AUTO-DETECTION of ComfyUI installs on this machine";
+  const provenBy =
+    m.liveSource === "base-directory"
+      ? "its own --base-directory"
+      : m.liveSource === "argv"
+        ? "its own /system_stats launch argv"
+        : "the OS process listening on that port, anchored on the interpreter it runs";
+  return (
+    `${what} would write into ${m.base}, but this session is connected to ` +
+    `${target}, which runs from ${m.liveRoot} (established from ${provenBy}). ` +
+    `Those are two DIFFERENT ComfyUI installs, so NOTHING was written: the pack would have ` +
+    `landed in a custom_nodes/ the connected server never scans, and this call would have ` +
+    `reported success. ${m.base} was chosen by ${chosenBy} — configuration, which describes ` +
+    `this MACHINE; the root above is what the running server says about ITSELF. To install ` +
+    `into the connected server, set COMFYUI_PATH=${m.liveRoot} and retry. If ${m.base} really ` +
+    `is where you want packs for this server, launch it with --base-directory ${m.base} — ` +
+    `that is the flag that makes a data root authoritative, and it is honored here.`
+  );
+}
+
+async function cloneCustomNodeFallback(
   gitId: string,
   repoName: string,
   gitRef: string | undefined,
   managerStatus: unknown,
-): NodeOpResult {
-  if (!config.comfyuiPath) {
+  basePath?: string,
+  /**
+   * #1129 — why we are here, when it was NOT "the pack is unregistered". The
+   * refusal messages below name that reason by default, and stating it for a
+   * policy refusal would be a wrong explanation for a correct action; the caller
+   * that knows better passes its own.
+   */
+  opts?: {
+    managerRefusalNote?: string;
+    /** #1470 — did `gitRef` come from the `version` selector rather than an explicit
+     *  `ref`? Only a version-derived ref may be skipped when the repo does not have it. */
+    refFromVersion?: boolean;
+    /** Do not re-read the shared saved-default resolver when the caller's
+     *  call-scoped target was deliberately unavailable. */
+    allowSharedWorkspaceFallback?: boolean;
+    /**
+     * #2523 — Manager listed this pack under a different owner/repo than the
+     * requested git URL (bare-name aliasing). The existing checkout must be
+     * replaced with a clone of `gitId` rather than left in place.
+     */
+    replaceOrigin?: string;
+  },
+): Promise<NodeOpResult> {
+  const because =
+    opts?.managerRefusalNote ?? `"${repoName}" is not in the ComfyUI-Manager registry`;
+  // basePath is the CALL-SCOPED local ComfyUI root. When the caller has already
+  // established that no safe root exists, do not re-read the saved-default
+  // resolver and recreate the wrong-machine clone hazard.
+  const comfyuiBase =
+    basePath ??
+    (opts?.allowSharedWorkspaceFallback === false ? undefined : resolveEffectiveComfyUIBase());
+  // Same hazard as the CLI paths (codex gate P0): the guard below catches "no
+  // path", but the dangerous case is HAVING one while connected elsewhere. A
+  // clone into a stale local tree would report a successful install of a pack the
+  // connected server will never see.
+  if (isRemoteMode()) {
     throw new ProcessControlError(
-      `"${repoName}" is not in the ComfyUI-Manager registry and cloning it ` +
-        `requires a local ComfyUI install, but config.comfyuiPath is not set ` +
-        `(running in remote --comfyui-url mode). Install it on the ComfyUI host, ` +
-        `or pass a registered pack id.`,
+      `${because}. Cloning it would write to a ` +
+        `LOCAL install` +
+        (comfyuiBase ? ` (${comfyuiBase})` : "") +
+        ` — but this session targets a REMOTE ComfyUI (--comfyui-url), so that is not the ` +
+        `server you are connected to. Nothing was cloned. Install it on the ComfyUI host, or ` +
+        `pass a registered pack id the Manager can resolve there.`,
+    );
+  }
+  if (!comfyuiBase) {
+    throw new ProcessControlError(
+      `${because}, and cloning it ` +
+        `requires a local ComfyUI install, but no ComfyUI path is set. ` +
+        `Install it on the ComfyUI host, or pass a registered pack id.`,
     );
   }
 
@@ -873,10 +3985,10 @@ function cloneCustomNodeFallback(
   assertSafeGitUrl(gitId);
   assertSafeRepoName(repoName);
 
-  // Resolve the target and ASSERT it stays inside <comfyuiPath>/custom_nodes,
+  // Resolve the target and ASSERT it stays inside <comfyuiBase>/custom_nodes,
   // mirroring manifest.ts's isWithinRoot containment check (defense in depth on
   // top of the repoName validation above).
-  const customNodesRoot = resolve(config.comfyuiPath, "custom_nodes");
+  const customNodesRoot = resolve(comfyuiBase, "custom_nodes");
   const nodeDir = resolve(customNodesRoot, repoName);
   const rel = relative(customNodesRoot, nodeDir);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
@@ -886,7 +3998,55 @@ function cloneCustomNodeFallback(
   }
 
   const warnings: string[] = [];
-  const alreadyPresent = existsSync(nodeDir);
+  let alreadyPresent = existsSync(nodeDir);
+
+  // A directory that is already there but holds nothing but git metadata is NOT
+  // a pack — it is the husk an earlier failed install left behind (#900). Without
+  // this check the clone below is skipped ("the directory exists") and the call
+  // reports a successful install of nothing. It is also not ours to delete: this
+  // call did not create it, and a directory we did not create is the user's —
+  // so REFUSE, name it, and leave it untouched.
+  if (alreadyPresent && !looksLikeAPack(nodeDir)) {
+    throw new NodeManagementError(
+      `${because}, and custom_nodes/${repoName} already exists but holds nothing but ` +
+        `git metadata — the husk of an install that did not complete, which ComfyUI ` +
+        `cannot import and logs an error for on every start. This call did not create ` +
+        `it, so it was left untouched. Delete ${nodeDir} by hand and retry the install.`,
+    );
+  }
+
+  // #2523 — Manager v4 resolves a from-source install by BARE REPO NAME and
+  // clones the channel/registry URL, so artokun/comfyui-teskors-utils can land
+  // as teskor-hub/comfyui-teskors-utils in the same folder. A name hit is not
+  // the requested origin. A verified disk remote is authoritative: stale
+  // Manager metadata must never delete a checkout that already has the right
+  // origin (or any local changes in it). If the disk remote is wrong, replace
+  // it; if the disk remote cannot answer, the Manager aux_id may still prove an
+  // alias replacement is needed.
+  const diskOrigin = alreadyPresent ? readGitRemoteOrigin(nodeDir) : undefined;
+  const diskOriginDiffers = gitOriginsDiffer(gitId, diskOrigin);
+  const managerOriginDiffers = gitOriginsDiffer(gitId, opts?.replaceOrigin);
+  if (
+    alreadyPresent &&
+    (diskOriginDiffers || (!diskOrigin && managerOriginDiffers))
+  ) {
+    const landed = opts?.replaceOrigin ?? diskOrigin ?? "a different origin";
+    try {
+      rmSync(nodeDir, { recursive: true, force: true });
+    } catch (err) {
+      throw new NodeManagementError(
+        `ComfyUI-Manager resolved "${landed}" instead of the requested "${gitId}", ` +
+          `but custom_nodes/${repoName} could not be replaced ` +
+          `(${err instanceof Error ? err.message : String(err)}). ` +
+          `Delete ${nodeDir} by hand and retry the install.`,
+      );
+    }
+    alreadyPresent = false;
+    warnings.push(
+      `ComfyUI-Manager resolved "${landed}" instead of the requested "${gitId}"; ` +
+        `replaced custom_nodes/${repoName} with a direct clone of the requested origin.`,
+    );
+  }
 
   if (!alreadyPresent) {
     // A concrete ref needs the full history reachable; otherwise shallow-clone.
@@ -897,7 +4057,7 @@ function cloneCustomNodeFallback(
     logger.info("Cloning unregistered custom node", { gitId, nodeDir, gitRef });
     try {
       execFileSync("git", cloneArgs, {
-        cwd: config.comfyuiPath,
+        cwd: comfyuiBase,
         encoding: "utf-8",
         timeout: GIT_CLONE_TIMEOUT,
         env: nonInteractiveGitEnv(),
@@ -906,31 +4066,94 @@ function cloneCustomNodeFallback(
       const e = err as NodeJS.ErrnoException & {
         stdout?: Buffer | string;
         stderr?: Buffer | string;
+        pid?: number;
       };
+      // A TIMEOUT killed only the direct `git` child; its descendants
+      // (git-remote-https, index-pack) may still be running and holding locks on
+      // the partial pack, which is exactly how the #900 husk survived its own
+      // cleanup (EBUSY on .git/objects/pack/tmp_pack_*). Kill the tree first —
+      // best-effort: if the kill itself fails, the removal below still runs and
+      // still discloses what it could not remove.
+      const timedOut = e.code === "ETIMEDOUT";
+      if (timedOut && typeof e.pid === "number") {
+        try {
+          killGitProcessTree(e.pid);
+        } catch {
+          // best-effort — see above
+        }
+      }
+      const leftover = discardFailedClone(nodeDir, alreadyPresent, timedOut);
       throw new NodeManagementError(
-        `Failed to clone "${gitId}" into custom_nodes/${repoName}: ${e.message}`,
+        `Failed to clone "${gitId}" into custom_nodes/${repoName}: ${e.message}${leftover}`,
         {
           stdout: e.stdout ? e.stdout.toString() : "",
           stderr: e.stderr ? e.stderr.toString() : "",
         },
       );
     }
-    if (gitRef) runGitCheckout(gitId, gitRef);
+    if (gitRef) {
+      // #1470 — ASK WHETHER THE REF EXISTS, then act. "nightly" is overloaded in this
+      // tool's own surface: it names the git-HEAD channel for a Manager install (one of
+      // our paths mints it), and `version` is documented as a git ref for a from-source
+      // install. A repository that HAS a `nightly` branch must get it; one that does not
+      // is not a caller error, it is the other reading of the same word — and the clone
+      // already sits at HEAD, which is what that reading asks for.
+      // The checkout is part of producing the pack, so its failure leaves the
+      // same husk as a failed clone — and the clone directory is ours either way.
+      try {
+        const checkoutWarning = runGitCheckout(gitId, gitRef, comfyuiBase, {
+          refFromVersion: opts?.refFromVersion === true,
+        });
+        if (checkoutWarning) warnings.push(checkoutWarning);
+      } catch (err) {
+        const leftover = discardFailedClone(nodeDir, alreadyPresent);
+        const detail = err instanceof GitRefProbeError
+          ? `Could not determine whether "${gitRef}" is available: ${err.message}`
+          : `Cloned "${gitId}" but could not check out "${gitRef}": ` +
+            `${err instanceof Error ? err.message : String(err)}`;
+        throw new NodeManagementError(`${detail}${leftover}`);
+      }
+    }
   }
 
-  // VERIFY the clone landed before attempting deps.
+  // VERIFY the clone produced a PACK, not merely a directory (#900).
+  //
+  // `existsSync(nodeDir)` passed for a directory containing nothing but `.git` —
+  // which is exactly what a clone killed by the timeout leaves behind. One such
+  // husk sat in a user's custom_nodes for over a month, and ComfyUI logged an
+  // import failure for it on EVERY boot, because ComfyUI loads directories and
+  // does not care what we think we installed.
+  //
+  // Worse than useless: to any later reader — including our own disk-presence
+  // checks — it is indistinguishable from a pack the user installed on purpose
+  // that is now broken.
   if (!existsSync(nodeDir)) {
     throw new NodeManagementError(
       `Clone of "${gitId}" reported success but ${nodeDir} is missing.`,
     );
   }
+  if (!alreadyPresent && !looksLikeAPack(nodeDir)) {
+    const leftover = discardFailedClone(nodeDir, alreadyPresent);
+    throw new NodeManagementError(
+      `Clone of "${gitId}" reported success but produced no loadable pack in ` +
+        `custom_nodes/${repoName} — the directory holds nothing but git metadata, which ` +
+        `ComfyUI cannot import and would log an error for on every start.${leftover}`,
+    );
+  }
 
   // Best-effort python deps. Don't fail the install if these don't.
+  // #2530 — never pip (or recommend pip) with an interpreter the environment
+  // probe would mark untrusted. resolveInstallInterpreter now shares that
+  // verdict; when it refuses, this is a PARTIAL install and Manager repair is
+  // the next step, not a copy-paste of the same unsafe python -m pip command.
   const requirements = join(nodeDir, "requirements.txt");
   const installScript = join(nodeDir, "install.py");
   if (existsSync(requirements) || existsSync(installScript)) {
-    const python = resolveVenvPython();
-    if (existsSync(requirements)) {
+    const resolved = await resolveVenvPython(comfyuiBase);
+    if (!resolved.python) {
+      warnings.push(depsSkippedUnknownInterpreterWarning(resolved.reason, repoName));
+    } else if (existsSync(requirements)) {
+      const python = resolved.python;
       try {
         execFileSync(python, ["-m", "pip", "install", "-r", requirements], {
           cwd: nodeDir,
@@ -938,13 +4161,11 @@ function cloneCustomNodeFallback(
           timeout: COMFY_CLI_TIMEOUT,
         });
       } catch (err) {
-        const e = err as Error;
-        warnings.push(
-          `Python dependencies (requirements.txt) failed to install (${e.message}); install them manually with "${python} -m pip install -r requirements.txt".`,
-        );
+        warnings.push(depsPipFailedWarning(err, python, repoName));
       }
     }
-    if (existsSync(installScript)) {
+    if (resolved.python && existsSync(installScript)) {
+      const python = resolved.python;
       try {
         execFileSync(python, [installScript], {
           cwd: nodeDir,
@@ -962,7 +4183,7 @@ function cloneCustomNodeFallback(
 
   const base = alreadyPresent
     ? `"${repoName}" already exists in custom_nodes (${repoName}) — left it in place.`
-    : `"${repoName}" is not in the ComfyUI-Manager registry — cloned it directly into custom_nodes (${repoName}).`;
+    : `${because} — cloned it directly into custom_nodes (${repoName}).`;
   const warn = warnings.length ? ` ${warnings.join(" ")}` : "";
   return {
     mechanism: "git-clone",
@@ -975,6 +4196,19 @@ function cloneCustomNodeFallback(
 // Public API — install
 // ---------------------------------------------------------------------------
 
+export interface LocalFallbackBinding {
+  /** The apply_manifest operation that owns this fallback. */
+  readonly operationId: string;
+  /** The manifest custom_node entry bound to this fallback. */
+  readonly itemId: string;
+  /** The agent scope authorized to observe the operation. */
+  readonly scope: string;
+  /** The exact Manager target captured at operation entry. */
+  readonly target: string;
+  /** The monotonic target generation captured at operation entry. */
+  readonly targetGeneration: number;
+}
+
 export interface InstallOptions {
   id: string;
   source?: InstallSource;
@@ -985,15 +4219,223 @@ export interface InstallOptions {
   channel?: string;
   /** Force the official comfy-cli subprocess instead of the HTTP API. */
   useCmCli?: boolean;
+  /** CALL-SCOPED local ComfyUI data/base root for the git-clone / ref-checkout
+   *  fallback, threaded by callers (e.g. apply_manifest) that resolve an adopted
+   *  saved-default/live `--base-directory` WITHOUT mutating global config. Falls
+   *  back to verified live custom_nodes evidence when COMFYUI_PATH is unset; it
+   *  does not authorize a saved default by itself. */
+  comfyuiPath?: string;
+  /** The caller has already resolved the only safe local clone root. When set,
+   *  an absent comfyuiPath means Manager-only, never a second local-root lookup. */
+  localCloneFallback?: "verified-only";
+  /**
+   * Internal caller policy for an empty Manager v4 Git enqueue. Direct installs
+   * can drain and verify before cloning; apply_manifest enables the queue path
+   * but separately disables a late local fallback after an empty acknowledgement.
+   */
+  allowEmptyV2Enqueue?: boolean;
+  /**
+   * Internal apply_manifest policy: an empty v4 acknowledgement may be the
+   * normal response, but an unresolved/absent post-state must not trigger a
+   * speculative local clone after the manifest call has returned.
+   */
+  allowLocalFallbackAfterEmptyV2Enqueue?: boolean;
+  /** Call-scoped Manager base captured with the target generation at operation entry. */
+  managerBase?: string;
+  /** Monotonic ComfyUI target generation captured with managerBase. */
+  targetGeneration?: number;
+  /** Binding required by the internal fallback phase hooks. */
+  localFallbackBinding?: LocalFallbackBinding;
+  /**
+   * Internal apply_manifest phase hook. Called once when this operation has
+   * selected its local git fallback, before it waits for the local writer lock.
+   * It is observational only and does not change the install decision.
+   */
+  onLocalFallback?: (binding: LocalFallbackBinding) => void;
+  /** Internal apply_manifest hook called after a selected local fallback settles. */
+  onLocalFallbackSettled?: (
+    binding: LocalFallbackBinding,
+    state: "applied" | "failed",
+  ) => void;
 }
 
-export async function installCustomNode(
+function notifyLocalFallbackSelected(opts: InstallOptions): void {
+  const binding = opts.localFallbackBinding;
+  if (!binding) return;
+  try {
+    opts.onLocalFallback?.(binding);
+  } catch (err) {
+    // This is an observational hook used by apply_manifest; a reporting
+    // callback must never prevent the selected local fallback from running.
+    logger.debug("Ignoring local fallback phase-hook failure", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function notifyLocalFallbackSettled(
+  opts: InstallOptions,
+  state: "applied" | "failed",
+): void {
+  const binding = opts.localFallbackBinding;
+  if (!binding) return;
+  try {
+    opts.onLocalFallbackSettled?.(binding, state);
+  } catch (err) {
+    // This is an observational hook used by apply_manifest; a reporting
+    // callback must never change the install result.
+    logger.debug("Ignoring local fallback settle-hook failure", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Installing/updating/reinstalling/repairing a pack changes which node classes
+ * this ComfyUI can register, so the orchestrator's memoized /object_info snapshot
+ * (getObjectInfo) is now stale — create_workflow's validate and node_info
+ * actions, and get_history (action:"diagnose"),
+ * would keep reporting the just-installed types as `missing_node_type` in their
+ * top-level summaries until some later reboot bumped the epoch (#444, the residual
+ * of the #235/#247/#352/#364 staleness cluster). Drop the cache the moment a
+ * mutation succeeds so the next read refetches the live registry. Applied via a
+ * single choke point (rather than at every early return) so every install branch —
+ * cm-cli, Manager HTTP, and the git clone fallback — is covered.
+ */
+async function withObjectInfoInvalidation<T>(op: () => Promise<T>): Promise<T> {
+  const result = await op();
+  resetObjectInfoCache();
+  return result;
+}
+
+// NOTE on `async`: these wrappers are declared async purely so the PIN GUARD's
+// throw surfaces as a REJECTED PROMISE rather than a synchronous exception.
+// Callers rely on that — apply_manifest does `installCustomNode(...).then().catch()`
+// and documents that it never rejects, which a sync throw would walk straight past.
+
+export async function installCustomNode(opts: InstallOptions): Promise<NodeOpResult> {
+  // PIN GUARD (see panel-pin-guard.ts). The panel is an ordinary node pack, so
+  // these generic mutations are a second door into the same ComfyUI-Manager
+  // operation that install_comfyui(action:'panel') drives. Guarding here — where the TARGET is
+  // known — covers every caller, including a bulk "all". The check and the
+  // mutation are atomic under the panel mutation lock (withPanelPinGuard).
+  const op = () => withPanelPinGuard("install", opts.id, () =>
+    withObjectInfoInvalidation(() => installCustomNodeImpl(opts)),
+  );
+  return op();
+}
+
+/**
+ * Why the comfy-cli subprocess path cannot run against `workspace`, or
+ * undefined when it can. Probed BEFORE anything is submitted (#808): an
+ * explicit useCmCli on a host without a usable CLI must fall back to Manager
+ * HTTP, not die with NODE_MANAGEMENT_ERROR after the tool description promised
+ * a fallback. `workspace` is the caller's captured local pack/data root —
+ * COMFYUI_PATH, an adopted live `--base-directory`, or the saved default
+ * workspace, which the CLI layer supports natively.
+ */
+function comfyCliUnavailableReason(workspace: string | undefined): string | undefined {
+  // REMOTE MODE FIRST (codex gate P0). comfy-cli runs against a LOCAL install,
+  // while every check around these calls — the pre-state, the post-verify — talks
+  // to the Manager on the REMOTE server. With a stale local COMFYUI_PATH the two
+  // describe different machines: the CLI uninstalls or disables a pack here, the
+  // verification reports on a pack over there, and the local destructive action is
+  // never disclosed at all.
+  //
+  // `workspace` is non-empty in exactly that case, which is why this cannot be
+  // folded into the check below: having a path is what makes it dangerous.
+  if (isRemoteMode()) {
+    return (
+      "this session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+      "LOCAL install" +
+      (workspace
+        ? ` — running it would modify ${workspace}, which is NOT the server you are connected to`
+        : "") +
+      ". Run it on the machine the install lives on"
+    );
+  }
+  if (!workspace) {
+    return "no local ComfyUI install is available (COMFYUI_PATH unset and no saved default workspace), which the comfy-cli subprocess needs";
+  }
+  const executable = resolveComfyCliExecutable({ workspace });
+  if (!executable) {
+    return "comfy-cli was not found on PATH or in the workspace's .venv (install comfy-cli>=1.11.1, set COMFY_CLI_PATH, or install it into the workspace venv)";
+  }
+  const version = getComfyCliVersion({ workspace });
+  if (!isSupportedComfyCliVersion(version)) {
+    return `comfy-cli >=1.11.1 is required; found ${version ?? "an unrecognized version"}`;
+  }
+  return undefined;
+}
+
+async function resolveInstallLocalWorkspace(
+  opts: InstallOptions,
+): Promise<string | undefined> {
+  if (opts.comfyuiPath !== undefined) return opts.comfyuiPath;
+  if (opts.localCloneFallback === "verified-only") return undefined;
+
+  // An unset COMFYUI_PATH is not permission to use the saved default. The
+  // connected local server must identify a usable custom_nodes scan root, or
+  // this operation remains Manager-only. This resolver never throws for an
+  // unavailable/ambiguous live root; the Manager attempt still proceeds.
+  if (!process.env.COMFYUI_PATH && !isRemoteMode()) {
+    try {
+      return await resolveCustomNodesScanBaseLiveStrict({ requireLive: true });
+    } catch {
+      return undefined;
+    }
+  }
+  return resolveEffectiveComfyUIBase();
+}
+
+function assertInstallTargetStable(
+  expectedGeneration: number,
+  managerBase: string,
+): void {
+  const actualGeneration = getComfyuiTargetGeneration();
+  if (actualGeneration === expectedGeneration) return;
+  throw new ProcessControlError(
+    "ComfyUI's target changed while this custom-node install was being prepared. " +
+      "The Manager request and any local clone were refused; retry after the target settles.",
+    {
+      kind: "target-generation-changed",
+      managerBase,
+      expectedGeneration,
+      actualGeneration,
+    },
+  );
+}
+
+/**
+ * Serialize only a local install writer. The callback must be the complete
+ * filesystem transaction, including any existence check that decides whether
+ * it will create the destination. Manager probing, enqueueing, draining, and
+ * Manager-only fallback decisions stay outside this boundary.
+ */
+function withLocalInstallMutationLock<T>(
+  expectedGeneration: number,
+  managerBase: string,
+  op: () => Promise<T>,
+): Promise<T> {
+  return withPanelMutationLock(async () => {
+    // Another local writer may have held the lock while the target changed.
+    // Refuse before touching the captured filesystem target in that case.
+    assertInstallTargetStable(expectedGeneration, managerBase);
+    return op();
+  });
+}
+
+async function installCustomNodeImpl(
   opts: InstallOptions,
 ): Promise<NodeOpResult> {
   const { id, version, mode = "remote", channel = "default" } = opts;
   const parsedGit = parseGitUrl(id);
   const gitId = parsedGit.baseUrl;
-  const gitRefCandidate = opts.ref ?? parsedGit.ref ?? version;
+  const gitRefCandidate = gitRefForInstall({
+    ref: opts.ref,
+    urlRef: parsedGit.ref,
+    version,
+  });
   const source =
     opts.source && opts.source !== "auto"
       ? opts.source
@@ -1004,6 +4446,11 @@ export async function installCustomNode(
     source === "git" && gitRefCandidate
       ? validateGitRef(gitRefCandidate)
       : gitRefCandidate;
+  // #1470 — provenance, not spelling. `gitRefForInstall` prefers an explicit ref/urlRef, so
+  // the candidate came from `version` exactly when neither was supplied. Only that case may
+  // fall back to HEAD for a repo that lacks the ref; an explicit `ref:` is the caller naming
+  // a git ref and must fail loudly if it is absent.
+  const refFromVersion = opts.ref === undefined && parsedGit.ref == null;
 
   // SECURITY: validate a git URL ONCE, up front, before it can reach ANY install
   // path — cm-cli (`cm-cli install <url>`), the Manager queue, or the clone
@@ -1012,70 +4459,426 @@ export async function installCustomNode(
   // actually used (runGitCheckout, cloneCustomNodeFallback).
   if (source === "git") assertSafeGitUrl(gitId);
 
+  // Keep the mutation, its post-queue verification, AND any local filesystem
+  // work on the target selected for this invocation. The Manager base is
+  // captured before the live-root lookup so a panel retarget cannot move the
+  // HTTP half of this operation while the filesystem target is being verified.
+  // With COMFYUI_PATH unset, a live custom_nodes root is required; a saved
+  // default is machine-local configuration, not proof of what this panel target
+  // scans.
+  const managerBase = opts.managerBase ?? managerBaseUrl();
+  const targetGeneration = opts.targetGeneration ?? getComfyuiTargetGeneration();
+  const cliWorkspace =
+    source === "git" || opts.useCmCli
+      ? await resolveInstallLocalWorkspace(opts)
+      : opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
+  assertInstallTargetStable(targetGeneration, managerBase);
+  const presenceCtx = capturePackPresenceContext(cliWorkspace, {
+    allowConfiguredFallback: cliWorkspace !== undefined,
+  });
+  // #1765 — and is that root the install this session is actually CONNECTED to?
+  // Pinned to the very cliWorkspace the write will use, so a panel retarget
+  // mid-call cannot judge one install's root against another's server.
+  //
+  // Taken only when a LOCAL write is reachable for this call: a registry install
+  // goes through ComfyUI-Manager, which targets the connected server by
+  // construction and has no local destination to misdirect.
+  const localWriteMismatch =
+    source === "git" || opts.useCmCli === true
+      ? await detectLocalWriteTargetMismatch(cliWorkspace)
+      : undefined;
+  assertInstallTargetStable(targetGeneration, managerBase);
+  // THE PRE-STATE, OBSERVED BEFORE THE OPERATION (codex gate P0). The "already
+  // installed" verdict below used to be inferred from POST-op disk state alone:
+  // a pack that was absent before the call and installed as a registry ZIP —
+  // which Manager does not track — creates a directory the post-check then reads
+  // as "it was already there", telling the user nothing happened when their pack
+  // had just been installed. A pre-state cannot be recovered afterwards; it has
+  // to be taken now.
+  const diskBefore = presenceCtx.diskRoot
+    ? findPackOnDisk(id, presenceCtx.diskRoot)
+    : undefined;
+
+  // #808 — a requested comfy-cli that is not usable is a FALLBACK, not a fatal
+  // error: the probe runs before anything is submitted, so dropping to Manager
+  // HTTP cannot double-run anything, and the git path below keeps its own
+  // direct-clone fallback for an unregistered repo. The note is prepended to
+  // whichever result the HTTP path produces, so the mechanism switch is
+  // disclosed rather than silent.
+  let cliFallbackNote: string | undefined;
   if (opts.useCmCli) {
-    // cm-cli install accepts registry ids and git urls alike.
-    const installId = source === "git" ? gitId : id;
-    const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel]);
-    if (source === "git" && gitRef) {
-      runGitCheckout(gitId, gitRef);
+    const cliProblem = comfyCliUnavailableReason(cliWorkspace);
+    if (cliProblem === undefined) {
+      // #1765 — comfy-cli writes into `--workspace`, so the wrong-install hazard
+      // is identical here to the direct clone below.
+      if (localWriteMismatch) {
+        throw new ProcessControlError(
+          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", comfy-cli)', managerBase),
+        );
+      }
+      // cm-cli install accepts registry ids and git urls alike.
+      const installId = source === "git" ? gitId : id;
+      const { out, checkoutWarning } = await withLocalInstallMutationLock(
+        targetGeneration,
+        managerBase,
+        async () => {
+          // The lock is intentionally acquired only after the CLI availability
+          // probe and Manager-only fallback decision. The helper re-checks the
+          // target after waiting, so a retarget while another local writer held
+          // the lock cannot send this mutation to an obsolete install.
+          const out = runCmCli(
+            ["install", installId, "--mode", mode, "--channel", channel],
+            cliWorkspace,
+          );
+          let checkoutWarning: string | undefined;
+          if (source === "git" && gitRef) {
+            checkoutWarning = runGitCheckout(gitId, gitRef, cliWorkspace, { refFromVersion });
+          }
+          return { out, checkoutWarning };
+        },
+      );
+      return {
+        mechanism: "comfy-cli",
+        message: `Installed "${id}" via official comfy-cli.${checkoutWarning ? ` ${checkoutWarning}` : ""}`,
+        details: out.trim(),
+      };
     }
-    return {
-      mechanism: "comfy-cli",
-      message: `Installed "${id}" via official comfy-cli.`,
-      details: out.trim(),
-    };
+    logger.info("comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP", {
+      reason: cliProblem,
+    });
+    cliFallbackNote =
+      `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
+      `NOTHING was run through comfy-cli — the install below used ComfyUI-Manager instead.`;
   }
+  const withCliNote = (result: NodeOpResult): NodeOpResult =>
+    cliFallbackNote
+      ? { ...result, message: `${cliFallbackNote} ${result.message}` }
+      : result;
 
   if (source === "git") {
     const repoName = gitCheckoutDir(gitId);
-    let status: QueueStatus;
-    if ((await detectManagerApi()) !== "v2") {
-      // 3.x SEMANTICS (both the custom-node Manager AND pip Manager in
-      // legacy-UI mode, whose /v2 batch runs the same 3.x handlers — codex
-      // review on #235): a REAL git URL installs natively via
-      // { version:'unknown', files:[url] }, cloning it as an unregistered
-      // pack. (Gated server-side by security_level + allow_git_url_install
-      // config — a rejection surfaces as a 403/404 from the queue route.)
-      status = await queueManagerTask("install", {
-        id: repoName,
-        version: "unknown",
-        selected_version: "unknown",
-        files: [gitId],
-        channel: opts.channel ?? "default",
-        mode: opts.mode ?? "cache",
-      });
-    } else {
-      // Manager v4: REGISTRY-FIRST, CLONE FALLBACK. The v4 backend resolves an
-      // install by the pack's REPO NAME / CNR id — NOT a full git URL
-      // (do_install splits `${id}@${selected_version}` and looks the result up
-      // in its DB; a full URL matches nothing and the queue silently marks the
-      // task "done"). So we mirror the frontend UI: id = repo name,
-      // selected_version = ref or "nightly" (the git-HEAD channel for unclaimed
-      // packs), channel "dev", mode "cache".
-      const selected = gitRef ?? "nightly";
-      status = await queueManagerTask("install", {
-        id: repoName,
-        version: selected,
-        selected_version: selected,
-        channel: opts.channel ?? "dev",
-        mode: opts.mode ?? "cache",
-      });
-    }
-
-    // VERIFY: /v2/customnode/installed reflects on-disk custom_nodes, so a
-    // freshly-cloned pack shows up even before a reboot. If the Manager actually
-    // installed it, we're done; otherwise it's unregistered → clone it directly.
-    const installed = await listInstalledNodes().catch(
-      () => [] as InstalledNode[],
+    // A git install's PARAMS are dialect-specific, not just its route, so they
+    // are built per-attempt from the dialect actually being spoken. Precomputing
+    // them from the cached dialect would let a self-heal retry (#646) resend
+    // 3.x-shaped params to a v4 server (or the reverse) and install the wrong
+    // thing — the retry has to rebuild the body, not just re-route it.
+    // #1129 — A REFUSED ENQUEUE IS NOT THE END OF THE ROAD.
+    //
+    // The 3.x git-URL install is gated by security_level + allow_git_url_install,
+    // and a host that does not serve the route answers the same way. Both come
+    // back as a status on the POST, which throws — so the direct-clone fallback
+    // twenty lines below, which needs no Manager at all and is exactly what the
+    // user would do by hand, was unreachable in the one case it exists for. A
+    // reporter on legacy 3.x got "ComfyUI-Manager not reachable", then a 404 with
+    // "A security error has occurred", and was left with no install path on a
+    // machine whose custom_nodes directory was sitting right there.
+    //
+    // Only a PRE-QUEUE refusal diverts (see managerEnqueueRefusal): the response
+    // describes the request, so nothing is running and the clone cannot race a
+    // Manager task writing to the same directory. Everything else rethrows.
+    // An empty successful enqueue is not a pre-queue refusal: Manager may
+    // have accepted the task and simply omitted its acknowledgement body.
+    // Start and drain the queue first, then the exact installed-pack/disk
+    // verification below decides whether a local clone is still needed.
+    let refusedBy: number | undefined;
+    let emptyV2Enqueue = false;
+    const enqueue = async (): Promise<unknown> =>
+      await queueManagerTask(
+      "install",
+      (api) =>
+        api !== "v2"
+        ? // 3.x SEMANTICS (both the custom-node Manager AND pip Manager in
+          // legacy-UI mode, whose /v2 batch runs the same 3.x handlers — codex
+          // review on #235): a REAL git URL installs natively via
+          // { version:'unknown', files:[url] }, cloning it as an unregistered
+          // pack. (Gated server-side by security_level + allow_git_url_install
+          // config — a rejection surfaces as a 403/404 from the queue route.)
+          {
+            id: repoName,
+            version: "unknown",
+            selected_version: "unknown",
+            files: [gitId],
+            channel: opts.channel ?? "default",
+            mode: opts.mode ?? "cache",
+          }
+        : // Manager v4: REGISTRY-FIRST, CLONE FALLBACK. The v4 backend resolves
+          // an install by the pack's REPO NAME / CNR id — NOT a full git URL
+          // (do_install splits `${id}@${selected_version}` and looks the result
+          // up in its DB; a full URL matches nothing and the queue silently
+          // marks the task "done"). So we mirror the frontend UI: id = repo
+          // name, selected_version = ref or "nightly" (the git-HEAD channel for
+          // unclaimed packs), channel "dev", mode "cache".
+          {
+            id: repoName,
+            version: gitRef ?? "nightly",
+            selected_version: gitRef ?? "nightly",
+            channel: opts.channel ?? "dev",
+            mode: opts.mode ?? "cache",
+          },
+      managerBase,
+      // Manager v4 may accept the task while omitting its acknowledgement
+      // body. Direct installs can safely drain and verify before cloning;
+      // apply_manifest opts out so a late completion cannot start a local
+      // write after that budgeted call has returned UNKNOWN/pending.
+      {
+        rejectEmptyEnqueue: true,
+        allowEmptyV2Enqueue: opts.allowEmptyV2Enqueue !== false,
+        onEmptyV2Enqueue: () => {
+          emptyV2Enqueue = true;
+        },
+      },
     );
-    if (nodeInstalledMatches(gitId, installed)) {
-      return {
-        mechanism: "manager-http",
-        message: `Installed "${repoName}" via ComfyUI-Manager. Restart may be required to load new nodes.`,
-        details: status,
-      };
+
+    let status: unknown;
+    try {
+      status = await enqueue();
+    } catch (err) {
+      refusedBy = managerEnqueueRefusal(err);
+      // A remote target keeps the original error: the clone would write to a
+      // LOCAL tree that is not the server we are connected to, so "the Manager
+      // refused" is the honest and complete answer there.
+      assertInstallTargetStable(targetGeneration, managerBase);
+      const absenceAllows = await managerAbsenceAllowsGitFallback(err, managerBase);
+      assertInstallTargetStable(targetGeneration, managerBase);
+      if (isRemoteMode() || !absenceAllows) {
+        throw err;
+      }
+      // BEFORE the log line, which says "cloning directly" and would otherwise be
+      // recording an action that then does not happen.
+      if (localWriteMismatch) {
+        throw new ProcessControlError(
+          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
+        );
+      }
+      const localFallback = !isRemoteMode();
+      if (localFallback) notifyLocalFallbackSelected(opts);
+      const managerUnavailable =
+        refusedBy === undefined &&
+        isManagerQueueDetectionFailure(err) &&
+        // Two 404s no longer settle this on their own: if the same detection saw
+        // Manager answer its version route (or get auth-refused), "absent" is a
+        // claim its own error object refutes (#2754).
+        (!initialManagerQueueAbsenceWasProven(err) ||
+          managerAbsenceUnprovenDuringDetection(err));
+      logger.info("Manager refused, was unavailable, or was proven absent — cloning directly", {
+        status: refusedBy,
+        gitId,
+      });
+      const clone = () => cloneCustomNodeFallback(
+        gitId,
+        repoName,
+        gitRef,
+        refusedBy === 403 || refusedBy === 404
+          ? { manager_refused: refusedBy }
+          : managerUnavailable
+            ? { manager_unavailable: true }
+            : { manager_absent: true },
+        cliWorkspace,
+        {
+          refFromVersion,
+          allowSharedWorkspaceFallback: cliWorkspace !== undefined,
+          managerRefusalNote:
+            refusedBy === 403
+              ? `ComfyUI-Manager REFUSED the git-URL install (HTTP 403) via its ` +
+                `security_level / allow_git_url_install policy gate. Nothing was queued there.`
+              : refusedBy === 404
+                ? `ComfyUI-Manager's git-install route returned HTTP 404 before queueing. ` +
+                  `Nothing was queued there.`
+                : managerUnavailable
+                  ? `ComfyUI-Manager's queue/status surface was unavailable: both dialect ` +
+                    `probes repeatedly returned no queue status before any install task was ` +
+                    `submitted. Nothing was queued there.`
+                : `ComfyUI-Manager is confirmed absent: both queue/status dialects returned HTTP 404 ` +
+                  `on the connected ComfyUI. Nothing was queued there.`,
+        },
+      );
+      // A remote target never writes locally. In particular, an accepted
+      // Manager task that resolves no pack reaches cloneCustomNodeFallback only
+      // to receive its authoritative remote-target refusal; do not make that
+      // refusal wait behind an unrelated local writer.
+      let cloned: NodeOpResult;
+      try {
+        cloned = localFallback
+          ? await withLocalInstallMutationLock(targetGeneration, managerBase, clone)
+          : await clone();
+        assertInstallTargetStable(targetGeneration, managerBase);
+      } catch (err) {
+        if (localFallback) notifyLocalFallbackSettled(opts, "failed");
+        throw err;
+      }
+      if (localFallback) notifyLocalFallbackSettled(opts, "applied");
+      return withCliNote(cloned);
     }
-    return cloneCustomNodeFallback(gitId, repoName, gitRef, status);
+    assertInstallTargetStable(targetGeneration, managerBase);
+
+    // VERIFY: the Manager's installed-pack list is the FIRST witness — but it is
+    // Manager's own bookkeeping, not the filesystem, so #2714 crosses it with a
+    // disk scan before any success wording (see diskCorroboratesManagerInstall).
+    // Three outcomes, and only one of them writes: for ordinary direct installs,
+    // a scan that finds the pack ABSENT falls through to the same direct clone an
+    // unregistered pack takes; apply_manifest disables that fallback after an
+    // empty v4 acknowledgement because the Manager task may still have landed.
+    // A HUSK throws; a scan that could not answer (remote, no proven scan root, an
+    // unreadable custom_nodes) keeps the Manager result and says the disk was not
+    // checked. "Could not look" is never folded into "not there".
+    const installed = await listInstalledNodesAt(managerBase).catch(
+      (err) => {
+        if (emptyV2Enqueue) {
+          const listError = err instanceof Error ? err.message : String(err);
+          throw new NodeManagementError(
+            `ComfyUI-Manager accepted the git install with an empty v4 response and the queue ` +
+              `drained, but its installed-pack list could not be read (${listError}). ` +
+              `The result is UNKNOWN; no local fallback is authorized because that could ` +
+              `duplicate a Manager task whose post-state cannot be verified. Verify the pack ` +
+              `state before reissuing the install.`,
+            {
+              kind: "manager-enqueue-empty-unverified",
+              base: managerBase,
+              repoName,
+              listError,
+            },
+          );
+        }
+        return [] as InstalledNode[];
+      },
+    );
+    assertInstallTargetStable(targetGeneration, managerBase);
+    const listedNode = findInstalledNode(gitId, installed);
+    // A registry/CNR identity can intentionally point at a differently named
+    // source checkout (the #2714 aux-id alias test); only a bare from-source
+    // Manager entry's aux_id is origin evidence for this pack alias case.
+    const originMismatch =
+      listedNode !== undefined &&
+      !listedNode.cnrId &&
+      !gitOriginMatchesRequested(gitId, listedNode.auxId);
+    const rejectEmptyV2Fallback = (
+      verification: string,
+      extra: Record<string, unknown> = {},
+    ): never => {
+      throw new NodeManagementError(
+        `ComfyUI-Manager accepted the git install with an empty v4 response and the queue ` +
+          `drained, but ${verification}. The result is UNKNOWN; no local fallback is ` +
+          `authorized because that could duplicate a Manager task that completed without a ` +
+          `visible matching post-state. Verify the pack state before reissuing the install.`,
+        {
+          kind: "manager-enqueue-empty-unverified",
+          base: managerBase,
+          repoName,
+          ...extra,
+        },
+      );
+    };
+    if (
+      emptyV2Enqueue &&
+      opts.allowLocalFallbackAfterEmptyV2Enqueue === false &&
+      (listedNode === undefined || originMismatch)
+    ) {
+      rejectEmptyV2Fallback(
+        originMismatch
+          ? `it listed a different source origin for "${repoName}"`
+          : `it did not provide a matching installed-pack record for "${repoName}"`,
+      );
+    }
+    /** #2714 — why the Manager's own "installed" verdict was not taken. */
+    let uncorroboratedNote: string | undefined;
+    if (listedNode && !originMismatch) {
+      // The disk is only consulted when it can answer ABOUT THIS SERVER: in
+      // remote mode the tree we could read is not the host's, and with no local
+      // root captured there is nothing to scan. In both cases the list is the
+      // only witness there is, and saying so is the honest report — not silence.
+      const corroboration =
+        presenceCtx.remote || !presenceCtx.diskRoot
+          ? undefined
+          : diskCorroboratesManagerInstall(gitId, listedNode, presenceCtx.diskRoot);
+      if (corroboration?.state === "absent") {
+        if (
+          emptyV2Enqueue &&
+          opts.allowLocalFallbackAfterEmptyV2Enqueue === false
+        ) {
+          rejectEmptyV2Fallback(
+            `it still lists "${repoName}", but no matching pack exists under ${corroboration.scanned}`,
+            { scanned: corroboration.scanned },
+          );
+        }
+        uncorroboratedNote =
+          `ComfyUI-Manager drained the install task and still lists "${repoName}" in its ` +
+          `installed-pack list, but NO matching pack exists under ${corroboration.scanned} ` +
+          `— so that list is describing its own bookkeeping, not this filesystem, and a ` +
+          `drained queue proves nothing landed (#2714). Nothing was installed by that route.`;
+      } else if (corroboration?.state === "husk") {
+        // Same class as #900/#1816, reached from the git route: a directory the
+        // install left behind that ComfyUI cannot import. This call is not the
+        // proven author of it, so it is named and left untouched rather than
+        // deleted, and no success is claimed over it.
+        throw new NodeManagementError(
+          `ComfyUI-Manager drained the install task and lists "${repoName}" as installed, but ` +
+            `${corroboration.dir} holds nothing ComfyUI can import — only metadata/marker files, ` +
+            `the husk of an install that did not complete. ComfyUI loads DIRECTORIES, so it will ` +
+            `fail to import that on every start. NOT reporting success: nothing usable was ` +
+            `installed. Delete ${corroboration.dir} by hand and retry the install.`,
+          status,
+        );
+      } else {
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `Installed "${repoName}" via ComfyUI-Manager` +
+            (corroboration?.state === "corroborated"
+              ? `, verified present on disk at ${corroboration.dir}`
+              : `. Its presence on disk was NOT verified from here (${
+                  presenceCtx.remote
+                    ? "this session targets a REMOTE ComfyUI, so the local filesystem is not the host's"
+                    : !presenceCtx.diskRoot
+                      ? "no local custom_nodes scan root could be established for the connected server"
+                      : "the local custom_nodes scan could not answer"
+                }), so ComfyUI-Manager's installed-pack list is the only witness`) +
+            `. Restart may be required to load new nodes.`,
+          details: status,
+        });
+      }
+    }
+    const replaceOrigin =
+      originMismatch ? listedNode?.auxId : undefined;
+    if (localWriteMismatch) {
+      throw new ProcessControlError(
+        wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
+      );
+    }
+    const localFallback = !isRemoteMode();
+    if (localFallback) notifyLocalFallbackSelected(opts);
+    const clone = () => cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace, {
+      refFromVersion,
+      allowSharedWorkspaceFallback: cliWorkspace !== undefined,
+      ...(replaceOrigin
+        ? {
+            replaceOrigin,
+            managerRefusalNote:
+              `ComfyUI-Manager installed "${replaceOrigin}" instead of the requested ` +
+              `origin ${gitOwnerRepo(gitId) ?? gitId}`,
+          }
+        : {}),
+      // #2714 — the default reason ("not in the ComfyUI-Manager registry") is the
+      // wrong explanation when Manager DID list the pack; state what was actually
+      // observed instead, so a subsequent refusal from here is not misattributed.
+      ...(uncorroboratedNote && !replaceOrigin
+        ? { managerRefusalNote: uncorroboratedNote }
+        : {}),
+    });
+    // An accepted remote Manager task that resolves no pack still reaches this
+    // helper only for its authoritative remote-target refusal; it is not a
+    // local write and must not wait on the local writer lock.
+    let cloned: NodeOpResult;
+    try {
+      cloned = localFallback
+        ? await withLocalInstallMutationLock(targetGeneration, managerBase, clone)
+        : await clone();
+      assertInstallTargetStable(targetGeneration, managerBase);
+    } catch (err) {
+      if (localFallback) notifyLocalFallbackSettled(opts, "failed");
+      throw err;
+    }
+    if (localFallback) notifyLocalFallbackSettled(opts, "applied");
+    return withCliNote(cloned);
   }
 
   // Registry (plain CNR id). Keep the prior defaults channel "default" /
@@ -1090,23 +4893,283 @@ export async function installCustomNode(
     selected_version: version ?? "latest",
     channel,
     mode,
-  });
-  const installed = await listInstalledNodes().catch(
-    () => [] as InstalledNode[],
-  );
-  if (!nodeInstalledMatches(id, installed)) {
-    throw new NodeManagementError(
-      `"${id}" was queued but is not present afterward — it was not found in the ` +
-        `ComfyUI-Manager registry. Check the pack id, or pass a git URL to clone ` +
-        `it directly.`,
-      status,
-    );
+  }, managerBase);
+  assertInstallTargetStable(targetGeneration, managerBase);
+  // #797: verify across BOTH sources (Manager list + local disk) and keep
+  // "could not determine" distinct from "determined absent" — an unreadable
+  // Manager list collapsed to [] used to read as "not found in the registry".
+  const presence = await resolvePackPresence(id, managerBase, presenceCtx);
+  assertInstallTargetStable(targetGeneration, managerBase);
+  switch (presence.state) {
+    case "manager-listed":
+      return withCliNote({
+        mechanism: "manager-http",
+        message: `Installed "${id}" via ComfyUI-Manager. Restart may be required to load new nodes.`,
+        details: status,
+      });
+    case "on-disk":
+      // #1816 — a registry zip that extracted nothing still creates the target
+      // directory (Manager writes `.tracking` first). Directory-exists is not
+      // "installed": ComfyUI cannot import a marker-only folder. Fail before
+      // any success wording, including the unreadable-list / already-there
+      // branches, so a retry over the husk cannot report success either.
+      if (!looksLikeAPack(presence.dir)) {
+        throw await refuseEmptyRegistryPack(
+          id,
+          presence.dir,
+          status,
+          diskBefore?.state === "not-found",
+        );
+      }
+      if (!presence.managerListReadable) {
+        // Present on disk, but the Manager list could not be read — claiming
+        // "already installed, nothing new happened" would assert an outcome
+        // nobody observed.
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `"${id}" is present on disk at ${presence.dir}. Whether the queued install ` +
+            `changed anything could NOT be verified: ComfyUI-Manager's installed-pack ` +
+            `list could not be read (${presence.listError}). NOT claiming a fresh install ` +
+            `— check install_custom_node (action:"list").`,
+          details: status,
+        });
+      }
+      // The Manager install resolved to nothing and the pack IS on disk. WHICH of
+      // those two stories it is depends entirely on the PRE-state, which is why
+      // it is read here and not inferred.
+      if (diskBefore?.state === "not-found") {
+        // It was NOT there before and it is now, AND the directory holds pack
+        // files (the empty-husk gate above already ran). Reporting "already
+        // installed" here hid a successful install behind a no-op.
+        // STATES THE OBSERVATION, NOT A CAUSE (codex gate P1, #1816). `diskBefore`
+        // is a filesystem snapshot with nothing binding it to this operation, so
+        // under two concurrent agents on one rig — which is in scope — the pack
+        // could have been created by the OTHER agent between our pre-check and
+        // our post-check. "It was absent before and is present now" is exactly
+        // what we saw; "this call installed it" is an inference the evidence
+        // does not support. The user's next action (restart to load it) is
+        // identical either way, so the weaker claim costs them nothing.
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `"${id}" is now present on disk at ${presence.dir}, and was NOT there before ` +
+            `this call, though ComfyUI-Manager does not track it (a Comfy Registry zip ` +
+            `install is not in its installed-pack list). If another agent is working on ` +
+            `this ComfyUI, it may have been the one that put it there. Restart ComfyUI ` +
+            `to load it.`,
+          details: status,
+        });
+      }
+      if (diskBefore?.state === "found") {
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager does not ` +
+            `track it (a Comfy Registry zip install or a manual copy), and it was ALREADY ` +
+            `there before this call — so the queued registry install resolved to nothing ` +
+            `new. Restart ComfyUI if it was just added.`,
+          details: status,
+        });
+      }
+      // No usable pre-state (no disk root, or the pre-check was unreadable). The
+      // pack is on disk NOW; whether this call put it there is undetermined, and
+      // saying either would be a guess dressed as a finding.
+      return withCliNote({
+        mechanism: "manager-http",
+        message:
+          `"${id}" is present on disk at ${presence.dir}, and ComfyUI-Manager does not ` +
+          `track it (a Comfy Registry zip install or a manual copy). Whether THIS call ` +
+          `installed it could not be determined — the pack's state before the call was ` +
+          `${diskBefore?.state === "unreadable" ? `unreadable (${diskBefore.reason})` : "not observable in this session"}. ` +
+          `Restart ComfyUI if it was just added.`,
+        details: status,
+      });
+    case "absent":
+      throw new NodeManagementError(
+        presence.evidence === "manager+disk"
+          ? `"${id}" was queued but is not present afterward — it is in neither the ` +
+            `ComfyUI-Manager installed-pack list NOR on disk under ${presence.scanned}. ` +
+            `It was not found in the ComfyUI-Manager registry. Check the pack id, or pass ` +
+            `a git URL to clone it directly.`
+          : `"${id}" was queued but is not present afterward — it was not found in the ` +
+            `ComfyUI-Manager registry. Check the pack id, or pass a git URL to clone ` +
+            `it directly.`,
+        status,
+      );
+    case "unverifiable":
+      throw new NodeManagementError(
+        `"${id}" was queued, but whether it landed could NOT be verified: ${presence.reason} ` +
+          `NOT reporting success on an unverified install. Check install_custom_node (action:"list"), ` +
+          `then retry if it is genuinely absent.`,
+        status,
+      );
   }
-  return {
-    mechanism: "manager-http",
-    message: `Installed "${id}" via ComfyUI-Manager. Restart may be required to load new nodes.`,
-    details: status,
-  };
+}
+
+/**
+ * Post-op presence gate for update/reinstall (#730) — the same fail-closed
+ * check install got in #232, reusing the same helpers (listInstalledNodesAt +
+ * nodeInstalledMatches). A drained Manager queue proves NOTHING about whether
+ * work happened: for an id that resolves nowhere the enqueue is a silent no-op
+ * and the drain passes trivially (total_count 0 while done_count increments),
+ * which is how update/reinstall reported "Queued + updated/reinstalled" for
+ * packs that do not exist. So re-read the installed list afterward —
+ * /customnode/installed reflects the on-disk custom_nodes — and require the
+ * pack to resolve SOMEWHERE before claiming success.
+ *
+ * A pack that IS installed but not in the registry (git-cloned) still matches —
+ * nodeInstalledMatches covers the module/auxId spellings — so that path is
+ * unaffected; only an id that resolves NOWHERE fails.
+ */
+/**
+ * Thrown by assertPackPresentAfterOp ONLY when absence was actually observed
+ * (every consulted source agrees the pack is gone). An unverifiable post-state
+ * throws a plain NodeManagementError instead, so a caller wrapping failures —
+ * the reinstall path, which CAN truthfully say "left the pack REMOVED" for an
+ * observed absence but not for an unreadable one — can tell them apart
+ * (codex gate round 10).
+ */
+export class PackAbsentAfterOpError extends NodeManagementError {
+  constructor(message: string, details?: unknown) {
+    super(message, details);
+    this.name = "PackAbsentAfterOpError";
+  }
+}
+
+async function assertPackPresentAfterOp(
+  id: string,
+  op: "update" | "reinstall",
+  base: string,
+  status: QueueStatus,
+  ctx?: PackPresenceContext,
+): Promise<void> {
+  // #771 — SAY WHAT WE ACTUALLY CHECKED; #797 — CHECK THE DISK TOO. This gate
+  // consults up to TWO sources: the Manager's installed list AND (in a local
+  // session) the on-disk custom_nodes scan. The Manager list alone never sees a
+  // Comfy Registry zip install or a manual copy, so a list-only miss is NOT
+  // proof the pack "is not installed locally" — for the sidebar panel installed
+  // as a zip, that assertion was flatly false while install_comfyui(action:'panel', panel_action:'status')
+  // reported the same pack at a concrete directory and version.
+  //
+  // The three outcomes stay distinct (this fold is #796's recurring defect):
+  // present (either source), absent (BOTH consulted sources agree), and
+  // unverifiable (a source that could not answer — an unreadable list or an
+  // unenumerable directory is never treated as absence).
+  const presence = await resolvePackPresence(id, base, ctx);
+  switch (presence.state) {
+    case "manager-listed":
+      return;
+    case "on-disk":
+      if (!presence.managerListReadable) {
+        // The pack IS on disk, but Manager's list could not be read — so whether
+        // Manager tracked it, and whether the queued op did anything, are both
+        // UNKNOWN. Asserting "resolved to nothing" would be a guess.
+        throw new NodeManagementError(
+          `"${id}" was queued for ${op}. The pack IS present on disk at ${presence.dir}, ` +
+            `but ComfyUI-Manager's installed-pack list could not be read (${presence.listError}), ` +
+            `so whether the ${op} took effect could NOT be verified. NOT reporting success ` +
+            `on an unverified ${op}. Check that ComfyUI-Manager is reachable, then retry.`,
+          status,
+        );
+      }
+      // The pack IS installed — the op still resolved to nothing, because
+      // Manager can only update/reinstall packs IT tracks. Refuse, but with the
+      // truth: where the pack is and why Manager could not touch it.
+      throw new NodeManagementError(
+        `"${id}" was queued for ${op}, which resolved to NOTHING: the pack is present ` +
+          `on disk at ${presence.dir} but ComfyUI-Manager does not track it (a Comfy ` +
+          `Registry zip install or a manual copy), and Manager can only ${op} packs in ` +
+          `its own installed list. ` +
+          `The pack was NOT ${op === "update" ? "updated" : "reinstalled"}. To move it, reinstall it from its ` +
+          `registry id or repository URL (install_custom_node action:"install" / action:"reinstall"), ` +
+          `or — when ${presence.dir} is a git checkout — pull it there directly.`,
+        status,
+      );
+    case "absent":
+      if (presence.evidence === "manager+disk") {
+        throw new PackAbsentAfterOpError(
+          `"${id}" was queued for ${op} but is not present afterward — it is in neither ` +
+            `ComfyUI-Manager's installed-pack list NOR on disk under ${presence.scanned} — ` +
+            `so the ${op} resolved to nothing. Check the pack id with install_custom_node (action:"list"), ` +
+            `or find the right id with search_custom_nodes.`,
+          status,
+        );
+      }
+      // Remote session: only the Manager list could be consulted. Say exactly that.
+      throw new PackAbsentAfterOpError(
+        `"${id}" was queued for ${op} but is not present afterward in ` +
+          `ComfyUI-Manager's installed-pack list, so the ${op} resolved to nothing. NOTE: this ` +
+          `check reads ComfyUI-Manager's registry/installed list ONLY — it does not ` +
+          `inspect custom_nodes, so a pack that IS on disk but unknown to the Manager ` +
+          `(a Comfy Registry zip install, or a manual copy) reaches here too. Check ` +
+          `the pack id with install_custom_node (action:"list"), and for the sidebar panel use ` +
+          `install_comfyui(action:'panel', panel_action:'status'), which reads the directory itself.`,
+        status,
+      );
+    case "unverifiable":
+      throw new NodeManagementError(
+        `"${id}" was queued for ${op}, but whether it landed could NOT be verified: ` +
+          `${presence.reason} NOT reporting success on an unverified ${op}. Check that ` +
+          `ComfyUI-Manager is reachable on the host, then retry.`,
+        status,
+      );
+  }
+}
+
+/**
+ * Pre-op resolution for update/reinstall (#730's gate moved BEFORE the queue,
+ * codex gate round 8): the queued task must name the pack's MANAGER module
+ * name — a caller's registry id can differ from it ("comfyui-impact-pack" vs
+ * "ComfyUI-Impact-Pack"), and the legacy routes resolve by module, so an
+ * update enqueued under the registry id no-ops while the post-check still
+ * matches the pre-existing record by cnr_id and reports "updated". Resolving
+ * first also means a target that resolves nowhere is refused with NOTHING
+ * queued rather than after a meaningless queue cycle. Returns the tracked
+ * entry; throws the truthful refusal otherwise.
+ */
+async function resolveTrackedForOp(
+  id: string,
+  op: "update" | "reinstall",
+  base: string,
+  ctx?: PackPresenceContext,
+): Promise<InstalledNode> {
+  const presence = await resolvePackPresence(id, base, ctx);
+  switch (presence.state) {
+    case "manager-listed":
+      return presence.node as InstalledNode;
+    case "on-disk":
+      throw new NodeManagementError(
+        presence.managerListReadable
+          ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not ` +
+            `track it (a Comfy Registry zip install or a manual copy), so Manager cannot ` +
+            `${op} it and NOTHING was queued. To move it, reinstall it from its registry id ` +
+            `or repository URL (install_custom_node action:"install" / action:"reinstall"), or — when ` +
+            `${presence.dir} is a git checkout — pull it there directly.`
+          : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
+            `installed-pack list could not be read (${presence.listError}), so whether ` +
+            `Manager can ${op} it could NOT be determined and NOTHING was queued. Check ` +
+            `that ComfyUI-Manager is reachable, then retry.`,
+      );
+    case "absent":
+      throw new NodeManagementError(
+        presence.evidence === "manager+disk"
+          ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
+            `list NOR on disk under ${presence.scanned} — so there is nothing to ${op} ` +
+            `and NOTHING was queued. Check the pack id with install_custom_node (action:"list"), or find ` +
+            `the right id with search_custom_nodes.`
+          : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is nothing ` +
+            `to ${op} and NOTHING was queued. NOTE: this check reads the Manager list only ` +
+            `(remote session — no disk check possible). Check the pack id with ` +
+            `install_custom_node (action:"list").`,
+      );
+    case "unverifiable":
+      throw new NodeManagementError(
+        `Whether "${id}" is installed could not be determined (${presence.reason}), so ` +
+          `the ${op} was NOT queued — a ${op} queued blind would drain silently whether ` +
+          `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
+      );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,7 +5184,185 @@ export interface UpdateOptions {
   useCmCli?: boolean;
 }
 
-export async function updateCustomNode(
+/** Does this update target refer to ComfyUI-Manager itself (any spelling)? */
+function isManagerSelfTarget(id: string): boolean {
+  const norm = basename(id.trim().toLowerCase()).replace(/[_\s]+/g, "-");
+  return norm === "comfyui-manager" || norm === "comfy-manager";
+}
+
+/**
+ * Actionable terminal error for a Manager build that does not register its own
+ * self-update route. This is the ONLY outcome of that case — see updateManagerSelf
+ * for why there is deliberately no local-git fallback.
+ */
+function managerSelfUpdateUnsupported(api: ManagerApi, cause?: unknown): NodeManagementError {
+  const dialect =
+    api === "legacy"
+      ? "the LEGACY ComfyUI-Manager 3.x queue API"
+      : api === "v2-batch"
+        ? "this Manager's legacy-UI (3.x-under-/v2) queue API"
+        : "this Manager's queue API";
+  return new NodeManagementError(
+    `Updating ComfyUI-Manager ITSELF is not supported by ${dialect} on this build — ` +
+      `its self-update route answered HTTP 405, i.e. the route is not registered. ` +
+      `NOTHING WAS UPDATED. Update ComfyUI-Manager on the ComfyUI HOST instead — for a ` +
+      `custom_nodes checkout: \`git -C custom_nodes/ComfyUI-Manager pull\`; for the pip ` +
+      `package: \`pip install -U comfyui_manager\` — then restart ComfyUI. ` +
+      `(comfyui-mcp will not git-pull a checkout on ITS OWN machine for you here: it cannot ` +
+      `prove that checkout is the one the connected server actually loaded — a loopback URL ` +
+      `can be a container or an SSH port-forward — and pulling the wrong copy would report a ` +
+      `fix that never reached your ComfyUI.) ` +
+      `See https://comfyui-mcp.artokun.io/docs/troubleshooting`,
+    cause instanceof NodeManagementError ? cause.details : undefined,
+  );
+}
+
+/**
+ * Update ComfyUI-Manager ITSELF (#424).
+ *
+ * The released Manager 3.x DOES support this through its ordinary per-operation
+ * route — POST /manager/queue/update with { id: "comfyui-manager", version } —
+ * verified against ComfyUI-Manager 3.41 glob/manager_server.py + manager_core.py:
+ * `unified_update` has NO comfyui-manager guard (unlike install/enable/disable/
+ * uninstall, which explicitly refuse it), and /manager/queue/update_all itself
+ * enqueues 'comfyui-manager' as an update task. The original #424 HTTP 405 came
+ * from posting the v4-only unified envelope path (…/queue/task) at a 3.x server,
+ * where an UNREGISTERED POST is answered 405 by ComfyUI's frontend catchall —
+ * not from any per-pack refusal. So: route the self-update at the real endpoint
+ * for the detected dialect first.
+ *
+ * When THAT route also answers 405 (genuinely unregistered on this build) the ONLY
+ * outcome is the explicit "not supported here, update it on the host via X" error.
+ *
+ * There is deliberately NO local-git fallback. The previous implementation pulled
+ * the resolved code workspace's custom_nodes/ComfyUI-Manager checkout, which is only ever
+ * correct if that checkout is the one the CONNECTED server actually loaded — and
+ * that cannot be established over HTTP. Successive review rounds killed one
+ * wrong-target hole after another (remote host; --force-remote over a forwarded
+ * loopback port; a second local instance on another port; finally a loopback
+ * container or SSH forward whose reported install root string coincides with a
+ * DIFFERENT host path — /system_stats argv reports a path in the SERVER's
+ * filesystem namespace, which we cannot compare to ours). Each hole ends the same
+ * way: git-pull a checkout the running Manager never loads, then report it as the
+ * fix. shouldDispatchDownloadToManager (model-resolver.ts) hits the same wall and
+ * settles for an existsSync probe only because ITS failure mode is a stray
+ * directory; here it would be a fabricated success, which this issue exists to
+ * eliminate. Refusing with the exact host-side command is always correct; guessing
+ * is not. (The primary path above is the real #424 fix — released Manager 3.x
+ * registers the route, so this branch is for builds that genuinely lack it.)
+ */
+async function updateManagerSelf(id: string): Promise<NodeOpResult> {
+  // Keep this self-update on the ComfyUI instance selected at invocation. A
+  // panel retarget during the dialect recheck must not update another instance.
+  const base = managerBaseUrl();
+  const api = await detectManagerApi(base);
+  // ONLY the enqueue is inspected for the 405 signal. A 405 raised later, while
+  // draining (e.g. `${prefix}/start`), says nothing about whether the update route
+  // exists, so it must propagate as itself rather than be reported as "unsupported"
+  // (codex review) — hence enqueue and drain are called separately here.
+  //
+  // The enqueue goes through the dialect self-heal (#646) first: a 405 can ALSO
+  // mean we spoke a dialect the server no longer runs (a Manager upgrade + restart
+  // at the same URL), and telling that user "your build doesn't support this" would
+  // be flatly wrong. Only a 405 that survives a re-probe — the route really is
+  // unregistered on the live dialect — reaches the unsupported verdict.
+  let used: ManagerApi;
+  // The verdict must name the dialect of the attempt that ACTUALLY 405'd — after a
+  // re-probe that can differ from the dialect detected on entry, and the message is
+  // dialect-specific ("the LEGACY 3.x queue API" vs the legacy-UI one).
+  let lastTried = api;
+  try {
+    used = await enqueueWithDialectSelfHeal("update", (dialect, epoch) => {
+      lastTried = dialect;
+      return enqueueManagerTask(
+        dialect,
+        "update",
+        () => ({ node_name: id }),
+        randomUUID(),
+        base,
+        epoch,
+      );
+    }, base);
+  } catch (err) {
+    if (errorStatus(err) !== 405) throw err;
+    // 405 = the update route is not registered on this build (#424).
+    logger.debug("Manager self-update route 405 — reporting unsupported", { api: lastTried });
+    throw managerSelfUpdateUnsupported(lastTried, err);
+  }
+  const status = await runManagerQueue(used, base);
+  return {
+    mechanism: "manager-http",
+    message:
+      `Queued ComfyUI-Manager's own update via ComfyUI-Manager (${id}) and the queue drained. ` +
+      `Manager marks a task done even when the underlying git/registry update was a no-op or ` +
+      `failed, and a Manager self-update only takes effect after a RESTART — restart ComfyUI, ` +
+      `then confirm the Manager version actually changed.`,
+    details: status,
+  };
+}
+
+/**
+ * ENQUEUE update-all on its dedicated route in the detected dialect, WITHOUT
+ * draining the queue. Shared by updateCustomNode({id:"all"}) (which drains) and
+ * the update-all tool's fire-and-forget path (queueUpdateAllCustomNodes), so
+ * both inherit dialect selection, cache invalidation, and the 404/405-only
+ * re-send discipline from enqueueWithDialectSelfHeal — a 400 re-detects but is
+ * never re-sent, so update-all can never run twice (#656).
+ *
+ * Returns the dialect the enqueue ACTUALLY spoke (so the caller starts/polls
+ * the queue holding the task), the route's raw response body, and the ui_id
+ * of the attempt that LANDED (a self-heal retry mints a fresh one — only the
+ * last one's tasks exist, so only it correlates with v4 queue history, #689).
+ */
+async function enqueueUpdateAll(
+  mode: string,
+  base: string,
+): Promise<{ used: ManagerApi; response: unknown; uiId: string }> {
+  let response: unknown;
+  let uiId = "";
+  const used = await enqueueWithDialectSelfHeal("update-all", async (api) => {
+    // The v4 backend reads UpdateAllQueryParams from the QUERY STRING
+    // (manager_server.py), NOT the JSON body — a body-only request leaves mode
+    // defaulting to 'remote' and drops client_id/ui_id. Send them as URL query
+    // params. A fresh ui_id per attempt keeps the two attempts distinguishable.
+    const attemptUiId = randomUUID();
+    if (api === "legacy") {
+      // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
+      response = await managerFetch("/manager/queue/update_all", {
+        method: "POST",
+        body: { mode, ui_id: attemptUiId },
+        base,
+      });
+    } else {
+      const query = new URLSearchParams({
+        mode,
+        client_id: MANAGER_CLIENT_ID,
+        ui_id: attemptUiId,
+      }).toString();
+      response = await managerFetch(`/v2/manager/queue/update_all?${query}`, {
+        method: "POST",
+        base,
+      });
+    }
+    // Only reached when the enqueue did NOT throw — this attempt's id is the
+    // one whose tasks are actually on the queue.
+    uiId = attemptUiId;
+  }, base);
+  return { used, response, uiId };
+}
+
+export async function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
+  // PIN GUARD — covers id="comfyui-agent-panel", the repo-name and git-URL
+  // spellings, and id="all" (a bulk update moves the panel too). The check and
+  // the mutation are atomic under the panel mutation lock: update-all waits on
+  // the Manager queue, and a pin written in that window must block the NEXT
+  // op, not land inside this one (withPanelPinGuard).
+  return withPanelPinGuard("update", opts.id, () =>
+    withObjectInfoInvalidation(() => updateCustomNodeImpl(opts)),
+  );
+}
+
+async function updateCustomNodeImpl(
   opts: UpdateOptions,
 ): Promise<NodeOpResult> {
   const { id, mode = "remote", channel = "default" } = opts;
@@ -1138,40 +5379,120 @@ export async function updateCustomNode(
     };
   }
 
+  // Updating ComfyUI-Manager ITSELF is its own routing problem (#424): it has a
+  // real endpoint on every dialect, but a build that doesn't register it answers
+  // 405 (ComfyUI's catchall) and the in-panel 3.x→v4 upgrade path deadlocks.
+  // updateManagerSelf routes at the right endpoint for the detected dialect, and
+  // on a 405 there reports an explicit "not supported here, run X on the host".
+  if (!all && isManagerSelfTarget(id)) return updateManagerSelf(id);
+
   let status: QueueStatus;
+  /** #1999 — set only on the single-pack branch; see NodeOpResult.taskUiId. The
+   *  update-all branch deliberately leaves it undefined: v4 derives a SEPARATE
+   *  per-pack task id (`${uiId}_${pack}`) there, so the bare enqueue id would
+   *  never resolve in queue history and handing it out would invite a lookup
+   *  that answers "no such task" about a task that really ran. */
+  let taskUiId: string | undefined;
+  // Freeze the target BEFORE the first await (queueManagerTask does the same):
+  // a mid-op retarget must not split the enqueue and the post-op verification
+  // across two servers. The base travels back on the result so callers (the
+  // #724 panel fallback's dialect probe) verify against the SAME Manager.
+  const base = managerBaseUrl();
+  // Captured with the target, before any await: the pre-resolve AND the
+  // post-drain gate must read the SAME disk context (codex gate round 11).
+  const presenceCtx = capturePackPresenceContext();
   if (all) {
-    // update_all keeps its own dedicated route. The backend reads
-    // UpdateAllQueryParams from the QUERY STRING (manager_server.py), NOT the
-    // JSON body — a body-only request leaves mode defaulting to 'remote' and
-    // drops client_id/ui_id. Send them as URL query params.
-    const uiId = randomUUID();
-    if ((await detectManagerApi()) === "legacy") {
-      // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
-      await managerFetch("/manager/queue/update_all", {
-        method: "POST",
-        body: { mode, ui_id: uiId },
-      });
-    } else {
-      const query = new URLSearchParams({
-        mode,
-        client_id: MANAGER_CLIENT_ID,
-        ui_id: uiId,
-      }).toString();
-      await managerFetch(`/v2/manager/queue/update_all?${query}`, {
-        method: "POST",
-      });
-    }
-    status = await runManagerQueue();
+    // update-all keeps its own dedicated route (so it does NOT go through
+    // queueManagerTask), but it is just as dialect-dependent — route it through
+    // the same enqueue-only self-heal so a stale classification can't wedge it
+    // either (#646). Enqueue here, drain once below.
+    const { used } = await enqueueUpdateAll(mode, base);
+    status = await runManagerQueue(used, base);
   } else {
+    // Resolve the target BEFORE queueing (codex gate round 8): the update body
+    // must name the pack's MANAGER module name — a caller's registry id can
+    // differ from it, a legacy route resolves by module, and a no-op update
+    // would still pass a post-check that matches by cnr_id. A target that
+    // resolves nowhere is refused with NOTHING queued.
+    const tracked = await resolveTrackedForOp(id, "update", base, presenceCtx);
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
-    status = await queueManagerTask("update", { node_name: id });
+    const queued = await queueManagerTaskTracked(
+      "update",
+      { node_name: tracked.module },
+      base,
+    );
+    status = queued.status;
+    taskUiId = queued.uiId;
+    // VERIFY (#730): the drain passes trivially for an id Manager never
+    // enqueued (total_count 0 — the "Queued + updated" lie in the issue).
+    // Require the pack to resolve SOMEWHERE post-op before claiming success.
+    await assertPackPresentAfterOp(id, "update", base, status, presenceCtx);
   }
   return {
     mechanism: "manager-http",
     message: all
-      ? "Queued + updated all installed node packs via ComfyUI-Manager."
+      ? "Queued update-all with ComfyUI-Manager. Completion and the sidebar panel's on-disk version are not verified yet."
       : `Queued + updated "${id}" via ComfyUI-Manager.`,
     details: status,
+    managerBase: base,
+    taskUiId,
+  };
+}
+
+/**
+ * Result of the update-all tool's fire-and-forget path (queueUpdateAllCustomNodes).
+ */
+export interface QueueUpdateAllResult {
+  /** The update-all route the enqueue actually used (dialect-dependent). */
+  endpoint: string;
+  /** Whether the queue worker was confirmed started. */
+  queueStarted: boolean;
+  /** Raw update-all response body, when the route produced one. */
+  managerResponse?: unknown;
+  /** The ComfyUI base the enqueue actually targeted (captured at invocation,
+   *  so a later cancel can aim at the same server — #689). */
+  base: string;
+  /** The ui_id of the enqueue attempt that landed; v4 derives each per-pack
+   *  task id as `${uiId}_${pack}`, so this correlates with queue history. */
+  uiId: string;
+}
+
+/**
+ * The update-all MCP tool's path (#656): enqueue update-all in the DETECTED
+ * dialect and kick the queue worker, then return WITHOUT draining — the tool
+ * reports "queued + started" and the updates run asynchronously (unlike
+ * updateCustomNode({id:"all"}), which drains the queue). Routed through the
+ * same detectManagerApi + enqueue-with-self-heal machinery as every other
+ * Manager mutation, so it inherits dialect selection, cache invalidation, and
+ * the no-double-execute discipline rather than assuming the legacy 3.x route.
+ *
+ * No object_info invalidation here: the queued updates only take effect after
+ * a ComfyUI RESTART, and the restart lifecycle already drops that cache.
+ */
+export async function queueUpdateAllCustomNodes(): Promise<QueueUpdateAllResult> {
+  // One pinned target for the whole operation — detection, the enqueue, any
+  // self-heal retry, and the queue start all stay on the instance selected at
+  // invocation, even if the panel retargets mid-call.
+  const base = managerBaseUrl();
+  const { used, response, uiId } = await enqueueUpdateAll("remote", base);
+  const prefix = managerQueuePrefixFor(used);
+  let queueStarted = true;
+  try {
+    await managerQueueControl(`${prefix}/start`, base);
+  } catch (err) {
+    // The update-all IS queued — a start failure must not fail the whole call;
+    // report it so the user can kick the queue manually.
+    queueStarted = false;
+    logger.warn("Queued update-all but failed to start the queue worker", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return {
+    endpoint: `${prefix}/update_all`,
+    queueStarted,
+    managerResponse: response,
+    base,
+    uiId,
   };
 }
 
@@ -1187,7 +5508,15 @@ export interface ReinstallOptions {
   useCmCli?: boolean;
 }
 
-export async function reinstallCustomNode(
+export async function reinstallCustomNode(opts: ReinstallOptions): Promise<NodeOpResult> {
+  // PIN GUARD — same door as install/update, and check + mutation are likewise
+  // atomic under the panel mutation lock (withPanelPinGuard).
+  return withPanelPinGuard("reinstall", opts.id, () =>
+    withObjectInfoInvalidation(() => reinstallCustomNodeImpl(opts)),
+  );
+}
+
+async function reinstallCustomNodeImpl(
   opts: ReinstallOptions,
 ): Promise<NodeOpResult> {
   const { id, version, mode = "remote", channel = "default" } = opts;
@@ -1202,15 +5531,56 @@ export async function reinstallCustomNode(
   }
 
   // The unified queue has no `reinstall` kind, so model it as uninstall + a
-  // fresh install of the same target. Each is its own drained queue cycle.
-  await queueManagerTask("uninstall", { node_name: id });
+  // fresh install of the same target. Each is its own drained queue cycle, but
+  // the TWO cycles are one logical operation and must share ONE pinned target:
+  // captured once, up front, so a panel retarget after the uninstall drains
+  // cannot send the install to a different ComfyUI — which would leave the
+  // user's server uninstalled while reporting success for another.
+  const base = managerBaseUrl();
+  const presenceCtx = capturePackPresenceContext();
+  // Resolve BEFORE the uninstall half (codex gate round 8): it must name the
+  // Manager module name, and a nowhere-resolving id is refused with NOTHING
+  // queued — previously both cycles no-op'd and the post-check could still
+  // match a pre-existing record by cnr_id.
+  const tracked = await resolveTrackedForOp(id, "reinstall", base, presenceCtx);
+  await queueManagerTask("uninstall", { node_name: tracked.module }, base);
+  // The install half must name an identity the registry can actually RESOLVE
+  // (codex gate round 9): when the caller passed the module/folder spelling,
+  // installing it back under that spelling resolves nowhere — the pack would
+  // be removed and not restored. The tracked record's CNR id is the stable
+  // identity; a git/aux pack without one keeps the caller's spelling (the v4
+  // backend also resolves repo names), as before.
+  const reinstallId = tracked.cnrId ?? id;
   const status = await queueManagerTask("install", {
-    id,
+    id: reinstallId,
     version: version ?? "latest",
     selected_version: version ?? "latest",
     channel,
     mode,
-  });
+  }, base);
+  // VERIFY (#730): same queue-drain trust hole as update — for an id that
+  // resolves nowhere BOTH cycles no-op and both drains pass trivially. Require
+  // the pack to be present afterward before claiming a reinstall. An OBSERVED
+  // post-op absence gets the reinstall-specific truth (the uninstall half
+  // already ran — the pack is REMOVED, not untouched); an UNVERIFIABLE
+  // post-state keeps the gate's own "could not verify" message.
+  try {
+    await assertPackPresentAfterOp(id, "reinstall", base, status, presenceCtx);
+  } catch (err) {
+    // "Left the pack REMOVED" is only true when absence was OBSERVED — an
+    // unverifiable post-state (unreadable list, inconclusive disk) establishes
+    // neither removal nor a failed install, and keeps its own message
+    // (codex gate round 10).
+    if (err instanceof PackAbsentAfterOpError) {
+      throw new NodeManagementError(
+        `The reinstall of "${id}" left the pack REMOVED: the uninstall half drained, ` +
+          `but the install half did not restore it. Install it again with ` +
+          `install_custom_node ("${reinstallId}"). Underlying detail: ${err.message}`,
+        err.details,
+      );
+    }
+    throw err;
+  }
   return {
     mechanism: "manager-http",
     message: `Queued + reinstalled "${id}" (uninstall + install) via ComfyUI-Manager. A restart may be required.`,
@@ -1231,6 +5601,14 @@ export interface FixOptions {
 }
 
 export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
+  // `fix` reinstalls the pack's dependencies and can pull the pack itself, and
+  // it accepts "all" — same door, same guard, same lock (withPanelPinGuard).
+  return withPanelPinGuard("fix", opts.id, () =>
+    withObjectInfoInvalidation(() => fixCustomNodeImpl(opts)),
+  );
+}
+
+async function fixCustomNodeImpl(opts: FixOptions): Promise<NodeOpResult> {
   const { id, mode = "remote", channel = "default" } = opts;
   const all = id.trim().toLowerCase() === "all";
 
@@ -1248,11 +5626,1273 @@ export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
 
   // FixPackParams requires node_ver; "" lets Manager resolve the installed
   // version (do_fix looks the pack up by name).
-  const status = await queueManagerTask("fix", { node_name: id, node_ver: "" });
+  // Pin the target before the first await so the enqueue, drain, and per-task
+  // history lookup stay on the same Manager even if the panel retargets.
+  const base = managerBaseUrl();
+  const queued = await queueManagerTaskTracked("fix", { node_name: id, node_ver: "" }, base);
+  const status = queued.status;
+  // #2490 — a drained queue / done_count is not a repair. Manager v4 records
+  // the real verdict on the per-task history row (status_str + result); a
+  // not-found / error there used to still print "Queued + repaired".
+  let taskRecord: ManagerTaskHistoryEntry | null | undefined;
+  try {
+    taskRecord = await fetchManagerTaskHistoryEntry(queued.uiId, base);
+  } catch {
+    taskRecord = undefined;
+  }
+  const failure = managerTaskLooksFailed(taskRecord);
+  if (failure) {
+    throw new NodeManagementError(
+      `ComfyUI-Manager recorded the fix of "${id}" as ${failure.status}. ` +
+        `The queue drained, but that only proves the task finished running; it does not prove ` +
+        `the pack was repaired.` +
+        (failure.excerpt ? ` Manager result: ${failure.excerpt}` : ""),
+      {
+        queueStatus: status,
+        managerTask: taskRecord ? safeManagerTaskDetails(taskRecord, failure.excerpt) : undefined,
+        uiId: queued.uiId,
+      },
+    );
+  }
   return {
     mechanism: "manager-http",
     message: `Queued + repaired "${id}" via ComfyUI-Manager.`,
     details: status,
+    managerBase: base,
+    taskUiId: queued.uiId,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// disable / enable / uninstall (#775)
+//
+// The cleanup surface was install/update/reinstall/fix only — there was no
+// reversible "take this pack out of the running install" action at all, so a
+// safe cleanup audit meant hand-moving directories. Manager has native
+// disable/enable/uninstall task kinds on every dialect (legacyTaskRequest maps
+// them for 3.x); these wrap them with post-state verification against the
+// installed list, because a drained queue is not proof the state changed.
+// ---------------------------------------------------------------------------
+
+export interface NodeStateOptions {
+  /** Registry id / module name of an INSTALLED pack. */
+  id: string;
+  useCmCli?: boolean;
+}
+
+/**
+ * The post-op verdict for disable/enable, read back from the Manager installed
+ * list — shared by the HTTP path (after the queue drain) and the comfy-cli
+ * path (after the CLI's own success report, which is a CLAIM, not an
+ * observation). Three outcomes, reported as what they are: applied /
+ * not-applied / could-not-verify (unreadable list, pack vanished from it, or
+ * no enabled flag reported at all).
+ */
+type EnabledVerdict =
+  | { state: "applied" }
+  | { state: "not-applied"; reported: "enabled" | "disabled" }
+  | { state: "inconclusive"; reason: string };
+
+async function readEnabledVerdict(
+  id: string,
+  expectEnabled: boolean,
+  base: string,
+): Promise<EnabledVerdict> {
+  let installed: InstalledNode[] | undefined;
+  let listError: string | undefined;
+  try {
+    installed = await listInstalledNodesAt(base);
+  } catch (err) {
+    listError = err instanceof Error ? err.message : String(err);
+  }
+  if (!installed) {
+    return {
+      state: "inconclusive",
+      reason: `ComfyUI-Manager's installed-pack list could not be read (${listError})`,
+    };
+  }
+  const node = findInstalledNode(id, installed);
+  if (!node) {
+    return {
+      state: "inconclusive",
+      reason: `"${id}" no longer appears in ComfyUI-Manager's installed-pack list`,
+    };
+  }
+  if (node.enabled === undefined) {
+    return {
+      state: "inconclusive",
+      reason: `ComfyUI-Manager did not report an enabled/disabled flag for "${id}"`,
+    };
+  }
+  if (node.enabled === !expectEnabled) {
+    return { state: "not-applied", reported: node.enabled ? "enabled" : "disabled" };
+  }
+  return { state: "applied" };
+}
+
+async function setCustomNodeEnabled(
+  opts: NodeStateOptions,
+  enable: boolean,
+): Promise<NodeOpResult> {
+  const { id } = opts;
+  const op = enable ? "enable" : "disable";
+  const base = managerBaseUrl();
+  // Pinned with the target: the CLI must run against the SAME local install
+  // the pre/post checks describe, even if the configured workspace is retargeted
+  // during an await below (codex gate round 5).
+  const cliWorkspace = resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
+
+  // A disabled Manager cannot answer its own installed-list or queue routes.
+  // For local enable, only permit the recovery path for a validated real
+  // `<pack>.disabled` child of this operation's captured custom_nodes root.
+  // Remote sessions never inspect or mutate local disk.
+  const localPackId = !presenceCtx.remote ? assertSafeLocalPackId(id) : id;
+  const localRecoveryAllowed =
+    !presenceCtx.remote && opts.useCmCli !== false && isManagerSelfTarget(localPackId);
+  const disabledOnDisk =
+    enable && !presenceCtx.remote && opts.useCmCli !== false && presenceCtx.diskRoot
+      ? findDisabledPackOnDisk(localPackId, presenceCtx.diskRoot)
+      : undefined;
+  const managerDisabledOnDisk =
+    localRecoveryAllowed &&
+    disabledOnDisk &&
+    isManagerSelfTarget(disabledOnDisk.cliId)
+      ? disabledOnDisk
+      : undefined;
+
+  // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
+  // runs yet: the presence pre-check below comes before either mechanism,
+  // because a CLI run of an already-satisfied/no-such-pack request reports a
+  // pre-existing state as a fresh transition exactly like a queued no-op.
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason(cliWorkspace) : undefined;
+  const useCli = opts.useCmCli === true && cliProblem === undefined;
+  let cliFallbackNote: string | undefined;
+  if (opts.useCmCli && !useCli) {
+    logger.info(`comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP for ${op}`, {
+      reason: cliProblem,
+    });
+    cliFallbackNote =
+      `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
+      `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
+  }
+
+  // Honor an explicitly requested usable comfy-cli BEFORE the Manager list
+  // precheck. This is the only safe early escape: the directory was found by
+  // enumerating the captured custom_nodes root, its name is validated, and the
+  // CLI is given the canonical directory name rather than the raw caller id.
+  if (enable && useCli && managerDisabledOnDisk && presenceCtx.diskRoot) {
+    return enablePackViaComfyCliFromDisk(
+      localPackId,
+      presenceCtx.diskRoot,
+      managerDisabledOnDisk,
+    );
+  }
+
+  // Pre-op validation: a disable/enable for an id Manager never heard of is a
+  // silent no-op (queue or CLI alike), and the LEGACY dialects key the body on
+  // the pack's REAL installed version (node-bisect's controller does the same
+  // — "never send 'unknown' for an installed pack"). Both need the installed
+  // list read up front.
+  const presence = await resolvePackPresence(id, base, presenceCtx);
+  if (
+    enable &&
+    disabledOnDisk &&
+    !managerDisabledOnDisk &&
+    (presence.state === "on-disk" || presence.state === "unverifiable")
+  ) {
+    throw new NodeManagementError(
+      `Refusing local recovery for "${id}": only the validated ` +
+        `ComfyUI-Manager identity may be enabled from a .disabled directory ` +
+        `without a readable Manager installed-pack list. NOTHING was changed.`,
+    );
+  }
+  if (
+    presence.state === "on-disk" &&
+    !(enable && managerDisabledOnDisk) &&
+    // A READABLE list that doesn't track the pack: refuse — neither mechanism
+    // can verify the op through it. An UNREADABLE list with the pack on disk
+    // only blocks the HTTP path; comfy-cli works on the local install directly,
+    // so it proceeds below with the uncertainty disclosed.
+    (presence.managerListReadable || !useCli)
+  ) {
+    throw new NodeManagementError(
+      presence.managerListReadable
+        ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not ` +
+          `track it (a Comfy Registry zip install or a manual copy), so Manager cannot ` +
+          `${op} it and NOTHING was queued. To ${op} it yourself, ${
+            enable
+              ? `remove any ".disabled" suffix from that directory's name`
+              : `rename that directory with a ".disabled" suffix (Manager's own convention)`
+          }, then restart ComfyUI.`
+        : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
+          `installed-pack list could not be read (${presence.listError}), so whether ` +
+          `Manager can ${op} it could NOT be determined and NOTHING was queued. Check ` +
+          `that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+
+  // Manager-unreadable or Manager-untracked local disabled packs can still be
+  // enabled safely without queueing blind: the source and destination are
+  // validated siblings under the captured custom_nodes root, and the rename is
+  // followed by an exact on-disk postcondition check.
+  if (
+    enable &&
+    managerDisabledOnDisk &&
+    presenceCtx.diskRoot &&
+    (presence.state === "on-disk" || presence.state === "unverifiable")
+  ) {
+    return enablePackFromDisk(localPackId, presenceCtx.diskRoot, managerDisabledOnDisk);
+  }
+  if (presence.state === "absent") {
+    throw new NodeManagementError(
+      presence.evidence === "manager+disk"
+        ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
+          `list NOR on disk under ${presence.scanned} — so there is nothing to ${op} ` +
+          `and NOTHING was queued. Check the id with install_custom_node (action:"list").`
+        : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is ` +
+          `nothing to ${op} and NOTHING was queued. NOTE: this check reads the Manager ` +
+          `list only (remote session — no disk check possible). Check the id with ` +
+          `install_custom_node (action:"list").`,
+    );
+  }
+  if (presence.state === "unverifiable" && !useCli) {
+    // The HTTP path cannot validate or verify without the Manager list. The
+    // comfy-cli path CAN still act (it works on the local install directly) —
+    // it proceeds below, disclosing that the pre-state was never established.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined (${presence.reason}), so ` +
+        `the ${op} was NOT queued — a ${op} queued blind would drain silently whether ` +
+        `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+
+  // Already in the requested state: running anything would be a no-op whose
+  // post-op read-back would "verify" a state that predates the call. Say so
+  // and do nothing. (An UNREPORTED enabled flag is not this case: proceed and
+  // let the post-op verdict be inconclusive if it stays unreported.)
+  if (presence.state === "manager-listed" && presence.node?.enabled === enable) {
+    return {
+      mechanism: useCli ? "comfy-cli" : "manager-http",
+      message:
+        `"${id}" is already ${enable ? "enabled" : "disabled"} in ComfyUI-Manager's ` +
+        `installed-pack list — NOTHING was run.` +
+        (cliFallbackNote ? ` ${cliFallbackNote}` : ""),
+    };
+  }
+
+  if (useCli) {
+    const preStateReason =
+      presence.state === "unverifiable"
+        ? presence.reason
+        : presence.state === "on-disk"
+          ? `ComfyUI-Manager's installed-pack list could not be read (${presence.listError}); the pack is present on disk at ${presence.dir}`
+          : undefined;
+    const out = runCmCli([op, id], cliWorkspace);
+    // comfy-cli's exit is its OWN claim — verify against the Manager list
+    // when it can be read rather than reporting the claim as the state.
+    const verdict = await readEnabledVerdict(id, enable, base);
+    if (verdict.state === "not-applied") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the ${op} of "${id}" successful, but ComfyUI-Manager ` +
+          `still reports the pack as ${verdict.reported} — the ${op} did NOT take ` +
+          `effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+    return {
+      mechanism: "comfy-cli",
+      message:
+        (verdict.state === "applied"
+          ? `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
+            `(verified against ComfyUI-Manager's installed-pack list)`
+          : `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
+            `(comfy-cli's own report — the post-state could not be independently ` +
+            `verified: ${verdict.reason})`) +
+        (preStateReason
+          ? `. NOTE: the pre-operation state was never established (${preStateReason}), so this is not a verified transition`
+          : "") +
+        `. A ComfyUI restart is required for the change to take effect.`,
+      details: out.trim(),
+    };
+  }
+
+  if (presence.state !== "manager-listed") {
+    // Unreachable by construction (absent/on-disk threw; unverifiable without a
+    // usable CLI threw; unverifiable WITH one returned inside the CLI branch) —
+    // a guard, not a load-bearing check.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined, so the ${op} was NOT queued.`,
+    );
+  }
+  const tracked = presence.node as InstalledNode;
+
+  const status = await queueManagerTask(
+    op,
+    // The body is dialect-specific: v2 keys enable on cnr_id / disable on
+    // node_name; the legacy 3.x bodies key on node_name + the REAL installed
+    // version (legacyTaskRequest maps node_ver → version). node_name is the
+    // MANAGER'S module/folder name (tracked.module), never the caller's id —
+    // a registry id ("comfyui-impact-pack") and the module name
+    // ("ComfyUI-Impact-Pack") can differ, and the 3.x routes resolve by module
+    // (codex gate round 7).
+    (api) =>
+      api === "v2"
+        ? enable
+          ? { cnr_id: tracked.cnrId ?? id, node_name: tracked.module }
+          : { node_name: tracked.module, is_unknown: false }
+        : { node_name: tracked.module, node_ver: tracked.version ?? "unknown" },
+    base,
+  );
+  const verdict = await readEnabledVerdict(id, enable, base);
+  const result: NodeOpResult =
+    verdict.state === "applied"
+      ? {
+          mechanism: "manager-http",
+          message:
+            `${enable ? "Enabled" : "Disabled"} "${id}" via ComfyUI-Manager (verified ` +
+            `against its installed-pack list). A ComfyUI restart is required for the ` +
+            `change to take effect.`,
+          details: status,
+        }
+      : verdict.state === "not-applied"
+        ? {
+            mechanism: "manager-http",
+            message:
+              `The ${op} of "${id}" was queued and the queue drained, but ComfyUI-Manager ` +
+              `still reports the pack as ${verdict.reported} — the ${op} did NOT take ` +
+              `effect. Check the ComfyUI server log for the underlying error.`,
+            details: status,
+          }
+        : {
+            mechanism: "manager-http",
+            message:
+              `The ${op} of "${id}" was queued and the queue drained, but the result ` +
+              `could NOT be verified: ${verdict.reason}. NOT claiming it took effect — ` +
+              `check install_custom_node (action:"list").`,
+            details: status,
+          };
+  return cliFallbackNote
+    ? { ...result, message: `${cliFallbackNote} ${result.message}` }
+    : result;
+}
+
+/**
+ * Disable an installed pack WITHOUT removing it — the reversible cleanup step
+ * (#775). Verified against the Manager installed list afterwards; a restart is
+ * required for the change to take effect.
+ */
+export async function disableCustomNode(opts: NodeStateOptions): Promise<NodeOpResult> {
+  // PIN GUARD — disabling the panel kills the agent's own UI; a pinned panel
+  // must not be moved through this door either (withPanelPinGuard).
+  return withPanelPinGuard("disable", opts.id, () =>
+    withObjectInfoInvalidation(() => setCustomNodeEnabled(opts, false)),
+  );
+}
+
+/** Re-enable a pack previously disabled with install_custom_node (action:"disable") (#775). */
+export async function enableCustomNode(opts: NodeStateOptions): Promise<NodeOpResult> {
+  return withPanelPinGuard("enable", opts.id, () =>
+    withObjectInfoInvalidation(() => setCustomNodeEnabled(opts, true)),
+  );
+}
+
+/**
+ * Uninstall an installed pack (#775). Irreversible through this tool — prefer
+ * disableCustomNode for a cleanup audit. The pack must be one ComfyUI-Manager
+ * TRACKS: a pre-queue check refuses an id that resolves nowhere (nothing would
+ * be uninstalled, and a drained queue would look exactly like success), naming
+ * the on-disk directory when the pack is present but unmanaged so the caller
+ * can remove it themselves. Post-op, the installed list is re-read and the
+ * pack must be GONE before anything claims "uninstalled".
+ */
+export async function uninstallCustomNode(opts: NodeStateOptions): Promise<NodeOpResult> {
+  // PIN GUARD — same door as install/update (withPanelPinGuard).
+  return withPanelPinGuard("uninstall", opts.id, () =>
+    withObjectInfoInvalidation(() => uninstallCustomNodeImpl(opts)),
+  );
+}
+
+/**
+ * Disk root for uninstall presence / postcondition checks (#2485).
+ *
+ * comfy-cli still runs against the configured workspace. Disk verification must
+ * use the custom_nodes tree the LIVE server actually scans — on ComfyUI Desktop
+ * `--base-directory` is commonly a different data root than COMFYUI_PATH, and
+ * scanning the configured workspace reports "custom_nodes does not exist"
+ * while the pack may still sit under the live scan root.
+ *
+ * Fall back to the configured workspace only when the live server cannot prove
+ * a scan root. An explicit unavailable `--base-directory` is contradictory
+ * evidence and must not fall back — that would recreate the false inconclusive.
+ */
+async function resolveUninstallPresenceDiskRoot(
+  configuredWorkspace: string | undefined,
+): Promise<string | undefined> {
+  if (isRemoteMode()) return undefined;
+  try {
+    const liveScan = await resolveCustomNodesScanBaseLiveStrict({ requireLive: true });
+    if (liveScan) return liveScan;
+  } catch {
+    return undefined;
+  }
+  return configuredWorkspace;
+}
+
+async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpResult> {
+  const { id } = opts;
+  const base = managerBaseUrl();
+  // Pinned with the target, same as in setCustomNodeEnabled (codex gate round 5).
+  const cliWorkspace = resolveEffectiveComfyUIBase();
+  const presenceDiskRoot = await resolveUninstallPresenceDiskRoot(cliWorkspace);
+  const presenceCtx = capturePackPresenceContext(presenceDiskRoot, {
+    allowConfiguredFallback: presenceDiskRoot !== undefined,
+  });
+
+  // CLI availability probe FIRST (#808 fallback discipline) — but nothing runs
+  // until the presence pre-check below has answered what there is to remove.
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason(cliWorkspace) : undefined;
+  const useCli = opts.useCmCli === true && cliProblem === undefined;
+  let cliFallbackNote: string | undefined;
+  if (opts.useCmCli && !useCli) {
+    logger.info("comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP for uninstall", {
+      reason: cliProblem,
+    });
+    cliFallbackNote =
+      `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
+      `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
+  }
+
+  // Pre-op: an uninstall of an id that resolves nowhere is a silent no-op —
+  // via Manager (drained queue) or comfy-cli (exit 0) alike — and reading
+  // absence afterwards would "verify" a state that predated the call. Refuse
+  // with the reason that is actually true.
+  const presence = await resolvePackPresence(id, base, presenceCtx);
+  if (
+    presence.state === "on-disk" &&
+    // A READABLE list that doesn't track the pack: refuse. An UNREADABLE list
+    // with the pack on disk only blocks the HTTP path — comfy-cli works on the
+    // local install directly, and its postcondition is verified on disk below.
+    (presence.managerListReadable || !useCli)
+  ) {
+    throw new NodeManagementError(
+      presence.managerListReadable
+        ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not track ` +
+          `it (a Comfy Registry zip install or a manual copy), so Manager cannot uninstall ` +
+          `it and NOTHING was queued. To remove it, delete or move that directory yourself ` +
+          `(moving it into a custom_nodes/.disabled folder keeps it reversible), then ` +
+          `restart ComfyUI.`
+        : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
+          `installed-pack list could not be read (${presence.listError}), so whether ` +
+          `Manager can uninstall it could NOT be determined and NOTHING was queued. ` +
+          `Check that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+  if (presence.state === "absent") {
+    throw new NodeManagementError(
+      presence.evidence === "manager+disk"
+        ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
+          `list NOR on disk under ${presence.scanned} — so there is nothing to uninstall ` +
+          `and NOTHING was queued. Check the id with install_custom_node (action:"list").`
+        : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is nothing ` +
+          `for Manager to uninstall and NOTHING was queued. NOTE: this check reads the ` +
+          `Manager list only (remote session — no disk check possible); a pack present on ` +
+          `disk but unknown to Manager must be removed on the ComfyUI host. Check the id ` +
+          `with install_custom_node (action:"list").`,
+    );
+  }
+  if (presence.state === "unverifiable" && !useCli) {
+    // The HTTP path cannot validate or verify without the Manager list. The
+    // comfy-cli path can still act on the local install — it proceeds below,
+    // with the postcondition checked on disk instead.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined (${presence.reason}), so the ` +
+        `uninstall was NOT queued — an uninstall queued blind would drain silently whether ` +
+        `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+
+  if (useCli) {
+    const out = runCmCli(["uninstall", id], cliWorkspace);
+    // comfy-cli's exit is its OWN claim. "Uninstalled" requires BOTH an
+    // observed pre-op presence (manager-listed, or on-disk) AND observed
+    // post-op absence — absence alone may predate the call (codex gate rounds
+    // 8-9). A pack still discoverable afterwards means the uninstall did NOT
+    // take effect — disclose it.
+    const preObserved =
+      presence.state === "manager-listed" || presence.state === "on-disk";
+    const preUnknownNote =
+      presence.state === "unverifiable"
+        ? `whether the pack was installed beforehand could NOT be established (${presence.reason})`
+        : undefined;
+    // The disk postcondition applies to EVERY CLI uninstall (a CLI session is
+    // always a local one), and for a pack that was never Manager-tracked
+    // (on-disk pre-state) it is the ONLY meaningful one. Checked against the
+    // ENTRY-captured presence disk root (the live scan root when proven), never
+    // a recomputed one: a retarget during the awaits must not verify against a
+    // different install (codex gate round 6).
+    const diskAfter = presenceCtx.diskRoot
+      ? findPackOnDisk(id, presenceCtx.diskRoot)
+      : undefined;
+    if (diskAfter?.state === "found") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the uninstall of "${id}" successful, but the pack ` +
+          `directory still exists at ${diskAfter.dir} — the uninstall did NOT take ` +
+          `effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+
+    let installed: InstalledNode[] | undefined;
+    let listError: string | undefined;
+    try {
+      installed = await listInstalledNodesAt(base);
+    } catch (err) {
+      listError = err instanceof Error ? err.message : String(err);
+    }
+    if (installed && findInstalledNode(id, installed)) {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the uninstall of "${id}" successful, but the pack is ` +
+          `STILL in ComfyUI-Manager's installed-pack list — the uninstall did NOT ` +
+          `take effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+    const listGone = installed !== undefined; // readable AND not in it
+    const diskGone = diskAfter?.state === "not-found";
+    if (preObserved && (listGone || diskGone)) {
+      const evidence: string[] = [];
+      if (listGone) evidence.push("the pack is absent from ComfyUI-Manager's installed-pack list");
+      if (diskGone) {
+        evidence.push(
+          `no matching directory remains under ${(diskAfter as { scanned: string }).scanned}`,
+        );
+      }
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `Uninstalled "${id}" via official comfy-cli (verified: ${evidence.join(" and ")}). ` +
+          `A ComfyUI restart is required to unload it fully.`,
+        details: out.trim(),
+      };
+    }
+    // Either the pre-state was never observed (absence may predate the call)
+    // or nothing could be read post-op — disclose, never claim the removal.
+    return {
+      mechanism: "comfy-cli",
+      message:
+        `comfy-cli reported the uninstall of "${id}" successful, but the removal ` +
+        `could NOT be verified: ` +
+        (preUnknownNote ??
+          `ComfyUI-Manager's installed-pack list could not be read (${listError})` +
+            (diskAfter?.state === "unreadable"
+              ? ` and the disk check was inconclusive (${diskAfter.reason})`
+              : "")) +
+        `. NOT claiming an uninstall happened; if the pack was never there, nothing ` +
+        `needed removing — otherwise check install_custom_node (action:"list") / custom_nodes yourself.`,
+      details: out.trim(),
+    };
+  }
+
+  const withCliNote = (result: NodeOpResult): NodeOpResult =>
+    cliFallbackNote
+      ? { ...result, message: `${cliFallbackNote} ${result.message}` }
+      : result;
+
+  if (presence.state !== "manager-listed") {
+    // Unreachable by construction (absent/on-disk threw; unverifiable without a
+    // usable CLI threw; unverifiable WITH one returned inside the CLI branch) —
+    // a guard, not a load-bearing check.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined, so the uninstall was NOT queued.`,
+    );
+  }
+  const status = await queueManagerTask(
+    "uninstall",
+    // Legacy 3.x keys the body on node_name + the REAL installed version
+    // (legacyTaskRequest maps node_ver → version); v2 needs only node_name.
+    // node_name is the Manager's module name (presence.node.module), which can
+    // differ from the caller's registry-id spelling (codex gate round 7).
+    (api) =>
+      api === "v2"
+        ? { node_name: presence.node?.module ?? id }
+        : {
+            node_name: presence.node?.module ?? id,
+            node_ver: presence.node?.version ?? "unknown",
+          },
+    base,
+  );
+
+  // Post-op: the pack must be GONE from the installed list. A drained queue is
+  // not proof (#639); "still there" is disclosed, never reported as removed.
+  let installed: InstalledNode[] | undefined;
+  let listError: string | undefined;
+  try {
+    installed = await listInstalledNodesAt(base);
+  } catch (err) {
+    listError = err instanceof Error ? err.message : String(err);
+  }
+  if (!installed) {
+    return withCliNote({
+      mechanism: "manager-http",
+      message:
+        `The uninstall of "${id}" was queued and the queue drained, but the result could ` +
+        `NOT be verified: ComfyUI-Manager's installed-pack list could not be read ` +
+        `(${listError}). NOT claiming the pack was uninstalled — check install_custom_node (action:"list").`,
+      details: status,
+    });
+  }
+  if (findInstalledNode(id, installed)) {
+    return withCliNote({
+      mechanism: "manager-http",
+      message:
+        `The uninstall of "${id}" was queued and the queue drained, but the pack is STILL ` +
+        `in ComfyUI-Manager's installed-pack list — the uninstall did NOT take effect. ` +
+        `Check the ComfyUI server log for the underlying error.`,
+      details: status,
+    });
+  }
+  // MANAGER'S LIST IS NOT THE DISK (codex gate P0). A partial uninstall can drop
+  // the tracking entry and leave `custom_nodes/<pack>` in place — and ComfyUI
+  // loads directories, not Manager's bookkeeping, so the pack comes back on the
+  // next restart while we have already called it uninstalled. A destructive
+  // postcondition deserves the strongest evidence available, not the most
+  // convenient, and this branch has the disk check the rest of this file uses.
+  const diskAfter = presenceCtx.diskRoot ? findPackOnDisk(id, presenceCtx.diskRoot) : undefined;
+  // `findPackOnDisk` accepts a matching SYMLINK without following it, so a
+  // dangling link would be reported as a pack that survived the uninstall
+  // (codex gate P2). ComfyUI cannot load a dead link, so calling that an
+  // incomplete removal is a false alarm on a destructive operation — the one
+  // place a spurious warning does real damage, because it sends the user to
+  // delete something by hand. `existsSync` follows the link, which is exactly
+  // the question: is there anything at the other end?
+  const diskAfterReal = diskAfter?.state === "found" && existsSync(diskAfter.dir);
+  if (diskAfterReal) {
+    return withCliNote({
+      mechanism: "manager-http",
+      message:
+        `The uninstall of "${id}" removed it from ComfyUI-Manager's installed-pack list, ` +
+        `but the pack directory is STILL on disk at ${diskAfter.dir}. ComfyUI loads ` +
+        `directories, not Manager's list, so it will load again on the next restart — ` +
+        `this is NOT a completed uninstall. Remove the directory manually, or re-run the ` +
+        `uninstall, and check the ComfyUI server log for the underlying error.`,
+      details: status,
+    });
+  }
+  const diskNote =
+    diskAfter?.state === "found"
+      ? ` and gone from disk (a dangling symlink remains at ${diskAfter.dir}, which ComfyUI ` +
+        `cannot load — remove it at your leisure)`
+      : diskAfter?.state === "not-found"
+      ? " and gone from disk"
+      : diskAfter?.state === "unreadable"
+        ? `; the disk check was inconclusive (${diskAfter.reason}), so the directory may ` +
+          `still be present`
+        : "; no disk check was possible in this session";
+  return withCliNote({
+    mechanism: "manager-http",
+    message:
+      `Uninstalled "${id}" via ComfyUI-Manager (verified absent from its installed-pack ` +
+      `list afterwards${diskNote}). A ComfyUI restart is required to unload it fully.`,
+    details: status,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// panel_install_node argument normalization (#789)
+// ---------------------------------------------------------------------------
+
+export interface GitUrlInstallArgs {
+  id?: string;
+  repository?: string;
+  version?: string;
+}
+
+export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
+  /** Human-facing disclosure of any rewrite, for the tool result. */
+  note?: string;
+  /** Set when the call names two targets; the caller must REFUSE, not pick one. */
+  conflict?: string;
+}
+
+/**
+ * #789 — panel_search_nodes can return a REPOSITORY URL as a pack's `id` (the
+ * Manager's legacy/repository-style entries). Feeding that URL back as `id`
+ * with the default version "latest" asks the Manager to resolve
+ * `<RepoName>@latest` as a REGISTRY install, which it rejects ("not available
+ * node: ComfyUI-Impact-Pack@8.28.3") — while the same URL passed as
+ * `repository` with version "nightly" installs fine. So when the effective
+ * target is a git URL:
+ *   - carry it as `repository` (the from-source install path), and
+ *   - translate an absent or "latest" version to "nightly" (git HEAD — the only
+ *     channel a from-source install can resolve).
+ * An explicit non-"latest" version is the caller's own choice and passes
+ * through untouched; the rewrite is always disclosed in `note`.
+ *
+ * `id` AND `repository` together name TWO targets (the schema presents them as
+ * alternatives); that is a conflict to refuse, not a precedence to pick.
+ */
+/**
+ * The route that still works when the Manager has no route at all (#789, recurrence).
+ *
+ * Rerouting a git URL to a from-source "nightly" install fixed the ORIGINAL report,
+ * where the pack was registered and only the version spec was wrong. It cannot fix
+ * the recurrence, because that pack is not in the registry:
+ *
+ *   Node 'ComfyUI-MiniMaxH3-FirstBlockCache@nightly' not found
+ *     — ManagerChannel.dev, ManagerDatabaseSource.remote
+ *
+ * Manager v4's do_install resolves a pack by its registry ID, never by URL (the
+ * 3.x `files:[url]` clone path does not exist there), so a repository the resolved
+ * LIST does not carry has no Manager route. The panel cannot clone either — it is
+ * browser JS.
+ *
+ * `install_custom_node` can: it tries the Manager first and then clones the URL
+ * directly into custom_nodes, verifying the result is a real pack. That is the
+ * one tool that finishes this job, and the reporter had to find it by hand after
+ * being left at "not found". Naming it here costs a sentence.
+ *
+ * Stated up front rather than on the failure: the failure text comes back from
+ * the panel and matching on it would be brittle, and an agent that reads this
+ * when the install is queued needs one fewer round trip than one that reads it
+ * after the queue drains.
+ *
+ * #1539 GATE ROUND 2 — THIS CONTRADICTED THE NOTE IT SHIPS ALONGSIDE. It said a
+ * not-found means "the pack is not in the Manager's registry at all ... NO Manager
+ * route, by any spelling", and then the channel note appended right after it said the
+ * miss rules out ONE channel and to retry with another. Both reached the caller in the
+ * same reply, and the first one sends a pack that IS remotely installable — the
+ * reporter's own, which is listed in `default` — down the local-only clone path. That
+ * is the same over-claim this branch retracted from the tool description, surviving one
+ * layer down because the description test could not see a runtime string.
+ *
+ * WHAT A NOT-FOUND ACTUALLY MEANS, read out of V4.2.2 rather than inferred. The lookup
+ * resolves against ONE list, chosen by channel, and which file that is depends on how
+ * the Manager was installed:
+ *
+ *   * `get_data_by_mode` takes an OFFLINE branch when `network_mode == 'offline'` OR
+ *     `is_manager_pip_package()` — the latter being simply "the Manager is not inside a
+ *     custom_nodes tree", i.e. every pip/Desktop install. That branch reads the cache
+ *     file for that exact channel URL, else the snapshot BUNDLED in the package, and
+ *     never fetches. So on a pip host `mode` is inert and a channel name only reaches a
+ *     real list if a cache for its URL happens to exist.
+ *   * Measured on this rig: the only cache present is for `DEFAULT_CHANNEL`
+ *     (`ltdrdata/ComfyUI-Manager`), written at startup by `default_cache_update()` —
+ *     while the channel NAME "default" normalizes through `channels.list` to
+ *     `Comfy-Org/ComfyUI-Manager`, which hashes to a different cache file that does not
+ *     exist. So a pip host serves the bundled snapshot (3587 packs), and the reporter's
+ *     pack is NOT in it (checked directly).
+ *   * A Manager cloned into custom_nodes takes the public branch and FETCHES the
+ *     channel URL, where `default` carries 5891 packs including the reporter's.
+ *
+ * So the channel fix is a strict improvement on a cloned Manager and a NO-OP on a pip
+ * one (there, old `dev` and new `default` both land on the same bundled file) — it
+ * cannot make any host worse. The earlier note attributed the pip fallback to "a host
+ * configured to a non-default channel URL"; that was wrong, the trigger is the pip
+ * packaging, not the configuration.
+ *
+ * The text below therefore stops declaring the registry empty of the pack, names both
+ * causes it could actually be, and puts the retry that CAN succeed before the local
+ * clone that ends the road.
+ */
+function unregisteredPackEscapeHatch(): string {
+  return (
+    `If this comes back "not found" / "not available node", that is one LIST saying no, ` +
+    `not the Manager's whole registry: v4 resolves against a single channel's node list, ` +
+    `and on a pip-installed Manager it reads a bundled snapshot rather than fetching. So ` +
+    `try an explicit \`channel\` first (the pack may simply live on another one), and if ` +
+    `the plausible channels are ruled out, use install_custom_node (source:"git"): it ` +
+    `clones the URL directly into custom_nodes and verifies a real pack landed. That one ` +
+    `requires a LOCAL ComfyUI, since the clone writes to its filesystem — which need not ` +
+    `be the ComfyUI this panel drives.`
+  );
+}
+
+/**
+ * #1539 GATE ROUND 3 — THE ROUTING PREDICATE HAD TO MATCH THE PANEL'S, AND DID NOT.
+ *
+ * Whether this function reroutes decides the version rewrite, the channel, and every
+ * note attached to them — but the PANEL decides, independently, whether its own
+ * `buildInstallRequest` takes the git branch (and so whether `channel || "dev"` fires).
+ * When the two predicates disagree, the orchestrator sends a payload normalized for one
+ * route down the other one.
+ *
+ * They disagreed. `looksLikeGitUrl` above recognizes `https?://`, `git@`, `git+` and a
+ * `.git` suffix. The panel's recognizes those PLUS `ssh://`, `git://`, and a bare
+ * `author/repo` shorthand (#301) — and `author/repo` is the form this tool's own
+ * description tells callers to pass in `id`. So
+ * `panel_install_node({id:"Wenaka2004/comfyui-anima-ipadapter"})` — the reporter's own
+ * pack, in the documented spelling — fell through here with no channel, and the panel
+ * then routed it as git and asked `dev`. The channel fix reached the URL spelling and
+ * missed the shorthand.
+ *
+ * Mirrored here rather than by widening `looksLikeGitUrl`, which is shared with the
+ * HEADLESS `install_custom_node` clone path: widening it there would newly treat a
+ * slash-bearing registry id as a URL to clone, which is a different tool's behaviour and
+ * not this fix's business.
+ */
+function looksLikeOwnerRepoShorthand(s: string): boolean {
+  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(s);
+}
+
+/** Exactly the panel's `looksLikeGitUrl` (web/js/lib/manager-install.js). */
+function panelRoutesAsGitInstall(s: string): boolean {
+  return (
+    /^(https?|ssh|git):\/\//i.test(s) ||
+    /^git\+/i.test(s) ||
+    /^git@/i.test(s) ||
+    s.endsWith(".git") ||
+    looksLikeOwnerRepoShorthand(s)
+  );
+}
+
+/** Exactly the panel's `installGitUrl` expansion: a bare shorthand becomes clonable. */
+function panelGitInstallUrl(s: string): string {
+  return looksLikeOwnerRepoShorthand(s) ? `https://github.com/${s}` : s;
+}
+
+export function normalizeGitUrlInstallArgs(
+  args: GitUrlInstallArgs,
+): NormalizedGitUrlInstallArgs {
+  if (args.id && args.repository) {
+    return {
+      conflict:
+        `panel_install_node was given BOTH id ("${args.id}") and repository ` +
+        `("${args.repository}") — those are two different ways to name the target and ` +
+        `they may not name the same pack. Pass exactly one: the registry id, or the ` +
+        `git repository URL.`,
+    };
+  }
+  const gitSpelling =
+    args.repository && panelRoutesAsGitInstall(args.repository)
+      ? args.repository
+      : args.id && panelRoutesAsGitInstall(args.id)
+        ? args.id
+        : undefined;
+  if (!gitSpelling) return {};
+  // Expanded the way the panel expands it, so `repository` is a fetchable URL on the
+  // 3.x dialects that put it straight into Manager's `files` clone list.
+  const gitTarget = panelGitInstallUrl(gitSpelling);
+  const version = args.version?.trim();
+  // The URL travels as `repository` ONLY: a URL that arrived as `id` is not
+  // forwarded as both (routing off the id path is the whole point), and
+  // id+repository together were refused above.
+  const out: NormalizedGitUrlInstallArgs = { repository: gitTarget };
+  // #1254 — the same sentinel test the git path uses, so "latest" cannot come to
+  // mean one thing here and another there. This site already trimmed; the helper
+  // trims too, which makes " Latest " behave like "latest" on both paths.
+  if (version === undefined || version.length === 0 || isLatestSentinel(version)) {
+    out.version = "nightly";
+    out.note =
+      `"${gitTarget}" is a git repository URL, so this was queued as a from-source ` +
+      `install with version "nightly" (git HEAD): ComfyUI-Manager cannot resolve a ` +
+      `registry "latest" for a repository-style entry and rejects it ("not available ` +
+      `node: <repo>@<version>"). Pass an explicit version/ref to override. ` +
+      unregisteredPackEscapeHatch();
+  } else {
+    out.version = args.version;
+  }
+  return out;
+}
+
+/**
+ * #1539 — the Manager channel a git-URL ("nightly") install asks for when the
+ * caller named none.
+ *
+ * WHY THIS EXISTS AT ALL. The panel's `buildInstallRequest` defaults the v4 git-URL
+ * payload to `channel: "dev"` while defaulting the registry-ID payload — and BOTH
+ * of the 3.x payload shapes — to `"default"`. Nothing justifies the difference, and
+ * because the panel spells it `channel || "dev"`, only a NON-EMPTY channel sent from
+ * here can displace it. So this is the field that fixes it on panels already in the
+ * field, including the version the report was filed from.
+ *
+ * WHAT "dev" COSTS, MEASURED. Manager's channels are separate lists, not a
+ * superset/subset pair. Fetched 2026-08-14 from the channel URLs the live Manager
+ * itself reports (`GET /v2/manager/channel_url_list`):
+ *
+ *   default  .../ComfyUI-Manager/main/custom-node-list.json               5887 packs
+ *   dev      .../ComfyUI-Manager/main/node_db/dev/custom-node-list.json   1210 packs
+ *   overlap                                                                 3 packs
+ *
+ * So asking `dev` hides ~99.9% of what `default` lists — including packs
+ * `panel_search_nodes` had just returned, because that search reads
+ * `extension-node-map.json`, which is NOT channel-scoped (measured: the live
+ * `getmappings?mode=cache` and `getmappings?mode=cache&channel=dev` returned
+ * byte-identical bodies). Search answered from one file, the install resolved
+ * against a different one, and the reporter was told their pack did not exist.
+ *
+ * WHY THE CHANNEL DECIDES ANYTHING. Read out of ComfyUI-Manager V4.2.2's own source
+ * (`glob/manager_core.py`), not inferred: `install_by_id` for a `nightly` spec does
+ * `custom_nodes = await self.get_custom_nodes(channel, mode)` → `load_nightly` →
+ * `get_data_by_mode(mode, 'custom-node-list.json', channel_url)`, keys that map by
+ * the BARE REPO NAME (`repo_name = y.split('/')[-1]`), and on a hit clones
+ * `the_node['repository']` — the CHANNEL's URL. The `repository` field we send is
+ * never read on that path; it is stored in the task params and nothing more.
+ *
+ * A MISS IS NOT AUTOMATICALLY THE REPORTED FAILURE (#1616 gate round 6). For a
+ * `nightly` spec, v4 first tries `self.cnr_map.get(node_id)` and clones that entry's
+ * `repository` — the COMFY REGISTRY's repo for an id equal to the bare name — and only
+ * when the registry lacks the id too does it return the reported
+ * `Node '<name>@nightly' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]`,
+ * naming the channel THIS argument chose. So a channel that carries nothing under the
+ * name still resolves to SOMETHING, which is why `bareNameAmbiguity` treats a miss on a
+ * contested name as an ambiguity rather than an exemption.
+ *
+ * WHAT THIS DOES NOT CLAIM. Not that `default` always resolves — and gate round 2
+ * corrected WHY. On a pip Manager v4 `manager_util.is_manager_pip_package()` is true,
+ * which sends `get_data_by_mode` down its offline branch unconditionally — it reads the
+ * cache file for that exact channel URL, else the snapshot bundled in the package, and
+ * never fetches, so `mode` is inert there. The earlier wording blamed "a host configured
+ * to a non-default channel URL"; that is not the trigger. `is_manager_pip_package()` is
+ * simply "the Manager is not inside a custom_nodes tree", so it is true of every
+ * pip/Desktop install regardless of configuration, and the caches a stock host actually
+ * holds do not line up with the channel NAMES: `default_cache_update()` writes the cache
+ * for `DEFAULT_CHANNEL` (`ltdrdata/ComfyUI-Manager`) at startup, while the name
+ * "default" normalizes through `channels.list` to `Comfy-Org/ComfyUI-Manager` — a
+ * different URL, so a different cache file, which does not exist. Measured on this rig:
+ * the cache directory holds exactly one node list, hashed from the ltdrdata URL, and the
+ * bundled snapshot it therefore falls back to (3587 packs) does NOT contain the
+ * reporter's pack.
+ *
+ * So the honest split is by PACKAGING, not by configuration: on a Manager cloned into
+ * custom_nodes this reaches the real 5891-pack list and fixes the report; on a pip
+ * Manager old `dev` and new `default` both land on the same bundled file, so the change
+ * is a no-op there rather than an improvement. It cannot make any host worse. Reaching
+ * the pip case would need the Manager to be asked for the channel the USER configured,
+ * which v4.2.2 gives no way to name (`channel: null` makes `load_nightly` return `{}`
+ * outright), so it is out of reach from here and is not claimed to be fixed.
+ *
+ * What IS established is narrower and still worth shipping: `dev` is the wrong
+ * question for every host, `default` is the right one for a host on the stock
+ * channel, and the registry-ID path has been asking `default` all along.
+ */
+export const GIT_INSTALL_DEFAULT_CHANNEL = "default";
+
+/**
+ * #1539 review — NO SINGLE DEFAULT IS CORRECT, so the one taken is DISCLOSED.
+ *
+ * `default` and `dev` are near-disjoint (5887 vs 1210 packs, 3 shared), which cuts
+ * both ways: whichever this call picks, the other one is a list it did not search.
+ * Review proposed resolving that by trying the picked channel and retrying the other
+ * on a not-found — a not-found being a proven negative that installed nothing, which
+ * it is (`install_by_id` returns before `to_path` is even computed, and four live
+ * probes left `custom_nodes` untouched).
+ *
+ * MEASURED, AND IT DOES NOT HOLD. The premise is true about the FIRST attempt and
+ * false about the SECOND. v4 resolves a from-source install by the BARE REPO NAME —
+ * `load_nightly` keys its map on `y.split('/')[-1]` — and then clones
+ * `the_node['repository']`, the URL recorded in THAT channel's entry, not the URL the
+ * caller passed. Comparing the two channels on that key: 38 bare names appear in
+ * both, and for 35 of them the two channels point at DIFFERENT authors' repositories
+ * (`comfyui-birefnet` is hieuck's on default and mohammadaboulela's on dev;
+ * `comfyui-lmstudio`, `comfyui-kittentts`, `ComfyUI-Image-Selector` and 31 more are
+ * the same story). An automatic second attempt would therefore clone, silently, a
+ * repository the caller never named — arbitrary code from an unintended author. That
+ * is the wrong-target bug this project already has a standing finding about, only
+ * automated. So the fallback position applies: do not silently pick between two
+ * candidates, NAME them.
+ *
+ * Refusing outright was rejected as the larger harm — it breaks every existing bare
+ * git-URL call — so the choice is taken, disclosed, and made reversible in one
+ * argument. Stated at DISPATCH rather than on the failure, for the reason
+ * `unregisteredPackEscapeHatch` already gives: the failure text comes back from the
+ * panel, matching on it would be brittle, and a caller who reads this when the
+ * install is queued needs one fewer round trip than one who reads it after.
+ *
+ * HOW BIG THE REGRESSION ACTUALLY IS, since review costed it as all 1207 dev-only
+ * packs. On a pip Manager v4 `get_data_by_mode` reads the cache file for that exact
+ * channel URL, else the snapshot bundled in the package — so a channel name only
+ * reaches its real list when it is the channel the user CONFIGURED (nothing else
+ * writes that cache). The bundled snapshot is a stale `default`-flavoured list: 3587
+ * packs, holding 3482 of default's 5891 and exactly 1 of dev's 1223 dev-only entries.
+ * So on a stock v4 the old `dev` never reached the dev list either — it landed on
+ * that same bundled file. The population that genuinely regresses is users whose
+ * Manager is CONFIGURED to the dev channel, and the note below hands them the exact
+ * argument that restores them.
+ */
+function gitInstallChannelNote(channel: string): string {
+  return (
+    `CHANNEL: this asked ComfyUI-Manager's "${channel}" channel, because the call named ` +
+    `none — saying so rather than picking silently, since Manager's channels are ` +
+    `near-disjoint lists (default ~5900 packs, dev ~1200, sharing 3). So a "not found" ` +
+    `from this install rules the pack out of "${channel}" ONLY; it says NOTHING about ` +
+    `dev/recent/legacy/forked/tutorial. If that happens, retry with an explicit channel ` +
+    `(e.g. channel:"dev") before concluding the pack does not exist. ` +
+    `NOT retried for you on purpose: by the same bare-name resolution described above, ` +
+    `an automatic second attempt could install a repository you did not name.`
+  );
+}
+
+/** `owner/repo` out of a git URL, or undefined when it does not parse that way. */
+function gitUrlOwnerRepo(url: string): string | undefined {
+  const m = /[/:]([^/:]+)\/([^/]+?)(?:\.git)?\/*$/.exec(url.trim());
+  return m ? `${m[1]}/${m[2]}` : undefined;
+}
+
+/**
+ * `owner/repo` from a git URL, an `aux_id`, or a shorthand `owner/repo` string.
+ * Manager reports git packs as `aux_id: "teskor-hub/comfyui-teskors-utils"` while
+ * a manifest names `https://github.com/artokun/comfyui-teskors-utils` — those must
+ * compare as different origins, not as the same bare repo name (#2523).
+ */
+function gitOwnerRepo(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim().replace(/\.git$/i, "").replace(/\/+$/, "");
+  if (!trimmed) return undefined;
+  const hosted = /(?:github\.com|gitlab\.com|bitbucket\.org)[/:]([^/]+)\/([^/#?]+)/i.exec(
+    trimmed,
+  );
+  if (hosted) return `${hosted[1]}/${hosted[2]}`.toLowerCase();
+  const short = /^([^/]+)\/([^/]+)$/.exec(trimmed);
+  return short ? `${short[1]}/${short[2]}`.toLowerCase() : undefined;
+}
+
+/** True when both values name an owner/repo and those identities differ. */
+function gitOriginsDiffer(wanted: string, other: string | undefined): boolean {
+  const a = gitOwnerRepo(wanted);
+  const b = gitOwnerRepo(other);
+  return Boolean(a && b && a !== b);
+}
+
+/**
+ * A Manager installed-list hit for a git URL is only the requested origin when
+ * `aux_id` names the same owner/repo. Missing aux_id cannot prove a mismatch,
+ * so it is treated as a match (the clone fallback still checks `git remote`).
+ */
+function gitOriginMatchesRequested(gitId: string, auxId: string | undefined): boolean {
+  return !gitOriginsDiffer(gitId, auxId);
+}
+
+function readGitRemoteOrigin(nodeDir: string): string | undefined {
+  try {
+    const out = execFileSync("git", ["-C", nodeDir, "remote", "get-url", "origin"], {
+      encoding: "utf-8",
+      timeout: GIT_CLONE_TIMEOUT,
+      env: nonInteractiveGitEnv(),
+    });
+    const origin = typeof out === "string" ? out.trim() : String(out).trim();
+    return origin || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * #1539 gate round 2 — THE FIRST ATTEMPT CAN ALSO HIT THE WRONG AUTHOR, and until now
+ * this only said so as a reason not to RETRY.
+ *
+ * The gate's finding, restated: because v4 resolves by bare repo name against the
+ * channel's list and clones the URL in THAT entry, a caller who passes
+ * `mohammadaboulela/ComfyUI-BiRefNet` with no channel now resolves the same bare name
+ * in `default` and gets `hieuck/ComfyUI-BiRefNet` — a repository they never named, and
+ * it reports success. That is real, and it is disclosed here rather than left to the
+ * retry paragraph.
+ *
+ * WHAT THE GATE HAD BACKWARDS, measured rather than argued. The hazard is not created
+ * by this change; it is PRE-EXISTING and SYMMETRIC — before it, the same call with no
+ * channel asked `dev`, so a caller passing hieuck's URL got mohammadaboulela's. What
+ * changed is which way it points, and the direction is now the safe one. Of the 35 bare
+ * names listed in both channels under different authors, `extension-node-map.json` —
+ * the channel-independent file `panel_search_nodes` reads, and where the reporter got
+ * their URL — carries the DEFAULT author's repo for 33 and the DEV author's repo for
+ * ZERO (2 in neither; fetched live 2026-08-15). So every colliding URL this tool can
+ * actually hand a caller resolved to the WRONG author under the old `dev` default and
+ * resolves to the RIGHT one now. The residue is a caller who hand-types a dev-only
+ * author's URL, which search never returns.
+ *
+ * Stated on EVERY git-URL install, not just the defaulted-channel one: bare-name
+ * resolution is a property of the v4 from-source route, not of who picked the channel,
+ * so a caller who passed `channel:"dev"` themselves faces exactly the same substitution.
+ * It names the owner from the caller's own URL so the check is concrete — the standing
+ * rule being that two candidates are NAMED, never silently picked between.
+ *
+ * #1616 — THE COUNT IN THIS TEXT WAS AN UNDERCOUNT, and is corrected here. "35" came from
+ * comparing bare names case-SENSITIVELY. Manager's own lookup is not: `get_custom_nodes`
+ * returns a `NormalizedKeyDict` whose `get` keys on `key.strip().lower()`, so
+ * `comfyui_tagger` and `ComfyUI_tagger` are one name. Counted the way the lookup counts:
+ * 111 names resolve to different repositories across the six published channels, 60 of
+ * them between `default` and `dev` alone. This note is now the FALLBACK disclosure — the
+ * measured 111 are refused before dispatch by `bareNameAmbiguity` when the channel was
+ * defaulted, and this text covers everything that snapshot has not seen.
+ */
+function gitInstallSubstitutionNote(channel: string, url: string): string {
+  const owner = gitUrlOwnerRepo(url);
+  const bare = url.trim().replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
+  return (
+    `WHAT GETS CLONED IS NOT NECESSARILY THE URL YOU PASSED. Manager v4 resolves a ` +
+    `from-source install by the BARE REPO NAME ("${bare}") against the "${channel}" ` +
+    `channel's list, then clones the URL recorded in THAT entry — 111 bare names resolve ` +
+    `to DIFFERENT repositories depending on the channel asked. So if "${channel}" lists ` +
+    `that name under anyone other than ${owner ? `the ${owner} you passed` : "the author you passed"}, ` +
+    `this installs THEIR repository and still reports success. Confirm with ` +
+    `panel_list_nodes that what landed is the repo you meant before you restart or ` +
+    `report success.`
+  );
+}
+
+/**
+ * The FINAL dispatch fields for the panel's `nodes_install` command, after
+ * #789 normalization. Built here — not by `??`-merging with the raw args at
+ * the call site — because a rerouted git URL must DROP `id`, and a
+ * `norm.id ?? args.id` merge silently restores it (codex gate round 4).
+ */
+/**
+ * #1539 recurrence — Manager v4 (`v2` dialect) ignores `repository` and looks
+ * the pack up by bare name in its registry. Queueing a git URL there is the
+ * unlisted-URL failure the reporter still hits. Legacy 3.x / v2-batch still
+ * clone `files:[url]`.
+ */
+export function v4GitUrlQueueRefusal(url: string): string {
+  return (
+    `Refusing to queue "${url}" as a Manager v4 install. Manager v4 ignores the supplied ` +
+    `repository and resolves by bare name against its registry, so a Git URL is not a ` +
+    `successful v4 from-source install. Use a registry id from panel_search_nodes; or ` +
+    `install_custom_node(source:'git') only when its local target is the same ComfyUI as ` +
+    `this panel. If the panel drives another machine, install the repository on the ` +
+    `ComfyUI host instead.`
+  );
+}
+
+/** True when this dialect would send a git URL through v4's registry lookup. */
+export function managerDialectQueuesGitUrlAsRegistryLookup(api: ManagerApi): boolean {
+  return api === "v2";
+}
+
+export function nodesInstallCommandArgs(args: {
+  id?: string;
+  repository?: string;
+  version?: string;
+  channel?: string;
+  mode?: string;
+}): {
+  id?: string;
+  repository?: string;
+  version?: string;
+  channel?: string;
+  mode?: string;
+  note?: string;
+  conflict?: string;
+} {
+  const norm = normalizeGitUrlInstallArgs(args);
+  if (norm.conflict) return { conflict: norm.conflict };
+  const rerouted = norm.repository !== undefined;
+  // #1539 — only the git-URL route is touched, and only when the caller named no
+  // channel. A caller who passed one keeps it (including on this route: naming a
+  // channel is the one way to reach a pack that really does live in `dev`), and
+  // the registry-ID route is left exactly as it was, because the panel already
+  // defaults THAT one to "default".
+  //
+  // Blank counts as unset. The panel's `channel || "dev"` treats "" as absent and
+  // substitutes `dev`, so forwarding an empty string would silently land back on
+  // the channel this fix exists to stop asking for.
+  const explicitChannel = args.channel?.trim() ? args.channel : undefined;
+  // DISCLOSE only what THIS function chose. A caller who named a channel made the
+  // choice themselves and does not need it read back to them, and `norm.note` rides
+  // only the "latest"→nightly branch — so an explicit version with no channel would
+  // otherwise dispatch a defaulted channel with nothing said about it.
+  const defaultedChannel = rerouted && explicitChannel === undefined;
+  const effectiveChannel = explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL;
+  // #1616 — WHERE THE DISCLOSURE BECOMES A REFUSAL. `gitInstallSubstitutionNote` below
+  // warns that v4's bare-name resolution CAN hand back another author's repository; for
+  // the names where that is not hypothetical but measured, this refuses instead. It fires
+  // only on the channel THIS code defaulted to, because that is the case where the tool
+  // would be picking between two candidate repositories on the caller's behalf — the one
+  // thing the standing rule says to refuse. A caller who named the channel made the choice
+  // themselves and gets the collision NAMED instead (`ambiguousBareNameWarning`), which
+  // also leaves a stale snapshot escapable in one argument rather than bricking the tool.
+  //
+  // GATE ROUND 4 — AND IT ONLY APPLIES WHERE A CHANNEL IS ACTUALLY READ. Manager gates
+  // the whole channel lookup on the version: `install_by_id` calls `get_custom_nodes`
+  // only for "nightly"/"unknown" and otherwise falls through to `cnr_install`, which
+  // resolves the bare name as a COMFY REGISTRY ID and reads neither the channel nor the
+  // `repository` passed. `bareNameAmbiguity`'s exemption — "this channel carries exactly
+  // your repo, so there is nothing to pick between" — is therefore not just unhelpful
+  // there, it is wrong: measured, `{repository:"hieuck/ComfyUI-BiRefNet",
+  // version:"1.0.0"}` was allowed through on that exemption while registry id
+  // `comfyui-birefnet` is viperyl's. Split the two routes so each is judged by the thing
+  // that actually decides it.
+  //
+  // GATE ROUND 5 — AND THIS REFUSAL TAKES NO CHANNEL BYPASS, unlike the one below it.
+  // Every reason the from-source refusal yields to an explicit `channel` is absent here:
+  //   * the channel is not merely unhelpful on this route, Manager never reads it, so
+  //     naming one expresses nothing at all about which repository lands;
+  //   * the 3.x escape does not apply either — the panel's 3.x shapes HARDCODE
+  //     `version:"unknown"` with `files:[url]` (manager-install.js, verified on the panel's
+  //     origin/main), so a 3.x host never takes the registry route no matter what version
+  //     the caller passed;
+  //   * and the remedy costs the caller nothing on either generation: dropping `version`
+  //     gives v4 the channel-resolved from-source install and gives 3.x the same clone it
+  //     would have done anyway.
+  // So a bypass here would only ever hand back a repository the caller did not name.
+  const registryAmbiguity =
+    rerouted && norm.repository && norm.version
+      ? registryVersionAmbiguity(norm.repository, norm.version)
+      : undefined;
+  if (registryAmbiguity) return { conflict: registryVersionRefusal(registryAmbiguity) };
+  // #1624 — THE SAME REGISTRY-ROUTE HAZARD FOR A REPO THAT NO CHANNEL CONTESTS. Above is
+  // scoped to the contested names; a repository filed under a Comfy Registry id that is
+  // not its own name loses the id race just as completely, and needs no second channel to
+  // do it. Same route, same reason it takes no channel bypass — Manager reads no channel
+  // here — so it is refused in the same place rather than warned about later.
+  const rekeyedVersionAmbiguity =
+    rerouted && norm.repository && norm.version
+      ? rekeyedRegistryVersionAmbiguity(norm.repository, norm.version)
+      : undefined;
+  if (rekeyedVersionAmbiguity) {
+    return { conflict: rekeyedRegistryVersionRefusal(rekeyedVersionAmbiguity) };
+  }
+  // Past that return, the request is necessarily on the from-source route — a contested
+  // name with a registry version has already been refused — so the channel-based
+  // reasoning below is only ever applied where a channel is actually consulted.
+  const ambiguity =
+    rerouted && norm.repository ? bareNameAmbiguity(norm.repository, effectiveChannel) : undefined;
+  if (ambiguity && defaultedChannel) return { conflict: ambiguousBareNameRefusal(ambiguity) };
+  // #1624 — AND THE FROM-SOURCE ROUTE FOR THE SAME REPOSITORIES. Consulted only when the
+  // contested-name table said nothing, because when it DOES fire it already reasons about
+  // re-keying (`REKEYED_REPOS`) for that name and a second message would say it twice.
+  //
+  // GATE FINDING — AND ONLY ON THE ROUTE THAT READS A CHANNEL. The two returns above do
+  // NOT leave "necessarily from-source" true for this table the way they do for the
+  // contested one. `registryVersionAmbiguity` covers every contested name a channel can
+  // answer to, but `rekeyedRegistryVersionAmbiguity` requires a `registryTarget`, and 12
+  // of the 98 re-keyed records have none — the registry holds nothing under their bare
+  // name. For those, an explicit version fell through to a refusal that told the caller
+  // the channel's list was what would be cloned, when on that route Manager calls
+  // `cnr_install(bare, version)`, reads no channel, finds no such id and fails. Refusing
+  // was directionally defensible and the remedy it named was even correct, which is how a
+  // fabricated mechanism survives review — so the check is scoped to the route it
+  // describes, and Manager's own "not found" (which substitutes nobody's code) stands.
+  const rekeyed =
+    rerouted && norm.repository && !ambiguity && isFromSourceSpec(norm.version)
+      ? rekeyedRepoAmbiguity(norm.repository, effectiveChannel)
+      : undefined;
+  if (rekeyed && defaultedChannel) return { conflict: rekeyedRepoRefusal(rekeyed) };
+  // The substitution warning rides EVERY git-URL install (gate round 2), because
+  // bare-name resolution is a property of the v4 from-source route rather than of
+  // who chose the channel — an explicit `channel:"dev"` substitutes just as readily.
+  const note =
+    [
+      norm.note,
+      rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
+      ambiguity ? ambiguousBareNameWarning(ambiguity) : undefined,
+      rekeyed ? rekeyedRepoWarning(rekeyed) : undefined,
+      defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
+    ]
+      .filter((s): s is string => typeof s === "string" && s.length > 0)
+      .join(" ") || undefined;
+  return {
+    id: rerouted ? norm.id : args.id,
+    repository: rerouted ? norm.repository : args.repository,
+    version: rerouted ? norm.version : args.version,
+    channel: rerouted ? effectiveChannel : args.channel,
+    mode: args.mode,
+    ...(note ? { note } : {}),
   };
 }
 
@@ -1265,14 +6905,22 @@ export interface ListInstalledOptions {
   useCmCli?: boolean;
 }
 
-export async function listInstalledNodes(
+async function listInstalledNodesAt(
+  base: string,
   opts: ListInstalledOptions = {},
 ): Promise<InstalledNode[]> {
   const { mode = "default" } = opts;
 
-  if (opts.useCmCli) {
+  // `list` is read-only, so an explicitly requested CLI is a preference here,
+  // not a reason to reject an otherwise useful inventory when the installed
+  // executable is absent or its version probe is unrecognized. Keep the remote
+  // branch on runCmCli so its existing no-local-CLI refusal remains intact.
+  const useCli = opts.useCmCli === true && (isRemoteMode() || isComfyCliUsable());
+  if (useCli) {
     // cm-cli `show installed` prints a formatted table — return raw lines as
-    // pseudo-nodes since structured data is HTTP-only.
+    // pseudo-nodes since structured data is HTTP-only. `enabled` is left
+    // undefined: the table does not report it, so claiming a value would be
+    // inventing state.
     const out = runCmCli(["show", "installed"]);
     const lines = out
       .split("\n")
@@ -1280,18 +6928,59 @@ export async function listInstalledNodes(
       .filter((l) => l.length > 0 && !l.startsWith("#"));
     return lines.map((line) => ({
       module: line,
-      enabled: true,
       version: undefined,
     }));
   }
 
   // Both pip-Manager modes serve /v2/customnode/installed (the legacy-UI
   // module registers it too); only the 3.x custom-node Manager lacks /v2.
-  const prefix = (await detectManagerApi()) === "legacy" ? "" : "/v2";
+  const prefix = (await detectManagerApi(base)) === "legacy" ? "" : "/v2";
   const raw = await managerFetch<unknown>(
     `${prefix}/customnode/installed?mode=${encodeURIComponent(mode)}`,
+    { base },
   );
+  // A 200 with an empty or non-JSON body parses to undefined / a raw string in
+  // managerFetch, and an ERROR ENVELOPE parses to an object whose values are
+  // scalars ({"error": "…"}) or an object keyed by "error"/"detail"
+  // ({"error": {"message": …}}, FastAPI's {"detail": …}) — parseInstalled
+  // would silently turn ALL of these into an empty or junk list, which
+  // downstream gates read as "the pack is absent". An unreadable payload is
+  // NOT an empty list: refuse to answer from it. ({} is a legitimate
+  // "nothing installed"; a module literally named "error" is the pathological
+  // case accepted as collateral.)
+  let readable = false;
+  if (Array.isArray(raw)) {
+    // parseInstalled only understands entry OBJECTS — a bare string element
+    // (["temporary failure"]) would be silently dropped, reading as empty.
+    readable = raw.every(
+      (el) => el !== null && typeof el === "object" && !Array.isArray(el),
+    );
+  } else if (raw !== undefined && raw !== null && typeof raw === "object") {
+    const rec = raw as Record<string, unknown>;
+    readable =
+      !("error" in rec) &&
+      !("detail" in rec) &&
+      Object.values(rec).every(
+        (v) => v !== null && typeof v === "object" && !Array.isArray(v),
+      );
+  }
+
+  if (!readable) {
+    throw new NodeManagementError(
+      `ComfyUI-Manager's installed-pack list returned an unreadable payload ` +
+        `(expected a JSON object of pack records or an array, got ${
+          raw === undefined ? "an empty body" : `a ${typeof raw}`
+        }) — treating the list as UNREADABLE, not as empty.`,
+    );
+  }
   return parseInstalled(raw);
+}
+
+export async function listInstalledNodes(
+  opts: ListInstalledOptions = {},
+  base = managerBaseUrl(),
+): Promise<InstalledNode[]> {
+  return listInstalledNodesAt(base, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,11 +7077,17 @@ const REMOTE_LANDING_TIMEOUT_MS = 4 * 60 * 60 * 1000; // generous: multi-GB on s
  * if it never shows within the timeout. Fire-and-forget: the tool call returns
  * at dispatch; this keeps the tray honest afterwards. No-op outside the panel
  * (progress channel disabled).
+ *
+ * `base` is the ComfyUI the download was DISPATCHED to: the file lands there,
+ * so the poll must stay there even if the panel retargets mid-download —
+ * following the new target would watch a server the file never lands on and
+ * eventually report a false "error".
  */
 export function watchRemoteModelLanding(
   category: string,
   filename: string,
   url: string,
+  base = getComfyUIBaseUrl(),
 ): void {
   if (!progressEnabled()) return;
   const id = createHash("sha256").update(url).digest("hex").slice(0, 16);
@@ -1404,7 +7099,7 @@ export function watchRemoteModelLanding(
       let listed = false;
       try {
         const res = await comfyuiFetch(
-          `${getComfyUIBaseUrl()}/models/${encodeURIComponent(category)}`,
+          `${base}/models/${encodeURIComponent(category)}`,
         );
         if (res.ok) {
           const names = (await res.json()) as unknown;
@@ -1461,21 +7156,42 @@ export async function installModelViaManager(
     type: params.type,
     save_path,
   };
-  const status = await queueManagerTask("install-model", taskParams);
-  // NOTE: the Manager queue reports the task "done" once it DRAINS, even when
-  // the underlying OperationResult failed (e.g. a 404 download, or Manager's
-  // security gate rejecting a network fetch) — and with an aria2 sidecar
-  // (COMFYUI_MANAGER_ARIA2_SERVER) it drains at HANDOFF, while the host is
-  // still streaming gigabytes. The v2 queue/status endpoint only exposes
-  // aggregate counts (no per-task result), so a clean drain here does NOT
-  // prove the file landed — phrase the result as "dispatched", not
-  // "installed", and leave final verification to a list on the pod.
+  // One pinned target for the whole operation — the dispatch, its self-heal
+  // retry/drain, AND the landing watcher (the file lands on the server the task
+  // was dispatched to, so that is the only server worth polling).
+  const base = managerBaseUrl();
+  const queued = await queueManagerTaskTracked("install-model", taskParams, base);
+  const status = queued.status;
+  let taskRecord: ManagerTaskHistoryEntry | null | undefined;
+  try {
+    taskRecord = await fetchManagerTaskHistoryEntry(queued.uiId, base);
+  } catch {
+    taskRecord = undefined;
+  }
+  const taskStatus = taskRecord?.statusStr?.trim().toLowerCase();
+  if (taskRecord && (taskStatus === "failed" || taskStatus === "error")) {
+    const excerpt = managerTaskResultExcerpt(taskRecord?.result);
+    throw new NodeManagementError(
+      `ComfyUI-Manager recorded the server-side model download task as ${taskStatus}. ` +
+        `The queue drained, but that only proves the task finished running; it does not prove ` +
+        `the model file landed or is valid.` +
+        (excerpt ? ` Manager result: ${excerpt}` : ""),
+      { queueStatus: status, managerTask: safeManagerTaskDetails(taskRecord, excerpt), uiId: queued.uiId },
+    );
+  }
+  // NOTE: the Manager queue reports the task "done" once it DRAINS, and with
+  // an aria2 sidecar (COMFYUI_MANAGER_ARIA2_SERVER) it drains at HANDOFF,
+  // while the host is still streaming gigabytes. On v4, queue/history can tell
+  // us that OUR task already failed; older or unreadable history cannot. A
+  // clean drain (or unknown history) still does NOT prove the file landed —
+  // phrase the result as "dispatched", not "installed", and leave final
+  // verification to a list on the pod.
   //
   // DEPLOYMENT: remote model install requires the pod's ComfyUI-Manager to be
   // in network_mode=personal_cloud (or loopback) with permissive security; a
   // stricter security_level rejects the server-side download.
   if (params.trayCategory) {
-    watchRemoteModelLanding(params.trayCategory, params.filename, params.url);
+    watchRemoteModelLanding(params.trayCategory, params.filename, params.url, base);
   }
   return {
     mechanism: "manager-http",
@@ -1484,8 +7200,8 @@ export async function installModelViaManager(
       `${params.type} on the connected ComfyUI via ComfyUI-Manager. The queue ` +
       `drained, but that only means the download was HANDED OFF (with an aria2 ` +
       `sidecar the host keeps streaming after the queue drains), and Manager ` +
-      `reports tasks "done" even on failure with no per-task result — so ` +
-      `success is NOT guaranteed. The file appears in the server's ` +
+      `history did not prove the file landed — so success is ` +
+      `NOT guaranteed. The file appears in the server's ` +
       `/models/<category> listing only once the download COMPLETES (in-progress ` +
       `files are hidden), and Manager may store it under its own type dir ` +
       `(e.g. unet/, clip/) which ComfyUI aliases to diffusion_models/` +

@@ -16,8 +16,8 @@ change — it works against your ComfyUI and replies right there. Pick a provide
 **Claude**, **ChatGPT**, **Gemini**, or **Ollama (local)** — and the matching
 agent runs in the background: subscriptions with **no API key**, local models
 with **no account at all** (and the Ollama backend reaches any hosted
-OpenAI-compatible endpoint too). See [Backends](/backends) for the matrix and
-the [LLM Arena](/arena) for how each model class actually performs.
+OpenAI-compatible endpoint too). See [Backends](./backends) for the matrix and
+the [LLM Arena](./arena) for how each model class actually performs.
 
 ```
 you ⇄ panel (pick a provider) ⇄ loopback bridge ⇄ panel orchestrator ⇄ background agent: Claude · ChatGPT · Gemini · any LLM
@@ -26,13 +26,13 @@ you ⇄ panel (pick a provider) ⇄ loopback bridge ⇄ panel orchestrator ⇄ b
 **No API keys, no per-token billing** on the subscription providers — and fully
 free/offline on local models. The agent authenticates with your on-disk login
 (or, for Ollama, just talks to the local daemon). One orchestrator on one
-loopback bridge port (`ws://127.0.0.1:9180`) serves every provider; each panel
+loopback bridge port (`ws://127.0.0.1:9199`) serves every provider; each panel
 tab picks its provider in the handshake. The bridge is loopback-only, and the
 panel executes a **fixed allowlist** of graph commands (no arbitrary
 JavaScript).
 
 <Note>
-  New here: [Backends / providers](/backends) explains the picker, the provider-neutral
+  New here: [Backends / providers](./backends) explains the picker, the provider-neutral
   `AgentBackend` port, and the capability matrix (what's identical across Claude and
   ChatGPT, and the few things that differ).
 </Note>
@@ -46,6 +46,22 @@ JavaScript).
    git clone https://github.com/artokun/comfyui-mcp-panel
    ```
 
+   <Warning>
+   **Pick `Latest`, not `Nightly`, in Manager's version dropdown.** Despite the
+   name, Manager's **Nightly** is not built nightly: it clones the repo **once**
+   at install time and then never tracks the branch again. It freezes you on
+   whatever commit happened to be `main` that day, while `Latest` keeps pace with
+   every release — so Nightly is routinely *older* than Latest, and silently drifts
+   further behind the longer you leave it. It reports no update available, because
+   from its point of view there isn't one.
+
+   To check where you actually are, compare the SHA under **Node Pack Info →
+   Version** against [the repo's commit
+   history](https://github.com/artokun/comfyui-mcp-panel/commits/main). To escape,
+   either select `Latest (x.y.z)` in that same dropdown, or — if you want to stay on
+   git — `git pull` in `custom_nodes/comfyui-mcp-panel`, which fast-forwards cleanly.
+   </Warning>
+
 2. **Sign in to the provider you want** once, so the background agent can use your
    subscription:
 
@@ -54,26 +70,30 @@ JavaScript).
    codex login   # ChatGPT (Codex)
    ```
 
-3. **Restart ComfyUI**, open the **Agent** tab, **pick a provider** (Claude /
-   ChatGPT chips), and click **Connect**. The panel starts that provider's
-   orchestrator (`npx -y comfyui-mcp@latest connect`) on your subscription and
-   links to its loopback bridge. Type a request and the agent responds.
-   **Disconnect** stops it.
+3. **Start the orchestrator** on your machine and leave it running — see
+   [Starting the panel orchestrator](./installation#3-starting-the-panel-orchestrator):
 
-No `claude mcp add`, no API key. The orchestrator is started **only when you click
-Connect** — never silently on load — and the panel auto-connects if a bridge is
-already running. Prerequisites are Node.js/`npx` on your PATH and the provider login
-above. To run an orchestrator yourself, set `COMFYUI_MCP_NO_AUTOSPAWN=1` and launch
-`npx -y comfyui-mcp@latest connect`, then click Connect; change the bridge
-port with `COMFYUI_MCP_BRIDGE_PORT`.
+   ```bash
+   npx -y comfyui-mcp@latest connect
+   ```
+
+4. **Restart ComfyUI**, open the **Agent** tab, **pick a provider** (Claude /
+   ChatGPT chips), and click **Connect**. The panel links to the orchestrator's
+   loopback bridge. Type a request and the agent responds. **Disconnect** unlinks
+   it; the orchestrator keeps running until you stop it.
+
+No `claude mcp add`, no API key. The panel is a pure-frontend extension and cannot
+spawn the orchestrator itself, so it is always a process you start — the panel
+auto-connects to a bridge that is already running. Prerequisites are Node.js/`npx`
+on your PATH and the provider login above. Change the bridge port with
+`COMFYUI_MCP_BRIDGE_PORT`.
 
 <Note>
 **Driving a remote ComfyUI** (a cloud GPU pod, another box on your LAN)? The setup
-above still applies, but the orchestrator needs to run **on your own machine**,
-not the remote box — turn on **Settings → General → "Use external/local
-orchestrator (advanced)"**, then click Connect. `connect <remote-url>` on your
-laptop handles the rest, including a secure tunnel back to the pod's HTTPS page.
-See [Cloud deployment](/cloud-deployment) for the full walkthrough.
+above still applies, but run the orchestrator **on your own machine**, not the
+remote box: `npx -y comfyui-mcp@latest connect <remote-url>` handles the rest,
+including a secure tunnel back to the pod's HTTPS page. Then click Connect in the
+panel. See [Cloud deployment](./cloud-deployment) for the full walkthrough.
 </Note>
 
 <Note>
@@ -82,7 +102,7 @@ See [Cloud deployment](/cloud-deployment) for the full walkthrough.
   appears only when **neither** provider is signed in. If your saved pick isn't usable
   the panel **auto-switches to a ready provider** (your saved preference is kept), and a
   not-ready provider's row offers a **"set up"** action that seeds the one-time
-  `claude` / `codex login` step. See [Backends → readiness & onboarding](/backends#connect-time-readiness--onboarding).
+  `claude` / `codex login` step. See [Backends → readiness & onboarding](./backends#connect-time-readiness--onboarding).
 </Note>
 
 ## What it can do
@@ -90,15 +110,15 @@ See [Cloud deployment](/cloud-deployment) for the full walkthrough.
 The agent (Claude *or* ChatGPT) loads comfyui-mcp's model skills (IDEOGRAM, WAN,
 LTX, Qwen, and more), so it already knows the models you run — Claude natively, and
 ChatGPT via the same knowledge exposed as MCP tools
-([knowledge parity](/tools/skills-knowledge)). It can generate images, video and
+([knowledge parity](./tools/skills-knowledge)). It can generate images, video and
 audio, inspect and manage your ComfyUI, and reason about your setup — then reply in
 the panel chat.
 
 It can also **load a whole workflow or installer pack in one shot**
 (`panel_load_workflow pack:<name>`) and is **cost-aware**: bundled packs are
 local-GPU / free, and for an ad-hoc graph the agent checks the runtime
-(`check_workflow_runtime`) and **asks before spending paid API credits**. See
-[Skills, Packs & Runtime Cost](/tools/skills-knowledge).
+(`list_packs` with `action:"check_runtime"`) and **asks before spending paid API credits**. See
+[Skills, Packs & Runtime Cost](./tools/skills-knowledge).
 
 ## Driving the live graph
 
@@ -106,7 +126,7 @@ The autonomous agent works your live ComfyUI through a **fixed allowlist** of
 `panel_*` commands — no arbitrary JavaScript. Every graph mutation goes through
 LiteGraph's change tracking, so each is undoable with **Ctrl+Z**. The same
 `panel_*` surface is exposed identically to both backends (in-process for Claude,
-over a loopback HTTP MCP for ChatGPT/Codex), so [parity](/backends) is automatic.
+over a loopback HTTP MCP for ChatGPT/Codex), so [parity](./backends) is automatic.
 
 ### Read
 
@@ -130,9 +150,8 @@ over a loopback HTTP MCP for ChatGPT/Codex), so [parity](/backends) is automatic
 | `panel_remove_node` | Remove a node |
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots by name or index (omit both slots on `panel_connect` to auto-match by type; `auto_match:false` restores legacy index-0 semantics) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
-| `panel_move_node` | Move a node to a new canvas position |
+| `panel_edit_node` | Atomically move, resize, retitle, recolor, reshape, collapse, or pin one or more nodes |
 | `panel_auto_layout` | Auto-arrange the whole graph (or a subset) into a clean flow/grid layout by link topology — `dry_run` to preview |
-| `panel_set_node_title` | Rename a node's header title |
 | `panel_clear` | Remove every node — the whole wipe is one Ctrl+Z |
 
 ### Subgraphs
@@ -158,8 +177,6 @@ straight in.
 |---|---|
 | `panel_move_rail` | Move a subgraph's input / output rail so boundary wires stay short |
 | `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Create, move, retitle/recolor, or delete a labeled group box (pass `node_ids` to auto-wrap) |
-| `panel_set_node_color` | Color-code a node — named LiteGraph preset (`blue`, `purple`, `green`, …) or hex |
-| `panel_set_node_collapsed` | Collapse / expand a node to a title chip |
 | `panel_screenshot` | Render the canvas to a PNG and hand it back as an image so the agent can verify its layout |
 
 ### Workflow tabs
@@ -182,14 +199,14 @@ straight in.
 
 The agent discovers bundled expertise and checks runtime cost before spending
 credits (same tools on both backends — see
-[Skills, Packs & Runtime Cost](/tools/skills-knowledge)):
+[Skills, Packs & Runtime Cost](./tools/skills-knowledge)):
 
 | Tool | Effect |
 |---|---|
-| `list_skills` / `read_skill` | Discover and read bundled model-family + workflow skills |
-| `list_packs` / `read_pack_workflow` | List one-command installer packs (local-GPU / free) and read a pack's graph |
-| `list_workflow_templates` | List the connected server's official ComfyUI workflow templates |
-| `check_workflow_runtime` | Classify a graph as **local** (free) or **api/mixed/unknown** (paid) — the agent asks before spending paid API credits |
+| `list_packs` (`action:"skill_list"` / `action:"skill_read"`) | Discover and read bundled model-family + workflow skills |
+| `list_packs` (`action:"list"` / `action:"read_workflow"`) | List one-command installer packs (local-GPU / free) and read a pack's graph |
+| `list_packs` (`action:"list_templates"`) | List the connected server's official ComfyUI workflow templates |
+| `list_packs` (`action:"check_runtime"`) | Classify a graph as **local** (free) or **api/mixed/unknown** (paid) — the agent asks before spending paid API credits |
 
 ### Run & view
 
@@ -248,7 +265,7 @@ Two shortcuts cover the common cases:
   orchestrator via per-turn snapshots. **Conversation** rollback (forking the chat
   back to a past turn) is currently **Claude-only**; the ChatGPT/Codex backend
   resumes whole threads only, so the panel gates that scope off for it. See the
-  [capability matrix](/backends#capability-matrix).
+  [capability matrix](./backends#capability-matrix).
 </Note>
 
 ## Pending-message tray
@@ -305,7 +322,7 @@ stops blindly stacking jobs behind a wedged one). The threshold is the
 **Render stall warning (seconds)** setting under **Settings → Comfy MCP Agent →
 General** (default 180s, range 15–3600). It's sent on Connect and pushed **live** —
 changing it applies without a reconnect. See
-[Configuration → `COMFYUI_MCP_STALL_S`](/configuration#panel-orchestrator--the-bridge).
+[Configuration → `COMFYUI_MCP_STALL_S`](./configuration#panel-orchestrator--the-bridge).
 
 ## Background-tab reliability
 
@@ -319,15 +336,15 @@ hide and resumes the typewriter on return. Foreground animation is unchanged.
 
 ## RunPod cloud control
 
-A toolbar **host pill** reads **🟢 Local · your rig** or **🔵 RunPod · <pod> ·
+A toolbar **host pill** reads **🟢 Local · your rig** or **🔵 RunPod · `<pod>` ·
 GPU · $/hr** and opens a **RunPod control panel**: a live status card (GPU / VRAM
 / uptime / $·hr / ComfyUI URL / idle auto-stop countdown), a pod dropdown that
 lists your pods **by name**, Connect / Start / Stop / **Use Local**, and a
 confirm-armed **Deploy**. Set `RUNPOD_API_KEY` once in the API-Keys card and you
 can deploy, monitor, switch local⇄pod, and stop a cloud GPU without touching the
 RunPod console — the host pill always tells you where the next render runs. See
-[Cloud deployment](/cloud-deployment) and the blog
-[Run ComfyUI on a rented cloud GPU](/blog/runpod-comfyui).
+[Cloud deployment](./cloud-deployment) and the blog
+[Run ComfyUI on a rented cloud GPU](./blog/runpod-comfyui).
 
 ## CivitAI browser
 
@@ -335,15 +352,15 @@ The **Civitai** toolbar button opens a full CivitAI browser — images, videos,
 checkpoints, LoRAs and workflows with search, filters, and a fullscreen viewer.
 Pick a result to **share it with the agent**, **download it to your machine**, or
 **save an embedded workflow** to the canvas. The story:
-[CivitAI inside ComfyUI](/blog/civitai-in-comfyui).
+[CivitAI inside ComfyUI](./blog/civitai-in-comfyui).
 
 ## See also
 
-- [Mobile app (beta)](/mobile) — pair your phone with the panel and chat with the agent on the go
-- [Backends / providers](/backends) — Claude vs ChatGPT, the picker, capability parity
-- [Skills, Packs & Runtime Cost](/tools/skills-knowledge) — knowledge parity + the cost guardrail
-- [Bridge configuration](/configuration)
-- [Cloud deployment](/cloud-deployment) — drive the panel against a remote ComfyUI pod (RunPod, etc.)
-- [Self-hosted relay](/self-hosted-relay) — run your own tunnel infrastructure for the bridge
-- [The Claude Code plugin](/plugin) — model skills, slash commands, agents
+- [Mobile app (beta)](./mobile) — pair your phone with the panel and chat with the agent on the go
+- [Backends / providers](./backends) — Claude vs ChatGPT, the picker, capability parity
+- [Skills, Packs & Runtime Cost](./tools/skills-knowledge) — knowledge parity + the cost guardrail
+- [Bridge configuration](./configuration)
+- [Cloud deployment](./cloud-deployment) — drive the panel against a remote ComfyUI pod (RunPod, etc.)
+- [Self-hosted relay](./self-hosted-relay) — run your own tunnel infrastructure for the bridge
+- [The Claude Code plugin](./plugin) — model skills, slash commands, agents
 - [comfyui-mcp on GitHub](https://github.com/artokun/comfyui-mcp) · [comfyui-mcp-panel on GitHub](https://github.com/artokun/comfyui-mcp-panel)

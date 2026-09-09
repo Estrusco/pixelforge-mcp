@@ -10,8 +10,16 @@ fs.mkdirSync(path.join(AGENTS_DIR, 'skills'), { recursive: true });
 fs.mkdirSync(GEMINI_DIR, { recursive: true });
 
 function extractFrontmatter(content) {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!match) return { frontmatter: {}, body: content };
+  // Normalize BOM + CRLF before matching the fence, the same way splitFrontmatter
+  // (src/tools/skills-access.ts) does. Without this, every checkout with
+  // core.autocrlf=true — the Windows default — fails `^---\n`, falls through to the
+  // no-frontmatter branch, and generates .agents/skills/<n>/SKILL.md with an EMPTY
+  // description plus the original frontmatter duplicated into the body. That was true
+  // for all 39 skills. Same root cause as #1617, which fixed a test that read raw bytes;
+  // this is the generator that had the identical bug.
+  const normalized = content.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  const match = normalized.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!match) return { frontmatter: {}, body: normalized };
   
   const frontmatterStr = match[1];
   const body = match[2];
@@ -57,9 +65,25 @@ ${body.trim()}`;
 const skillsDir = path.join(PLUGIN_DIR, 'skills');
 if (fs.existsSync(skillsDir)) {
   for (const skillName of fs.readdirSync(skillsDir)) {
-    const srcPath = path.join(skillsDir, skillName, 'SKILL.md');
-    const destPath = path.join(AGENTS_DIR, 'skills', skillName, 'SKILL.md');
+    const skillSrcDir = path.join(skillsDir, skillName);
+    if (!fs.statSync(skillSrcDir).isDirectory()) continue;
+    const srcPath = path.join(skillSrcDir, 'SKILL.md');
+    const destSkillDir = path.join(AGENTS_DIR, 'skills', skillName);
+    const destPath = path.join(destSkillDir, 'SKILL.md');
     processSkillOrAgent(srcPath, destPath, skillName, false);
+
+    // Also copy sibling asset folders the SKILL.md links to (references/, docs/).
+    // Without this the synced bundle keeps the SKILL.md but drops the docs it
+    // points at, leaving dangling relative-doc links in .agents/skills/<name>/
+    // (the class of breakage reported in #552).
+    for (const sub of ['references', 'docs']) {
+      const subSrc = path.join(skillSrcDir, sub);
+      if (fs.existsSync(subSrc) && fs.statSync(subSrc).isDirectory()) {
+        const subDest = path.join(destSkillDir, sub);
+        fs.cpSync(subSrc, subDest, { recursive: true });
+        console.log(`Synced ${subSrc} -> ${subDest}`);
+      }
+    }
   }
 }
 
@@ -125,12 +149,6 @@ const mcpConfig = {
     pixelforge: {
       command: "npx",
       args: ["-y", "comfyui-mcp"]
-    },
-    civitai: {
-      url: "https://mcp.civitai.com/mcp",
-      headers: {
-        Authorization: "Bearer ${CIVITAI_API_TOKEN:-}"
-      }
     },
     huggingface: {
       url: "https://huggingface.co/mcp",

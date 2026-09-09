@@ -48,6 +48,7 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import { startQuickTunnel } from "../../services/tunnel.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 describe("startQuickTunnel", () => {
   beforeEach(() => {
@@ -65,7 +66,7 @@ describe("startQuickTunnel", () => {
     const promise = startQuickTunnel(8765);
 
     // Tunnel.quick should be invoked synchronously after ensureBinary().
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
 
     const call = quickCalls[0];
     expect(call.url).toBe("http://localhost:8765");
@@ -88,9 +89,39 @@ describe("startQuickTunnel", () => {
     });
   });
 
+  it.each(["0.0.0.0", "::"])(
+    "uses IPv4 loopback when the server binds the wildcard address (%s)",
+    async (host) => {
+      const promise = startQuickTunnel(9100, host);
+
+      await waitFor(() => expect(quickCalls).toHaveLength(1));
+      expect(quickCalls[0].url).toBe("http://127.0.0.1:9100");
+
+      state.lastTunnel!.emit("url", "https://wildcard.trycloudflare.com");
+      await expect(promise).resolves.toMatchObject({
+        url: "https://wildcard.trycloudflare.com",
+      });
+    },
+  );
+
+  it.each(["::1", "2001:db8::7"])(
+    "brackets an IPv6 origin host for the tunnel URL (%s)",
+    async (host) => {
+      const promise = startQuickTunnel(9101, host);
+
+      await waitFor(() => expect(quickCalls).toHaveLength(1));
+      expect(quickCalls[0].url).toBe(`http://[${host}]:9101`);
+
+      state.lastTunnel!.emit("url", "https://ipv6.trycloudflare.com");
+      await expect(promise).resolves.toMatchObject({
+        url: "https://ipv6.trycloudflare.com",
+      });
+    },
+  );
+
   it("stop() tears down the tunnel and marks state stopped", async () => {
     const promise = startQuickTunnel(9000);
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
     state.lastTunnel!.emit("url", "https://abc.trycloudflare.com");
     const handle = await promise;
 
@@ -101,14 +132,14 @@ describe("startQuickTunnel", () => {
 
   it("rejects when the tunnel errors before becoming ready", async () => {
     const promise = startQuickTunnel(9100);
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
     state.lastTunnel!.emit("error", new Error("boom"));
     await expect(promise).rejects.toThrow(/boom/);
   });
 
   it("rejects when cloudflared exits before the url event", async () => {
     const promise = startQuickTunnel(9200);
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
     state.lastTunnel!.emit("exit", 1, null);
     await expect(promise).rejects.toThrow(/exited before tunnel was ready/);
   });

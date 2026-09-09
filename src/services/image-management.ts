@@ -1,10 +1,18 @@
-import { readFile, copyFile, readdir, stat } from "node:fs/promises";
-import { join, basename, extname, relative, sep } from "node:path";
-import { config, isRemoteMode } from "../config.js";
-import { getHistory } from "../comfyui/client.js";
-import { ValidationError, ModelError } from "../utils/errors.js";
+import { readFile, copyFile, open, readdir, realpath, stat } from "node:fs/promises";
+import { join, basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { config, isCloudMode, isRemoteMode } from "../config.js";
+import {
+  getHistory,
+  getObjectInfo,
+  resetObjectInfoCache,
+  MAX_PREVIEW_SOURCE_BYTES,
+  MAX_VIEW_RESPONSE_BYTES,
+} from "../comfyui/client.js";
+import type { ObjectInfo } from "../comfyui/types.js";
+import { ValidationError, ModelError, ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
-import { resolveOutputDir, resolveInputDir } from "./output-dir.js";
+import { resolveOutputDir, resolveInputDir, resolveTempDir } from "./output-dir.js";
+import { tryLoadSharp } from "./sharp-loader.js";
 
 /**
  * Resolve ComfyUI's REAL input directory (honors a custom --input-directory /
@@ -200,10 +208,13 @@ export interface OutputImage {
   /** Subfolder relative to the output dir ("" for top level), forward-slash
    *  normalized. ComfyUI writes to subfolders when a node's filename_prefix
    *  contains a path (e.g. SaveVideo "video/clip" → output/video/clip_00001.mp4).
-   *  Pass { filename, subfolder } to get_image / stage_output_as_input. */
+   *  Pass { filename, subfolder } to get_image (action:"get") / upload_image (action:"stage"). */
   subfolder: string;
   /** Media kind derived from the file extension. */
   kind: "image" | "video";
+  /** ComfyUI directory the file lives in. Omitted/output for output/; "temp"
+   *  for VHS_VideoCombine with `save_output` unchecked (#2370). */
+  type?: "output" | "temp";
 }
 
 // Still-image extensions.
@@ -220,68 +231,32 @@ function mediaKind(ext: string): "image" | "video" {
 }
 
 /**
- * List image AND video/animation files in the ComfyUI output directory.
- *
- * Covers VHS_VideoCombine / LTX / WAN video outputs (.mp4, .webm, …) in addition
- * to still images, because ComfyUI's /history often does NOT register VHS-style
- * video outputs — so a filesystem scan is the reliable way to confirm a finished
- * video render.
+ * Recursive media listing of one ComfyUI directory (output/ or temp/).
+ * `allowedExts` is MEDIA_EXTS for output/ and VIDEO_EXTS for temp/ so
+ * PreviewImage stills in temp/ stay omitted while VHS .mp4s are returned.
  */
-export async function listOutputImages(options?: {
-  limit?: number;
-  pattern?: string;
-}): Promise<OutputImage[]> {
-  const limit = options?.limit ?? 20;
-  const pattern = options?.pattern?.toLowerCase();
-
-  // REMOTE mode: no local filesystem to scan. Derive the output media from
-  // ComfyUI's /history (HTTP, works against a remote instance) instead. Size and
-  // modification time are unavailable over HTTP, so they come back as 0 / "".
-  // Key off isRemoteMode() (not mere comfyuiPath absence): when a remote target
-  // coexists with an unrelated local COMFYUI_PATH, scanning the local output dir
-  // would report the wrong machine's outputs. Also fall back to /history when no
-  // local path is configured at all.
-  if (isRemoteMode() || !config.comfyuiPath) {
-    return listOutputImagesFromHistory(limit, pattern);
-  }
-
-  // Resolve the real local output dir. Asking the running ComfyUI can fail
-  // (unreachable, or a non-local --output-directory we can't read); treat any
-  // failure as "nothing to list" rather than throwing, so the tool degrades to
-  // an empty result instead of an opaque error.
-  let outputDir: string;
-  try {
-    outputDir = await resolveOutputDir();
-  } catch {
-    return [];
-  }
-
-  // RECURSIVE scan: ComfyUI writes to subfolders when a node's filename_prefix
-  // contains a path (SaveVideo / VHS / "video/clip" → output/video/clip_00001.mp4).
-  // A flat readdir of the top level silently misses those — so a finished video can
-  // look "not found" even though the dir resolved correctly. Walk the whole tree.
-  let dirents;
-  try {
-    dirents = await readdir(outputDir, { recursive: true, withFileTypes: true });
-  } catch {
-    return [];
-  }
-
+async function collectMediaFromDir(
+  root: string,
+  pattern: string | undefined,
+  type: "output" | "temp",
+  allowedExts: Set<string>,
+): Promise<{ images: OutputImage[]; matched: number }> {
+  const dirents = await readdir(root, { recursive: true, withFileTypes: true });
   const images: OutputImage[] = [];
+  let matched = 0;
 
   for (const dirent of dirents) {
     if (!dirent.isFile()) continue;
     const ext = extname(dirent.name).toLowerCase();
-    if (!MEDIA_EXTS.has(ext)) continue;
+    if (!allowedExts.has(ext)) continue;
 
-    // Dirent.parentPath (Node ≥20.12) is the absolute dir holding the entry.
-    const parent = dirent.parentPath ?? outputDir;
-    const subfolder = relative(outputDir, parent).split(sep).join("/"); // "" at top level
+    const parent = dirent.parentPath ?? root;
+    const subfolder = relative(root, parent).split(sep).join("/");
     const relPath = subfolder ? `${subfolder}/${dirent.name}` : dirent.name;
-    // Match the pattern against the subfolder-relative path so "video/clip" works.
     if (pattern && !relPath.toLowerCase().includes(pattern)) continue;
 
     const filePath = join(parent, dirent.name);
+    matched += 1;
     try {
       const info = await stat(filePath);
       images.push({
@@ -291,24 +266,238 @@ export async function listOutputImages(options?: {
         modified: info.mtime.toISOString(),
         subfolder,
         kind: mediaKind(ext),
+        type,
       });
     } catch {
       continue;
     }
   }
 
+  return { images, matched };
+}
+
+/**
+ * List image AND video/animation files in the ComfyUI output directory.
+ *
+ * Covers VHS_VideoCombine / LTX / WAN video outputs (.mp4, .webm, …) in addition
+ * to still images, because ComfyUI's /history often does NOT register VHS-style
+ * video outputs — so a filesystem scan is the reliable way to confirm a finished
+ * video render.
+ */
+/** Where a listing came from, and what established it. */
+export interface OutputListingSource {
+  /** The directory that was actually scanned. Absent on the /history path,
+   *  which has no directory to name — it is a listing from the server's
+   *  in-memory history, not from disk. */
+  directory?: string;
+  /** ComfyUI temp/ that was scanned for video files (VHS save_output
+   *  unchecked). Absent when temp could not be resolved or read, and on the
+   *  /history path. */
+  tempDirectory?: string;
+  /** How the answer was produced, so a caller never has to guess which. */
+  basis: "local-scan" | "server-history" | "server-history-fallback";
+}
+
+/**
+ * The listing PLUS where it came from.
+ *
+ * `listOutputImages` returns bare filenames, which forces any caller that needs
+ * the path to reconstruct it — and the obvious reconstruction (the workspace
+ * path from `install_comfyui (action:"environment")`) is WRONG on every install launched with
+ * `--output-directory`, in the silent way: the filenames look plausible against
+ * it, so a caller that does not stat them reports a directory holding nothing
+ * (#899, observed live).
+ *
+ * The directory is resolved exactly ONCE, here, and travels with the entries it
+ * describes. Resolving it a second time in the caller would be the same class of
+ * bug this fixes: two answers to one question, free to disagree.
+ */
+export async function listOutputMedia(options?: {
+  limit?: number;
+  pattern?: string;
+}): Promise<{ images: OutputImage[]; source: OutputListingSource }> {
+  const limit = options?.limit ?? 20;
+  const pattern = options?.pattern?.toLowerCase();
+
+  // REMOTE mode: no local filesystem to scan. Derive the output media from
+  // ComfyUI's /history (HTTP, works against a remote instance) instead. Size and
+  // modification time are unavailable over HTTP, so they come back as 0 / "".
+  // Keyed off isRemoteMode() ALONE (#877): when a remote target coexists with an
+  // unrelated local COMFYUI_PATH, scanning the local output dir would report the
+  // wrong machine's outputs — but the converse test, `!config.comfyuiPath`, was
+  // never a test for "no local path". It reads one ENV VAR, while a local
+  // portable install is perfectly well located by the SAVED DEFAULT WORKSPACE,
+  // which `resolveOutputDir` consults and `install_comfyui (action:"environment")` reports. So a local
+  // install with `COMFYUI_PATH` unset silently took the remote branch, asked
+  // /history — which had been emptied by a restart — and returned `[]` over an
+  // output directory holding the files the caller was asking about. A silent
+  // wrong answer, not an error: the agent concludes the file does not exist.
+  if (isRemoteMode()) {
+    return {
+      images: await listOutputImagesFromHistory(limit, pattern),
+      source: { basis: "server-history" },
+    };
+  }
+
+  // Local. `resolveOutputDir` already knows every way this path can be
+  // established, so let it answer rather than pre-judging on one env var.
+  let outputDir: string;
+  try {
+    outputDir = await resolveOutputDir();
+  } catch (err) {
+    // The local root could not be established. /history is the only source left,
+    // and it CANNOT see the disk — so a zero result from it does not establish
+    // that there are no outputs. Falling back is right; reporting its emptiness
+    // as an answer is not.
+    const fromHistory = await listOutputImagesFromHistory(limit, pattern);
+    if (fromHistory.length > 0) {
+      return { images: fromHistory, source: { basis: "server-history" } };
+    }
+    throw new ComfyUIError(
+      `Could not determine this ComfyUI's output directory (${err instanceof Error ? err.message : String(err)}), ` +
+        `so the local output folder was never scanned. ComfyUI's /history was asked instead and ` +
+        `returned nothing — but history is emptied by a restart and cannot see files on disk, so ` +
+        `that is NOT a finding that there are no outputs. Set COMFYUI_PATH, or save a default ` +
+        `workspace (workspace tool, action 'set_default'), so the output folder can be read directly.`,
+      "OUTPUT_DIR_UNKNOWN",
+    );
+  }
+
+  // RECURSIVE scan: ComfyUI writes to subfolders when a node's filename_prefix
+  // contains a path (SaveVideo / VHS / "video/clip" → output/video/clip_00001.mp4).
+  // A flat readdir of the top level silently misses those — so a finished video can
+  // look "not found" even though the dir resolved correctly. Walk the whole tree.
+  //
+  // #2370 — also scan temp/ for VIDEO files. VHS_VideoCombine with `save_output`
+  // unchecked writes the completed .mp4 (including the muxed `-audio.mp4` a run
+  // completion names) to folder_paths.get_temp_directory() and tags it
+  // type:"temp". Scanning output/ only listed that render as nothing. Preview
+  // stills in temp/ stay omitted so PreviewImage does not flood the listing.
+  const images: OutputImage[] = [];
+  // How many entries MATCHED the query, versus how many we could actually stat.
+  // A per-file stat failure is skipped silently, which is fine when it is one
+  // file among many — but if it swallows every match, the caller gets `[]` over
+  // a directory that demonstrably held what they asked for (codex gate).
+  let matched = 0;
+
+  try {
+    const outputScan = await collectMediaFromDir(outputDir, pattern, "output", MEDIA_EXTS);
+    images.push(...outputScan.images);
+    matched += outputScan.matched;
+  } catch (err) {
+    // We know WHERE the outputs are and could not read them. That is not an
+    // empty directory, and returning `[]` told the caller their file does not
+    // exist when the truth is we could not look (#877).
+    throw new ComfyUIError(
+      `Could not read the ComfyUI output directory "${outputDir}": ` +
+        `${err instanceof Error ? err.message : String(err)}. This is NOT a finding that there ` +
+        `are no outputs — the directory could not be listed at all.`,
+      "OUTPUT_DIR_UNREADABLE",
+    );
+  }
+
+  let tempDirectory: string | undefined;
+  try {
+    const tempDir = await resolveTempDir();
+    try {
+      const tempScan = await collectMediaFromDir(tempDir, pattern, "temp", VIDEO_EXTS);
+      images.push(...tempScan.images);
+      matched += tempScan.matched;
+      tempDirectory = tempDir;
+    } catch (err) {
+      const code =
+        typeof err === "object" && err !== null && "code" in err && typeof err.code === "string"
+          ? err.code
+          : undefined;
+      if (code === "ENOENT") {
+        // temp/ is created on first preview. Absence is an empty scan, not a miss.
+        tempDirectory = tempDir;
+      } else {
+        logger.debug("Could not scan ComfyUI temp directory; listing output/ only", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } catch (err) {
+    logger.debug("Could not resolve ComfyUI temp directory; listing output/ only", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  if (matched > 0 && images.length === 0) {
+    // Every entry that matched the query failed to stat. Returning `[]` here says
+    // "there are none" over a directory that demonstrably held what was asked for
+    // — the same fold as the two above, at the last place it can still happen
+    // (codex gate).
+    throw new ComfyUIError(
+      `Found ${matched} matching file(s) under "${outputDir}", but none of them could be read ` +
+        `(every stat failed — a permissions or I/O problem, or they were all removed mid-scan). ` +
+        `This is NOT a finding that there are no outputs.`,
+      "OUTPUT_ENTRIES_UNREADABLE",
+    );
+  }
+
+  // #2539 — a successful local scan of the WRONG directory looks identical to
+  // a genuine empty folder: resolveOutputDir fell back to an unrelated
+  // COMFYUI_PATH (relative `ComfyUI/main.py`, no --output-directory, no cwd)
+  // while the live /view endpoint served the files. Returning `{images:[],
+  // source: local-scan}` here is a silent miss, not an error. /history is the
+  // same source action:"get" uses; if it has matches, those are the answer.
+  // An unreadable history is not a finding that the empty scan was right —
+  // keep the empty local result rather than convert a readable empty folder
+  // into HISTORY_UNREADABLE.
+  if (images.length === 0) {
+    try {
+      const fromHistory = await listOutputImagesFromHistory(limit, pattern);
+      if (fromHistory.length > 0) {
+        return {
+          images: fromHistory,
+          source: {
+            directory: outputDir,
+            ...(tempDirectory ? { tempDirectory } : {}),
+            basis: "server-history-fallback",
+          },
+        };
+      }
+    } catch (err) {
+      logger.debug("Could not fall back to /history after an empty local output scan", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // Sort newest first
   images.sort((a, b) => b.modified.localeCompare(a.modified));
 
-  return images.slice(0, limit);
+  return {
+    images: images.slice(0, limit),
+    source: {
+      directory: outputDir,
+      ...(tempDirectory ? { tempDirectory } : {}),
+      basis: "local-scan",
+    },
+  };
+}
+
+/**
+ * Just the entries. Kept because most callers only want the list; anything that
+ * needs to SAY where the files are must use `listOutputMedia`, so the path it
+ * reports is the path that was scanned.
+ */
+export async function listOutputImages(options?: {
+  limit?: number;
+  pattern?: string;
+}): Promise<OutputImage[]> {
+  return (await listOutputMedia(options)).images;
 }
 
 /**
  * Remote-mode source for listOutputImages: derive output media from ComfyUI's
  * /history (HTTP) when there is no local filesystem to scan. Walks every history
- * entry's node outputs (images + videos/gifs), keeps only those that landed in
- * the "output" directory, dedupes by subfolder/filename, and returns them
- * newest-first (history is roughly insertion-ordered, so we iterate in reverse).
+ * entry's node outputs (images + videos/gifs), keeps output-directory assets
+ * plus temp/ videos (VHS save_output unchecked, #2370), skips temp still
+ * previews, dedupes by type/subfolder/filename, and returns them newest-first
+ * (history is roughly insertion-ordered, so we iterate in reverse).
  * Size/modified are unavailable over HTTP and come back as 0 / "".
  */
 async function listOutputImagesFromHistory(
@@ -319,8 +508,16 @@ async function listOutputImagesFromHistory(
   try {
     history = await getHistory();
   } catch (err) {
-    logger.debug("getHistory failed while listing remote output media", { err });
-    return [];
+    // A FAILED request is not an empty history (codex gate). Returning `[]` here
+    // told the caller there are no outputs when we never got an answer at all —
+    // and in remote mode this is the only source, so that `[]` was the whole
+    // reply. Throwing makes the difference visible; the caller upstream already
+    // distinguishes "history had nothing" from "history could not be asked".
+    throw new ComfyUIError(
+      `Could not read ComfyUI's generation history (${err instanceof Error ? err.message : String(err)}). ` +
+        `This is NOT a finding that there are no outputs — the history could not be read at all.`,
+      "HISTORY_UNREADABLE",
+    );
   }
 
   const seen = new Set<string>();
@@ -351,18 +548,22 @@ async function listOutputImagesFromHistory(
           if (typeof media.filename !== "string" || media.filename.length === 0) {
             continue;
           }
-          // Only list assets in the output directory (skip temp previews).
-          const type = typeof media.type === "string" ? media.type : "output";
-          if (type !== "output") continue;
+          // output/ stills+video, plus temp/ videos (VHS save_output unchecked).
+          // Temp stills are PreviewImage previews and stay omitted.
+          const rawType = typeof media.type === "string" ? media.type : "output";
+          const type: "output" | "temp" | undefined =
+            rawType === "temp" ? "temp" : rawType === "output" ? "output" : undefined;
+          if (!type) continue;
           const ext = extname(media.filename).toLowerCase();
           if (!MEDIA_EXTS.has(ext)) continue;
+          if (type === "temp" && !VIDEO_EXTS.has(ext)) continue;
           const subfolder =
             typeof media.subfolder === "string" ? media.subfolder : "";
           const relPath = subfolder
             ? `${subfolder}/${media.filename}`
             : media.filename;
           if (pattern && !relPath.toLowerCase().includes(pattern)) continue;
-          const dedupeKey = relPath.toLowerCase();
+          const dedupeKey = `${type}:${relPath}`.toLowerCase();
           if (seen.has(dedupeKey)) continue;
           seen.add(dedupeKey);
           images.push({
@@ -373,6 +574,7 @@ async function listOutputImagesFromHistory(
             modified: "",
             subfolder,
             kind: mediaKind(ext),
+            type,
           });
         }
       }
@@ -388,22 +590,27 @@ import { fetchImage, uploadImageHttp } from "../comfyui/client.js";
 import { readFile as nodeReadFile } from "node:fs/promises";
 
 /**
- * Reject filename / subfolder values that could traverse out of ComfyUI's
- * output, input or temp directory when forwarded to the /view endpoint.
+ * Split and reject filename / subfolder values that could traverse out of
+ * ComfyUI's output, input or temp directory when forwarded to the /view
+ * endpoint.
  *
  * ComfyUI's /view handler joins the requested `subfolder` and `filename`
  * onto the configured base directory; the server has historically been
  * permissive about ".." segments and absolute paths in those parameters
  * (see e.g. comfyanonymous/ComfyUI#785), so an attacker who can reach the
- * MCP tool surface could otherwise pivot through get_image / view_image /
- * stage_output_as_input to read arbitrary files from the ComfyUI host.
+ * MCP tool surface could otherwise pivot through get_image (action:"get"/"view") /
+ * upload_image (action:"stage") to read arbitrary files from the ComfyUI host.
  *
- * Legitimate ComfyUI values are a single filename (no separators) and a
- * relative subfolder produced by listOutputImages (forward-slash joined,
- * no ".." segments). Anything outside that shape is refused here BEFORE
- * the request is forwarded.
+ * get_history (action:"list") prints media as `subfolder/filename`, so callers
+ * paste that combined string into get_image's `filename`. A relative prefix is
+ * the same thing as the `subfolder` argument and is adopted, not refused.
+ * Absolute paths, drive prefixes, and ".." still fail closed BEFORE the
+ * request is forwarded.
  */
-function assertSafeViewRef(filename: string, subfolder: string): void {
+function normalizeViewRef(
+  filename: string,
+  subfolder: string,
+): { filename: string; subfolder: string } {
   if (typeof filename !== "string" || filename.length === 0) {
     throw new ValidationError("filename is required");
   }
@@ -412,60 +619,806 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
       "filename / subfolder must not contain NUL bytes",
     );
   }
-  // Filename must be a single path segment — no separators, no traversal.
+
+  const rejectFilename = (): never => {
+    throw new ValidationError(
+      `Invalid filename "${filename}": must be a filename or relative subfolder/filename reference without absolute paths, drive prefixes, or '..' segments`,
+    );
+  };
+
+  // Rooted / drive-prefixed FILENAME is not a relative output ref. Refuse
+  // rather than stripping the prefix into a quietly different destination.
   if (
-    filename.includes("/") ||
-    filename.includes("\\") ||
-    filename === "." ||
-    filename === ".." ||
-    filename.split(/[\\/]/).some((s) => s === "..")
+    filename.startsWith("/") ||
+    filename.startsWith("\\") ||
+    /^[A-Za-z]:/.test(filename)
   ) {
-    throw new ValidationError(
-      `Invalid filename "${filename}": must be a single filename without path separators or '..' segments`,
-    );
+    rejectFilename();
   }
-  if (!subfolder) return;
-  // Subfolder must be a forward-slash-joined relative path with no ".."
-  // segments and no Windows-style drive / absolute prefix.
-  if (
-    subfolder.startsWith("/") ||
-    subfolder.startsWith("\\") ||
-    /^[A-Za-z]:[\\/]/.test(subfolder)
-  ) {
-    throw new ValidationError(
-      `Invalid subfolder "${subfolder}": must be relative to the ComfyUI media directory`,
-    );
+
+  const endsInSeparator = /[/\\]\s*$/.test(filename);
+  const parts = filename.split(/[/\\]+/).filter((p) => p !== "" && p !== ".");
+  const name = endsInSeparator ? "" : (parts.pop() ?? "");
+  if (name === "" || name === "." || name === ".." || /^[A-Za-z]:/.test(name)) {
+    rejectFilename();
   }
-  const segments = subfolder.split(/[\\/]/);
-  if (segments.some((s) => s === "..")) {
-    throw new ValidationError(
-      `Invalid subfolder "${subfolder}": '..' segments are not allowed`,
-    );
+  if (parts.some((p) => p === "..")) {
+    rejectFilename();
+  }
+  const prefix = parts.join("/");
+
+  let resolvedSubfolder = subfolder;
+  if (prefix) {
+    resolvedSubfolder = subfolder
+      ? `${subfolder.replace(/\\/g, "/").replace(/\/+$/, "")}/${prefix}`
+      : prefix;
+  }
+
+  if (resolvedSubfolder) {
+    // Subfolder must be a forward-slash-joined relative path with no ".."
+    // segments and no Windows-style drive / absolute prefix.
+    if (
+      resolvedSubfolder.startsWith("/") ||
+      resolvedSubfolder.startsWith("\\") ||
+      /^[A-Za-z]:/.test(resolvedSubfolder)
+    ) {
+      throw new ValidationError(
+        `Invalid subfolder "${subfolder || prefix}": must be relative to the ComfyUI media directory`,
+      );
+    }
+    const segments = resolvedSubfolder.split(/[\\/]/);
+    if (segments.some((s) => s === "..")) {
+      throw new ValidationError(
+        `Invalid subfolder "${subfolder || prefix}": '..' segments are not allowed`,
+      );
+    }
+  }
+
+  return { filename: name, subfolder: resolvedSubfolder };
+}
+
+/** Strict lexical containment for the local fallback below. */
+function isStrictlyInside(root: string, candidate: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate));
+  return (
+    rel !== "" &&
+    rel !== ".." &&
+    !rel.startsWith(`..${sep}`) &&
+    !rel.startsWith("../") &&
+    !isAbsolute(rel)
+  );
+}
+
+function localViewMimeType(filename: string): string {
+  const ext = extname(filename).toLowerCase();
+  return (
+    IMAGE_MIME[ext] ??
+    VIDEO_MIME[ext] ??
+    AUDIO_MIME[ext] ??
+    (ext === ".json" ? "application/json" : "application/octet-stream")
+  );
+}
+
+/** Read at most `maxBytes`, including when the file grows after stat(). */
+async function readLocalViewFileBounded(
+  path: string,
+  maxBytes: number,
+): Promise<Buffer | undefined> {
+  const handle = await open(path, "r");
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      // Read one byte beyond the limit so growth after the initial stat is
+      // refused rather than silently truncated into a valid-looking payload.
+      const capacity = Math.min(64 * 1024, maxBytes - total + 1);
+      const chunk = Buffer.allocUnsafe(capacity);
+      const { bytesRead } = await handle.read(chunk, 0, capacity, null);
+      if (bytesRead === 0) return Buffer.concat(chunks, total);
+      total += bytesRead;
+      if (total > maxBytes) return undefined;
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Recover a local file when ComfyUI rejects an otherwise valid /view reference
+ * with HTTP 400. Some ComfyUI builds reject basenames containing repeated
+ * periods even though the loader can read the file from disk. This is only a
+ * local, 400-specific fallback; remote and cloud targets must never read this
+ * process's filesystem.
+ */
+async function readLocalViewFallback(
+  filename: string,
+  type: "output" | "input" | "temp",
+  subfolder: string,
+  maxBytes: number = MAX_VIEW_RESPONSE_BYTES,
+): Promise<{ base64: string; mimeType: string } | undefined> {
+  if (isRemoteMode() || isCloudMode()) return undefined;
+
+  try {
+    // Use the same live/argv-aware roots as local filesystem tools. In
+    // particular, input may be redirected with --input-directory and the
+    // configured COMFYUI_PATH may belong to a different installed copy.
+    const root =
+      type === "input"
+        ? await resolveInputDir()
+        : type === "output"
+          ? await resolveOutputDir()
+          : config.comfyuiPath
+            ? resolve(config.comfyuiPath, "temp")
+            : undefined;
+    if (!root) return undefined;
+    const candidate = resolve(root, subfolder, filename);
+    if (!isStrictlyInside(root, candidate)) return undefined;
+
+    // Check the canonical paths too: an input-side symlink must not turn this
+    // compatibility path into an arbitrary local file read.
+    const [realRoot, realCandidate] = await Promise.all([
+      realpath(root),
+      realpath(candidate),
+    ]);
+    if (!isStrictlyInside(realRoot, realCandidate)) return undefined;
+    const candidateStat = await stat(realCandidate);
+    if (!candidateStat.isFile() || candidateStat.size > maxBytes) return undefined;
+    const data = await readLocalViewFileBounded(realCandidate, maxBytes);
+    if (!data) return undefined;
+    return { base64: data.toString("base64"), mimeType: localViewMimeType(filename) };
+  } catch {
+    // Preserve the original /view 400 when the local path cannot be resolved
+    // or read; the fallback must not hide the server's actionable error.
+    return undefined;
+  }
+}
+
+function isViewBadRequest(error: unknown): error is ComfyUIError {
+  if (!(error instanceof ComfyUIError) || error.code !== "VIEW_ERROR") return false;
+  return (
+    typeof error.details === "object" &&
+    error.details !== null &&
+    (error.details as { status?: unknown }).status === 400
+  );
+}
+
+function isViewTooLarge(error: unknown): error is ComfyUIError {
+  return error instanceof ComfyUIError && error.code === "VIEW_TOO_LARGE";
+}
+
+function viewTooLargeForPreview(filename: string, maxBytes: number): ComfyUIError {
+  return new ComfyUIError(
+    `ComfyUI /view response for "${filename}" exceeds the ${maxBytes / 1024 ** 2} MB safety limit, ` +
+      `so it was not loaded into memory and the inline preview (max_preview_dimension) could not be built. ` +
+      `If the file is on this machine, use get_image action:"convert" with its path under the ComfyUI output directory. ` +
+      `The output is still intact on the ComfyUI server — do not re-run the render.`,
+    "VIEW_TOO_LARGE",
+    { filename, maxBytes },
+  );
+}
+
+/**
+ * Media formats get_image can save, identified by magic-byte sniff (#663).
+ * Format — not just family — so a cross-format mislabel (MP3 bytes declared
+ * audio/wav) is rejected even when both byte streams are genuine media.
+ */
+type MediaFormat =
+  | "mp4-video"
+  | "mp4-audio"
+  | "ebml"
+  | "avi"
+  | "wav"
+  | "flac"
+  | "ogg"
+  | "mpegaudio"
+  | "aac";
+
+// EBML magic and MPEG/ADTS frame syncs are only 2–4 bytes — short enough for
+// a truncated error-prefix to satisfy them — so formats with no cheap local
+// structure to validate require a plausible minimum file size instead.
+const MIN_MEDIA_BYTES = 256;
+
+/**
+ * Magic-byte sniff for the video/audio formats get_image can save (#663).
+ * Returns the media FORMAT the payload proves itself to be, or null when it
+ * matches none of them. Each check validates STRUCTURE, not just a leading
+ * signature: MP4/MOV/M4V/M4A need a well-formed "ftyp" box, RIFF containers
+ * (WAV/AVI) a chunk size consistent with the delivered body, FLAC the
+ * mandatory STREAMINFO first block, Ogg a version-0 page header whose
+ * segment table fits inside the body, and ID3 a syncsafe tag size that fits.
+ * A textual junk body (JSON/HTML error page) or a truncated prefix matches
+ * none of these.
+ */
+function sniffMediaFormat(base64: string): MediaFormat | null {
+  // 40 base64 chars decode to the first 30 bytes — enough for the deepest
+  // header below (the 27-byte Ogg page header).
+  const head = Buffer.from(base64.slice(0, 40), "base64");
+  const bodyLength =
+    Math.floor((base64.length * 3) / 4) -
+    (base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0);
+  const ascii = (start: number, end: number) =>
+    head.subarray(start, end).toString("ascii");
+  if (head.length >= 16 && ascii(4, 8) === "ftyp") {
+    // mp4/mov/m4v/m4a — require a well-formed ftyp BOX, not just the four
+    // bytes "ftyp": the box size (big-endian uint32) must cover the header +
+    // major brand + minor version (>= 16) and not exceed the actual body
+    // length, and the major brand must be printable ASCII. An 8-byte
+    // truncated body ending in "ftyp" fails every one of these.
+    const boxSize = head.readUInt32BE(0);
+    const printableBrand = head
+      .subarray(8, 12)
+      .every((b) => b >= 0x20 && b <= 0x7e);
+    if (boxSize >= 16 && boxSize <= bodyLength && printableBrand) {
+      // M4A/M4B are audio-only brands (m4a audio in an mp4 container); the
+      // rest (isom/mp41/mp42/avc1/qt/M4V…) are video.
+      const brand = ascii(8, 12);
+      return brand === "M4A " || brand === "M4B " ? "mp4-audio" : "mp4-video";
+    }
+  }
+  if (head.length >= 4 && head.readUInt32BE(0) === 0x1a45dfa3) {
+    // webm/mkv — EBML magic is only 4 bytes; require a plausible file size.
+    if (bodyLength >= MIN_MEDIA_BYTES) return "ebml";
+  }
+  if (head.length >= 8 && ascii(0, 4) === "fLaC") {
+    // flac — the magic must be followed by the mandatory first metadata
+    // block: a STREAMINFO block header (type 0, length exactly 34).
+    if (
+      (head[4] & 0x7f) === 0 &&
+      head.readUIntBE(5, 3) === 34 &&
+      bodyLength >= 42
+    ) {
+      return "flac";
+    }
+  }
+  if (head.length >= 27 && ascii(0, 4) === "OggS") {
+    // ogg — the page version byte must be 0 and the segment table must fit
+    // inside the body (27-byte page header + page_segments bytes).
+    if (head[4] === 0 && 27 + head[26] <= bodyLength) return "ogg";
+  }
+  if (head.length >= 12 && ascii(0, 4) === "RIFF") {
+    // wav/avi — the RIFF chunk size (file size − 8) must be consistent with
+    // the body actually delivered: at least the 4-byte form type, and never
+    // claiming more bytes than we have (a truncated/fabricated prefix).
+    const riffSize = head.readUInt32LE(4);
+    if (riffSize >= 4 && riffSize + 8 <= bodyLength) {
+      const form = ascii(8, 12);
+      if (form === "WAVE") return "wav";
+      if (form === "AVI ") return "avi";
+    }
+  }
+  if (head.length >= 10 && ascii(0, 3) === "ID3") {
+    // mp3 with an ID3v2 tag — the 4 tag-size bytes must be syncsafe (7-bit)
+    // and the declared tag must fit inside the body; a bare "ID3" prefix
+    // fails both, and the floor rejects a tag with no audio behind it.
+    if (head.subarray(6, 10).every((b) => (b & 0x80) === 0)) {
+      const tagSize =
+        (head[6] << 21) | (head[7] << 14) | (head[8] << 7) | head[9];
+      if (tagSize + 10 <= bodyLength && bodyLength >= MIN_MEDIA_BYTES) {
+        return "mpegaudio";
+      }
+    }
+  }
+  if (head.length >= 2 && head[0] === 0xff && (head[1] & 0xe0) === 0xe0) {
+    // mp3 / aac frame sync — 2 bytes is an error-prefix-sized signature, so
+    // require a plausible file size. ADTS (aac) frames always have the MPEG
+    // layer bits 00; mp3/mp2 frames have them set.
+    if (bodyLength >= MIN_MEDIA_BYTES) {
+      return (head[1] & 0x06) === 0 ? "aac" : "mpegaudio";
+    }
+  }
+  return null;
+}
+
+/**
+ * Declared content-type → the media format its payload must sniff as (#663).
+ * Cross-format mislabels within a family (MP3 bytes labeled audio/wav) are
+ * rejected just like cross-family ones. Unlisted media types fail closed;
+ * application/octet-stream is handled separately and accepts any format.
+ */
+const MEDIA_FORMAT_BY_MIME: Record<string, MediaFormat> = {
+  "video/mp4": "mp4-video",
+  "video/quicktime": "mp4-video",
+  "video/x-m4v": "mp4-video",
+  "video/webm": "ebml",
+  "video/x-matroska": "ebml",
+  "video/x-msvideo": "avi",
+  "video/avi": "avi",
+  "video/msvideo": "avi",
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+  "audio/wave": "wav",
+  "audio/vnd.wave": "wav",
+  "audio/mpeg": "mpegaudio",
+  "audio/mp3": "mpegaudio",
+  "audio/aac": "aac",
+  "audio/x-aac": "aac",
+  "audio/flac": "flac",
+  "audio/x-flac": "flac",
+  "audio/ogg": "ogg",
+  "audio/mp4": "mp4-audio",
+  "audio/x-m4a": "mp4-audio",
+};
+
+/**
+ * Filename extension → the media format its payload must sniff as (#663).
+ * application/octet-stream declares nothing, so the requested FILENAME is the
+ * only remaining claim: a WAV body returned as "clip.mp4" would otherwise be
+ * saved under a video extension it isn't. Unlisted extensions declare nothing
+ * we can check and pass any valid media format (fail-open for exotic-but-real
+ * assets — the bytes still have to prove themselves via the structural sniff).
+ */
+const MEDIA_FORMAT_BY_EXTENSION: Record<string, MediaFormat> = {
+  ".mp4": "mp4-video",
+  ".mov": "mp4-video",
+  ".m4v": "mp4-video",
+  ".m4a": "mp4-audio",
+  ".m4b": "mp4-audio",
+  ".webm": "ebml",
+  ".mkv": "ebml",
+  ".avi": "avi",
+  ".wav": "wav",
+  ".mp3": "mpegaudio",
+  ".aac": "aac",
+  ".flac": "flac",
+  ".ogg": "ogg",
+  ".oga": "ogg",
+};
+
+/** Image extensions claim a still image — never consistent with a sniffed
+ *  video/audio payload (an MP4 saved as clip.png is the same corruption). */
+const IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".bmp",
+  ".tif",
+  ".tiff",
+  ".avif",
+]);
+
+/**
+ * Attachment extensions that get_image may save when ComfyUI serves the file
+ * as an opaque octet-stream (mesh/material) or a ZIP. This is deliberately an
+ * explicit, small allowlist rather than an extension-shaped bypass for the
+ * image-content guard.
+ */
+const ATTACHMENT_EXTENSIONS = new Set([
+  ".obj",
+  ".glb",
+  ".gltf",
+  ".fbx",
+  ".ply",
+  ".stl",
+  ".mtl",
+  ".zip",
+]);
+
+/** MIME labels a ZIP /view may arrive with. Mesh/material still require octet-stream. */
+const ZIP_ATTACHMENT_MIMES = new Set([
+  "application/zip",
+  "application/x-zip-compressed",
+  "application/octet-stream",
+]);
+
+/** Local-file, empty-archive, and spanned ZIP signatures (#2858). */
+function sniffZipMagic(base64: string): boolean {
+  if (base64.length === 0) return false;
+  const head = Buffer.from(base64.slice(0, 8), "base64");
+  if (head.length < 4) return false;
+  return (
+    head[0] === 0x50 &&
+    head[1] === 0x4b &&
+    ((head[2] === 0x03 && head[3] === 0x04) ||
+      (head[2] === 0x05 && head[3] === 0x06) ||
+      (head[2] === 0x07 && head[3] === 0x08))
+  );
+}
+
+/**
+ * The history reconciler needs stronger evidence than an image/* header. Keep
+ * this check bounded: /view already caps the response bytes, and Sharp's input
+ * pixel limit bounds decoding before the result is reduced to one pixel.
+ */
+const HISTORY_IMAGE_MAX_INPUT_PIXELS = 192_000_000;
+const MAX_VIEW_RESPONSE_BASE64_CHARS = Math.ceil((MAX_VIEW_RESPONSE_BYTES / 3)) * 4;
+
+async function hasActualImageContent(base64: string, filename: string): Promise<boolean> {
+  // The transport normally enforces this first, but keep the consumer safe if
+  // another fetch implementation or a test seam hands it an oversized string.
+  if (base64.length === 0 || base64.length > MAX_VIEW_RESPONSE_BASE64_CHARS) return false;
+
+  const loaded = await tryLoadSharp();
+  if (!loaded.ok) {
+    logger.debug("Cannot validate history image content because sharp is unavailable", { filename });
+    return false;
+  }
+
+  try {
+    const bytes = Buffer.from(base64, "base64");
+    if (bytes.length === 0 || bytes.length > MAX_VIEW_RESPONSE_BYTES) return false;
+    const sharpOptions = {
+      limitInputPixels: HISTORY_IMAGE_MAX_INPUT_PIXELS,
+      // The default is warning, but keep the strict untrusted-input setting
+      // explicit: malformed pixel data must not be certified by metadata alone.
+      failOn: "warning" as const,
+    };
+    const metadata = await loaded.sharp(bytes, sharpOptions).metadata();
+    const hasDimensions =
+      typeof metadata.format === "string" &&
+      Number.isInteger(metadata.width) &&
+      metadata.width > 0 &&
+      Number.isInteger(metadata.height) &&
+      metadata.height > 0;
+    if (!hasDimensions) return false;
+
+    // metadata() only inspects headers. Decode and reduce to one pixel so
+    // corrupt compressed data is rejected while the output allocation stays
+    // constant even for a large, valid image.
+    await loaded
+      .sharp(bytes, sharpOptions)
+      .resize({ width: 1, height: 1, fit: "inside", withoutEnlargement: true })
+      .raw()
+      .toBuffer();
+    return true;
+  } catch (error) {
+    logger.debug("History image probe could not decode the /view body", {
+      filename,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
   }
 }
 
 /**
  * Fetch a generated image from ComfyUI via HTTP /view endpoint.
  * Does NOT require COMFYUI_PATH — works with remote ComfyUI instances.
+ *
+ * By default only image/* payloads are accepted. Pass `allowMedia: true` to
+ * also accept video/* and audio/* (e.g. a VHS_VideoCombine .mp4) so the caller
+ * can save them to disk — /view returns raw bytes for any media type. Media
+ * acceptance sniffs the payload's magic bytes instead of trusting the declared
+ * content-type, so a JSON/HTML error body mislabeled as video/mp4 is still
+ * rejected — and genuine media a proxy serves as application/octet-stream
+ * (ComfyUI itself reports video/mp4 via mimetypes) still passes. The sniffed
+ * media format must also match the declared subtype (MP3 bytes labeled
+ * audio/wav are rejected).
  */
 export async function getOutputImage(
   filename: string,
   type: "output" | "input" | "temp" = "output",
   subfolder = "",
+  {
+    allowMedia = false,
+    /**
+     * Accept a known mesh/material or ZIP attachment for get_image (action:"get").
+     * Meshes are served as application/octet-stream with no reliable subtype to
+     * sniff. ZIPs may also be application/zip or application/x-zip-compressed
+     * and must sniff as PK magic. The caller must opt in explicitly and the
+     * requested filename must use the narrow attachment extension allowlist.
+     */
+    allowAttachment = false,
+    /**
+     * Accept a `.json` attachment whose bytes actually PARSE as JSON (#1373).
+     *
+     * A ComfyUI input directory legitimately holds workflow `.json` files, and `get_image`
+     * refused to save them: the reporter's server labelled one `video/json`, which is
+     * neither `image/*` nor a sniffable media format.
+     *
+     * NOT AN ADDITION TO THE ACCEPT LIST. I could not reproduce that header — a stock
+     * ComfyUI 0.31.1 here returns `application/json` for the same request, so `video/json`
+     * comes from something in their stack, and the next install will invent a different
+     * one. Accepting the specific string would fix one machine.
+     *
+     * The declared type is a claim about the payload; parsing is a fact about it. So this
+     * follows the rule the media branch above already applies — bytes must be what they
+     * are said to be — and simply asks the question JSON can answer directly.
+     */
+    allowJson = false,
+    /**
+     * Require an image/* response body to contain decodable image content.
+     * This is intentionally opt-in for the history availability probe; the
+     * ordinary get_image fetch path keeps its existing MIME-based contract.
+     */
+    requireImageContent = false,
+    signal,
+    /**
+     * get_image action:"get" will downscale the inline payload. Raise the
+     * encoded-body ceiling for still images so a 32–64 MB PNG can be previewed
+     * instead of dying as VIEW_TOO_LARGE before max_preview_dimension runs.
+     * Videos/attachments keep the default 32 MB /view cap.
+     */
+    forInlinePreview = false,
+  }: {
+    allowMedia?: boolean;
+    allowAttachment?: boolean;
+    allowJson?: boolean;
+    requireImageContent?: boolean;
+    signal?: AbortSignal;
+    forInlinePreview?: boolean;
+  } = {},
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
-  assertSafeViewRef(filename, subfolder);
-  const result = await fetchImage(filename, type, subfolder);
+  ({ filename, subfolder } = normalizeViewRef(filename, subfolder));
+  const ext = extname(filename).toLowerCase();
+  const maxBytes =
+    forInlinePreview && IMAGE_EXTENSIONS.has(ext) ? MAX_PREVIEW_SOURCE_BYTES : MAX_VIEW_RESPONSE_BYTES;
+  const fetchOpts = {
+    ...(signal ? { signal } : {}),
+    ...(maxBytes !== MAX_VIEW_RESPONSE_BYTES ? { maxBytes } : {}),
+  };
+  let result: { base64: string; mimeType: string };
+  try {
+    result =
+      Object.keys(fetchOpts).length > 0
+        ? await fetchImage(filename, type, subfolder, fetchOpts)
+        : await fetchImage(filename, type, subfolder);
+  } catch (error) {
+    if (isViewTooLarge(error) || isViewBadRequest(error)) {
+      const local = await readLocalViewFallback(filename, type, subfolder, maxBytes);
+      if (local) {
+        result = local;
+      } else if (isViewTooLarge(error)) {
+        throw viewTooLargeForPreview(filename, maxBytes);
+      } else {
+        throw error;
+      }
+    } else {
+      throw error;
+    }
+  }
+
+  // Guard against non-image /view payloads. ComfyUI (or a reverse proxy in
+  // front of it) can answer /view with a 200 whose body is actually a JSON or
+  // HTML error page, or an empty body — this happens most often for `type=input`
+  // refs, where the caller picked a filename/subfolder that doesn't resolve to a
+  // real input file. The old code saved those bytes verbatim as a `.png` and
+  // returned them as an inline image block, so the MCP client then choked trying
+  // to decode them ("Unexpected end of JSON input"). Fail loudly and structured
+  // instead, so get_image surfaces a clean not-found rather than a corrupt image.
+  //
+  // Under allowMedia the same junk body can arrive labeled video/mp4 — the
+  // declared content-type alone is no proof, and get_image would save the junk
+  // bytes as a working .mp4. So media payloads must also SNIFF as media, and
+  // the sniffed FORMAT must match the declared subtype exactly: MP3 bytes
+  // labeled audio/wav are rejected even though both are audio, otherwise the
+  // asset is saved under a corrupt extension. The generic
+  // application/octet-stream label declares no format, so any genuine media
+  // signature passes.
+  const mime = result.mimeType.toLowerCase();
+  const isImage = mime.startsWith("image/");
+  const imageContentOk =
+    !requireImageContent || (isImage && (await hasActualImageContent(result.base64, filename)));
+  const sniffedFormat = allowMedia ? sniffMediaFormat(result.base64) : null;
+  // The sniffed format must satisfy EVERY claim present: the declared
+  // content-type (exact subtype match), and the requested filename's
+  // extension whenever we can classify it — audio/wav bytes requested as
+  // clip.mp4 pass mime↔sniff yet would still land on disk as a corrupt .mp4.
+  const extOk =
+    !IMAGE_EXTENSIONS.has(ext) &&
+    (!MEDIA_FORMAT_BY_EXTENSION[ext] || MEDIA_FORMAT_BY_EXTENSION[ext] === sniffedFormat);
+  const isMedia =
+    sniffedFormat !== null &&
+    extOk &&
+    (mime === "application/octet-stream" ||
+      MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
+  // ComfyUI serves mesh/material outputs as opaque octet-streams. There is no
+  // MIME subtype or universal magic header to validate, so acceptance is gated
+  // by the caller plus the explicit filename allowlist above. ZIP is the
+  // exception: /view often labels it application/zip, so those MIME values are
+  // accepted only with a PK local-file / empty-archive / spanned signature.
+  // This option is used only by get_image (action:"get"); image analysis/
+  // conversion keep the default refusal behavior.
+  const isZipAttachment =
+    ext === ".zip" && ZIP_ATTACHMENT_MIMES.has(mime) && sniffZipMagic(result.base64);
+  const isAttachment =
+    allowAttachment &&
+    ATTACHMENT_EXTENSIONS.has(ext) &&
+    result.base64.length > 0 &&
+    (isZipAttachment || (ext !== ".zip" && mime === "application/octet-stream"));
+  // A `.json` request whose bytes parse as JSON is accepted whatever the server called
+  // them (#1373). Gated on the REQUESTED extension so this can never widen the image or
+  // media paths, and on a successful parse so the rejection this function exists for is
+  // untouched: an HTML error page, a login redirect or a truncated body does not parse and
+  // is still refused. ComfyUI answers 200 with an error body often enough that this check
+  // is the only thing standing between the caller and a corrupt "image".
+  const jsonRefusal = allowJson && ext === ".json" ? jsonAttachmentRefusal(result.base64) : null;
+  const isJson = allowJson && ext === ".json" && jsonRefusal === null;
+  // WHICH REFUSAL THIS IS decides the code, the message and the remedy — see
+  // `jsonAttachmentRefusal`. Byte length was the first attempt at this discriminator and it
+  // got the error-envelope case backwards: a `/view` that answers `{"error":"not found"}`
+  // is the server reporting an ABSENT FILE, and calling that a content refusal sends the
+  // caller to inspect a payload when the filename is the thing to look at.
+  const contentRejected = jsonRefusal?.kind === "content";
+  // An OBJ/ZIP is a real attachment, but it is not an image, supported media,
+  // or JSON attachment that this caller opted to save. Do not send a successful
+  // non-empty response down the missing-file path.
+  const unsupportedAttachmentKind =
+    !allowAttachment &&
+    result.base64.length > 0 &&
+    !isImage &&
+    !isMedia &&
+    !isJson
+      ? ext === ".obj" && mime === "application/octet-stream"
+        ? "OBJ"
+        : isZipAttachment
+          ? "ZIP"
+          : null
+      : null;
+
+  if ((!isImage && !isMedia && !isJson && !isAttachment) || !imageContentOk || result.base64.length === 0) {
+    const where = subfolder ? `${type}/${subfolder}` : type;
+    const received =
+      result.base64.length === 0
+        ? "an empty response"
+        : requireImageContent && isImage && !imageContentOk
+          ? `invalid image content labeled "${result.mimeType}"`
+          : `content-type "${result.mimeType}"`;
+    throw new ComfyUIError(
+      unsupportedAttachmentKind
+        ? `ComfyUI /view returned an existing ${unsupportedAttachmentKind} attachment for "${filename}" (${where}), ` +
+          `but get_image cannot save this type. Nothing was saved. ` +
+          `Use ComfyUI's file browser or another raw-file download path for ${unsupportedAttachmentKind} attachments.`
+        : contentRejected
+        ? // NAME THE ACTUAL REASON (#1373). "The file may not exist" for a body that
+          // arrived and was rejected on its CONTENT sends the caller to re-check a
+          // filename that is perfectly correct — the wrong-cause failure this issue is
+          // about, reproduced by its own fix.
+          `ComfyUI /view returned ${jsonRefusal?.reason}, for "${filename}" (${where}). ` +
+          `Nothing was saved.`
+        : jsonRefusal
+          ? // A MISSING-kind JSON refusal: say what came back AND point at the name, which
+            // is the part the caller can act on.
+            `ComfyUI /view returned ${jsonRefusal.reason}, for "${filename}" (${where}). ` +
+            `Nothing was saved. The file may not exist in the ComfyUI ${type} directory — ` +
+            `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`
+          : `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
+          `got ${received}. ` +
+          `The file may not exist in the ComfyUI ${type} directory — ` +
+          `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
+      // THE CODE HAS TO AGREE WITH THE MESSAGE (codex P2). The message names the real
+      // reason, but a caller that branches on the code — which is the whole point of
+      // having one — still read IMAGE_NOT_FOUND and went off to re-check a filename that
+      // was never wrong. That is the same wrong-cause failure as the prose, one layer
+      // down, and it is the layer that automation reads.
+      unsupportedAttachmentKind
+        ? "ATTACHMENT_TYPE_UNSUPPORTED"
+        : contentRejected
+          ? "ATTACHMENT_CONTENT_REJECTED"
+          : "IMAGE_NOT_FOUND",
+      {
+        filename,
+        type,
+        subfolder,
+        mimeType: result.mimeType,
+        // The reason, structured, so a caller does not have to parse the sentence.
+        // The reason rides along on BOTH kinds — a caller should not have to parse a
+        // sentence to learn the server sent an error envelope rather than nothing at all.
+        ...(jsonRefusal ? { rejectedBecause: jsonRefusal.reason } : {}),
+      },
+    );
+  }
+
   return { ...result, filename };
+}
+
+/**
+ * Byte ceiling for the JSON validation (#1373).
+ *
+ * A workflow is tens to hundreds of kilobytes; ComfyUI's own saves are well under a
+ * megabyte. Parsing is the acceptance test, and parsing means decoding the whole payload
+ * into a string and building an object graph from it — so an enormous body would be paid
+ * for twice in memory before anything could reject it. 32 MB is far above any real
+ * workflow and far below a problem.
+ *
+ * Above the ceiling the answer is REFUSE, not accept-unchecked: a `.json` that large is
+ * not the workflow attachment this path exists to save, and accepting it unverified would
+ * hand back exactly the unvalidated payload the surrounding guard is for.
+ */
+const MAX_JSON_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+
+/** Why a `.json` payload is not savable, and which of the two remedies applies. */
+interface JsonRefusal {
+  kind: "missing" | "content";
+  reason: string;
+}
+
+/**
+ * Why a `.json` payload is not savable, or null when it is (#1373).
+ *
+ * Returns a REASON rather than a boolean so the refusal can say what was actually wrong.
+ * Collapsing "40 MB" and "this is an error envelope" into the generic "the file may not
+ * exist in the ComfyUI input directory" sends the caller to check a filename that is
+ * perfectly correct — which is the same wrong-cause failure this whole issue is about.
+ *
+ * WHAT COUNTS AS AN ERROR ENVELOPE (codex). A top-level `error` key alone was calibrated
+ * wrong in both directions: it missed ComfyUI's other shapes (`node_errors`, `detail`) and
+ * it rejected a legitimate workflow that happens to carry a top-level `error` field. The
+ * test is now "carries an error-ish key AND carries none of the markers a workflow always
+ * has" — so an error body is caught whatever it is called, and a real workflow is kept even
+ * if it has an `error` extension of its own.
+ */
+function jsonAttachmentRefusal(base64: string): JsonRefusal | null {
+  // WHY THE KIND EXISTS (codex round 3). "Nothing was saved" is one outcome with two
+  // different remedies, and the remedy is the whole value of the answer:
+  //
+  //   missing — the server says it has no such file (an error envelope, or nothing at
+  //             all). CHECK THE FILENAME. This is what IMAGE_NOT_FOUND means and what
+  //             #385 added it for.
+  //   content — a body arrived and it is not the attachment: an HTML login page from a
+  //             proxy, a truncated stream, something over the ceiling. Checking the
+  //             filename is useless here; the name was right and the payload was wrong.
+  //
+  // Deciding this on emptiness alone got the error-envelope case backwards: a `/view`
+  // answering `{"error":"not found"}` for a file that is genuinely absent is the server
+  // TELLING us it is absent, and routing that to "the payload was unusable" sends the
+  // caller to inspect content instead of the name.
+  if (base64.length === 0) return { kind: "missing", reason: "an empty response" };
+  // Decoded size from the base64 LENGTH, minus padding, so the ceiling costs nothing to
+  // enforce and does not overestimate a padded payload by a byte or two at the boundary.
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  const approxBytes = Math.floor((base64.length * 3) / 4) - padding;
+  if (approxBytes > MAX_JSON_ATTACHMENT_BYTES) {
+    return {
+      kind: "content",
+      reason:
+        `a ${(approxBytes / 1024 ** 2).toFixed(1)} MB JSON body, over the ` +
+        `${MAX_JSON_ATTACHMENT_BYTES / 1024 ** 2} MB ceiling for a workflow attachment — ` +
+        `parsing it to check it would cost that much again in memory, so it was refused unread`,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+  } catch {
+    return { kind: "content", reason: "a body that is not valid JSON" };
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const rec = parsed as Record<string, unknown>;
+    const errorish = ["error", "node_errors", "detail"].filter((k) => k in rec);
+    const workflowMarkers = ["nodes", "links", "last_node_id", "extra", "prompt", "workflow"];
+    const looksLikeAWorkflow = workflowMarkers.some((k) => k in rec);
+    if (errorish.length > 0 && !looksLikeAWorkflow) {
+      return {
+        // MISSING, not content. The server answered the request by saying it could not
+        // serve it; the actionable fact is the name, not the bytes.
+        kind: "missing",
+        reason:
+          `a JSON ERROR body (it carries "${errorish[0]}" and none of the keys a workflow has), ` +
+          `not the attachment you asked for — saving it would write a failure to disk under ` +
+          `the name of the thing that failed`,
+      };
+    }
+  }
+  return null;
+}
+
+export interface UploadedImageInput {
+  filename: string;
+  subfolder: string;
+  /** Whether a fresh LoadImage option list verified the returned reference. */
+  loaderSelectable: StageLoaderSelectability;
+  /** The requested nested reference, when a host required the root fallback. */
+  requestedFilename?: string;
 }
 
 /**
  * Upload a local image to ComfyUI via HTTP multipart POST.
  * Falls back to HTTP when COMFYUI_PATH is not available (remote ComfyUI).
+ *
+ * The returned `subfolder` is part of the answer, not a detail: when the
+ * requested `filename` carried a path ("minimax_h3/clip.png"), the server
+ * stores the file UNDER that subfolder and the bare `name` does not resolve
+ * in a loader — only `subfolder/name` does (#946). If that qualified name is
+ * stored but `/object_info` does not expose it on LoadImage, the same bytes
+ * are also registered at the input root and the verified root filename is
+ * returned instead (#2498 / same check as action:"stage").
  */
 export async function uploadImageAuto(
   sourcePath: string,
   filename?: string,
-): Promise<{ filename: string }> {
+): Promise<UploadedImageInput> {
   const resolvedFilename = filename ?? basename(sourcePath);
   const ext = extname(resolvedFilename).toLowerCase();
   if (!(ext in IMAGE_MIME)) {
@@ -476,8 +1429,21 @@ export async function uploadImageAuto(
   const data = await nodeReadFile(sourcePath);
   const mimeType = IMAGE_MIME[ext] ?? "application/octet-stream";
   logger.info("Uploading image to ComfyUI via HTTP", { sourcePath, resolvedFilename });
-  const result = await uploadImageHttp(resolvedFilename, data, mimeType);
-  return { filename: result.name };
+  const uploaded = await uploadAndVerifyLoaderReference({
+    kind: "image",
+    targetName: resolvedFilename,
+    data,
+    mimeType,
+    requestedName: resolvedFilename,
+  });
+  return {
+    filename: uploaded.filename,
+    subfolder: uploaded.subfolder,
+    loaderSelectable: uploaded.loaderSelectable,
+    ...(uploaded.requestedFilename
+      ? { requestedFilename: uploaded.requestedFilename }
+      : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +1461,7 @@ const IMAGE_MIME: Record<string, string> = {
   ".gif": "image/gif",
   ".tiff": "image/tiff",
   ".tif": "image/tiff",
+  ".avif": "image/avif",
 };
 
 const VIDEO_MIME: Record<string, string> = {
@@ -536,13 +1503,15 @@ async function uploadMediaHttp(
   filename: string | undefined,
   mimeMap: Record<string, string>,
   kind: "video" | "audio",
-): Promise<{ filename: string }> {
+): Promise<{ filename: string; subfolder: string }> {
   const resolvedFilename = filename ?? basename(sourcePath);
   const mimeType = resolveMediaMime(resolvedFilename, mimeMap, kind);
   const data = await nodeReadFile(sourcePath);
   logger.info(`Uploading ${kind} to ComfyUI via HTTP`, { sourcePath, resolvedFilename });
   const result = await uploadImageHttp(resolvedFilename, data, mimeType);
-  return { filename: result.name };
+  // Same contract as uploadImageAuto: the subfolder travels with the name,
+  // because a subfolder upload's bare name is not a usable loader reference.
+  return { filename: result.name, subfolder: result.subfolder ?? "" };
 }
 
 /** Local filesystem copy of a media file into ComfyUI's input/ (needs COMFYUI_PATH). */
@@ -577,7 +1546,7 @@ export const uploadAudioLocal = (sourcePath: string, filename?: string) =>
   uploadMediaLocal(sourcePath, filename, AUDIO_MIME, "audio");
 
 // ---------------------------------------------------------------------------
-// stage_output_as_input — pipe one pipeline stage's OUTPUT into the next stage's
+// upload_image (action:"stage") — pipe one pipeline stage's OUTPUT into the next stage's
 // loader (LoadImage / VHS_LoadVideo / LoadAudio) the CORRECT way: fetch the bytes
 // from the ComfyUI server (/view) and re-register them as an INPUT via the same
 // /upload/image endpoint the upload_* tools use. Because both legs go through the
@@ -587,6 +1556,213 @@ export const uploadAudioLocal = (sourcePath: string, filename?: string) =>
 // ---------------------------------------------------------------------------
 
 export type MediaKind = "image" | "video" | "audio";
+
+export type StageLoaderSelectability = "verified" | "root-fallback" | "unverified";
+
+/** Combo loaders whose /object_info lists input/ filenames. Path loaders are
+ * STRING filesystem widgets and must not count as combo proof (#2083). */
+const STAGE_LOADER_INPUTS: Readonly<Record<MediaKind, ReadonlyMap<string, ReadonlySet<string>>>> = {
+  image: new Map([
+    ["LoadImage", new Set(["image"])],
+    ["LoadImageMask", new Set(["image"])],
+    ["LoadImageOutput", new Set(["image"])],
+  ]),
+  video: new Map([
+    ["VHS_LoadVideo", new Set(["video"])],
+    ["VHS_LoadVideoFFmpeg", new Set(["video"])],
+  ]),
+  audio: new Map([
+    ["LoadAudio", new Set(["audio"])],
+    ["VHS_LoadAudio", new Set(["audio"])],
+    ["VHS_LoadAudioUpload", new Set(["audio"])],
+  ]),
+};
+
+const VHS_PATH_LOADERS: ReadonlySet<string> = new Set([
+  "VHS_LoadVideoPath",
+  "VHS_LoadVideoFFmpegPath",
+]);
+
+export function comboReferenceOf(staged: {
+  filename: string;
+  subfolder?: string;
+}): string {
+  return staged.subfolder ? `${staged.subfolder}/${staged.filename}` : staged.filename;
+}
+
+/**
+ * Map a staged input onto the widget value a loader actually accepts.
+ * VHS combo loaders take the input/ filename. VHS *Path loaders take a
+ * filesystem path — a combo filename is not a valid path and fails at
+ * panel_run with "Invalid file path" (#2083).
+ */
+export function stagedLoaderWidgetValue(
+  staged: Pick<StagedInput, "filename" | "subfolder" | "pathReference">,
+  classType: string,
+): string | undefined {
+  if (VHS_PATH_LOADERS.has(classType)) return staged.pathReference;
+  return comboReferenceOf(staged);
+}
+
+async function filesystemPathForStaged(result: {
+  name: string;
+  subfolder?: string;
+}): Promise<string | undefined> {
+  try {
+    const inputDir = await getInputDir();
+    const sub = result.subfolder ?? "";
+    return sub ? join(inputDir, sub, result.name) : join(inputDir, result.name);
+  } catch (err) {
+    logger.warn("Could not resolve input dir for staged Path-loader reference", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+async function withVideoPathReference(staged: StagedInput): Promise<StagedInput> {
+  if (staged.kind !== "video") return staged;
+  const pathReference = await filesystemPathForStaged({
+    name: staged.filename,
+    subfolder: staged.subfolder,
+  });
+  return pathReference ? { ...staged, pathReference } : staged;
+}
+
+/** Read every ComfyUI combo shape that can enumerate loader filenames. */
+function comboOptions(spec: unknown): string[] | null {
+  if (!Array.isArray(spec)) return null;
+  if (Array.isArray(spec[0])) {
+    return spec[0].filter((value): value is string => typeof value === "string");
+  }
+  const options = (spec[1] as { options?: unknown } | undefined)?.options;
+  if (!Array.isArray(options)) return null;
+  return options
+    .map((value) =>
+      value && typeof value === "object" && !Array.isArray(value) && "key" in value
+        ? (value as { key?: unknown }).key
+        : value,
+    )
+    .filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Verify the exact input reference against ComfyUI's fresh loader choices.
+ * `null` means the server did not expose a usable loader list, so callers must
+ * not turn an unverified upload into a claim that a widget can select it.
+ */
+function loaderReferenceIsSelectable(
+  objectInfo: ObjectInfo,
+  kind: MediaKind,
+  reference: string,
+): boolean | null {
+  let sawEnumerableList = false;
+  for (const [classType, inputNames] of STAGE_LOADER_INPUTS[kind]) {
+    const def = objectInfo?.[classType];
+    if (!def || typeof def !== "object") continue;
+    for (const inputName of inputNames) {
+      const spec = def.input?.required?.[inputName] ?? def.input?.optional?.[inputName];
+      if (!spec) continue;
+      const options = comboOptions(spec);
+      if (options) sawEnumerableList = true;
+      if (options?.includes(reference)) return true;
+    }
+  }
+  return sawEnumerableList ? false : null;
+}
+
+async function verifyLoaderReference(
+  kind: MediaKind,
+  reference: string,
+): Promise<boolean | null> {
+  try {
+    // The upload changes the server-side file list, not the node definitions.
+    // Invalidate the shared snapshot so this check cannot certify against the
+    // pre-stage /object_info response (#2082).
+    resetObjectInfoCache();
+    return loaderReferenceIsSelectable(await getObjectInfo(), kind, reference);
+  } catch (err) {
+    logger.warn("Could not verify staged input against /object_info", {
+      kind,
+      reference,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+interface LoaderCheckedUpload {
+  filename: string;
+  subfolder: string;
+  type: string;
+  loaderSelectable: StageLoaderSelectability;
+  requestedFilename?: string;
+}
+
+/**
+ * POST the bytes, then refuse to return a nested reference that the live
+ * loader combo does not enumerate. Hosts that store `subfolder/name` but
+ * only list top-level input files get a second, non-overwriting root
+ * upload so the value handed to LoadImage / VHS_LoadVideo is selectable
+ * (#2082, #2498).
+ */
+async function uploadAndVerifyLoaderReference(args: {
+  kind: MediaKind;
+  targetName: string;
+  data: Buffer;
+  mimeType: string;
+  requestedName: string;
+}): Promise<LoaderCheckedUpload> {
+  const nestedRequested =
+    args.requestedName.includes("/") || args.requestedName.includes("\\");
+  const result = await uploadImageHttp(args.targetName, args.data, args.mimeType);
+  const stagedReference = comboReferenceOf({
+    filename: result.name,
+    subfolder: result.subfolder,
+  });
+  const nestedTarget = nestedRequested || Boolean(result.subfolder);
+  const nestedSelectable = await verifyLoaderReference(args.kind, stagedReference);
+  const requestedFilename = nestedRequested
+    ? args.requestedName.replace(/\\/g, "/")
+    : undefined;
+
+  if (nestedTarget && nestedSelectable === false) {
+    // Some ComfyUI builds store a nested upload correctly but do not expose
+    // nested input paths in the loader combo. Re-register the same bytes at the
+    // root so the returned value is actually selectable, rather than claiming
+    // that the nested path works because /upload/image returned 200.
+    const alreadyRoot = !result.subfolder && args.targetName === basename(args.targetName);
+    if (!alreadyRoot) {
+      const rootName = basename(args.targetName);
+      // Never replace an unrelated root file when the host requires this
+      // compatibility fallback. ComfyUI will choose a unique name when the
+      // requested root name already exists, and the returned name is verified
+      // below before being reported as selectable.
+      const rootResult = await uploadImageHttp(rootName, args.data, args.mimeType, false);
+      const rootSelectable = await verifyLoaderReference(
+        args.kind,
+        comboReferenceOf({
+          filename: rootResult.name,
+          subfolder: rootResult.subfolder,
+        }),
+      );
+      return {
+        filename: rootResult.name,
+        subfolder: rootResult.subfolder ?? "",
+        type: rootResult.type,
+        loaderSelectable: rootSelectable === true ? "root-fallback" : "unverified",
+        requestedFilename: requestedFilename ?? stagedReference,
+      };
+    }
+  }
+
+  return {
+    filename: result.name,
+    subfolder: result.subfolder ?? "",
+    type: result.type,
+    loaderSelectable: nestedSelectable === true ? "verified" : "unverified",
+  };
+}
 
 const MIME_BY_KIND: Record<MediaKind, Record<string, string>> = {
   image: IMAGE_MIME,
@@ -620,7 +1796,7 @@ function mimeForKind(filename: string, kind: MediaKind): string {
 }
 
 export interface StageOutputAsInputArgs {
-  /** Filename of the existing output/temp asset (from get_history / list_output_images). */
+  /** Filename of the existing output/temp asset (from get_history / get_image (action:"list_outputs")). */
   filename: string;
   /** Subfolder the asset lives in, if any. */
   subfolder?: string;
@@ -641,6 +1817,12 @@ export interface StagedInput {
   type: string;
   /** Detected/forced media kind. */
   kind: MediaKind;
+  /** Whether a fresh loader option list verified the returned reference. */
+  loaderSelectable: StageLoaderSelectability;
+  /** The requested nested reference, when a host required the root fallback. */
+  requestedFilename?: string;
+  /** Filesystem path for VHS_*Path loaders. Combo filenames are not valid paths. */
+  pathReference?: string;
 }
 
 /**
@@ -649,7 +1831,7 @@ export interface StagedInput {
  *
  * Fetches the bytes from the server via /view (the same path get_image uses) and
  * re-registers them as an input via /upload/image (the same path upload_image /
- * upload_video / upload_audio use). Goes entirely through the server API, so it
+ * upload_image (action:"video") / upload_image (action:"audio") use). Goes entirely through the server API, so it
  * is correct even when ComfyUI runs with a custom input/output directory.
  */
 export async function stageOutputAsInput(
@@ -657,18 +1839,24 @@ export async function stageOutputAsInput(
 ): Promise<StagedInput> {
   const sourceType = args.type ?? "output";
   const kind = args.kind ?? inferMediaKind(args.filename);
-  const targetName = args.asFilename ?? basename(args.filename);
-  const mimeType = mimeForKind(targetName, kind);
+  const requestedName = args.asFilename ?? basename(args.filename);
+  const mimeType = mimeForKind(requestedName, kind);
+  const nestedRequested = requestedName.includes("/") || requestedName.includes("\\");
+  // VHS_LoadVideo combo lists only top-level input/ files. A nested video
+  // as_filename is stored in a subfolder that never appears in that combo, and
+  // VHS_LoadVideoPath then treats the combo filename as a filesystem path
+  // ("Invalid file path"). Stage videos at the input root instead (#2083).
+  const flattenVideoToRoot = kind === "video" && nestedRequested;
+  const targetName = flattenVideoToRoot ? basename(requestedName) : requestedName;
 
   // Fetch the existing asset's bytes via the same /view mechanism the asset
   // tools use (fetchImage handles cloud vs local). Despite the name, /view
   // returns raw bytes for any media type, not just images.
-  const sourceSubfolder = args.subfolder ?? "";
-  assertSafeViewRef(args.filename, sourceSubfolder);
+  const source = normalizeViewRef(args.filename, args.subfolder ?? "");
   const { base64 } = await fetchImage(
-    args.filename,
+    source.filename,
     sourceType,
-    sourceSubfolder,
+    source.subfolder,
   );
   const data = Buffer.from(base64, "base64");
 
@@ -679,11 +1867,30 @@ export async function stageOutputAsInput(
     targetName,
   });
 
-  const result = await uploadImageHttp(targetName, data, mimeType);
-  return {
-    filename: result.name,
-    subfolder: result.subfolder,
-    type: result.type,
+  const uploaded = await uploadAndVerifyLoaderReference({
     kind,
-  };
+    targetName,
+    data,
+    mimeType,
+    requestedName,
+  });
+  const requestedFilename = nestedRequested
+    ? requestedName.replace(/\\/g, "/")
+    : undefined;
+
+  return withVideoPathReference({
+    filename: uploaded.filename,
+    subfolder: uploaded.subfolder,
+    type: uploaded.type,
+    kind,
+    loaderSelectable:
+      flattenVideoToRoot && uploaded.loaderSelectable === "verified"
+        ? "root-fallback"
+        : uploaded.loaderSelectable,
+    ...(uploaded.requestedFilename
+      ? { requestedFilename: uploaded.requestedFilename }
+      : flattenVideoToRoot && requestedFilename
+        ? { requestedFilename }
+        : {}),
+  });
 }

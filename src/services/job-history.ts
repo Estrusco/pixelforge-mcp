@@ -35,6 +35,87 @@ export interface HistoryAnalysis {
 
 export type HistoryStatusMessage = readonly [string, Record<string, unknown>];
 
+/**
+ * Affirmative-success test for a history entry — the ONE eligibility gate both
+ * asset-registration paths (JobWatcher.handleCompletion and the get_image (action:"list_assets")
+ * history reconcile) share, so a run can never become an asset without real
+ * success evidence (#751 codex gate r3).
+ *
+ * It deliberately does NOT trust buildCompletionNotification's derived status:
+ * that derivation defaults to "success" whenever messages carry no well-formed
+ * execution_error/interrupted event, which silently promotes a run ComfyUI
+ * marked status_str:"error" (or any entry with missing/malformed status or
+ * messages) to "success". Here the entry's OWN status_str must affirm success
+ * AND no error/interrupt message may exist; anything short fails toward NOT
+ * registering.
+ */
+export function hasAffirmativeSuccessStatus(entry: HistoryEntry): boolean {
+  if (entry?.status?.status_str !== "success") return false;
+  const messages = normalizeHistoryMessages(entry);
+  return !messages.some(
+    (m) => m[0] === "execution_error" || m[0] === "execution_interrupted",
+  );
+}
+
+/** ComfyUI history timestamps are epoch seconds or milliseconds depending on
+ *  version — infer from magnitude, mirroring durationMs below. */
+function normalizeEpochMs(ts: unknown): number | undefined {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return undefined;
+  if (ts > 1_000_000_000_000) return ts; // epoch ms
+  if (ts > 1_000_000_000) return ts * 1000; // epoch s
+  return undefined;
+}
+
+/**
+ * The run's real completion time (ms epoch), taken ONLY from the
+ * execution_success message — the one truthful completion timestamp recorded
+ * by ComfyUI. execution_start is deliberately not a fallback: it is start
+ * time, and using it would backdate a long render past the TTL / a `since`
+ * boundary and hide it. Values implausibly far in the future (clock skew,
+ * non-epoch garbage) are rejected. Returns undefined when history carries no
+ * trustworthy value — the caller must then use its own truthful observation
+ * time (watched path) or skip the record (reconcile path). Shared by both
+ * asset-registration paths so "real completion time" means the same thing on
+ * each (#751 codex gate r4).
+ */
+export function historyCompletionTimeMs(
+  entry: HistoryEntry,
+  now: number,
+): number | undefined {
+  const success = normalizeHistoryMessages(entry).find(
+    (m) => m[0] === "execution_success",
+  );
+  const ms = normalizeEpochMs(success?.[1]?.timestamp);
+  if (ms === undefined || ms > now + 60_000) return undefined;
+  return ms;
+}
+
+/** Terminal history message: error wins over interrupt, interrupt over success. */
+export function historyTerminalMessage(
+  entry: HistoryEntry,
+): HistoryStatusMessage | undefined {
+  const messages = normalizeHistoryMessages(entry);
+  return (
+    messages.find((m) => m[0] === "execution_error") ??
+    messages.find((m) => m[0] === "execution_interrupted") ??
+    messages.find((m) => m[0] === "execution_success")
+  );
+}
+
+/**
+ * Real finish time from any terminal history message (success, error, or
+ * interrupt). `historyCompletionTimeMs` stays success-only for asset
+ * registration; interrupt/error timing is a display/duration fact (#2512).
+ */
+export function historyTerminalTimeMs(
+  entry: HistoryEntry,
+  now: number,
+): number | undefined {
+  const ms = normalizeEpochMs(historyTerminalMessage(entry)?.[1]?.timestamp);
+  if (ms === undefined || ms > now + 60_000) return undefined;
+  return ms;
+}
+
 const executionErrorSchema = z.object({
   node_id: z.union([z.string(), z.number()]).optional(),
   node_type: z.string().optional(),
@@ -96,9 +177,27 @@ function tracebackText(value: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * #809: a `traceback_truncated: true` boolean next to a traceback that just STOPS is
+ * indistinguishable, to a reader, from a traceback that ended. Mark the cut inline and
+ * say what to do — this cap is FIXED (no parameter raises it), so the remedy is the
+ * tool that holds the untruncated text, not a lever that does not exist.
+ */
 function truncateTraceback(text: string): { text: string; truncated: boolean } {
   if (text.length <= TRACEBACK_MAX_CHARS) return { text, truncated: false };
-  return { text: text.slice(0, TRACEBACK_MAX_CHARS), truncated: true };
+  const dropped = text.length - TRACEBACK_MAX_CHARS;
+  return {
+    // The remedy is deliberately a MAY, not a promise (codex gate): the full text came
+    // from ComfyUI's /history and no tool re-serves it, so claiming get_system_stats (action:"logs") "has" it
+    // would be the same lie as naming a parameter that does not exist. What IS certain:
+    // this is the HEAD, and a Python traceback prints the exception LAST — so the line
+    // that names the failure may be among the cut frames. Say that; it changes what the
+    // reader does next.
+    text:
+      text.slice(0, TRACEBACK_MAX_CHARS) +
+      `\n[... ${dropped} more char(s) cut at the fixed ${TRACEBACK_MAX_CHARS}-char traceback cap — no parameter raises it, and the rest is not retained in this result. This is the HEAD, so the final exception line is likely among the cut frames; get_system_stats (action:"logs") may still hold the full traceback if the run is recent ...]`,
+    truncated: true,
+  };
 }
 
 function isOomError(error: ExecutionErrorDetails): boolean {
@@ -138,10 +237,7 @@ export function extractExecutionStats(
 ): ExecutionStats | undefined {
   const messages = normalizeHistoryMessages(entry);
   const startTs = timestamp(messageData(entry, "execution_start"));
-  const endMsg = messages.find(
-    (m) => m[0] === "execution_success" || m[0] === "execution_error",
-  );
-  const endTs = timestamp(endMsg?.[1]);
+  const endTs = timestamp(historyTerminalMessage(entry)?.[1]);
   const nodes: ExecutionStats["nodes"] = {};
 
   let previousTs = startTs;
@@ -187,7 +283,9 @@ export function extractExecutionStats(
  *
  * Shapes in the wild: `{ text: ["hi"] }` (the common one), `{ text: "hi" }`, and
  * packs that use `string` instead of `text`. Non-string scalars are stringified;
- * empty strings are dropped so a node that emitted nothing stays absent.
+ * empty strings are PRESERVED — a ShowText node that legitimately emitted "" is a
+ * real (present-but-empty) output and must be reported, not silently dropped. A
+ * node with no `text`/`string` field at all still stays absent (nothing pushed).
  */
 export function extractTextOutputs(entry: HistoryEntry): TextOutput[] {
   const results: TextOutput[] = [];
@@ -202,11 +300,11 @@ export function extractTextOutputs(entry: HistoryEntry): TextOutput[] {
     for (const key of ["text", "string"] as const) {
       const value = record[key];
       if (typeof value === "string") {
-        if (value.length > 0) text.push(value);
+        text.push(value);
       } else if (Array.isArray(value)) {
         for (const item of value) {
           if (typeof item === "string") {
-            if (item.length > 0) text.push(item);
+            text.push(item);
           } else if (typeof item === "number" || typeof item === "boolean") {
             text.push(String(item));
           }

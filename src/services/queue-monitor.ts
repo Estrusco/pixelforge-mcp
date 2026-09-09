@@ -28,24 +28,48 @@
 // is simply "inactive" and nothing in the orchestrator changes. It must never
 // throw into the main path.
 
-import WebSocket from "ws";
+import { type RawData } from "ws";
 import { logger } from "../utils/logger.js";
 import { getComfyUIAuthHeaders } from "../config.js";
+import { LoopbackWebSocket } from "../transport/loopback-websocket.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { sameOrigin } from "../utils/origin.js";
 
 interface MonitorState {
   connected: boolean;
   runningPromptId: string | null;
+  // Prompt ids of the PENDING (queued, not yet running) tasks, from GET /queue's
+  // queue_pending. Enables per-item self-attribution: a backlog is only the agent's
+  // own batch when the running job AND every pending job are ids we queued (#559).
+  // Best-effort (poll-derived); empty when the poll hasn't populated it.
+  pendingPromptIds: string[];
   currentNode: string | null;
   progressValue: number | null;
   progressMax: number | null;
   // ComfyUI's status.exec_info.queue_remaining — the total tasks the server still
   // has (running + pending). Last-known value between status frames.
   queueRemaining: number;
+  // Node id → class_type for the RUNNING prompt's graph, captured from the
+  // /queue poll's queue_running entry — the only place this passive client
+  // learns class types on modern ComfyUI (sid-scoped frames never arrive here).
+  // Drives the training exemption in report() (#1652): TrainLoraNode & co. emit
+  // no per-step progress frames, so the hard stall floor would otherwise fire on
+  // EVERY healthy training run past 30 minutes. Empty until the poll captures
+  // the graph; cleared with the run.
+  runningNodeClassTypes: Record<string, string>;
   // Monotonic ms timestamp of the last FORWARD-progress signal (node advanced or
   // progress value ticked up) while a job runs. A stuck step re-emits the same
   // progress value, which must NOT refresh this — that's how we see the stall.
   lastActivityTs: number | null;
+  // LIVENESS heartbeats — the server is alive here (even if a long node emits no
+  // FORWARD progress) when EITHER is fresh (#183):
+  //   lastFrameTs      — any ws frame of any type arrived (server socket alive).
+  //   lastServerAliveTs — a /queue HTTP poll SUCCEEDED (server answered).
+  // A busy, progress-silent node (tiled VAE decode, audio/video sampling, a big
+  // model load) keeps the 1 Hz poll fresh, so it is NOT mistaken for a wedge; a
+  // server that stops answering lets both lapse → a real stall still surfaces.
+  lastFrameTs: number | null;
+  lastServerAliveTs: number | null;
   // The most recent completed run (from the /history tail diff or, on older
   // ComfyUI, the execution_success/error WS events). Sticky: survives idle so a
   // tab that connects late still learns what just finished.
@@ -69,6 +93,15 @@ export interface StallReport {
   /** More than one task in flight (running + pending) — a backlog the agent may
    *  not realize it created by re-queuing behind a slow job. */
   backlog: boolean;
+  /** True when the in-flight work is attributable to THIS session (a prompt id we
+   *  queued, or a very recent self-queue) — a deliberate batch, not a foreign or
+   *  stuck job. The backlog warning is suppressed in that case (#559). */
+  selfAttributed: boolean;
+  /** True when a VISIBLE in-flight prompt id is not one this session queued.
+   *  Extra queueRemaining with no such id is stale accounting, not proof of
+   *  foreign work — the turn note must not claim "this session didn't queue"
+   *  unless this is true (#559 recurrence). */
+  foreignVisible: boolean;
   runningPromptId: string | null;
   currentNode: string | null;
   /** running + pending, from ComfyUI's own queue_remaining. */
@@ -91,17 +124,113 @@ export interface QueueSnapshot {
   progressMax: number | null;
   /** The most recent completed run (sticky; null until one completes). */
   lastCompleted: CompletionEvent | null;
+  /** True when the in-flight work is attributable to THIS session (#559). */
+  selfAttributed: boolean;
+  /** STRICT attribution for the panel_run duplicate fence (#862): true only
+   *  when every visible in-flight prompt id is one this session queued AND the
+   *  reported depth is fully accounted for — the coarse recent-self-queue
+   *  fallback never counts here. */
+  selfAttributedProven: boolean;
+  /** #2684 — ms epoch of the last evidence the monitored ComfyUI answered HERE:
+   *  a successful `/queue` poll (`lastServerAliveTs`) or any decodable ws frame
+   *  (`lastFrameTs`), whichever is newer. null when neither has ever happened.
+   *
+   *  This is the SAME heartbeat `report()` reduces to `serverAlive`, exposed so
+   *  a consumer of `running`/`runningPromptId` can tell a live claim from a
+   *  last-known one. Every other field here is last-known state with no expiry;
+   *  without this there is no way to ask how old that state is, which is how a
+   *  never-confirmed run kept being named as present-tense fact (#2684). */
+  lastServerContactTs: number | null;
+}
+
+/**
+ * `new URL(...).pathname` with trailing slashes stripped, "" when unparseable.
+ * Only ever reached for parseable input — `sameComfyTarget` calls `sameOrigin`
+ * first, which rejects everything `new URL` cannot take.
+ */
+function basePathOf(url: string): string {
+  try {
+    return new URL(url).pathname.replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * True when `next` names the ComfyUI this monitor is already pointed at, differing
+ * only in SPELLING (#1615) — `http://127.0.0.1:8188` and `http://localhost:8188`
+ * are one server, and a panel hello can re-spell the target without moving it.
+ *
+ * The base path is compared separately because it is not part of an origin, and
+ * two ComfyUI can genuinely sit behind one reverse proxy at /comfy-a and /comfy-b
+ * — collapsing those would be a FALSE identity, the mirror of the bug this fixes.
+ * A null previous target never matches: there is no prior server to have owned
+ * anything on.
+ */
+function sameComfyTarget(prev: string | null, next: string): boolean {
+  if (!prev || !sameOrigin(prev, next)) return false;
+  return basePathOf(prev) === basePathOf(next);
 }
 
 const RECONNECT_MS = 5000;
+// How long after a self-queue (panel_run) the in-flight work is still treated as
+// this session's own batch when the running prompt id can't be matched directly
+// (e.g. the panel reply carried no prompt_id). A sweep of a dozen renders at tens
+// of seconds each drains well inside this, so a deliberate batch never trips the
+// backlog warning; a genuinely foreign job appearing long after our last queue
+// still surfaces (#559).
+const SELF_QUEUE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 // /history tail entries fetched per poll. Wide enough that a realistic burst
 // of sub-second runs between 1 Hz polls stays inside the window; when a diff
 // still saturates it (every entry new), we log the potential gap instead of
 // silently claiming coverage.
 const HISTORY_TAIL_ITEMS = 32;
+// Absolute floor of zero-forward-progress time after which a running job is
+// flagged as stalled EVEN when the server still looks alive here — the backstop
+// for a genuine in-node deadlock on a reachable ComfyUI (#183). Far beyond any
+// legitimate single-node NON-training runtime (a long tiled VAE decode / video
+// sample is minutes, not half an hour), so it never trips on a healthy render.
+// Training nodes legitimately exceed it (hours of silent tqdm), which is why
+// report() exempts runs whose graph contains a known trainer class (#1652).
+const HARD_STALL_FLOOR_MS = 30 * 60 * 1000; // 30 minutes
+/**
+ * #2684 — how long the monitored ComfyUI may stay SILENT before a believed
+ * running prompt stops being reported as present-tense fact.
+ *
+ * Keeping the last-known run across a blip is deliberate and right: one timed-out
+ * poll is not proof a render finished, and clearing on it would falsely report an
+ * active job as done. What was wrong is that the belief had no upper bound — when
+ * the monitored target stops answering entirely (`fetchJson` returns null on abort,
+ * timeout or non-2xx, and `applyQueue` then returns before it can clear), nothing
+ * ever downgrades "is running" to "was running, unverified since".
+ *
+ * 30 s is chosen against the two clocks that bound it. Below: the poll runs at
+ * ~1 Hz with a 2.5 s timeout, so 30 s of total silence is ten-plus consecutive
+ * failed polls AND zero ws frames — well past any transient blip. Above: the
+ * default stall threshold is 180 s and the live setting floors at 15 s, so the
+ * busy note downgrades BEFORE `report()` can raise a STALLED notice off the same
+ * lapsed heartbeat. That ordering is the point: the reported session got both
+ * statements at once, one derived from the other's negation.
+ */
+export const RUNNING_UNCONFIRMED_MS = 30_000;
+// Node classes whose HEALTHY runtime legitimately exceeds the hard floor with
+// ZERO forward-progress frames: ComfyUI's built-in LoRA training only rewrites
+// a tqdm bar on stdout — no per-step `progress` WS frames — so lastActivityTs
+// never bumps and idleFor grows monotonically for the whole run (#1652). A
+// 1500-step SDXL LoRA at ~2.6 s/it runs ~65 minutes and crossed the 30-minute
+// floor every single time; the false STALLED note (whose remedy is to CANCEL
+// the run) was structural, not a race. Best-effort list of known trainer
+// classes — deliberately narrow: a class that also appears in ordinary render
+// graphs (e.g. LoraModelLoader) must NOT be added, or common renders would
+// silently lose the deadlock backstop.
+const TRAINING_NODE_CLASS_TYPES = new Set([
+  "TrainLoraNode", // ComfyUI core
+  "TrainLoraNodeAdvanced", // core advanced variant
+  "LoraTrainer", // common community trainer packs
+]);
 
 class QueueMonitorImpl {
-  private ws: WebSocket | null = null;
+  private ws: LoopbackWebSocket | null = null;
   private url: string | null = null;
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -115,11 +244,15 @@ class QueueMonitorImpl {
   private state: MonitorState = {
     connected: false,
     runningPromptId: null,
+    pendingPromptIds: [],
     currentNode: null,
     progressValue: null,
     progressMax: null,
     queueRemaining: 0,
+    runningNodeClassTypes: {},
     lastActivityTs: null,
+    lastFrameTs: null,
+    lastServerAliveTs: null,
     lastCompleted: null,
   };
   // ---- HTTP-poll bookkeeping (the broadcast-safe channel on modern ComfyUI) ----
@@ -141,6 +274,16 @@ class QueueMonitorImpl {
   private completedReported = new Set<string>();
   // Completions not yet drained by the broadcaster. Bounded.
   private pendingCompletions: CompletionEvent[] = [];
+  /** Prompt that just left /queue this poll — record its history even if the
+   *  id was already in the tail (an in-progress row becoming interrupted). */
+  private vanishedPromptId: string | null = null;
+  // ---- self-attribution for the backlog warning (#559) ----
+  // Prompt ids THIS orchestrator queued via panel_run, plus the ms timestamp of
+  // the most recent self-queue. A backlog made entirely of the agent's own recent
+  // jobs is an EXPECTED batch (a sweep/comparison), not evidence of a wedge, so it
+  // must not trigger the destructive cancel-with-clear_pending remedy.
+  private selfQueuedIds = new Set<string>();
+  private lastSelfQueueTs: number | null = null;
 
   /** Open the watchdog WS to ComfyUI. Idempotent per-URL; best-effort (never
    *  throws). A retarget (new URL) or a prior stop() must re-open the socket:
@@ -149,6 +292,13 @@ class QueueMonitorImpl {
    *  NOT early-return — that left the watchdog permanently disconnected. */
   start(comfyuiUrl: string): void {
     if (this.url === comfyuiUrl && !this.stopped) return; // already live on this URL
+    // #1615 — read BEFORE `this.url` is overwritten below, and before our own
+    // stop() (which leaves the url intact). It has to be captured here rather
+    // than checked at the top, because the production retarget path in
+    // orchestrator/index.ts calls QueueMonitor.stop() ITSELF and only then
+    // start(url): by then `this.stopped` is true, so any early-return guarded on
+    // it would never fire on the one path that matters.
+    const respelledSameTarget = sameComfyTarget(this.url, comfyuiUrl);
     this.stop(); // tear down any prior socket/reconnect timer (also on URL change)
     this.url = comfyuiUrl;
     this.stopped = false;
@@ -162,7 +312,28 @@ class QueueMonitorImpl {
     this.historySeen.clear();
     this.completedReported.clear();
     this.pendingCompletions.length = 0;
+    this.vanishedPromptId = null;
     this.state.lastCompleted = null;
+    // Self-queued prompt ids belong to the OLD target — a fresh ComfyUI's jobs are
+    // foreign to us until we queue them, so drop the attribution (#559).
+    //
+    // #1615 — but ONLY when the target actually moved. A panel hello arriving as
+    // `localhost:8188` while we are live on `127.0.0.1:8188` is a retarget by
+    // string and the same server in fact, and clearing here made every render
+    // STILL IN FLIGHT ON IT unattributable. panel_run's duplicate fence keys on
+    // exactly that ledger (`selfAttributedProven`), so it then refused every run
+    // — including a scoped to_node_id preview — until the queue drained. Those
+    // jobs never became foreign; only their spelling changed. Ownership is a
+    // property of the SERVER, so it survives a re-spelling, and a genuine
+    // retarget still drops it.
+    if (!respelledSameTarget) {
+      this.selfQueuedIds.clear();
+      this.lastSelfQueueTs = null;
+    }
+    // Liveness heartbeats belong to the OLD target — reset so a fresh target's
+    // stall clock doesn't inherit a stale "alive" (or a stale "dark") reading.
+    this.state.lastFrameTs = null;
+    this.state.lastServerAliveTs = null;
     this.connect();
   }
 
@@ -203,6 +374,129 @@ class QueueMonitorImpl {
     return this.busy;
   }
 
+  /** Record a prompt THIS orchestrator just queued (panel_run), so the backlog
+   *  warning can tell the agent's own deliberate batch from a foreign or stuck
+   *  job (#559). `promptId` may be null when the panel reply carried none — the
+   *  timestamp alone still marks a recent self-queue. Never throws. */
+  markSelfQueued(promptId?: string | null): void {
+    this.lastSelfQueueTs = Date.now();
+    if (typeof promptId === "string" && promptId) {
+      this.selfQueuedIds.add(promptId);
+      // Bounded FIFO — Set iterates in insertion order, so drop the oldest.
+      while (this.selfQueuedIds.size > 200) {
+        const oldest = this.selfQueuedIds.values().next().value;
+        if (oldest === undefined) break;
+        this.selfQueuedIds.delete(oldest);
+      }
+    }
+  }
+
+  /**
+   * Can a run be attributed to THIS session? (#889)
+   *
+   * Three answers, and the third is the one that was missing. A run-errored
+   * notification used to open "The workflow run **you just queued** ERRORED" as
+   * a fixed template — for a session whose agent had never called panel_run at
+   * all. It then spent a round trip diagnosing a failure it did not cause, which
+   * the wording ("STOP — do not carry on as if it succeeded") made expensive
+   * rather than merely cosmetic: it invites inventing a connection.
+   *
+   *   "mine"     — the id is one we recorded queuing. Proven.
+   *   "not-mine" — this session has queued NOTHING, so it cannot be ours,
+   *                whether or not an id was parsed. Also proven, and it is the
+   *                reported case exactly.
+   *   "unknown"  — we have queued something, but this run carries no id (or an
+   *                unrecognised one). Genuinely undecidable: our own record is
+   *                bounded to the last 200 ids and a panel reply may carry none.
+   *
+   * `unknown` must not collapse into either certainty. Claiming the run is the
+   * agent's repeats this bug; claiming it is not risks telling an agent to
+   * ignore its own failed render.
+   */
+  attributeRun(promptId?: string | null): "mine" | "not-mine" | "unknown" {
+    const id = typeof promptId === "string" ? promptId.trim() : "";
+    if (id && this.selfQueuedIds.has(id)) return "mine";
+    // Nothing queued by this session, ever — including the coarse timestamp,
+    // which is set even when the panel reply carried no id. There is nothing
+    // this session could be the author of.
+    if (this.selfQueuedIds.size === 0 && this.lastSelfQueueTs === null) return "not-mine";
+    return "unknown";
+  }
+
+  /** Prompt ids the monitor can currently SEE (running + poll-derived pending).
+   *  Distinct from queueRemaining, which status frames can leave stale/high. */
+  private inFlightPromptIds(): string[] {
+    const ids: string[] = [];
+    if (this.state.runningPromptId) ids.push(this.state.runningPromptId);
+    ids.push(...this.state.pendingPromptIds);
+    return ids;
+  }
+
+  /** True when the ENTIRE in-flight queue is attributable to this session — i.e.
+   *  every visible prompt (the running one plus every pending one) is an id we
+   *  queued. That is the only safe basis for suppressing the backlog warning: a
+   *  single foreign job (running OR pending) means the queue is NOT purely our own
+   *  batch and the agent should still be told (#559).
+   *
+   *  Precise id-matching is used whenever we have ANY recorded self-queued id AND
+   *  there is at least one identifiable in-flight prompt. Only when we have no ids
+   *  to match against (the panel reply never carried a prompt_id) OR nothing is yet
+   *  identifiable do we fall back to the coarse "did we self-queue very recently"
+   *  heuristic — so a recent self-queue can NOT mask a job whose id we can see is
+   *  not ours.
+   *
+   *  Extra queueRemaining beyond the visible ids is NOT treated as foreign. Status
+   *  frames can leave that counter high after the poll has already listed every
+   *  real job (the #559 recurrence: one self-owned running prompt, pending empty,
+   *  queueRemaining=2). After the 10-minute window the 1 Hz poll has had hundreds
+   *  of chances to name a real extra job; if it hasn't, the extra slot is stale
+   *  accounting. The duplicate fence still uses the strict proven form. */
+  private isSelfAttributed(): boolean {
+    const inFlight = this.inFlightPromptIds();
+    const recentSelfQueue =
+      this.lastSelfQueueTs != null && Date.now() - this.lastSelfQueueTs < SELF_QUEUE_WINDOW_MS;
+
+    if (this.selfQueuedIds.size > 0 && inFlight.length > 0) {
+      // We receive a prompt id for every job we queue, so any VISIBLE in-flight id
+      // that isn't one of ours is definitively a foreign job → not our batch.
+      if (inFlight.some((id) => !this.selfQueuedIds.has(id))) return false;
+      // Every VISIBLE in-flight job is ours. Rapid bursts can leave pending ids
+      // lagging queueRemaining; a long self-owned render can leave queueRemaining
+      // stale-high after the timestamp window. Neither is a foreign job.
+      return true;
+    }
+    // No ids to match against (the panel never surfaced one) or nothing identifiable
+    // in flight yet → fall back to the coarse recent-self-queue timestamp.
+    return recentSelfQueue;
+  }
+
+  /** True when at least one visible in-flight prompt id is not one we queued.
+   *  Empty visibility (depth from status frames only) is unproven, not foreign. */
+  private isForeignVisible(): boolean {
+    return this.inFlightPromptIds().some((id) => !this.selfQueuedIds.has(id));
+  }
+
+  /** The STRICT form of isSelfAttributed, for the panel_run duplicate fence
+   *  (#862): true only when the in-flight work is PROVABLY this session's own —
+   *  every visible in-flight prompt id is one we queued AND the poll has fully
+   *  accounted for the reported depth. The coarse recent-self-queue timestamp
+   *  fallback NEVER proves attribution here: it shows this session queued
+   *  SOMETHING recently, not that the work in flight is it, and a fence that
+   *  refuses a dispatch needs a stronger warrant than a backlog warning does
+   *  (codex gate: under the fallback, an unrelated render appearing inside the
+   *  10-minute window would have sailed past the fence). The cost is deliberate:
+   *  a rapid self-queued burst whose ids the 1 Hz poll has not captured yet, or
+   *  a panel that returned no prompt_id, reads as unproven, and the run is
+   *  refused with the allow_duplicate override named — a false refusal with an
+   *  actionable remedy, never a silent duplicate. */
+  private isSelfAttributedProven(): boolean {
+    const inFlight = this.inFlightPromptIds();
+    if (this.selfQueuedIds.size === 0 || inFlight.length === 0) return false;
+    if (inFlight.some((id) => !this.selfQueuedIds.has(id))) return false;
+    const depth = Math.max(inFlight.length, Math.max(0, this.state.queueRemaining));
+    return inFlight.length >= depth;
+  }
+
   stop(): void {
     this.stopped = true;
     this.pollGeneration++; // strand any in-flight poll's pending responses
@@ -229,13 +523,13 @@ class QueueMonitorImpl {
 
   private connect(): void {
     if (this.stopped) return;
-    let ws: WebSocket;
+    let ws: LoopbackWebSocket;
     try {
       // Ride the same auth as HTTP (COMFYUI_AUTH_* + Cloudflare Access service
       // token) on the WS handshake, so the watchdog reaches a ComfyUI behind a
       // proxy / CF Access. undefined when unauth'd → identical to `new WebSocket(url)`.
       const authHeaders = getComfyUIAuthHeaders();
-      ws = new WebSocket(
+      ws = new LoopbackWebSocket(
         this.wsUrl(),
         Object.keys(authHeaders).length ? { headers: authHeaders } : undefined,
       );
@@ -254,7 +548,7 @@ class QueueMonitorImpl {
       this.state.connected = true;
       logger.debug("[queue-monitor] watchdog WS connected");
     });
-    ws.on("message", (raw: WebSocket.RawData, isBinary: boolean) => {
+    ws.on("message", (raw: RawData, isBinary: boolean) => {
       if (this.ws !== ws) return;
       if (isBinary) return; // preview image frames — ignore
       this.onMessage(raw.toString());
@@ -304,6 +598,7 @@ class QueueMonitorImpl {
     this.state.currentNode = null;
     this.state.progressValue = null;
     this.state.progressMax = null;
+    this.state.runningNodeClassTypes = {};
     this.state.lastActivityTs = null;
   }
 
@@ -314,6 +609,10 @@ class QueueMonitorImpl {
     } catch {
       return;
     }
+    // Any decodable frame proves the server's ws is alive right now — a liveness
+    // heartbeat independent of FORWARD progress, so a long progress-silent node
+    // isn't mistaken for a wedge (#183).
+    this.state.lastFrameTs = Date.now();
     const data = (msg.data ?? {}) as Record<string, unknown>;
     switch (msg.type) {
       case "status": {
@@ -329,6 +628,7 @@ class QueueMonitorImpl {
           // progress frames would otherwise never clear — drain it here.
           if (qr === 0) {
             if (this.state.runningPromptId !== null) this.clearRunning();
+            this.state.pendingPromptIds = []; // fully idle — no pending work
             this.emitEndIfIdle();
           }
         }
@@ -498,18 +798,42 @@ class QueueMonitorImpl {
   private applyQueue(raw: unknown, fetchStart: number): void {
     const q = raw as { queue_running?: unknown; queue_pending?: unknown } | null;
     if (!q || typeof q !== "object") return;
+    // The server answered this /queue poll → it's alive here right now. This is
+    // the heartbeat that keeps a long, progress-silent node (VAE decode, model
+    // load) from being flagged as stalled — and that lapses when the server
+    // stops answering, letting a real stall surface (#183).
+    this.state.lastServerAliveTs = fetchStart;
     const running = Array.isArray(q.queue_running) ? q.queue_running : [];
     const pending = Array.isArray(q.queue_pending) ? q.queue_pending : [];
     this.state.queueRemaining = running.length + pending.length;
+    // queue_pending entries are [number, prompt_id, prompt, extra, outputs] too —
+    // record their ids for per-item self-attribution (#559).
+    this.state.pendingPromptIds = pending
+      .map((entry) => (Array.isArray(entry) && typeof entry[1] === "string" ? entry[1] : null))
+      .filter((id): id is string => id !== null);
     // queue_running entries are [number, prompt_id, prompt, extra, outputs] —
     // the ONLY place a passive observer learns WHICH prompt runs on 0.28.
     const first = running[0];
     if (Array.isArray(first) && typeof first[1] === "string") {
       this.adoptRunningPrompt(first[1]);
+      // Index 2 is the full prompt graph (node id → { class_type, ... }) — the
+      // ONLY place this passive client learns the running run's class types.
+      // Captured so report() can tell a long TRAINING node (no per-step
+      // progress frames by design, #1652) from a wedge.
+      const prompt = first[2];
+      const types: Record<string, string> = {};
+      if (prompt && typeof prompt === "object" && !Array.isArray(prompt)) {
+        for (const [nodeId, def] of Object.entries(prompt as Record<string, unknown>)) {
+          const ct = (def as { class_type?: unknown } | null)?.class_type;
+          if (typeof ct === "string") types[nodeId] = ct;
+        }
+      }
+      this.state.runningNodeClassTypes = types;
     } else if (running.length === 0 && this.state.runningPromptId !== null) {
       // Empty queue → the tracked run is over. Skip the clear if a run was
       // adopted AFTER this fetch began (the response would be stale for it).
       if ((this.state.lastActivityTs ?? 0) <= fetchStart) {
+        this.vanishedPromptId = this.state.runningPromptId;
         this.clearRunning();
         this.emitEndIfIdle();
       }
@@ -533,11 +857,16 @@ class QueueMonitorImpl {
     } | null;
     const st = entry && typeof entry === "object" ? entry.status : undefined;
     const messages = Array.isArray(st?.messages) ? (st.messages as unknown[]) : [];
+    const has = (type: string) => messages.some((m) => Array.isArray(m) && m[0] === type);
     let status: CompletionStatus;
-    if (st?.completed === true || st?.status_str === "success" || st === undefined) {
-      status = "success";
-    } else if (messages.some((m) => Array.isArray(m) && m[0] === "execution_interrupted")) {
+    // Interrupt is terminal even when ComfyUI marks completed:true / status_str
+    // success-or-error — that used to classify a cancel as a successful finish.
+    if (has("execution_interrupted")) {
       status = "interrupted";
+    } else if (has("execution_error") || st?.status_str === "error") {
+      status = "error";
+    } else if (st?.completed === true || st?.status_str === "success" || st === undefined) {
+      status = "success";
     } else {
       status = "error";
     }
@@ -589,6 +918,29 @@ class QueueMonitorImpl {
     }
     for (const e of unseen) this.recordCompletion(e.id, e.status);
     this.historySeen = new Set(ids);
+    // A tracked run that left /queue this tick may already have been in the
+    // tail (in-progress). The unseen diff would miss it; record the terminal
+    // status now so an interrupt is not held until the next prompt (#2512).
+    const vanished = this.vanishedPromptId;
+    this.vanishedPromptId = null;
+    if (vanished && h[vanished] && !this.completedReported.has(vanished)) {
+      const terminal = this.terminalHistoryStatus(h[vanished]);
+      if (terminal) this.recordCompletion(vanished, terminal);
+    }
+  }
+
+  /** Fail-closed: only a proven finish (interrupt / error / completed success). */
+  private terminalHistoryStatus(raw: unknown): CompletionStatus | null {
+    if (!raw || typeof raw !== "object") return null;
+    const st = (raw as { status?: unknown }).status;
+    if (!st || typeof st !== "object") return null;
+    const status = st as { status_str?: unknown; completed?: unknown; messages?: unknown };
+    const messages = Array.isArray(status.messages) ? status.messages : [];
+    const has = (type: string) => messages.some((m) => Array.isArray(m) && m[0] === type);
+    if (has("execution_interrupted")) return "interrupted";
+    if (has("execution_error") || status.status_str === "error") return "error";
+    if (status.completed === true || status.status_str === "success") return "success";
+    return null;
   }
 
   /** Cheap snapshot for backpressure (panel_run) and the live `queue_status`
@@ -603,15 +955,63 @@ class QueueMonitorImpl {
       progressValue: this.state.progressValue,
       progressMax: this.state.progressMax,
       lastCompleted: this.state.lastCompleted,
+      selfAttributed: this.isSelfAttributed(),
+      selfAttributedProven: this.isSelfAttributedProven(),
+      lastServerContactTs: this.lastServerContactTs(),
     };
+  }
+
+  /** #2684 — newest of the two liveness heartbeats, null when the monitored
+   *  server has never answered here. Shared with `report()` so the busy notes
+   *  and the STALLED notice cannot disagree about whether the server is alive. */
+  private lastServerContactTs(): number | null {
+    const ts = Math.max(this.state.lastServerAliveTs ?? 0, this.state.lastFrameTs ?? 0);
+    return ts > 0 ? ts : null;
   }
 
   /** Stall/backlog report for the turn-start injector. */
   report(stallMs: number): StallReport {
     const running = this.state.runningPromptId !== null;
+    const now = Date.now();
     const queueDepth = Math.max(running ? 1 : 0, this.state.queueRemaining);
-    const idleFor = running && this.state.lastActivityTs ? Date.now() - this.state.lastActivityTs : 0;
-    const stalled = running && idleFor >= stallMs;
+    const idleFor = running && this.state.lastActivityTs ? now - this.state.lastActivityTs : 0;
+    // LIVENESS GATE (#183): a legitimately long node emits NO forward progress
+    // for minutes (tiled VAE decode, audio/video sampling, a big model load), so
+    // "no progress for N seconds" alone false-flagged healthy renders. A job is
+    // only stalled when the server has ALSO gone dark HERE — no ws frame and no
+    // successful /queue poll within the window. A reachable ComfyUI keeps the
+    // 1 Hz poll fresh, so a busy decode stays live and is NOT flagged; a server
+    // that stops answering (crashed / event-loop wedged) lets the heartbeat
+    // lapse → a real stall still surfaces.
+    const heartbeatTs = this.lastServerContactTs();
+    const serverAlive = heartbeatTs !== null && now - heartbeatTs < stallMs;
+    // Backstop so a genuine in-node DEADLOCK on a still-reachable server isn't
+    // suppressed FOREVER: after a long hard floor of zero forward progress, flag
+    // regardless of liveness. A real deadlock usually holds Python's GIL, which
+    // also freezes ComfyUI's own HTTP handler → the /queue heartbeat lapses and
+    // `serverAlive` catches it at stallMs without this floor; the floor only
+    // covers the rarer non-GIL wedge (a node stuck in a network/IO wait) that
+    // keeps HTTP alive.
+    //
+    // TRAINING EXEMPTION (#1652): a run whose CURRENT node is a known trainer —
+    // or, when the current node is unknown here (the reported case: attaching
+    // mid-run sees no progress_state transition, so currentNode stays null for
+    // the whole training), whose GRAPH contains one — legitimately sits silent
+    // for HOURS, so the floor must not override liveness for it: while the
+    // server keeps answering, it is not stalled. The tradeoff, stated plainly:
+    // a genuinely wedged trainer on a still-reachable server is no longer
+    // hard-flagged — but a GIL-holding deadlock freezes ComfyUI's HTTP too, and
+    // `serverAlive` catches that at stallMs regardless of node class. When the
+    // graph was never captured (poll never succeeded), nothing is exempt and
+    // the floor applies exactly as before.
+    const types = this.state.runningNodeClassTypes;
+    const currentType = this.state.currentNode !== null ? types[this.state.currentNode] : undefined;
+    const trainingRun =
+      currentType !== undefined
+        ? TRAINING_NODE_CLASS_TYPES.has(currentType)
+        : Object.values(types).some((t) => TRAINING_NODE_CLASS_TYPES.has(t));
+    const hardStalled = running && !trainingRun && idleFor >= Math.max(stallMs, HARD_STALL_FLOOR_MS);
+    const stalled = running && idleFor >= stallMs && (!serverAlive || hardStalled);
     const progress =
       this.state.progressValue !== null && this.state.progressMax !== null
         ? `${this.state.progressValue}/${this.state.progressMax}`
@@ -619,6 +1019,8 @@ class QueueMonitorImpl {
     return {
       stalled,
       backlog: queueDepth > 1,
+      selfAttributed: this.isSelfAttributed(),
+      foreignVisible: this.isForeignVisible(),
       runningPromptId: this.state.runningPromptId,
       currentNode: this.state.currentNode,
       queueDepth,

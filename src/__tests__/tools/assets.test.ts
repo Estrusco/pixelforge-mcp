@@ -5,15 +5,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { AssetRegistry } from "../../services/asset-registry.js";
 
-// enqueueWorkflow/viewAssetImage are ComfyUI-talking seams the regenerate
-// guard test never reaches (it must reject BEFORE either is called), but
-// registerAssetTools() imports them at module load time.
+// enqueueWorkflow is a ComfyUI-talking seam the regenerate guard test never
+// reaches (it must reject BEFORE it is called), but regenerateAction imports
+// it at module load time.
 const enqueueWorkflow = vi.fn();
 vi.mock("../../services/workflow-executor.js", () => ({
   enqueueWorkflow: (...a: unknown[]) => enqueueWorkflow(...a),
-}));
-vi.mock("../../services/view-image.js", () => ({
-  viewAssetImage: vi.fn(),
 }));
 
 type ToolResult = { content: Array<{ type: string; text?: string }>; isError?: boolean };
@@ -29,26 +26,40 @@ function fakeServer(): { server: McpServer; tools: Map<string, ToolHandler> } {
   return { server, tools };
 }
 
-function parse(result: ToolResult): { error?: string; message?: string } {
-  return JSON.parse(result.content[0].text ?? "{}");
+/**
+ * `regenerate` is no longer a standalone tool (0.50.0 slice 16 folded it into
+ * `generate_image (action:"regenerate")`) — the dispatcher wiring is covered by
+ * generate-image.test.ts's mocked `regenerateAction`. This exercises the REAL
+ * function body: the AssetRegistry lookup, the local-asset guard, and the
+ * enqueue call.
+ */
+async function callRegenerate(args: {
+  asset_id: string;
+  overrides?: Record<string, unknown>;
+  disable_random_seed?: boolean;
+}): Promise<ToolResult> {
+  const { regenerateAction } = await import("../../tools/assets.js");
+  try {
+    return await regenerateAction(args);
+  } catch (err) {
+    return { isError: true, content: [{ type: "text", text: (err as Error).message }] };
+  }
 }
 
-async function getRegenerateHandler(): Promise<ToolHandler> {
-  const { registerAssetTools } = await import("../../tools/assets.js");
-  const { server, tools } = fakeServer();
-  registerAssetTools(server);
-  const handler = tools.get("regenerate");
-  if (!handler) throw new Error("regenerate was not registered");
-  return handler;
-}
-
+/**
+ * `get_asset_metadata` is no longer a standalone tool either (folded into
+ * `get_image (action:"asset_metadata")`) — its dispatch is covered by
+ * image-assets.test.ts's mocked AssetRegistry. This exercises the REAL
+ * `saveWorkflowSnapshot` path (fork-specific: pixelforge-mcp-owned, not
+ * upstream's) against the real AssetRegistry and filesystem.
+ */
 async function getAssetMetadataHandler(): Promise<ToolHandler> {
-  const { registerAssetTools } = await import("../../tools/assets.js");
+  const { registerImageManagementTools } = await import("../../tools/image-management.js");
   const { server, tools } = fakeServer();
-  registerAssetTools(server);
-  const handler = tools.get("get_asset_metadata");
-  if (!handler) throw new Error("get_asset_metadata was not registered");
-  return handler;
+  registerImageManagementTools(server);
+  const handler = tools.get("get_image");
+  if (!handler) throw new Error("get_image was not registered");
+  return (args) => handler({ ...args, action: "asset_metadata" });
 }
 
 const scratchRoot = mkdtempSync(join(tmpdir(), "pixelforge-asset-metadata-"));
@@ -61,18 +72,15 @@ describe("regenerate", () => {
 
   it("rejects a locally-registered asset instead of enqueueing an empty workflow", async () => {
     const record = AssetRegistry.registerLocal({ filename: "pixelated_abc123.png" });
-    const handler = await getRegenerateHandler();
-    const result = await handler({ asset_id: record.assetId });
+    const result = await callRegenerate({ asset_id: record.assetId });
 
     expect(result.isError).toBe(true);
-    const body = parse(result);
-    expect(body.message).toContain("not a ComfyUI job");
+    expect(result.content[0].text).toContain("not a ComfyUI job");
     expect(enqueueWorkflow).not.toHaveBeenCalled();
   });
 
   it("reports a clear error for an unknown asset id", async () => {
-    const handler = await getRegenerateHandler();
-    const result = await handler({ asset_id: "a_doesnotexist" });
+    const result = await callRegenerate({ asset_id: "a_doesnotexist" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("No asset found");
     expect(enqueueWorkflow).not.toHaveBeenCalled();
@@ -92,8 +100,7 @@ describe("regenerate", () => {
         },
       ],
     });
-    const handler = await getRegenerateHandler();
-    const result = await handler({ asset_id: record.assetId });
+    const result = await callRegenerate({ asset_id: record.assetId });
     expect(result.isError).toBeFalsy();
     expect(enqueueWorkflow).toHaveBeenCalledTimes(1);
   });

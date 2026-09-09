@@ -6,6 +6,5213 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.202] - 2026-09-07
+
+### MCP
+
+#### Fixed
+- a relaunched ComfyUI preserves UTF-8 stdio on Windows under legacy codepages, including the case-insensitive `PythonUtf8=0` opt-out (#2792).
+- **`panel_reload` now returns a restart command only when this process's launch argv proves it, and otherwise gives launcher-specific fallback guidance (#2890).**
+- **the evidence rides on all THREE surfaces the Desktop verdict drives, not just the refusal (#2784).** The same classification also turns auto-restart supervision OFF ("Auto-restart supervision is only supported for directly spawned Python ComfyUI processes.") and produces "Could not determine ComfyUI Desktop executable path." — which is exactly the branch a NAME-match false positive lands in, since it has no Desktop install and so no exe path to find. Both asserted Desktop with nothing attached to check, and the auto-restart one is the hardest to trace back to a directory name because nothing was refused, a capability just quietly went away. Both now carry the same disclosure, worded for a statement rather than a refusal (the refusal clause says "this refusal is wrong with it" and points at "the arguments below", neither of which is true on these surfaces). The auto-restart message is pinned by a real call through a new test seam, not a source grep.
+
+
+## [0.52.201] - 2026-09-07
+
+### MCP
+
+#### Fixed
+- **npm-installed pi resolution now follows source order and uses the same readiness predicate as launch across explicit executables, `.cmd`, and POSIX shims (#2835, #2838).** This fixes explicit-path precedence, quoted/PATH and dead-UNC handling, `.cmd`-only Windows installs, and npm's POSIX shim format.
+- the empty-toolset notice now requires POSITIVE evidence that a server connected. It skipped servers known degraded or pending and named everything else, but "not degraded" is a different fact from "connected": inspectMcpServers classifies nothing at all when the report is absent or empty, and an unrecognised status is deliberately not an alarm. So one server's tools populating the list could get another server — with no usable status evidence — announced as having CONNECTED and contributed nothing. It now reads the reported status directly. Found by the Copilot review on the PR
+- **a `hello` frame carrying no `comfyui_url` is no longer reported as a dead instance.** The one verdict with no `base` fell through to the shared warning, rendering as `ignoring hello retarget to unreachable undefined (stale tab on a dead instance?)` — asserting a target was named AND found dead, about a frame that claimed neither. Seen 17 times in one report from tabs that were merely churning.
+- **an MCP server that connects and registers NO tools is now reported (#2774).** Once this process has seen ANY namespaced MCP tool -- proof the harness lists them -- a session with NONE reports every configured server, closing the blind spot where a failure that emptied EVERY server looked identical to a harness that does not namespace.
+
+- **`download_model` no longer falsely refuses split code/data model namespaces (#1147, #2906).** Model candidates are compared by resolved physical identity, including case aliases, while preserving fail-closed behavior for genuinely missing or ambiguous roots.
+
+#### Changed
+- ignore root agent scratch and vendored node packs (#2728)
+- stop claiming a panel counterpart that does not exist (#2852)
+
+
+## [0.52.200] - 2026-09-07
+
+### MCP
+
+#### Fixed
+- **`panel_set_widget` writes after `panel_load_workflow` without a manual `panel_set_workflow_target({mode:"current"})` rebind (#2886, #2891).** A successful load left leftover subgraph identity and a stale subgraph registry, so `graph_get_subgraph` could not classify a live H3 container or an ordinary root SaveVideo and refused before dispatch. Load now marks that mapping stale, and a mapping-unknown miss retries the subgraph read once after the walk; still unverifiable stays fail-closed.
+- list_local_models recovers remote inventory from panel object_info when fetch_comfyui_read rejects models/<category> as outside the panel allowlist (#2511, #2793)
+
+## [0.52.199] - 2026-09-05
+
+### MCP
+
+#### Fixed
+
+- **Connected-panel `get_image` fallback stays one `fetch_image` hop after headless `ECONNREFUSED`; it succeeds when the panel fetches `/view` via `fileURL` instead of ComfyUI `fetchApi`'s `/api` prefix (#2884, #2885).** History / system_stats keep `fetchApi` so cloud auth stays intact. Nested `fetchImage` retry and guessed origins stay refused.
+
+## [0.52.198] - 2026-09-05
+
+### MCP
+
+#### Fixed
+
+- **`panel_save_workflow` returns `saved:true` when a matching `late_save_receipts` entry proves the timed-out in-place save completed (#2880, #2881).** After the panel's 13s budget, settle used to also require `modified:false persisted:true` on top-level `active`, which live `workflow_list` does not carry (those flags are on the flagged-active `workflows[]` row). A later `panel_list_workflows` already showed the rid-matched receipt. A current panel with no matching receipt stays OUTCOME UNKNOWN so a retry does not write twice.
+
+
+## [0.52.197] - 2026-09-05
+
+### MCP
+
+#### Fixed
+
+- **`download_model` `action:"status"` does not advertise `install_comfyui action:"refresh_nodes"` when a just-landed file is on disk but not yet listed (#2876, #2877).** That action is not on `install_comfyui`. The note names `panel_refresh_nodes` only when the live panel bundle can run it; a tab behind the installed pack is told to hard-refresh first.
+
+
+## [0.52.196] - 2026-09-04
+
+### MCP
+
+#### Fixed
+
+- **`get_image(action:"get")` connected-panel image relay is one hop: one `fetch_image` after the headless `/view` is unreachable, then one bounded error (#2864, #2870).** An unreachable headless `127.0.0.1:8188` used to wrap `PANEL_FETCH_FAILED` / `MALFORMED_REPLY` until `Maximum call stack size exceeded` while the live panel stayed connected. Nested fallback into `fetchImage` is refused. Published diagnostic origins are still not dialed as `/view` targets.
+
+
+## [0.52.195] - 2026-09-04
+
+### MCP
+
+#### Fixed
+- **`get_history` / `get_system_stats` read the unique proven connected-panel origin+api_base after the headless target is unreachable, instead of only dispatching `fetch_comfyui_read` (#2836, #2867).** On 0.52.193 the named `PANEL_API_BASE_UNAVAILABLE` path still left history/health unavailable while `panel_run` worked: the live tab origin was never contacted, and the panel API object's undefined `api_base` crashed the relay. Mixed or unproven origins stay fail-closed (`PANEL_ORIGIN_UNPROVEN`); a guessed origin is never dialed. Same-origin dead loopback still uses one panel relay; an undefined panel `api_base` remains `PANEL_API_BASE_UNAVAILABLE`.
+
+
+## [0.52.194] - 2026-09-04
+
+### MCP
+
+#### Fixed
+
+- panel_save_subgraph accepts overwrite:true so a user-blueprint name collision can replace in place instead of being rejected as an unrecognized key (#2865, #2866)
+
+
+## [0.52.193] - 2026-09-04
+
+### MCP
+
+#### Fixed
+
+- **`panel_show_media` inlines a remote ComfyUI output through `fetchImage` (the same client `get_image` uses) instead of handing the browser a `/view` that 404s (#2861, #2862).** Local canvas tabs still get a viewRef. A remote/cloud tab that cannot be inlined (MCP 404, non-media, over the 20 MB cap) is refused rather than painted empty. Same-named local workspace files are never substituted (#877/#899).
+
+
+## [0.52.192] - 2026-09-04
+
+### MCP
+
+#### Fixed
+
+- get_image(action:"get") saves an existing ZIP from ComfyUI input/ instead of misreporting IMAGE_NOT_FOUND when /view returned 2xx application/zip. IMAGE_NOT_FOUND stays reserved for a missing or failed /view. (#2858, #2859)
+
+
+## [0.52.191] - 2026-09-04
+
+### MCP
+
+#### Fixed
+- **`panel_set_widget` / other mutations accept named node ids the graph readers print (#2855, #2856).** API-style graphs use string ids (`sampler`, `mac_studio_vlm`). `panel_graph_outline` already returned those; writes refused them at MCP validation (`NODE_ID_PATTERN` was integer / `120:104` only). Named ids stay strings on the wire — they are never `parseInt`'d. `"42px"` is still refused so it cannot become node 42.
+
+
+## [0.52.190] - 2026-09-04
+
+### MCP
+
+#### Fixed
+- **`get_workflow` `action:"strip"` does not Win32-resolve a remote Linux path on the MCP host (#2782, #2811).** Against a remote ComfyUI, an absolute POSIX `path` such as `/mydata/.../models/workflows/example.json` is no longer opened as `C:\mydata\...`. Library-shaped tails (`user/default/workflows`, `user/workflows`, `models/workflows`) are fetched from that server's userdata API; any other remote absolute path is refused instead of a local ENOENT.
+
+## [0.52.189] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **History/completion harvests a ComfyUI media ref under an unrecognised key (`dexter_video`, `nkd_video`) instead of only `images`/`videos`/`video`/`gifs` (#2845, #2847).** SaveVideoDexter emits `{filename, subfolder?, type?}` as a single object (or a one-item array); `buildCompletionNotification` / the panel_run watchdog now collect that one-level shape and classify by extension so completion names the mp4. Nested non-media values stay ignored. Panel v0.15.163 already collects the array form of this shape.
+
+
+## [0.52.188] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **`list_packs` `action:"list_templates"` uses the bound panel's `fetch_comfyui_read` relay when the template-index HTTP origin is unproven, and fails closed with `NO_PANEL_ORIGIN` when that origin stays unproven (#2839, #2843).** Compact `call_tool` listed templates through a loopback-only origin gate even while `panel_graph_outline` had a live bound canvas (`canvas_binding` / `graph_binding` bound). Native panel replies that carry the viewing witness are accepted; a unique published origin that matches the child's configured target may still be listed; mixed or malformed origin sets are not contacted.
+
+
+## [0.52.187] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **`get_history` and `get_system_stats` resolve the connected panel origin and API base before the read fallback, and fail closed with a named error when that origin is unproven (#2836, #2837).** An unreachable headless `127.0.0.1:8188` used to dispatch `fetch_comfyui_read` and then throw `Cannot read properties of undefined (reading api_base)`, which blocked diagnosis of the live-canvas run. The original transport failure is kept; an undefined `api_base` is reported as `PANEL_API_BASE_UNAVAILABLE` rather than a TypeError.
+
+
+## [0.52.186] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **`panel_restart_comfyui` restarts the panel's bound local ComfyUI when that origin is a proven loopback instance on a different port than `COMFYUI_URL` (#1593, #2832).** A live tab whose server-observed Origin is a concrete loopback host (and whose socket arrived on the local listener) is Manager-rebooted even if MCP is still configured for `:8188` while the panel is on `:8189`. The busy guard still applies, a guessed or DNS-ambiguous origin is never restarted, and a relayed tab stays fail-closed.
+
+
+## [0.52.185] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **Manager body-read timeouts fail closed with a named diagnosis instead of a bare `TimeoutError` (#2773, #2827).** After headers arrive, undici still aborts a stalled `Response.text()` on supported Node, but `comfyuiFetch`'s transport rewrite has already returned. `managerFetch` now races both body reads against its own ceiling (without threading a signal into `comfyuiFetch`, which would drop the transport-timeout message) and reports URL, method, and OUTCOME UNKNOWN on a mutation. The `raceAbort` comment no longer claims the fetch signal leaves `Response.text()` pending.
+- **`panel_call_tool` recovers a unique inner panel tool from a self-referential call (#2717, #2826).** `name: "panel_call_tool"` with the real tool on `tool` / `tool_name`, a nested key, or sibling fields unwraps once and runs that tool. Several inner names, a non-object keyed payload, or a nested router still fail closed; the refusal names the inner tool when it is unique. The schema now says `name` is the inner tool, never this router.
+- **`panel_set_widget` accepts a complete promoted-subgraph ownership envelope that omits `truncated:false` (#2783, #2828).** `graph_get_subgraph` already proves completeness when `node_count === nodes.length`; an omitted or null `truncated` flag is then `false`. An asserted `truncated:true`, or a list shorter than `node_count`, stays fail-closed.
+
+
+## [0.52.184] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **`panel_restart_comfyui` restarts the panel's bound remote ComfyUI via Manager instead of refusing it as a foreign local instance (#2804, #2821).** A live tab whose server-observed Origin is a concrete non-loopback host no longer requires `COMFYUI_MCP_FORCE_REMOTE`; the busy guard still applies, a guessed origin is never restarted, and unbound/local identity confirmation is unchanged.
+- **`upload_image` concurrent `action:"stage"` POSTs no longer die as outcome-unknown EPIPE (#2801, #2820).** Uploads to one ComfyUI target run one at a time. A write EPIPE/ECONNRESET is settled against `/view` of the intended input before the tool returns: matching bytes count as committed, a 404 is retried once, and only an unprovable miss stays unknown.
+- **`panel_set_widget` writes the official Qwen Image subgraph prompt from the host input/widget mapping (#2791, #2822).** Live host node 76 lists input label `prompt` on widget `text`, but an incomplete promoted-terminal witness refused the STRING write. The unique host mapping (and `proxyWidgets` inner CLIPTextEncode) now authorizes the enclosing subgraph widget; official subgraphs are not unpacked. Still unverifiable mappings stay fail-closed.
+- **`panel_set_widget` MiniMaxH3Director prompt workaround recommends PrimitiveStringMultiline, not PrimitiveNode (#2790, #2819).** The panel correctly refuses a direct `prompt` / `builder_state` / `timeline_data` write, but its recovery instruction used to name a frontend PrimitiveNode for `external_prompt_overwrite`; `panel_connect` rejects that forceInput-only STRING. The producer advice now shares the same helper as `panel_connect`.
+- **`panel_ui_render` documents the four-Image cap the validator already enforces (#2796, #2818).** The declared manual listed the 64-component ceiling but omitted `maxImages: 4`, so a valid-looking five-image card was rejected as `too many images (5 > 4)` after an avoidable retry.
+
+
+## [0.52.183] - 2026-09-03
+
+### MCP
+#### Fixed
+- **stale `panel-op.lock` is reclaimed automatically when the owner process is gone (#2788, #2814).** Acquire takes the lock after the same proven-dead rename-aside path as `panel_action:"unlock"`; a living owner is never stolen, and an unreadable or reuse-ambiguous record still fails closed.
+- **`get_image` applies `max_preview_dimension` to a PNG that exceeds the 32 MB `/view` cap (#2785, #2815).** A 41.5 MB upscale previously died as `VIEW_TOO_LARGE` before the documented preview downscale ran. Still images requested for inline preview now use a 64 MB encoded-source ceiling (the same bound as `action:"convert"`), recover a local file in that window without an unbounded read, and fail closed with a size error that names convert when the original is still too large.
+- **parallel CivitAI downloads accept a proven shared extra-path `base_path` as `model_root` (#2787, #2813).** Category expansion still lists `E:\models\poses (poses)`, but omitting the configured group `base_path` made concurrent `download_model` `action:"download_civitai"` calls reject that same valid root while siblings wrote into it. Known-root discovery stays request-local, never probes a guessed `:8188` origin, and still refuses an unproven invented path.
+- **manga-director-codex MiniMax H3 adapter accepts documented `text_to_video`.** Native H3 T2V is `MiniMaxH3ImageToVideo` with both image sockets empty; the adapter omitted that mode and compilation refused a valid prompt spec. `text_to_video` is declared; I2V / FL2VA / L2VA / R2V modes are unchanged (#2786, #2812).
+- **`panel_slice_workflow` seeds outputs inside nested overlapping groups (#2780, #2806).** Membership used the first containing box only, so a SaveImage inside both an outer group and a nested inner group was missed when slicing by the inner title. Any matching containing group now seeds, and a miss lists every containing title.
+- panel_search_nodes no longer returns a raw Git URL as an install `id`, and panel_install_node refuses Git URLs before Manager v4 queueing rather than sending an unlisted URL as a registry lookup (#1539, #2795)
+
+
+## [0.52.182] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **`panel_connect` wires an exposed subgraph INT rail to another INT widget input.** A Scene Seed rail that already fed KSampler.seed / FaceDetailer.seed was refused onto LocalWildcardText.seed as "INT is not compatible with INT" because the rail still carried numeric widget constraints as a COMBO-shaped socket type. Those specs are normalized to INT before compatibility; COMBO option lists and distinct concrete types are unchanged (#2778, #2808).
+- **`panel_set_widget` writes ordinary root widgets after a queue-busy refusal without a manual `panel_graph_outline` (#2730, #2807).** A correct queue-busy fence left the panel's subgraph registry stale, so the next idle `graph_set_widget` treated root `UNETLoader` nodes as unverifiable promoted containers. Mapping-unknown now refreshes once (or after the busy refusal clears) and retries the guard; still unverifiable stays fail-closed.
+- **`panel_save_workflow(name)` rebinds the session onto the Save-As dest canvas (#2768, #2805).** After a named save the live instance is dest, but the source tab id can still `canReach`; staying there left `panel_list_workflows` and `panel_set_workflow_target({mode:"current"})` stamped for the replaced instance. Dest is followed when this save replaced the session canvas, and dest's command stamp is refreshed from the save reply.
+- **`list_local_models` `action:"remove"` resolves against the same launch-proven extra-path files as inventory, including ComfyUI Desktop's `extra_models_config.yaml` (#2739, #2803).** Removal previously searched only the Desktop shared models yaml from argv, so a listed LTX file under another active extra root could not be deleted. Desktop extra roots are included only when the connected snapshot already named a Desktop extra-path config — never by probing a guessed :8188 origin — and still fail closed when that file cannot be proven unchanged since launch.
+
+## [0.52.181] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- **`panel_set_widget` creates a documented `lora_N` row on an ordinary Power Lora Loader inside a live subgraph (#2394, #2794).** Current panels flatten parentheses in the `graph_get_subgraph` "is not a subgraph" line, so a live `Power Lora Loader (rgthree)` was reported as `Power Lora Loader rgthree` and the identity-fenced ordinary write refused it as a type change. The two types are compared after that flatten; the write still fences the real unflattened type.
+
+## [0.52.180] - 2026-09-03
+
+### MCP
+
+#### Fixed
+- normalize saved workflow filenames (#2779)
+
+
+## [0.52.179] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- **the UI→API converter no longer shifts widgets past a `forceInput`-only input (#2753, #2755).**
+  A `["STRING", {forceInput: true}]` input is a socket on canvas, so ComfyUI writes no
+  `widgets_values` slot for it; the converter classified it as a widget, consumed the first
+  saved value, and reported every real widget with its neighbour's value — `get_workflow`
+  returned `unet_name` holding `clip_name`'s model, and so on down the row.
+  A workflow saved before ComfyUI's widget/input unification kept a placeholder slot for
+  such an input; that row is indistinguishable from one carrying an extra serialized
+  value, so it is no longer guessed at — it is reported, naming the unmapped values.
+  The deprecated `defaultInput` spelling is honoured the way the frontend migrates it:
+  socket-only on an OPTIONAL input, widget kept on a REQUIRED one.
+- **`apply_manifest` now tracks Manager v4 custom-node enqueues that return an empty success body (#2725, #2749).** Already-enabled packs are satisfied without a duplicate enqueue, and an unverified empty-ack outcome remains pending instead of authorizing a speculative fallback.
+
+- a parked read resumes only for a tab that PROVES it is the one that issued it (#2769)
+- qwen-txt2img examples start 16-channel, matching the official Qwen Image template (#2767)
+- the tunnel/pairing listener reads the handshake Origin it was throwing away (#2766)
+- a 404 on both queue routes is not evidence that ComfyUI-Manager is missing (#2762)
+- a screenshot is a READ — stop calling its timeout a mutation, and give it the bounded read budget (#2760)
+- a pack workflow miss must not advertise the pack it just refused (#2750)
+
+
+## [0.52.178] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- support IPv6-only ComfyUI loopback targets when `COMFYUI_URL` uses `127.0.0.1`, for issue #2719 (#2747)
+
+## [0.52.177] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- **`node_pack` accepts documented pack-relative paths for git operations (#2716).**
+  Paths are now resolved against the selected pack before the existing jail
+  containment checks, so entries such as `preset_core.py` no longer resolve
+  from `custom_nodes/` and get rejected as outside the pack.
+
+## [0.52.176] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- make wan-multitalk workflow runnable (#2702)
+
+
+## [0.52.175] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- get_workflow strip resolves an absolute path under the live ComfyUI userdata/workflows tree without dropping the workflows segment or mangling Unicode dashes (#2528, #2658)
+- panel_run accepts VHS_VideoCombine (and any class with live object_info output_node true) as a run-to-node target instead of refusing it as not an output node (#2529, #2659); recovery preserves scoped batch and cloud targets, and refuses a nested fallback when the panel cannot provide its exact colon-qualified execution path
+
+
+## [0.52.174] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- get_image accepts a get_history filename that includes a relative subfolder prefix (#2526)
+
+## [0.52.173] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- artokun-flow installs the SAM3 checkpoint its REPLACEMENT MODE subgraph requires, saves with VHS_VideoCombine (an OUTPUT_NODE), and honors the requested artokun/comfyui-teskors-utils git origin instead of Manager teskor-hub alias (#2523, #2657)
+- panel restart binds to the dynamic local target instead of a stale fixed origin (#2068, #2737)
+
+## [0.52.172] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- retry graph reads after `panel_open_workflow` when the initial panel response is incomplete (#2286, #2734)
+
+
+## [0.52.171] - 2026-09-02
+
+### MCP
+
+#### Fixed
+- recover full-graph `panel_run` queued-unknown responses from an exact rid-correlated Panel receipt without inferring a foreign queue prompt (#2143, #2732)
+
+
+## [0.52.170] - 2026-09-01
+
+### MCP
+
+#### Fixed
+- keep ingress completion blind-safe (#925)
+- canonicalize completion receipt prompt ids
+- acknowledge uncorrelatable completion frames
+
+
+## [0.52.169] - 2026-09-01
+
+### MCP
+
+#### Fixed
+- list_local_models removal resolves category-relative models from launch-state-proven ComfyUI Desktop shared roots without falling back to stale local roots (#1474)
+
+## [0.52.168] - 2026-09-01
+
+### MCP
+
+#### Fixed
+- resolve train refs from one live snapshot (#2720)
+- a git install must be corroborated on disk, not by ComfyUI-Manager's own list (#2715)
+- settle an unacked workflow_new against the panel's own rid-correlated receipt (#2710)
+- prove a VRAM release landed before reporting the reading as settled (#2708)
+- a PANEL_FETCH_FAILED panel read now names its cause (#2706)
+
+## [0.52.167] - 2026-09-01
+
+### MCP
+
+#### Fixed
+- panel_set_widget reconciles a missing ACK with a graph read-back and mutation receipt instead of leaving an applied subgraph write as outcome-unknown (#2489)
+- bind panel relay to selected tab target (#2656)
+- bind panel fallback relay to target generation
+- keep Unreleased changelog; vocabulary-safe list_assets mentions
+- name PreviewImage temp refs in panel completion events
+
+
+## [0.52.166] - 2026-09-01
+
+### MCP
+
+#### Fixed
+- panel_run(to_node_id) treats the paired random-mode seed-control graph-stamp diff as queue-time volatility rather than a real graph mismatch, while outer WorkerTransport failures remain outcome-unknown and are fenced for control-plane recovery (#2120, #2670)
+- panel-connected apply_manifest adopts the current panel-reported local ComfyUI path when COMFYUI_PATH is unset (#463, #2695)
+
+- handle DaSiWa seed stamp recurrence safely
+- ignore seed-only run-to-node stamp races
+- a promoted write refused by the ownership envelope names the invariant that failed (#2690)
+- terminate a generated API-node prompt with a sink matching its output type (#2687)
+- stop asserting a run the ComfyUI server has not confirmed (#2685)
+- flag an image-edit graph whose sampled canvas is not derived from the reference (#2683)
+- flag a sampler set below full denoise over an empty latent before it renders a flat field (#2682)
+- a loader input naming a file the server does not have says where it looked, and how to fix it (#2679)
+- a Windows updater that cannot reach npm or git says so, and says what to do (#2672)
+
+## [0.52.165] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- panel_set_widget writes promoted unet_name/clip_name and labelled prompt rails on the enclosing subgraph instead of the link-driven inner (#2533, #2667)
+- install_custom_node does not pip-install cloned-node requirements with an untrusted interpreter (Stability Matrix base Python / PEP 668) and does not recommend that same unsafe command (#2530, #2666)
+
+
+## [0.52.164] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- check_runtime does not classify environment-authenticated paid Gemini and WaveSpeed nodes as local/free (#2543, #2665)
+- install_comfyui action:"environment" reports the pip-installed ComfyUI-Manager version from a trusted interpreter instead of a disabled custom_nodes/ComfyUI-Manager checkout (#2538, #2664)
+
+## [0.52.163] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- panel_set_widget writes the enclosing subgraph widget before a link-driven promoted inner (#2500, #2599)
+
+
+## [0.52.162] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- queue action:"status" confirms an idle prompt against /history before calling it done, and does not report a completed run when ComfyUI has no record of it (#2507, #2661)
+
+## [0.52.161] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- get_image list_assets and get_system_stats logs fall back to the connected panel same-origin history/logs/view reads when the configured headless route is unreachable, and panel_run completion events name PreviewImage outputs with type temp (#2283)
+- panel_set_widget does not treat a MiniMaxH3Director duration write as failed when the value landed and only a setting-store onValueChange callback threw (#2545, #2654)
+- panel_connect retries a LiteGraph wildcard-to-wildcard (`*` → `*`) pairing when the panel reports "No input accepts type *" — PrimitiveNode "connect to widget input" can land on LogicIF.when_true / when_false so the primitive becomes typed from the destination (#2542, #2653)
+- panel_query_graph inspects the unsaved live canvas after custom-widget / builder content-only [root-shape-mismatch] instead of recommending a destructive re-open (#2544, #2652)
+- node_pack action:"patch" accepts the documented apply-patch (`*** Begin Patch` / `*** Update File`) format in addition to ---/+++ unified diffs (#2496, #2650)
+- list_packs action:"extract_deps" walks UI subgraph inner nodes and does not treat subgraph instance UUIDs as class types (#2648, #2649)
+
+
+## [0.52.160] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- get_image list_outputs scans the live server's output dir (and /history if that scan is empty) instead of an unrelated COMFYUI_PATH (#2539, #2642)
+- panel_connect refuses a frontend PrimitiveNode wired to a forceInput-only STRING instead of reporting a LiteGraph link that panel_run omits from the prompt (#2536, #2646)
+- panel_run retries once after a "Dynamic widget doesn't exist on node" serializer throw so the first queue after graph edits is not a false failure (#2537, #2643)
+- get_history and panel_run completion journaling fall back to the connected panel's global /history when the headless `/history/<prompt_id>` is unreachable, and queue.status discloses a cached done when that history still cannot be read (#2532, #2644)
+- panel_graph_outline accepts the documented `detail`:"full" argument instead of rejecting it as an unrecognized key (#2541, #2645)
+- panel_set_widget writes a promoted subgraph input on the enclosing host node instead of the link-driven inner widget (#2488, #2583)
+
+## [0.52.159] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- download_model can target a configured extra-model root when the live server is unreachable (#2499, #2600)
+- don't report a queue clear as failed when the queue verifiably holds no pending jobs (#2517, #2594)
+
+
+## [0.52.158] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- panel_open_workflow and a verified pin align turn routing onto the switched canvas so the next origin-less turn does not inherit the previous workflow (#2531, #2638)
+- panel_set_widget settles a missing ACK on a Power Lora lora_N row with a graph read-back instead of reporting outcome-unknown for a row that already landed (#2495, #2597)
+- panel_open_workflow does not report a successful tab switch as an error when only frontend-owned ue_properties / widget representations differ, including a live serialize that omits nested subgraph definitions (#2494, #2596)
+- upload_image action:image returns a LoadImage-selectable root filename when a nested path is stored but not enumerated (#2498, #2595)
+
+## [0.52.157] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- keep a pending panel_set_widget receipt until the frontend settles so a following graph read cannot certify a stale widget value, and retry_of reconciles the exact delivered command after a late reply (#2527, #2639)
+- install_comfyui(action:"update") prunes a stale origin/dev ref-lock once and switches a detached version-tag checkout onto local master/main when update is explicitly requested (#2524, #2637)
+- krea2-identity-edit ships the LoRA widget as a POSIX path so Linux ComfyUI can match the installed file (#2525, #2636)
+- panel_strip_workflow applies live capturedWidgetValues to promoted subgraph widgets instead of stale definition defaults (#2522, #2635)
+- panel_strip_workflow honors a verified pin when capturing the live canvas instead of refusing a stale last-advertised workflow instance (#2487, #2580)
+
+## [0.52.156] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- deliver interrupted run-completions at interrupt time with duration from ComfyUI's execution record, not from the next prompt (#2512, #2629)
+- panel_set_widget does not classify a root widget as promoted after a root-scope graph read, and a successful mode:current rebind clears leftover subgraph identity (#2518, #2632)
+- panel_run does not claim a /prompt left the panel when ComfyUI never logged a prompt; id-less queued_unknown fails closed as not queued (#2521, #2630)
+- panel_set_widget treats a root-scope promoted widget as the authoritative parent rail and suppresses the inner link-driven warning (#2514, #2627)
+- drain an empty-success Git install enqueue before using the verified local clone fallback (#2620, #2625)
+- panel_graph_outline retries once after save when query_graph already reads the same tab instead of refusing a transient instance mismatch (#2483, #2578)
+- uninstall disk verification uses the live ComfyUI Desktop custom_nodes scan root instead of COMFYUI_PATH (#2485, #2577)
+- save allowlisted OBJ attachments through get_image action:"get" (#2623)
+
+## [0.52.155] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- models_show local fallback does not report an arbitrary duplicate basename as the installed model (#2504, #2614)
+
+## [0.52.154] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- get_workflow get/analyze reads an absolute path under the live ComfyUI workspace from disk instead of sending it to /api/userdata/workflows/ (#2506)
+- z-image-turbo-inpainting no longer installs eight unused custom-node packs (#2484)
+- list_local_models reads inventory through the connected panel when the headless /models route is unreachable (#2511)
+- install_custom_node action:"fix" does not report repaired when Manager's task result is not-found/error (#2490)
+- panel_set_widget writes a promoted subgraph input on the enclosing host node instead of the link-driven inner widget (#2488)
+- panel_load_workflow restamps extra.comfyui_mcp.workflow_path (and uuid) to the active tab so an in-place save is not refused as belonging to the source workflow (#2505)
+- fall back to ComfyUI-Manager for install_custom_node action:"list" when the local comfy-cli version is unrecognized (#2603)
+- fence ordinary `panel_set_widget` writes against the current panel graph identity across reconnects, with an actionable rebind refusal (#2550)
+- clear terminal MCP panel refresh coordination state and reclaim only bounded, stale refresh records while keeping unknown completion fail-closed (#2549)
+- save allowlisted OBJ/mesh attachments returned as application/octet-stream through get_image action:"get" (#2540)
+
+
+
+## [0.52.153] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- rebind an imported tmp tab's extra.workflow_uuid to the assigned tab identity and accept panel_open_workflow on the exact tmp: key (#2503)
+- retry panel_connect against the live graph when a node reported by panel_graph_outline is refused as missing (#2502)
+- panel_open_workflow no longer treats frontend-normalized node fields as a failed load after reconnect (#2501)
+- make `resolve_missing` suggest `models/clip_vision/` for missing `CLIPVisionLoader.clip_name` models while keeping ordinary CLIP loaders on `models/text_encoders/` (#2604)
+- classify an existing `application/octet-stream` OBJ returned by `get_image` as an unsupported attachment instead of a missing file (#2608)
+- suppress acknowledged completion replays after reconnect (#2591)
+
+
+## [0.52.152] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- suppress already-acknowledged run-finished replays after panel reconnects while preserving undelivered completion recovery
+- concurrent panel_set_widget calls each settle after frontend acknowledgement instead of hanging the combined tool call (#2559, #2605)
+- panel_set_widget does not refuse an ordinary-root write when the panel connection identity is missing after a successful scope probe (#2551, #2601)
+- persist subgraph viewing scope across panel tool calls so interior mutations do not silently fall back to root (#2553, #2602)
+- use the authenticated connected panel for headless `/object_info` reads when the configured ComfyUI route is unreachable (#2283, #2566)
+
+## [0.52.151] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- panel_get_errors reports unavailable saved LoadImage values instead of reasonless stale flags (#2587, #2592)
+- re-point Save-As routing after pinned tmp: first save (#2419, #2570)
+- map official-template promoted COMBOs via the unique rail-backed inner widget (#2393, #2569)
+- get_image list_outputs lists completed VHS mp4 outputs in ComfyUI temp/ (#2370, #2568)
+- panel_expose_subgraph_input retries Anything Everywhere? wildcard sockets against the live LiteGraph slot array after Convert to Subgraph (#2493, #2590)
+- panel_search_nodes and panel_list_nodes serve host Manager HTTP when the panel's browser Manager request does not complete (#2492, #2589)
+- omit the unexpose reindex warning when removing the final slot (#2491, #2588)
+- map staged videos onto VHS combo and Path widgets (#2083, #2563)
+- list_templates via live panel when origin is unreachable (#2196, #2562)
+- panel_free_vram reports VRAM after CUDA release settles (#2050, #2561)
+- reconcile manifest outcomes across processes (#1129, #2556)
+- treat nested opened.routing_key as unsaved-open proof (#2477, #2560)
+- preserve bridge receiver for #1129 scope settlement (#2585)
+
+## [0.52.150] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- do not re-deliver run completions after a mid-reply interrupt (#2486, #2579)
+- retry the live origin after restart instead of a dead 8188 (#1845, #2573)
+- list configured unet dir instead of assuming diffusion_models on REST 404 (#2480, #2576)
+- recognise ComfyUI Desktop-2 so restart_comfyui stop records a start path (#2482, #2575)
+- panel_set_todo reconciles a missing ACK with a todo read-back and mutation receipt (#2481, #2572)
+- retry graph reads after enter or panel_run (#2395, #2567)
+- harden #619 command probe lookup (#2564)
+- do not refuse promoted writes when the connection fingerprint is missing (#2475)
+
+## [0.52.149] - 2026-08-30
+
+### MCP
+
+#### Fixed
+- graph tools inherit a live bound/current tab after a multi-workflow reconnect instead of requiring a manual rebind (#1001, #2557)
+- rewrite a panel's bare `unknown <cmd>` (and a missing `panel_version`) into the same actionable version-skew error as `Unknown command "…"` (#619, #2555)
+
+#### Changed
+- raise the filing bar, drop the beta reporting bias (#2554)
+
+
+## [0.52.148] - 2026-08-29
+
+### MCP
+
+#### Fixed
+- bound compact identity probes (#2513, #2478)
+- only list history assets fetchable through /view (#2515)
+- fence same-type transient writes
+- fence transient promoted reads
+- omit the unexpose reindex warning when the panel already reindexed (#2474)
+- keep the causal line above a native fault and stop blaming a pass-through node (#2508)
+- direct-clone local git installs when Manager queue is unavailable (#2509)
+- make the Kimi Code backend usable (#2552)
+- reconcile release citations (#2519, #2520)
+
+
+## [0.52.147] - 2026-08-28
+
+### MCP
+
+#### Fixed
+- omit the unexpose reindex warning when the panel already reindexed (#2474)
+- keep the causal line above a native fault and stop blaming a pass-through node (#2508) (#2519) (#2520) (#2478) (#2509) (#2552)
+- rewrite a panel's bare `unknown <cmd>` (and a missing `panel_version`) into the same actionable version-skew error as `Unknown command "…"` (#619)
+
+
+## [0.52.146] - 2026-08-27
+
+### MCP
+
+#### Fixed
+- report live segmented .seg staging instead of withholding progress (#2356, #2471)
+
+
+## [0.52.145] - 2026-08-27
+
+### MCP
+
+#### Fixed
+- a restart confirmation approval is delivered to the pending restart instead of only the next call (#2440)
+- panel_screenshot writes a PNG to a caller-specified save_path/output_path and refuses an existing file unless overwrite is true (#2439)
+- bundled anima-inpaint ships AnimaLLLiteApply_sdscripts so apply_manifest / node install does not miss the kohya-ss node (#2442)
+- create_workflow node_info does not treat a remote /object_info 401 empty body as a missing node pack (#2451)
+
+
+## [0.52.144] - 2026-08-27
+
+### MCP
+
+#### Fixed
+- apply_manifest counts a GGUF as installed when ComfyUI-GGUF lists it under clip_gguf/unet_gguf (#2447)
+- panel_list_nodes lists installed packs from host Manager HTTP when the panel tab is gone (#2459)
+- panel_run queued_unknown names a live-canvas next step instead of an unavailable queue inspector (#2438)
+
+## [0.52.143] - 2026-08-27
+
+### MCP
+
+#### Fixed
+- Ollama names the cause of a 0-tool ready and logs recovery when the surface appears (#2428)
+- disclose unreindexed host links after panel_unexpose_subgraph_input/output (#2437)
+- a blocked repeat tool call returns the earlier payload instead of an error-string-only nudge (#2430)
+- restart_comfyui treats a Manager dependency-reapply exit 0 as a handoff and replays the saved launch once (#2427)
+- panel_set_widget finds the promoted-write scope witness on a scope-bound session after a hello-cleared rebind (#2435)
+
+## [0.52.142] - 2026-08-27
+
+### MCP
+
+#### Fixed
+- compact-mode `list_tools` / `panel_list_tools` enumeration is not a catalog hunt (#2429)
+- Save-As re-points session routing so panel_set_todo and panel_canvas follow the dest tab (#2419)
+- #971 legacy rebind recovers a workflows/ path, and a later canvas move drops the proof (#2415)
+- bound panel_search_nodes at MCP route (#2417)
+- a deferral request that does not qualify says which requirement it missed (#2434)
+
+#### Changed
+- panel_list_nodes says it lists PACKS, and names the tool that finds a node class (#2443)
+
+
+## [0.52.141] - 2026-08-27
+
+### MCP
+
+#### Fixed
+- hoist probeOk out of the temporal dead zone (#2426)
+- a blocked sharp native library stops taking the whole server down, and says what broke (#2423)
+- a patch that changed nothing on disk is no longer reported as applied (#2432)
+- the panel router runs the call when its payload is under `parameters` (#2441)
+
+
+## [0.52.140] - 2026-08-27
+
+### MCP
+
+#### Fixed
+- disclose /models vs /object_info model mismatch (#2421)
+- ComfyUI-Seed-API BytePlus nodes are no longer reported as local/free (#2433)
+- bound ripgrep's printed line at the source so one minified file cannot ENOBUFS the search (#2431)
+- restore fail-closed changelog release guard (#2420)
+- verify the release section, not just generate it (#2412)
+
+
+## [0.52.139] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- fence the definitive-non-subgraph exit, via one shared check (#2410)
+- verify bare workflow aliases before reporting a successful open (#1639), via PR #2408
+- preserve and consume a proven legacy rebind exactly once (#971)
+- fence promoted ordinary fast path after scope probe (#2405)
+- definitive non-subgraph read must tolerate a parenthesised node type (#2402)
+
+#### Changed
+- 0.52.138 ships #2400 but does not list it (#2406)
+- panel_show_media says staging needs a LOCAL ComfyUI (#2404)
+
+
+## [0.52.138] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- retry active panel reads once (#2398)
+- reconcile promoted-widget writes (#2399)
+- a promoted write is judged on its own witness entry, not the whole array (#2400)
+
+
+## [0.52.137] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- pin the relay fetch to literal loopback addresses so localhost works again (#2391)
+
+
+## [0.52.136] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- keep refused panel origins fail-closed instead of falling through to a stale target (#2382, #2387)
+
+## [0.52.135] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- reject localhost relay identity (#2382) (#2385)
+
+#### Changed
+- credit #2378 to 0.52.133, where it shipped, and mark 0.52.134 as a no-op (#2384)
+
+
+## [0.52.134] - 2026-08-26
+
+### MCP
+
+#### Changed
+- no code changes: this release is identical to 0.52.133. The transport-failure classification listed here originally shipped in 0.52.133 (#2378)
+
+## [0.52.133] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- authorize panel template relays only for the exact canonical loopback origin and current target (#2196)
+- classify EventNotificationTransport-wrapped panel send failures and route them through the bounded MCP recovery path (#2378)
+
+## [0.52.132] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- a promoted write blocked by a panel build skew now names an existing compatible panel version (#2366)
+
+## [0.52.131] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- a promoted write blocked by canvas/root divergence relays the panel's own diagnosis (#2374)
+- an empty local output listing states the temp/ blind spot it has (#2372)
+- condition CONTINUE instruction for replayed completions (#2371)
+- guard promoted widget capability and name the version requirement (#2365)
+
+
+## [0.52.130] - 2026-08-26
+
+### MCP
+
+#### Changed
+- fix-2356-reconcile-download-status-with-durable-partial (#2358)
+
+
+## [0.52.129] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- separate wording for identified vs id-less POSSIBLE REPEAT cases (#2362)
+- guard promoted container widget writes (#2323)
+- name the exception when the traceback tail has no colon (rows D and E) (#2359)
+- handle ANSI escape sequences in log pattern matching (#2357)
+
+#### Changed
+- pin generation and witness.localPath clauses in localPathRecovered (#2354)
+
+
+## [0.52.128] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- cover ChatGPT image-history recovery and bounded retry behavior (#2224)
+- recognize ComfyUI health errors and OOMs from the actual log format (#2352)
+
+## [0.52.127] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- prevent recovered completion replays from duplicating agent turns (#2341)
+
+## [0.52.126] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- explain local model-listing refusal when a first-time comfyuiPath recovery occurs (#2338)
+
+## [0.52.125] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- redact all-alphabetic and structured identifier details without over-redacting provider prose (#2313)
+
+## [0.52.124] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- fence local model listings against local/remote target retargets (#2319)
+
+## [0.52.123] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- persist ComfyUI-Manager model downloads on RunPod volumes (#2302)
+
+## [0.52.122] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- preserve panel_run completion receipts across delayed prompts, teardown, and restart (#1824)
+
+## [0.52.121] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- the plugin's first run no longer fails silently: on the cold `npx` path the launcher
+  answers the MCP handshake itself while the ~818 MB install is still running, holds the
+  session with an empty tool list, then announces the real tools via `tools/list_changed`
+  (#1447). Measured cold, a first `initialize` took 21.6 s against a 10 s budget - so the
+  server never registered, ~40 skills still loaded and told the model to call tools that
+  were not there, and the failure read as "the agent is bad" rather than as an install
+  problem. The warm global path is untouched. A rescued handshake reports `serverInfo.version`
+  as `0.0.0-installing` and carries a stand-in `instructions` string until the real server
+  takes over.
+- the merge gate's own probe reads at pinpoint budget rather than the survey cap (#2304)
+
+
+## [0.52.120] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- refuse only proven dynamic-combo STRING sub-widget writes that can revert after verification (#2299)
+
+## [0.52.119] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- forward validated workflow-save subfolders through panel save and Save-As commands (#1794)
+
+## [0.52.118] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- classify semicolon-form panel transport send failures for reload recovery without replaying the turn (#2286)
+
+## [0.52.117] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- use an authenticated connected-panel fallback for headless history, system stats, and logs reads (#2283)
+
+## [0.52.116] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- apply ck_attention launch recommendations only with target-fenced local relaunch proof (#2277)
+
+## [0.52.115] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- reconcile download completion notifications with authoritative target-aware download status (#2057)
+
+## [0.52.114] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- allow panel_set_widget to share an authoritative in-flight object_info refresh before retrying (#2274)
+
+## [0.52.113] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- recover Desktop backends from verified ancestry when the listener is unavailable (#2265)
+
+## [0.52.112] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- resolve connected portable ComfyUI roots safely for git fallback installs (#2261)
+
+## [0.52.111] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- report staged ComfyUI-Manager panel updates instead of false success (#639)
+
+## [0.52.110] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- anchor portable ComfyUI restarts from the live absolute working directory (#2260)
+
+## [0.52.109] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- apply the canonical download cache directory on panel reload (#2255)
+- use portable git checkout arguments for custom-node installs (#2259)
+
+## [0.52.108] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- preserve workflow-list readiness refusals through panel-consumer rehello healing (#1785)
+
+## [0.52.107] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- anchor Windows embedded-python ComfyUI restarts to the observed install root (#2252)
+
+## [0.52.106] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- preserve animated GIF/APNG/WebP media bytes and report unobserved frame advancement (#2248)
+
+## [0.52.105] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- safely re-enable a disabled ComfyUI-Manager pack (#2247)
+
+## [0.52.104] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- keep the persistent panel launcher alive across service-start lock races (#2161)
+
+## [0.52.103] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- extend add-node refresh ACK budget (#2242)
+
+
+## [0.52.102] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- recover stale panel MCP transport safely (#1777)
+
+
+## [0.52.101] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- allow safe deferred widget edits through queue fence (#1716)
+- retry idempotent reads after transport errors (#2233)
+- recover Codex resume active-writer conflicts (#2232)
+
+
+## [0.52.100] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- persist connect orchestrator logs (#2198) (#2228)
+- recover widget schema after combo timeout (#2229)
+- complete large panel_get_errors audits (#2227)
+- route list_templates through connected panel relay (#2196) (#2230)
+
+
+## [0.52.99] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- Accept local input video filenames with repeated periods while preserving live input resolution, containment, and bounded reads (#2194)
+
+## [0.52.98] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Align bundled Krea2 workflows with the current RBG Smart Seed Variance schema (#2193)
+
+## [0.52.97] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Preserve route-bound Panel run receipts across reconnects, remounts, timeouts, batches, and duplicate delivery (#1728)
+- Prevent health diagnostics from recursively suggesting the environment-install path (#2188)
+
+## [0.52.96] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Recover partial Codex MCP catalogs only after explicit `call_tool` availability (#2139)
+
+## [0.52.95] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Respect pinned npx runtime versions (#1675)
+- Accept nested panel media references (#2182)
+
+
+## [0.52.94] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Classify queue status as read-only (#2181)
+
+
+## [0.52.93] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Verify untracked registry installs from disk (#2180)
+
+
+## [0.52.92] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Resolve version-derived nightly refs during comfy-cli installs (#1470)
+
+
+## [0.52.91] - 2026-08-24
+
+### MCP
+
+#### Changed
+- cover authenticated list_packs templates (#2151)
+
+
+## [0.52.90] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- relay get_image through authenticated panel transport (#2189)
+
+
+## [0.52.89] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- explain ignored widget detail caps
+
+
+## [0.52.88] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- classify nodes_search as safe read
+
+
+## [0.52.87] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- preserve queued-unknown panel receipts and known queued prompt IDs without redispatch
+- retain retry guidance when panel run completion is uncertain
+
+## [0.52.86] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- honor configured and Windows system proxies for model downloads
+- keep ComfyUI API traffic direct while routing supported download fetches
+- fail closed for private, loopback, link-local, metadata, and unresolved proxy targets
+
+## [0.52.85] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- honor proven frontend-only UI nodes
+- narrow empty UI conversion refusal
+- refuse empty UI-to-API conversion (#2125)
+
+
+## [0.52.84] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- bound repeated seed stamp retries
+- reject DNS-ambiguous EZi backend targets
+- route EZi proxy restarts to backend
+- reject malformed kitchen dictionaries
+- enforce kitchen backend payload boundaries
+- harden kitchen backend log parsing
+- parse dictionary-shaped kitchen backend logs
+
+
+## [0.52.83] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- reject DNS-ambiguous EZi backend targets
+- route EZi proxy restarts to backend
+- reject malformed kitchen dictionaries
+- enforce kitchen backend payload boundaries
+- harden kitchen backend log parsing
+- parse dictionary-shaped kitchen backend logs
+
+
+## [0.52.82] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- reject malformed kitchen dictionaries
+- enforce kitchen backend payload boundaries
+- harden kitchen backend log parsing
+- parse dictionary-shaped kitchen backend logs
+
+#### Changed
+- release-0.52.81 (#2160)
+
+
+## [0.52.81] - 2026-08-23
+
+### MCP
+
+#### Changed
+- fix/2114 bad request diagnostics (#2159)
+- release-0.52.80 (#2158)
+
+
+## [0.52.80] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- explain bare bad request turns (#2155)
+
+#### Changed
+- fix-mcp-panel-detail-widget-budget (#2157)
+
+
+## [0.52.79] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- explain bare Codex `Bad Request` turns with scrubbed diagnostic context (#2112)
+
+
+## [0.52.78] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- pin manifest install target generation and Manager-only fallback (#463)
+- close manager-only manifest clone gap
+- gate manager queue clone fallback
+- fall back when Manager is proven absent
+
+
+## [0.52.77] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- resolve group titles for panel mutations (#2108), refusing truncated indexes
+
+
+## [0.52.76] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- prevent false-success DaSiWa `stack_data` writes after node replacement (#2107).
+- preserve DaSiWa refusal in promoted retries
+- fence promoted inner widget retries
+- close widget write race fences
+- require expected node type write fence
+- bind stack widget writes to target type
+- fence DaSiWa widget identity before write
+- fail closed on DaSiWa widget identity
+- refuse DaSiWa stack widget writes
+
+
+## [0.52.75] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- reconcile panel workflow-load fetch failures without blind retries (#2106).
+
+## [0.52.74] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- support secure live-reloaded gateway credentials for remote Manager access (#2085).
+
+## [0.52.73] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- normalize text-serialized panel graph rows for `panel_kitchen` (#2109).
+
+
+## [0.52.72] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- align panel install contract with v4
+
+
+## [0.52.71] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- surface failed Manager model tasks
+
+
+## [0.52.70] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- allow the panel git fallback when ComfyUI-Manager is absent (#2096).
+
+
+## [0.52.69] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- `panel_show_media` now accepts audio files through the panel's existing audio card (panel #1572).
+
+## [0.52.68] - 2026-08-23
+
+_No user-facing changes._
+
+
+## [0.52.67] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- resolve local model route consistently (#2089)
+
+
+## [0.52.66] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- surface auth-gated probe failures
+
+
+## [0.52.65] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- validate RunPod readiness JSON
+
+
+## [0.52.64] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- verify staged loader references
+
+
+## [0.52.63] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- a save that persisted is no longer reported as outcome unknown (#2080)
+
+
+## [0.52.62] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- preserve reconnect recovery across MCP context loss
+
+### Fixed
+
+- **`panel_save_workflow` no longer reports OUTCOME UNKNOWN when the in-place save actually persisted (#2078).**
+  The panel's 13s save budget can fire while userdata PUT is still running.
+  #2004 already followed up with one `workflow_list`; if that snapshot was still
+  dirty, the tool returned unknown even though the next `panel_list_workflows`
+  showed `modified:false persisted:true`. After the budget fires it now keeps
+  reading tab state for a short grace and reports `saved:true` with `late_ack`
+  once the same canvas is clean and persisted. A canvas that stays dirty stays
+  outcome-unknown so a retry does not write twice.
+
+## [0.52.61] - 2026-08-22
+
+### Fixed
+
+- **`panel_set_widget` no longer paints a verified write as a degraded schema probe (#2075).**
+  After adding a node, both live schema routes (`api.getNodeDefs()` 1000 ms,
+  `GET /object_info` 500 ms) time out inside the panel's 2000 ms snapshot budget
+  and the write still lands from last-observed schema, with `schema_note` #1223
+  telling the agent ComfyUI went quiet. Sibling panel#1582 skips re-waiting once
+  silence is known; adding a node records a live map and unlatches that skip, so
+  the next write re-probes. A verified last-observed success against an unchanged
+  backend is now returned as a clean write.
+
+### MCP
+
+#### Fixed
+- a verified widget write is no longer reported as a degraded schema probe (#2077)
+
+
+## [0.52.60] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- a stale panel is refused instead of painting audio as a broken image (#2042)
+
+
+## [0.52.59] - 2026-08-22
+
+### Fixed
+
+- **`panel_show_media` refuses a kind a stale panel cannot paint (#2017).** A
+  pre-#710 panel has no audio painter: everything that is not video is drawn
+  with `<img>`, so a `.wav` (as a /view ref today, or as `kind:"audio"` once
+  the allowlist lands) becomes a broken-image card that still reports success.
+  The tool now asserts the panel can render the kind BEFORE dispatch. A hello
+  `show_media_kinds` list is the authority when present; otherwise a parseable
+  advertised version below panel 0.11.43 (the first release that shipped #710)
+  is proof. Missing, inherited, or unparseable versions fail open — same
+  tri-state as the command gate — so a current panel that omitted the field is
+  never told to update. Image and video skip the check. The refusal names the
+  advertised version and the upgrade, and tells the user to hard-refresh; a
+  restart alone leaves cached JS running.
+- **Restart does not report graph tools ready on a transient panel reconnect (#2067).**
+  `panel_restart_comfyui` accepted the first fresh original-tab hello as
+  `graph_tools_ready:true`. That socket can drop a moment later, so the next
+  `panel_get_errors` failed with Connected: none. The reconnect wait now
+  requires the new identity to remain present for a short stability window
+  (same check after conservative rebind) before it reports the tab durable.
+
+### MCP
+
+#### Fixed
+- restart waits for a stable panel reconnect before graph tools are ready (#2067)
+
+### MCP
+
+#### Fixed
+- panel_get_errors answers during concurrent panel reads (#2073)
+- resolve_missing reports unavailable custom-node LoRA combos (#2071)
+- restart waits for a stable panel reconnect before graph tools are ready (#2072)
+
+
+## [0.52.58] - 2026-08-22
+
+### Fixed
+
+- **Codex `panel_*` tools reappear after `panel_restart_comfyui` / a mid-session MCP drop (#1524).**
+  After a forced ComfyUI restart the Codex session resumed with the generic
+  comfyui gateway and no `mcp__panel__*` entries in `ALL_TOOLS`;
+  `tools.mcp__panel__panel_set_todo` then threw `TypeError: … is not a function`.
+  Codex does not auto-reconnect HTTP MCP (stdio `comfyui` is respawned by the
+  client; `panel` is not). The Codex lane now polls `mcpServerStatus/list` at
+  each turn end and reads `runtimeStatus` (cached `tools` do not prove the
+  thread is connected). When `panel` is down, one `config/mcpServer/reload`
+  is queued per down-episode — Codex's only reconnect verb, so a healthy
+  stdio `comfyui` child is bounced with it, between turns. Same bounded
+  recovery #1681 added for Claude. The drop's cause is still open; this is
+  the remaining user-visible half (re-register after the drop).
+
+### MCP
+
+#### Fixed
+- Codex panel_* tools reappear after panel_restart_comfyui (#1524)
+
+### MCP
+
+#### Fixed
+- panel_* tools reappear after panel_restart_comfyui (#2066)
+
+
+## [0.52.57] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- an unroutable show_media names who it is queued for, not whoever hellos next (#2041)
+
+## [0.52.56] - 2026-08-22
+
+### Fixed
+
+- **An unroutable `show_media` no longer reads as a delivery (#2013).**
+  `show_media` is the only command the bridge buffers when it cannot route —
+  a finished render survives a phone being away — and that receipt used to be
+  `{ok: true, mailboxed: true}` for both a concrete tab and a scope address.
+  A scope-keyed box then flushed to the first matching hello, which is how
+  "could not route" silently became "queued for whoever connects next". The
+  receipt now names the recipient when it knows one (`queued_for` is the
+  tab id, `recipient_known: true`) and says `recipient_known: false` /
+  `queued_for: null` when the box is scope-keyed. A flush to a client of the
+  wrong kind (a phone collecting a canvas-produced box, or the reverse) is
+  declined and the box stays queued for a matching reconnect. Untagged
+  (never-seen) boxes still flush to the first hello, which is the original
+  mailbox purpose.
+- **`panel_show_media` inlines a `/view` ref for the tab the frame will actually
+  reach, not for the address the session holds (#2012).** `ctx.tabId` may be a
+  scope (`orchestrator`, `orchestrator::<backend>`), an 8-char prefix, or a
+  migration alias, and `isHeadless(ctx.tabId)` is a lookup miss on every one of
+  those — `conns` is keyed by tab id — answering `false` while the frame lands
+  on a phone. The phone then gets a ComfyUI `/view` URL it cannot fetch. The
+  decision now goes through `resolveClientKind`, which asks `liveTabIdFor` where
+  the frame will land and only inlines for a proven headless destination. An
+  unroutable scope address is its own kind, not a synonym for "not a phone"
+  (`show_media` is the one buffered command; see #2013). A concrete tab that is
+  merely offline is still judged by sticky `isHeadless` — that id names the
+  mailbox recipient.
+
+### MCP
+
+#### Fixed
+- panel_show_media inlines /view refs for a phone reached via a scope address (#2039)
+
+
+## [0.52.55] - 2026-08-22
+
+### Fixed
+
+- **`panel_show_media`'s `/view` probe now asks whether the served family matches the filename (#2011).**
+  The probe exists to predict a card that will render BROKEN, and the panel
+  picks its painter from the ref's filename, never from the body. Asking only
+  "is this media" flagged `take.wav` serving `audio/wav` (a file the panel
+  paints into an `<audio>` card fine) and silently blessed `take.wav` serving
+  `image/png` (an `<audio>` card pointed at image bytes). Widening the old
+  image-or-video test to accept `audio/*` would have swapped the false alarm
+  for a false clearance of `plate.png` serving `audio/wav`. The probe now
+  compares families.
+
+### MCP
+
+#### Added
+- kitchen and panel_kitchen report what this GPU can run (#2029)
+
+#### Fixed
+- the /view probe flags a filename/body family mismatch, not a non-media body (#2038)
+- restore graph binding after restart when the active workflow record arrives late (#2062)
+- download tray no longer announces FAILED while status still shows the transfer streaming (#2061)
+- a long self-queued render is no longer called foreign backlog (#2060)
+
+## [0.52.54] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- stamp a download continuation with the live canvas, not the previous workflow (#2056)
+
+
+## [0.52.53] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- a boot that starts listening during the reconnect wait is reported server_ready (#2054)
+
+
+## [0.52.52] - 2026-08-21
+
+### Fixed
+
+- **`node_pack` scaffolds into the custom_nodes directory the running ComfyUI
+  actually scans on a split install (#2031).** Without `--base-directory`,
+  `folder_paths` loads packs from the `main.py` checkout, not from the data
+  workspace `COMFYUI_PATH` / `workspace_path` names. Scaffold was writing under
+  the workspace; after restart the class was missing from `/object_info`.
+  Authoring (scaffold / write / read / patch / git / verify / publish-by-name)
+  now shares one scan-root resolver: `--base-directory` when the runtime reports
+  one (Desktop, #1770), else the live checkout.
+
+### MCP
+
+#### Fixed
+- report settled clear_vram readings honestly
+- scaffold node packs into ComfyUI scanned roots
+- make RunPod tunnel and origin advertisements reachable
+- keep panel schema readiness honest after object_info timeouts
+
+
+## [0.52.51] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- the panel_* argument an agent guesses first is the one that works (#1985)
+
+
+## [0.52.50] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- first code-mode call survives a stale WinGet Node host path (#2046)
+
+
+## [0.52.49] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- refresh retry completion fence
+- retain and fence fast completion arms
+- retain fast render completions before ticketing
+- keep audit completion on rebound route
+- require workflow identity for completion
+- refuse opaque root graph completion
+
+
+## [0.52.48] - 2026-08-21
+
+### Fixed
+
+- **Bridge port 9180 collides with Logitech G HUB — default is now 9199 (#2030).**
+  `lghub_agent` already listens on `127.0.0.1:9180` on most gaming and creator
+  desktops, and the reclaim path offered to `taskkill /T /F` it as an "orphaned
+  session". A holder that does not speak the panel protocol is never prompted,
+  never killed, and never swept: the message names the process as not
+  comfyui-mcp and points at `COMFYUI_MCP_BRIDGE_PORT` (or the new default).
+  Fresh launches bind **9199** (panel HTTP-MCP 9198, pairing 9197, console 9196,
+  tunnel 9195 — counting *down* so 9200/Elasticsearch is never in the block).
+  A live 9180 session keeps 9180 across auto-update / self-restart: the child
+  inherits `COMFYUI_MCP_BRIDGE_PORT=<bound port>`, and an unpinned self-restart
+  from a pre-pin build stays on 9180 so the bind-retry still rides the parent's
+  release. A hand-set `COMFYUI_MCP_BRIDGE_PORT=9180` is a pin and is never
+  moved. 9180-era pairing on 9182 still answers. The orchestrator advertises
+  `ws://127.0.0.1:<bound-port>` on `advertise_bridge` so the panel can follow
+  (companion: [comfyui-mcp-panel#1596](https://github.com/artokun/comfyui-mcp-panel/issues/1596)).
+
+### MCP
+
+#### Fixed
+- target tunnels at the bound host (#2023) (#2036)
+- recover subgraph widget write scope (#2037)
+- default the panel bridge to 9199 and never kill a foreign holder (#2034)
+
+## [0.52.47] - 2026-08-21
+
+### Fixed
+
+- **`panel_get_errors` no longer presents a clean `errored_count: 0` while most of
+  the graph is unjudged (#1973).** On a 77-node workflow the panel's live combo scan
+  ran out of its shared server-call budget and abstained on 40 nodes — sampler,
+  decoders, assembler, final SaveVideo — yet the reply still led with
+  `errored_count: 0` and "no errors recorded since the last execution start", which
+  reads as a finished clean audit. The reply now LEADS with `audit_complete`,
+  `checked_count` and `unchecked_count`, and nodes the scan skipped for budget are
+  re-checked from one batched `graph_get_object_info` plus a targeted `graph_query`
+  rather than one server call per node. Completeness is judged from the abstention
+  LIST, not from the `unchecked_budget_exhausted` flag: the panel abstains for five
+  reasons and only two raise that flag, so a scan stopped by the file-probe cap
+  produced the same false-clean payload with no flag at all. The completion pass
+  abstains rather than guessing wherever the panel's own scanner would have —
+  notably on UPLOAD inputs, whose values ComfyUI's combo list structurally cannot
+  enumerate and which it has no `/view` probe to adjudicate.
+
+### MCP
+
+#### Fixed
+- panel_get_errors no longer reports a clean 0 while execution nodes stay unchecked (#1981)
+- uncollapse expands a title-chip; schema and save timeouts are named honestly (#2027)
+- panel_add_node names the live ConvertAny2Dict sibling instead of a missing-DICT dead end (#2026)
+- restart_comfyui reports a serving server as ready, not a failed start (#2025)
+
+
+## [0.52.46] - 2026-08-21
+
+### Fixed
+
+- **`panel_show_media` no longer repeats a claim its client did not support (#2010).**
+  The tool returns the CLIENT's reply, and the two clients that answer it do not
+  answer the same question. The sidebar panel replies with the #710 per-item
+  contract (`count`/`painted`/`unrenderable`) — it read the items and says what
+  became of each. The mobile / remote pseudo-panel replies `{"shown": true}` to
+  any `show_media` without reading the items at all, and it has no audio player:
+  an audio take became a broken image card while the agent was told it played.
+  A reply that does not account for the items now establishes acceptance and
+  nothing more — the tool answers with what it dispatched, keeps the client's own
+  words under `client_reply`, and says plainly that the user must not be told
+  what they saw or heard. Nothing is refused and nothing is withheld; the items
+  are dispatched exactly as before. This asks no question about the destination
+  (no `isHeadless` guess, no extension sniffing) — it reads the reply that came
+  back, so there is no address to resolve, no await to be stale across and no
+  buffered `show_media` (#2013) to mis-classify. A panel older than #710 (#2017)
+  is covered by the same rule without being named in it. Two things the rule has
+  to get right, both found by review: a reply that DECLARES failure (`ok:false`)
+  is left exactly as it arrived — it is not claiming a success, and rewriting it
+  as a dispatch would be the same over-claim with the sign flipped — and an
+  account only counts when it covers the batch that was sent, so a well-formed
+  reply about one item can no longer stand in for a two-item call and lose the
+  second in silence. A reply whose own numbers contradict each other is reported
+  as that, rather than as a short count.
+- **Ollama refuses audio unless the model is a verified listener (#1972).** Native
+  `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
+  closed). `huihui_ai/gemma-4-abliterated:E4b-qat` accepts the payload and
+  returns a fluent, run-to-run-varying fabricated transcript instead — `/api/show`
+  listing `audio` is an architecture flag, not proof these weights can hear.
+  The panel now also requires the tag to be one of the Ollama-tested set
+  (`gemma4:e2b`, `gemma4:e4b`, `nemotron3:33b`) before putting bytes on that
+  carrier, and refuses namespaced forks (including the default fine-tune) out
+  loud with a pull command. The gate also covers the HISTORY: Ollama is stateless
+  per request, so a live model switch used to replay already-delivered audio into
+  the newly-selected model's image slot along with the earlier "you can hear them"
+  note. That audio is now dropped, with a note telling the incoming model plainly
+  that it did not hear it.
+
+### MCP
+
+#### Fixed
+- a frontend-only type refused for an unavailable object_info says so (#2019)
+- a rejected tool call names the argument it meant, without guessing at intent (#1986)
+- the synthesis grace is read off the panel's own send bounds, and the notice stops claiming the panel never sent one (#2020)
+- a stock RunPod pod gets the container disk and CUDA host its image actually needs (#2022)
+- a show_media reply establishes only what it accounts for (#2018)
+- a drained ComfyUI-Manager queue is not a completed one — report what the task actually did (#2005)
+- a boot slower than the readiness budget no longer forfeits the post-restart reconnect wait (#1997)
+- install_comfyui(action:"panel") reports whether a NEWER panel is published, not only whether it clears the floor (#1995)
+- Ollama refuses audio unless the model is a verified listener (#1980)
+- retire the restart confirmation wherever the CARD LEAVES THE SCREEN (review fix for #1957) (#1982)
+
+
+## [0.52.45] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- segmented downloads can write a hole INSIDE a segment — the review landed one minute after the merge (#1977)
+
+## [0.52.44] - 2026-08-21
+
+### Added
+
+- **Transport-aware auto-update (#1963).** At the desk (LAN / no pairing tunnel)
+  the orchestrator still checks and applies, and the sidebar panel is checked
+  against the published pyproject — not just the floor — so a pack three
+  versions behind is no longer reported healthy. While a phone is paired over a
+  cloudflared quick-tunnel, both checks still run and a one-line notice says an
+  update is waiting, but APPLY (disk mutate + restart) does not: that restart
+  rotates the hostname and disconnects the phone. Pairing is sticky on the
+  tunnel handle, not the live socket, so a locked screen or a 5G/wifi handoff
+  cannot open the gate. Pair time carries a toggle defaulted ON ("Don't update
+  while my phone is paired") and an `apply_updates_now` affordance for when the
+  user is back at the desk. Relay and LAN remain safe to apply.
+
+### MCP
+
+#### Added
+- check+apply auto-update at the desk, check-only on a mobile tunnel (#1971)
+
+#### Fixed
+- promoted subgraph widget values persist when control_after_generate is randomize (#1966)
+- a restart confirmation the user gave late is claimed by the next attempt, not discarded (#1957)
+
+
+## 0.51.35
+
+### Fixed
+
+- **`panel_set_workflow_target({mode:"current"})` rebinds an unsaved tmp: tab after a multi-workflow reconnect (#1650).**
+  An unsaved canvas never has path/filename. After a reconnect the top-level
+  `active` record often omitted `key`/`routing_key` as well — the panel had not
+  yet established a reply identity — while the unique flagged-active list row
+  still published `tmp:<uuid>`. Corroboration treated that as "no comparable
+  identity field" and refused to adopt the live fence, so the documented
+  recovery left the next graph call fenced to the previous workflow.
+
+  `mode:"current"` now treats a `tmp:` handle on either side as the comparable
+  identity for that unique unsaved active tab, and adopts the uuid the panel
+  did publish. A saved path on either side, or two disagreeing uuids, still
+  fail closed. Filename-only records stay uncorroborated: that name collides
+  across tabs.
+
+- **An orchestrator that never finishes starting no longer lingers silently (#1524).**
+  A respawned instance was found alive for hours holding no listening ports at all,
+  while an older one still owned them. Nothing was wrong from the sidebar's point of
+  view, and nothing reported a problem -- the process simply sat there, burning a slot
+  and making "which one is the orchestrator?" ambiguous for anything that looks by
+  process name.
+
+  Failing to claim the port was already handled: that path retries, tries to take the
+  port over, and exits with a clear message. A process holding NO port never got that
+  far, so there was nothing to catch it. There is now a deadline covering startup
+  itself: if the bridge port has not been claimed within the window, the process says
+  why and exits instead of staying. It names the process holding the port when it can
+  identify one -- which is also when "your other copy is on an older version" becomes
+  worth saying -- and says plainly that the stall is earlier than the port when nothing
+  is holding it.
+
+  Tunable with `COMFYUI_MCP_STARTUP_DEADLINE_MS` for a genuinely slow machine, and a
+  value outside a sane range falls back to the default rather than being taken
+  literally: a number large enough to overflow, or smaller than a millisecond, would
+  otherwise be rounded into an immediate exit -- the guard causing the very outage it
+  exists to prevent.
+
+  Deliberately scoped: this catches a startup that hangs waiting on something. It
+  cannot catch one wedged in a tight loop with the event loop blocked, and the code
+  says so rather than implying otherwise.
+
+- **A misleading warning when the panel port is already taken (#1524).** It claimed the
+  session would keep working with only `panel_*` unavailable. No such mode exists -- the
+  process does not continue without that port -- and the sentence sent this session's
+  own debugging down a false path within minutes. It now reports what was actually
+  observed and leaves the outcome to the code that decides it.
+
+## 0.51.34
+
+### Fixed
+
+- **`list_tools` search finds the tool you named, and stops returning half the catalog (#1525).**
+  Searching `"download model"` returned only `runpod` -- while the unfiltered catalog
+  plainly contains `download_model`. The filter was matching the phrase literally, and
+  tool names are identifiers: `download_model` is spelled with an underscore, so the
+  phrase never occurred in it, whereas another tool's prose happens to say "download
+  model" as ordinary English. The one tool you obviously wanted was the one excluded,
+  and the only result was the coincidence.
+
+  Underscores and hyphens are now folded on both sides, so you can type a tool's name
+  the way you say it, and the words are matched individually rather than as a fixed
+  phrase. Dots and slashes are deliberately left alone, so a literal query like `v1.2`
+  still means what it says.
+
+  Matching every word across names, descriptions and parameter docs turned out to be
+  barely a filter on its own -- `"install node"` matched 19 of 37 tools, since those are
+  ordinary words in a dozen descriptions. So a tool whose NAME matches now wins outright:
+  `"download model"` gives you `download_model`, `"install node"` gives you
+  `install_custom_node`. When no name matches -- `"checkpoint"`, `"free vram"` -- the
+  search still looks through descriptions and parameters, which is the case that made
+  searching them worthwhile.
+
+  When results were chosen by name, the reply says so and tells you how many other tools
+  also matched, so a short list is never mistaken for the whole answer.
+
+## 0.51.33
+
+### Fixed
+
+- **An install ComfyUI-Manager accepted but never queued no longer looks like it worked (#1129).**
+  On legacy ComfyUI-Manager 3.x, `panel_install_node` could report an install as queued
+  while the Manager silently dropped it -- the queue then sat idle having seen no task
+  at all, and nothing appeared under `custom_nodes`. The panel's "queued" is an
+  acknowledgement, not a receipt, and it was being passed on as though it were one.
+
+  The reply now carries what a follow-up read actually found. It is careful about how
+  much that proves: the same counters are cleared by a queue reset, which other
+  operations here can issue, so an install that really did run can look identical. So it
+  says what was observed, says plainly that this settles nothing on its own, and asks for
+  the one check that does -- `panel_list_nodes`. It does not guess at the cause, and it
+  does not report a failure it cannot demonstrate; a wrong "this definitely failed" would
+  cost a needless reinstall, which is the same harm as the false success in the other
+  direction.
+
+  A related fix from 0.50.40 handled the case where the Manager REFUSES the install
+  outright (it falls back to a direct clone). This is the opposite shape -- accepted, then
+  dropped -- which that path could never catch, because nothing was refused.
+
+  The follow-up read is also pinned to the exact panel the install went to, so a browser
+  tab that reconnects or is replaced mid-install can never have its empty queue reported
+  as evidence about someone else's install.
+
+## 0.51.32
+
+### Fixed
+
+- **`apply_manifest` explains a PEP 668 refusal instead of walking into it (#1508).**
+  Installing a manifest's Python packages against a uv-managed interpreter (Stability
+  Matrix, and distro Pythons on Linux) is refused by design: the environment declares
+  itself externally managed. The manifest run simply failed with that raw error and no
+  way forward. Three different paths reached it -- with uv absent, with uv present and
+  refusing, and through the older non-venv fallback, where uv's unrelated "no virtual
+  environment" complaint sat on top of the real reason and sent readers off to fix the
+  wrong thing.
+
+  All three now say the same actionable thing: the interpreter is externally managed,
+  that is a deliberate guard rather than a broken install, and here is what actually
+  works. Notably it says what does NOT work -- routing through uv is refused by uv too,
+  which was worth measuring rather than assuming, because recommending it would have
+  cost the reader the time to find that out. It also names the check worth doing first:
+  if ComfyUI already runs from a virtual environment, the interpreter in the message is
+  the wrong one, and the fix is to point `COMFYUI_PYTHON` at the venv.
+
+  It does not force the install. pip offers an override for exactly this, and passing it
+  on a uv-managed interpreter writes into an environment uv may later reset -- turning a
+  clear failure now into a broken ComfyUI later. That stays a deliberate decision rather
+  than one inherited from a manifest, and the message says so.
+
+### Security
+
+- **A manifest entry's credentials no longer reach messages, results or logs (#1508).**
+  A pip entry or model URL may legitimately carry credentials (`https://user:token@...`).
+  Several failure paths echoed the entry back verbatim -- into the error message, into
+  the per-item report, and into the log line naming the package -- and a failed
+  subprocess additionally embeds the whole command line, so the spec travelled inside
+  ordinary install errors too. URL credentials are now masked at the single point every
+  manifest item passes through, which covers the Python-package, model and custom-node
+  paths together. Entries stay identifiable: only the user/password portion is masked,
+  so the host and path still read normally, and the underlying diagnosis is unchanged.
+
+## 0.51.31
+
+### Fixed
+
+- **A trailing space in `COMFYUI_PATH` no longer breaks every install-root check silently (#1512).**
+  On Windows the usual launcher line -- `set COMFYUI_PATH=C:\...\ComfyUI && comfyui-mcp connect ...`
+  -- captures the space BEFORE the `&&`, because that is how `cmd.exe` assigns. The
+  orchestrator then consumed the value exactly as given, so nothing matched and the
+  connected ComfyUI was reported as undeterminable. The failure surfaced about forty
+  minutes later, at the first write, with a message that echoed the path back but never
+  pointed at the space. It cost a 12.3 GB download, stranded at 11.35 GB and finished by
+  hand. The panel pack had always stripped this; the orchestrator had not.
+
+  The value is normalized now -- surrounding whitespace, and a matched pair of surrounding
+  quotes, which is the other thing that survives a paste. This is a REPAIR, not a cleanup:
+  a value that already names a real directory is never touched, because a trailing space
+  is a legal filename character (on POSIX, and in fact on Windows too), and redirecting
+  someone away from a folder that works would be worse than the bug. Only a value that
+  names nothing is repaired.
+
+  It also says so at startup, naming both forms and the launcher line that produced them,
+  instead of leaving a malformed value to surface as a mystery much later. A launcher that
+  bakes in a bad value will hand the same one to everything else it starts.
+
+  Applied at every reader, not just the obvious one: the same value feeds workflow-library
+  lookups, the environment handed to spawned agents, and the check that decides whether a
+  ComfyUI root was named explicitly or inferred. Fixing only the first would have left the
+  rest wrong -- and would have made that last one worse, by comparing a normalized value
+  against a raw one.
+
+## 0.51.30
+
+### Fixed
+
+- **A panel command that WAS applied stops being reported as a failed mutation (#1468).**
+  `panel_civitai_search` timed out at 10 s while the search demonstrably ran (`renderRev`
+  advanced, the grid reported `loading:true`), and `panel_exit_subgraph` timed out at 15 s
+  while the very next `panel_graph_outline` showed the view already back at `root`. Both
+  handed back a failure for work that had happened.
+
+  The reported cause -- that these wait on a slow frontend or external request -- turned out
+  not to be true on the affected build, and the earlier diagnosis in that issue has been
+  corrected. `driveSearch` does not await the CivitAI fetch: it dispatches and returns
+  `{dispatched:true, renderRev}` immediately, which shipped in panel 0.11.0 while the report
+  came from 0.11.44. `graph_exit_subgraph`'s own navigation receipt budgets about a second
+  and returns early on success. Neither was waiting on anything.
+
+  What was left was a bound tighter than this codebase's own default failing on a busy but
+  alive tab. `civitai_search` now waits as long as every other panel command instead of half
+  as long. And because an exit's effect is something the panel can simply be ASKED about,
+  an unanswered exit now takes one scope read and reports what it found: at the root graph
+  is decisive and says so; still inside a subgraph is NOT decisive -- an exit pops to the
+  immediate parent, so that reading cannot separate "never landed" from "landed, from a
+  nested subgraph" -- and it says which question is open rather than guessing. A read that
+  cannot answer claims nothing in either direction.
+
+  The confirmation reports where the canvas IS, not that this command is what put it there,
+  and it is pinned to the tab the navigation was dispatched to, so a session that silently
+  rebinds to another tab can never have that tab's canvas read as this navigation landing.
+  Whether the tab answered at all is now taken from the bridge's own reply-timeout marker
+  rather than inferred from message wording, so a panel error that merely reads like a
+  timeout can never be promoted to a success.
+
+## 0.51.29
+
+### Fixed
+
+- **A rebind refusal after a reconnect now runs the check it tells you to run (#1473).**
+  Right after a ComfyUI restart, `panel_set_workflow_target({mode:"current"})` reported that
+  the graph binding was NOT restored -- and the very next `panel_graph_outline` succeeded
+  with the expected graph. The session was never wedged; it was told it was, and then sent
+  to find out for itself.
+
+  That refusal already explained the situation correctly: the panel had flagged its active
+  workflow UNCONFIRMED, so nothing could be adopted, and the identity it reported already
+  matched the fence this session held. It ended by prescribing a cheap graph read to settle
+  which of the two remaining cases this was. It now RUNS that read and reports what it
+  found: a read that passes is reported as evidence of a reconciliation race, and a read
+  the fence rejects confirms the wedge instead of leaving it ambiguous.
+
+  The result is still reported as a failure, deliberately: the rebind genuinely did not
+  happen, and softening the diagnosis must not soften the result. What changed is that the
+  answer arrives WITH the refusal instead of one call later.
+
+  The message says only what the read established -- that this fence did not reject THAT
+  command a moment ago -- and not that graph tools work in general. Mutations are governed
+  by a separate write-fence capability, so a tab that serves reads while refusing every edit
+  is told so rather than waved through, and a read that fails for any reason OTHER than a
+  fence refusal (a timeout, a backgrounded tab) settles nothing and claims nothing.
+
+## 0.51.28
+
+### Fixed
+
+- **Installing a custom node from a Git URL with `version:"nightly"` no longer fails and
+  deletes the clone (#1470).** The repository cloned successfully, then the checkout died
+  with `fatal: '--detach' cannot be used with '-b/-B/--orphan'` and the clone was discarded
+  as a husk -- so a perfectly good install left nothing behind.
+
+  "nightly" is overloaded in this tool's own surface, which is what made it awkward to fix.
+  For a Manager install it names the git-HEAD channel -- one of our own paths mints it,
+  rewriting an absent or "latest" version because ComfyUI-Manager rejects a registry
+  "latest" for a repository-style entry. For a from-source git install, `version` is
+  documented as a git ref. Someone typing it may mean either.
+
+  So the meaning is resolved by ASKING the repository rather than guessing: tags are
+  fetched, the ref is looked up, and only if the repository genuinely has no such ref -- and
+  the ref came from `version` rather than an explicit `ref:` -- is the checkout skipped and
+  the clone left at the default HEAD, which is what the channel reading asks for. The reply
+  says that happened.
+
+  Everything else is unchanged: a repository that DOES have a `nightly` branch gets it, an
+  explicit `ref:"nightly"` still fails loudly when it is absent, and any other missing ref
+  still fails rather than quietly installing something else. Asking for `v1.2.3` and
+  silently receiving HEAD would be a worse bug than the one being fixed.
+
+## 0.51.27
+
+### Fixed
+
+- **A workflow-instance mismatch right after loading a workflow now names the load as its
+  cause (#1478).** `panel_load_workflow` returned `loaded:true` and the very next graph
+  call was refused with *"workflow instance mismatch … the active workflow last moved …
+  and NO PANEL COMMAND CLAIMED IT"*. A panel command had caused it one call earlier, so
+  that sentence sent the reader looking for a tab switch that never happened -- twice,
+  deterministically, in the reporting session.
+
+  The load now says so itself: an API-format load can re-mint the canvas workflow
+  instance, and if the next graph command is refused this is why, with the one call that
+  clears it (`panel_set_workflow_target({mode:"current"})`). If nothing is refused, nothing
+  needs doing.
+
+  Deliberately a CONDITIONAL rather than a claim that the fence is stale, because the
+  reply cannot tell: a UI-format load into an active workflow preserves the instance on
+  purpose, and a second API load into the same active workflow reuses it as well. Nothing
+  in the reply separates "re-minted" from "reused", so stating it as fact would be a guess
+  wearing the clothes of a measurement.
+
+  It also does NOT repair the fence automatically. The obvious repair adopts whatever
+  workflow is active at that moment, which has no tie to the load -- a user switching
+  canvases in that window would silently re-point the session and the next edit would land
+  on the wrong graph. Reporting the cause accurately is worth more than a repair that can
+  aim at the wrong workflow.
+
+## 0.51.26
+
+### Fixed
+
+- **Cancelling a large batch no longer floods every later turn with a growing block of
+  errors (#1489).** Stopping a 27-scene run left ComfyUI with no history for the prompts it
+  cleared while pending, so each one came back after reconnect as an urgent error -- and the
+  block GREW every turn, carrying prompts 1..N, then 1..N+1, dragging the user's original
+  message along with it. It reproduced roughly 25 messages dozens of times and consumed a
+  large share of the context window on noise.
+
+  The report describes this as missing deduplication, and it is not: every notice names a
+  different prompt, so all of them are distinct and nothing would dedupe. The cause is that
+  each error INTERRUPTED the live turn and re-queued it, and after the first error the
+  interrupted turn is itself an error turn -- so error N re-queued errors 1 through N-1 and
+  the next turn carried all of them.
+
+  A burst now collapses into one turn instead of nesting. An error arriving while an error
+  turn is already waiting joins it; one arriving while an error turn is being handled waits
+  its turn instead of interrupting the handling. A single error arriving during ordinary
+  work still stops that work, which was the intended behaviour all along.
+
+  Every cancelled prompt is still reported exactly once -- collapsing the noise must not
+  swallow a real failure -- and notices from DIFFERENT workflow tabs are never merged, so
+  each keeps the origin that pins "diagnose and fix it" to the graph that actually failed.
+
+  Not fixed here, and still open on the issue: those prompts should not be reported as
+  errors at all, since the cancellation was requested. That half lives in the panel.
+
+## 0.51.25
+
+### Fixed
+
+- **A very large render can be inspected again -- `get_image` no longer inlines an
+  unbounded image (#1495).** An 8504x17008 output encoded to about 267 MB and exceeded the
+  caller's 64 MB message limit, so a render that had saved perfectly could not be looked at
+  at all; the reporter added a low-resolution preview branch to their own workflow to
+  inspect their own output. The only check before inlining was a media-type test that sent
+  video and audio to disk -- there was no size budget of any kind.
+
+  The saved file is untouched. Only what goes back over the wire is capped, and when it is,
+  the reply says so: the preview reports the true original dimensions and states plainly
+  that fine detail, small text and pixel-level artefacts must not be judged from it. A
+  silently downscaled image would be a worse failure than the original bug, because an
+  agent reads detail off it and answers confidently.
+
+  The budget is on the ENCODED size and the scale is MEASURED rather than predicted --
+  base64 inflates by a third and PNG size swings by an order of magnitude with content, so
+  a pixel cap alone still overshoots on exactly the images that matter. Decoding is bounded
+  by a MEMORY budget computed from the file's own depth and channel count, not by a pixel
+  count: a pixel limit is the wrong unit for protecting memory, which is how a 16-bit image
+  can pass a generous-looking ceiling and still need over a gigabyte to open.
+
+  Everything else about the preview is disclosed too: whether the source format could have
+  held animation (in which case you are seeing one frame), and whether colour depth or
+  colour space changed. A preview that cannot be built at all never destroys the fetch --
+  the reply keeps the saved path and says why, and says honestly when the save ALSO failed
+  and the image is not available locally either.
+
+  `max_preview_bytes` and `max_preview_dimension` let a caller tighten both bounds.
+
+## 0.51.24
+
+### Fixed
+
+- **The MCP server now reports the version it actually is (#1447).** `serverInfo.version` was
+  the hardcoded literal `0.1.0` -- a version this package has never shipped. That string is what
+  an MCP client displays and what a bug report quotes, so every report was ambiguous about which
+  build produced it, including the reports we ask people to send us. It is now read from the
+  package's own manifest, once, at startup.
+
+  Deliberately kept CHEAP: resolving it through the install-mode detector would have put a
+  symlink-resolving directory walk in front of the MCP handshake, which is self-defeating in a
+  fix filed under "startup exceeds the client's timeout". It is one small read of our own
+  manifest, resolved relative to the module so it can never pick up a parent directory's
+  package.json, and a UTF-8 byte-order mark no longer downgrades a working install to the
+  fallback.
+
+  If that read ever fails the version reads `0.0.0-unknown` -- a sentinel no release can carry,
+  rather than a plausible-looking number that would recreate the same ambiguity.
+
+  This is the second defect in #1447 and does not close it: the report's headline -- a cold `npx`
+  install exceeding the client's startup budget -- is a distribution problem measured on the
+  issue, where the tempting one-flag fix was tried and rejected because it produces an install
+  that cannot start.
+
+## 0.51.23
+
+### Fixed
+
+- **`check_runtime` no longer calls a paid third-party service node "local -- no paid credits"
+  (#1483).** A workflow containing `NanoBananaPro_fal` -- a node whose whole job is to bill a
+  fal.ai endpoint -- was reported as `runtime:"local"`, `usesApiNodes:false`, with the guidance
+  "every node runs on the user's own GPU, no paid credits". Being INSTALLED is what made it
+  confidently wrong: the node is in `/object_info`, so it was never "unknown", and
+  known-and-unmarked resolved to local.
+
+  Measured against a real 4304-node `/object_info` rather than assumed: not one of the 3464
+  custom-node-registered classes carries ComfyUI's `api_node` marker -- all 220 marked nodes are
+  core. So the partner marker can never fire for a third-party pack, and this was a category-wide
+  hole that fal.ai happened to expose.
+
+  Two signals now catch it, because neither covers the case alone: an enumerated registry of packs
+  known to bill a remote service (matched on the pack's module path AND its category, so cloning it
+  into a differently-named folder does not slip past), and any node declaring a service credential
+  input -- the general catch for packs nobody has enumerated. A pack's own local helpers stay free:
+  `FAL/Utils` resizes an image before upload and spends nothing.
+
+  The tempting one-line fix -- flag anything taking an `api_key` -- was rejected because it misses
+  the reported node: that pack reads its key from the environment, so its nodes expose only
+  `prompt`/`aspect_ratio`/`seed`. Equally rejected: treating every custom node as unclassifiable,
+  which would flag 3464 of 4304 classes and make the warning meaningless.
+
+  These stay OUT of the Comfy partner-node list, which feeds tools that hand out schemas assuming
+  Comfy's own auth model -- a fal.ai node is paid, but it is not a partner node. They ride a
+  separate `externalApiNodes` field that counts the same way for the verdict, and the guidance now
+  names WHO bills (e.g. fal.ai, on the user's own account with them, not Comfy api credits) so a
+  reader who checks their Comfy balance and finds it untouched does not conclude the warning was
+  wrong.
+
+## 0.51.22
+
+### Fixed
+
+- **A remote ComfyUI that a restart stops and nothing brings back is now reported, not described
+  as restarting (#742).** `panel_restart_comfyui` against a REMOTE-classified target returned
+  "it is restarting out-of-band -- check in a few seconds" whether the server was mid-restart or
+  dead for good: the recovery probe is loopback-only, so on that path nothing was ever watched and
+  the two outcomes were indistinguishable.
+
+  The reporter's Pinokio install was addressed by its LAN IP -- which classifies as remote even
+  though it is the same machine -- stopped, and never relaunched, because Pinokio's launcher only
+  re-launches on the Manager's dependency-install signal. They learned the server was gone from
+  every later panel call failing with a generic "still reconnecting".
+
+  The address this session already uses for every other call is now watched after a remote
+  dispatch, and what it may conclude is one-directional by design: it can report a failure to come
+  back, and can never manufacture readiness. `ready` and `confirmed_cycle` stay false on every
+  branch here exactly as before -- a healthy answer proves the address responds, not that this
+  instance cycled.
+
+  The report is deliberately narrow about what it knows. It states that the address went down and
+  had not come back within the window, says outright that this does not prove the server is gone
+  (a remote host can boot slower than the budget), names the other explanation, and names the one
+  check that separates them. It also requires the LAST observation to still be unreachable rather
+  than trusting a flag that latches on a single missed connection, so a brief refusal from a
+  tunnel or NAT can no longer be reported as a dead install.
+
+  Nothing about what gets refused changed, so a working supervised-remote restart is untouched.
+
+## 0.51.21
+
+### Fixed
+
+- **A wrong-canvas refusal on a NEVER-SAVED workflow is no longer a dead end (#1480).** The
+  `root-workflow-uuid-mismatch` guard tells the caller to re-open the tab with
+  `panel_open_workflow(<path>)`. A tab that has never been saved has no path -- the workflow list
+  reports `path: null, filename: null` for it, because ComfyUI reuses the "Unsaved Workflow" title
+  across unsaved tabs -- so the reporter passed the tab's TITLE, got "no workflow matching", and
+  found every other documented exit closed too: reload refuses while unsaved, save refuses under
+  this same guard. The agent could read the user's canvas and change nothing, and handed the
+  problem back with "please press Ctrl+S yourself".
+
+  The exit existed the whole time and nothing named it. Each tab's per-instance ROUTING KEY is a
+  valid selector -- for an unsaved tab it is the only one it has -- and the workflow list already
+  publishes it on every record.
+
+  So this refusal now does what the two refusals beside it already do: one read-only workflow-list
+  read, exempt from the fence it is reporting on, establishes the single fact that decides which
+  remedy is followable, and the message names THAT one -- the routing key for an unsaved tab, the
+  real path for a saved one, and neither when the read did not land. It also warns off the two
+  exits that refuse from this state.
+
+  Nothing is auto-applied and the guard is not weakened: a canvas that really does belong to
+  another workflow still refuses, and the saved-tab advice is unchanged. Reads get the diagnosis
+  too, because a refused `panel_graph_outline` was half of the reported dead end. Verified on a
+  live rig, not only in tests: with the fix the named remedy re-opens the unsaved tab, restores its
+  identity tag, and the previously-refused read and widget edit both succeed.
+
+## 0.51.20
+
+### Fixed
+
+- **`download_model action:"status"` no longer reports a dead download as "still streaming" (#1479).**
+  Three transfers died with their owning process, and status rendered them as *downloading --
+  still streaming* with "the transfer may still be running ... Do not report this download as failed
+  or missing" -- while `action:"cancel"` on the same ids, in the same process, answered "that session
+  is confirmed GONE".
+
+  The evidence was already there: `writerProcessGone()` probes the owner pid, but it was only reached
+  from the cancel path, and the status render branched on heartbeat AGE alone. Status now consults
+  the same probe, and both the status line and the note change together.
+
+  A merely-stale record keeps the cautious wording -- a missed heartbeat still does not prove the
+  transfer stopped (#761) -- and the pid verdict is carried as "proven gone" or absent, never as a
+  tri-state, so "cannot tell" can never render as death. The verdict is scoped to what was measured:
+  no process with that pid exists ON THIS MACHINE. A writer on another host or container looks the
+  same from here, and `cancel` shares that blind spot, so the message says so rather than promising
+  a safe recovery it cannot guarantee.
+
+## 0.51.19
+
+### Fixed
+
+- **A download can no longer land in a ComfyUI the connected server does not read (#1371).** A
+  model was written into a DIFFERENT local installation than the one serving the session: connected
+  to ComfyUI on `:8190`, the download streamed into a tree belonging to another install, resolved
+  from a stale `COMFYUI_PATH`, while visibility was checked against the connected server.
+
+  The existing divergence guard shipped in v0.49.4 and the reporter was on 0.50.107, so it was
+  present and did not fire: it proves divergence from CONTENT -- files on disk the running server
+  does not list -- and a sparse or empty destination category proves nothing.
+
+  The destination is now checked against the roots the live server actually reads, including any
+  registered through `extra_model_paths.yaml`, with junctions and symlinks resolved and the check
+  scoped to the destination's category. It refuses only on a demonstrated mismatch, never on an
+  unverifiable one -- an unknown answer proceeds exactly as before, because treating "the server
+  did not vouch for it" as "the server cannot read it" is what produced false refusals every
+  previous time that inference was tightened.
+
+## 0.51.18
+
+### Fixed
+
+- **A model download can no longer exhaust the system drive (#1477).** `download_model` stages
+  the whole file in the content-addressed cache before it lands, and that cache path came only
+  from `homedir()` -- on Windows essentially always the system drive, while models are almost
+  always on a big secondary volume. The reporter's ComfyUI lives on `F:` with 1 TB free; `C:`
+  had 0.7 GB free of 232 GB, and a 32.29 GB download grew a `.partial` to 22.62 GB heading for
+  zero. Taking a Windows system drive to zero risks the page file and general OS stability, so
+  the failure did not stay confined to the download that caused it.
+
+  `Content-Length` is already known before the first byte is written, and there was no
+  free-space check anywhere in the codebase. There is now: the download is REFUSED up front,
+  naming the space needed, the space available, the destination's free space when it is a
+  different volume, and `COMFYUI_DOWNLOAD_CACHE_DIR` as the lever. The reserve scales as
+  min(1 GiB, 5% of the volume) so a small or removable cache volume stays usable. Every check
+  fails soft: an unknown size or an unreadable volume proceeds exactly as before, because an
+  unmeasurable volume must not become an unusable one.
+
+  Not addressed here, and deliberately: relocating the cache to the destination volume, the
+  cached copies retained after a model lands, and the ~10x progress under-report -- all three
+  are recorded on the issue.
+
+## 0.51.17
+
+### Fixed
+
+- **The stable_audio_3 template could not produce audio at all, and its defaults rendered
+  silence (#1458).** `SaveAudioMP3` was emitted without the required `quality` input, so every
+  generation for this family failed validation before execution with
+  `Required input is missing (quality)`. Separately, the shipped `lcm` + cfg 7 pairing renders
+  DIGITAL SILENCE at mean -91 dB while ComfyUI reports success -- a correctly-sized,
+  correctly-durated file of nothing, with nothing in the logs to grep for. The default sampler
+  is now `dpmpp_2m`; passing `sampler_name` explicitly is unaffected. The reporter measured six
+  combinations to isolate it.
+- **A ComfyUI-Manager failure now shows the Manager's own error body (#1397).** An opaque
+  exception for a deno-compatible pack reported a bare status and discarded everything the
+  Manager said about why. The body is now carried into the message, bounded, with credential
+  shapes redacted first -- git-remote userinfo, bearer/token headers, `Authorization: Basic`,
+  and cookie/session pairs.
+- **`list_local_models` `remove` says WHY it searched fewer roots than `list_paths` shows
+  (#1474).** The two tools disagreed with nothing to reconcile them. The resolver behind
+  deletion enumerates only roots provable from the running server's launch arguments, which is
+  deliberate and unchanged; the refusal now states that, and that "not found" here does NOT
+  mean "not on disk".
+- **`list_templates` says it reflects what the server REGISTERS, not what is on disk (#1454).**
+  Installed `example_workflows` were omitted from a list that looked complete.
+- **The npx update note names the restart that actually applies it (#1471).** "restart to pick
+  it up" sent users to the panel's `/restart`, which does not restart the long-lived
+  orchestrator process -- the one that keeps the build it launched with. The note now names the
+  levers that do NOT work, says an unchanged version cannot distinguish a missed restart from a
+  deliberate pin from a cached copy, and no longer claims `npm cache clean` clears npx's
+  execution cache.
+
+## 0.50.114
+
+### Fixed
+
+- **A failed local download now says what made ComfyUI-Manager necessary (#1374).** A LOCAL
+  Windows-portable install could not download anything: every attempt died on "ComfyUI-
+  Manager's queue API is not reachable", for a capability that needs no Manager at all. The
+  reporter downloaded ~45 GB with `curl` instead.
+
+  That error is raised in generic Manager code which cannot know it is serving a download,
+  so it named the thing that BROKE and not the decision that made Manager necessary — this
+  MCP could not resolve where the connected server keeps its models. Only the second has a
+  remedy you can apply, and nothing distinguished it from "your ComfyUI is remote, this is
+  normal".
+
+  The failure now explains the route, per case, with the `argv[0]` and `cwd` that identify
+  which one you hit. It is appended ONLY when the Manager API call itself failed — a bad
+  source URL or an auth refusal keeps its own error untouched.
+
+  **The routing is deliberately unchanged.** The reporter's decision could not be
+  reproduced here: a live ComfyUI on this machine reports a relative `main.py` and no `cwd`
+  — the shape that looked like the culprit — and still resolves, because the process-table
+  probe anchors it. Guessing at which of six conditions fires for them, and "fixing" that,
+  is how a routing change breaks installs that work today. What ships is the answer being
+  visible in the next report.
+
+## 0.50.113
+
+### Fixed
+
+- **A frontend-only node no longer makes a workflow's runtime "unknown" (#1372).**
+  `list_packs(action:"check_runtime")` counted `MarkdownNote` as an unclassifiable node and
+  refused to say the workflow was free, stopping the paid-API safety flow to ask a question
+  that already had an answer.
+
+  `MarkdownNote`, `Note`, `Reroute` and `PrimitiveNode` are LiteGraph-native: the frontend
+  registers them, `/object_info` never lists them, and they are stripped before a prompt is
+  queued. A node that does not execute cannot be a paid partner node, so it earns none of
+  the doubt the "unknown" verdict exists to express. They are also removed from the
+  classifiable denominator — one API node beside three Notes used to read as "mixed".
+
+  The caution itself is unchanged: a genuinely unrecognised node still collapses the
+  verdict, and a node the server DOES register under one of those names is classified
+  normally rather than skipped — a safety check that a name collision can bypass would be
+  worse than the false "unknown" it replaced.
+
+  The type list is imported from the workflow converter, which has always known which types
+  never reach the backend. The two disagreeing was the bug.
+
+  Not covered: third-party virtual nodes (KJNodes `GetNode`/`SetNode`, rgthree's
+  canvas-only nodes) still report "unknown". They have the same property but a hardcoded
+  list of third-party names goes stale silently — tracked in #1400.
+
+## 0.50.112
+
+### Fixed
+
+- **A remote panel can convert its own live canvas (#1359).** `panel_strip_workflow` read the
+  graph from the connected panel but fetched node definitions over `COMFYUI_URL` — the same
+  machine locally, two different ones whenever the panel is remote. A canvas on a proxy URL
+  could not be stripped at all: the definitions request went to `127.0.0.1:8188`.
+
+  The live canvas now takes its definitions from the ComfyUI the PANEL is connected to,
+  which the panel has been able to serve since 0.13.0. In a tunnel or loopback-only
+  topology the browser is the only thing that can reach that server, so this is not a
+  workaround for the remote case — it is the correct source for every case.
+
+  There is deliberately **no fallback** to `COMFYUI_URL`. Both hosts can answer, and when
+  they disagree a fallback returns a workflow converted against the wrong server's schema —
+  wrong widget order, wrong input names — with no error at all. That is worse than the
+  connection failure this issue was filed about, which at least announced itself. A panel
+  that cannot serve definitions, an empty map, an error body, and a map that describes some
+  other install are each refused with the reason.
+
+  Requires panel 0.13.0+; an older panel is refused by the version gate with the version it
+  needs, rather than an "unknown command" error that reads like a broken ComfyUI.
+
+## 0.50.111
+
+### Fixed
+
+- **`download_model` no longer promises a resumable partial it never looked for (#1370).**
+  Cancelling a download reported "the partial was left on disk and can be resumed by
+  re-issuing" purely from the job's status — nothing stat'd the file. A reporter paused a
+  33 GB download because of that sentence, found no partial anywhere, and restarted from
+  zero.
+
+  Both cancelled branches now report what is actually staged: the partial's SIZE when there
+  is one, so "resumable" is something you can weigh against restarting, or its absence, so
+  you learn it before re-spending the bandwidth rather than after. A cancel that leaves
+  nothing is not an error; telling you it left something is.
+
+  The lookup derives the staged path from the same function the writer uses, so the two
+  cannot drift. Getting there took two corrections — the file is keyed by the download's
+  CACHE identity rather than its destination filename, and it is HIDDEN (a leading dot) —
+  and each wrong version would have reported "no partial found" to someone holding tens of
+  gigabytes of resumable bytes.
+
+## 0.50.110
+
+### Fixed
+
+- **A progress line is no longer handed to you as a failure reason (#417).** When a
+  comfy-cli download died, its stderr often held only progress, so the error you were shown
+  was comfy-cli's own `Start downloading URL: … into …` — a sentence that reads like a
+  diagnosis and names no cause. Output that carries no failure information now says exactly
+  that, and names what to check; the raw output is still kept. A real error is passed
+  through unchanged.
+
+  The progress patterns match the emitter that actually exists: comfy-cli's own downloader
+  is `rich.progress` (which writes nothing to a pipe), so the bars that reach us come from
+  `huggingface_hub` with a `desc` prefix. The diagnosis is also scoped to downloads — a
+  failing `comfy node install` was being handed disk-space and gated-Hugging-Face advice
+  about a transfer it never performed.
+
+- **A reconnect no longer wedges every mutating `panel_*` call (#1331).** After a workflow
+  switch, a save/rename, or an id-scheme change the tab gets a new id, and the trusted
+  workflow stamp was deleted and only restored if that same hello resolved an identity. A
+  reconnect hello that lands before the canvas identity is readable carries none, so the
+  stamp was gone for the rest of the session and every mutation was refused with "this
+  workflow has no trusted identity" while reads kept working.
+
+  The stamp now moves with the rest of the routing state. It cannot widen authorization —
+  the panel authorizes only when the stamp equals the live workflow uuid — while an absent
+  stamp was unrecoverable. This restores `carryWorkflowCommandStamp`, which #436 added for
+  exactly this and the #884 refactor dropped.
+
+### Added
+
+- **`panel_remove_widget` removes ONE dynamic widget row (#938)** — rgthree Power Lora
+  Loader `lora_N`, Impact/Inspire list rows. Their add/remove affordance is a canvas-drawn
+  button an agent cannot click, so those rows were previously un-removable from an agent
+  session. Requires panel 0.13.7.
+
+  The rows are deliberately NOT renumbered (`lora_N` is a monotonic id, not a position), and
+  removal is refused with the specific reason for a backend-declared input, a
+  frontend-generated control widget, a linked widget, or a subgraph container. Node
+  definitions that cannot be READ are reported as unknown rather than treated as "declares
+  nothing".
+
+## 0.50.109
+
+### Added
+
+- **Operator-level restriction of the tool surface (#873).** For a hosted deployment — a
+  shared Open WebUI, a team frontend — where the operator is not the person prompting,
+  three environment variables now withhold tools from the model entirely:
+  `COMFYUI_MCP_TOOL_PRESET` (`safe` | `readonly`), `COMFYUI_MCP_TOOL_DENY`, and
+  `COMFYUI_MCP_TOOL_ALLOW`. A withheld tool is never registered, so it is absent from
+  `tools/list`, absent from `call_tool`, and the model never learns it exists.
+
+  Measured on a built server: 40 tools unrestricted, 16 under `safe`, 10 under `readonly`.
+  Under `readonly`, `call_tool {"name": "restart_comfyui"}` answers `Unknown tool` —
+  absent from dispatch, not merely hidden from the listing, which was the reporter's
+  specific concern about compact mode.
+
+  A misconfiguration **refuses to start** rather than starting unrestricted: an unknown
+  preset, or a variable set but empty (an unexpanded `${VAR}` in a compose file), aborts
+  with the reason on every transport — stdio, `--http`, and `--panel-orchestrator`.
+  Coming up with a full surface while the operator believes it is restricted is worse than
+  having no filter.
+
+  This is a boundary against the model and the people prompting it — not against whoever
+  sets the environment, and not a substitute for keeping an untrusted party off the
+  ComfyUI host. `docs/configuration.mdx` says so.
+
+### Fixed
+
+- `list_packs` is withheld by both presets. Its `action:"install_deps"` installs custom
+  node packs through ComfyUI-Manager — downloading and RUNNING third-party code on the
+  host — behind a name that reads like inspection. Same for `apps` (`action:"import"`
+  installs from the public registry), `get_defaults` (writes config), `list_local_models`
+  (`action:"remove"` deletes a model file) and `queue` (destroys work).
+- `search_custom_nodes` is NOT withheld. It only searches; the installing tool is
+  `install_custom_node`, which is withheld.
+
+## 0.50.66
+
+### Fixed
+
+- The restart-confirmation timeout no longer points you at a server it never checked. When
+  `panel_restart_comfyui`'s confirmation card times out it suggests the headless
+  `restart_comfyui` as a fallback — but that targets `COMFYUI_URL`, which is not
+  necessarily the ComfyUI the panel is running inside. It now says which server it would
+  restart, and refuses to recommend it outright when it can prove that is a different one.
+  A confirmed origin mismatch (a tab fronting a second local ComfyUI) reaches that strong
+  warning instead of being lost inside a proof that only answers "is it the same"; an
+  origin that merely cannot be proven stays a mild, target-naming note. The warning also
+  now names the worse outcome — restarting a live wrong target can succeed and take down a
+  ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
+
+## Unreleased
+
+## [0.52.43] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- **`panel_set_workflow_target({mode:"current"})` rebinds a Codex session after reconnect (panel#1557).**
+  After a ComfyUI restart/reload, Codex's live-canvas tools are scope-bound
+  (`orchestrator::codex`). The documented recovery refused with "no connected
+  tab belongs to this conversation's backend (codex)" and "did NOT restore this
+  session's graph binding": a scope ctx returns a refusal instead of throwing,
+  so the zero-tab DEFER path never fired, and a unique canvas that re-hello'd
+  without `backend` joined the default conversation so Codex could not adopt it.
+  The session stayed fenced to the previous workflow instance; retrying
+  `panel_graph_outline` failed identically until a manual browser refresh.
+
+  Zero connected tabs now DEFER the same way a real-tab session already did,
+  and the consent is kept so the next graph call binds the canvas that
+  reconnects. A dead or ambiguous pin plus exactly one live canvas is adopted
+  even when that hello joined the default backend — idle (no pin) unique-foreign
+  still refuses, so another conversation's tab is not stolen.
+
+### MCP
+
+#### Fixed
+- current-workflow rebind restores the live canvas after reconnect (#1964)
+- panel_open_workflow no longer false-mismatches the already-open canvas after restart (#1962)
+- a successful panel_run completion is no longer left silent for 45s (#1960)
+- panel_strip_workflow strips a pack against the connected panel, not localhost (#1959)
+
+
+## [0.52.42] - 2026-08-20
+
+### MCP
+
+#### Added
+- multi-connection model downloads, with the single-connection path proven as fallback (#1956)
+
+#### Fixed
+- self-restart no longer leaves an unreclaimable panel-op.lock (#1955)
+
+## [0.52.41] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_set_workflow_target reports bound after a settling read that proves writes (#1951)
+- a timed-out ComfyUI call makes the same connected-panel comparison a refused one does (#1952)
+- correct what a successful revoke actually proves, and pin the requeue window (#1949)
+
+
+## [0.52.40] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_add_node names live sibling socket producers instead of a missing-output dead end (#1947)
+- a completion QUEUED onto an agent is not one the agent has READ (#1946)
+
+
+## [0.52.39] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- Save-As 409 names the rename path instead of a third filename (#1942)
+
+
+## [0.52.38] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- the instance-mismatch refusal names TOOLS, not bridge commands (#1939)
+- install_custom_node refuses a local write aimed at an install this session is not connected to (#1938)
+
+#### Changed
+- prove the tool/command PAIRING end-to-end across the fenced surface (#1937)
+
+
+## [0.52.37] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- the QUEUE BUSY refusal names TOOLS, not bridge commands (#1934)
+- first Windows code-mode call survives a sharing-violation host spawn (#1932)
+
+
+## [0.52.36] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- a localhost COMFYUI_URL is loopback, and now says so (#1931)
+- the restart refusal names WHICH identity proof was missing (#1927)
+
+#### Changed
+- AI SDK 6 -> 7 (ai + all three providers, together) (#1928)
+
+
+## [0.52.35] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- **`panel_graph_outline` after `panel_restart_comfyui` waits out a 26–28s Desktop recover (panel#654).**
+  The post-restart tab wait defaulted to 20s (`COMFYUI_PANEL_RECONNECT_WAIT_S`). ComfyUI Desktop recoveries of 26–28s after the server was already healthy expired that budget, so `panel_graph_outline` reported still reconnecting / `Connected: none` and only a hard browser refresh restored the tab. The default is now 35s (still capped at 60s).
+- **`panel_get_workflow_target` discloses when a live turn pin routes graph commands elsewhere (#1924).** The read and set tools now share the same machine-readable routing verdict so an agent is not told that `mode:"current"` governs graph commands when the live turn pin still holds another tab.
+- **`panel_create_group` preserves requested preview-node membership after SaveImage rehydration (#1925).** Auto-bounds now account for the stable full-height center of requested DOM-preview nodes before persisting the group, while preserving collapsed-node and failed-repair behavior.
+
+## [0.52.34] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- mode:"current" may not claim a routing target the turn pin holds elsewhere (#1919)
+
+## [0.52.33] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- pinned graph reads recover their instance stamp after reconnect without releasing the pin (#1916 / #1913)
+- panel_restart_comfyui accounts for a loopback instance on a non-default port (#1914)
+
+
+## [0.52.32] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- a workflow pin may not claim a graph target it did not establish (#1912)
+
+## [0.52.31] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- report every skipped action-button token, and stop double-reporting unknown nodes (#1908)
+- an origin-less download turn after a workflow switch inherits the routed tab, not the retired id (#1906)
+- validate_workflow no longer flags action-button tokens as widget values (#1880)
+- an add refused for a stale schema takes its own retry after a lost refresh ack (#1902)
+
+#### Changed
+- restart tests no longer depend on a live ComfyUI port (#1907)
+
+
+## [0.52.30] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_run returns queued:true after a mid-command drop if the prompt is already in the queue (#1901)
+- a rejected node id says what it wanted and what it got (#1897)
+- an occupied GPU after free is named instead of a silent freed:true (#1898)
+- the ENV line reports the panel ComfyUI will run, and the refusal names the cause that applied
+
+
+## [0.52.29] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- a successful free is no longer reported as failure from another server's GPU (#1890)
+- a post-restart graph READ waits out the reconnect instead of losing the race (#1886)
+- panel_create_group includes requested collapsed nodes (#1885)
+- restart_comfyui relaunches the venv python, not the trampoline's base child (#1884)
+- **`panel_restart_comfyui` relaunches a Desktop instance when the parent PID exists but its command line cannot be read (#1847).**
+  The parent-process walk used to refuse as soon as a live parent could not be identified, even when the connected server had already exposed a complete `sys.argv`, the live ComfyUI path, the `.venv` interpreter, `main.py`, and the instance-model-paths config. Newly installed custom nodes then needed a manual Desktop restart.
+
+  When that first-hop identity is unreadable, the restart now fail-closes on disk proof instead of guessing that Desktop is still supervising: if the interpreter, `main.py`, `sys.argv`, and every `--extra-model-paths-config` file resolve on disk, the confirmation card is offered and Manager stops the old server. The proven command is spawned only if that parent process is then gone and the port is free — a live parent may already be bringing the backend back, and a free port is what a supervised cold start looks like. Any missing file keeps the current refusal. A parent proven gone at preflight (#814) and a chain that went unreadable deeper than the first hop are unchanged.
+- a queued tool-session respawn sees the downloads started after the save, instead of killing them with no warning (#1567)
+- it waits on those transfers' live byte counts rather than treating every one as already stalled (#1567)
+- panel_update_node reports an error that never reached Manager without recommending a reinstall (#1888)
+- read-only graph calls are no longer refused while a render is running (panel#1489)
+
+## [0.52.28] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_update_node reports the Manager update-git error, not a stale generation traceback (#1879)
+- panel_free_vram no longer reports VRAM freed when a device stays pinned (#1878)
+
+
+## [0.52.27] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_run takes the node id its own tools printed (#1874)
+- a stale tab advertisement stops being reported as a restored graph binding (#1868)
+- panel_get_errors waits as long as the panel is allowed to take (#1867)
+
+
+## [0.52.26] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- a Blind conversation no longer receives run-completion pixels through the synthesised (watchdog) door — the strip now applies wherever a completion enters, and video refs are named rather than attached as `image/png` (#1863)
+- `panel_add_node`'s automatic refresh no longer reports a reply TIMEOUT as a failed refresh: a refresh that outruns its ack keeps running, so the reply now says the schema may already be current and to retry, instead of telling the caller a retry will refuse again (#1864)
+- `panel_load_workflow` loads a saved workflow after a confirmed restart instead of failing with ECONNREFUSED (#1850)
+
+## [0.52.25] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- launch-server tests collect on a Windows checkout (#1860)
+
+
+## [0.52.24] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- check_runtime knows PoYo's pack is a paid service, not a local node (#1858)
+- a dropped panel completion still arrives with the history output filenames (#1856)
+
+
+## [0.52.23] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- panel_open_workflow succeeds after placeholder definition rehydration (#1849)
+
+
+## [0.52.22] - 2026-08-19
+
+### MCP
+
+#### Changed
+- bump the npm-minor-patch group across 1 directory with 10 updates (#1837)
+- from bug report to published release, autonomously (#1831)
+
+
+## [0.52.21] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a departed Blind tab stops blinding the whole conversation, and the strip says it happened (#1842)
+- a dev-symlink panel below the floor reports behind:true (#1840)
+
+#### Changed
+- bump the actions-all group with 6 updates (#1836)
+- bump typescript from 5.9.3 to 7.0.2 (#1838)
+
+
+## [0.52.20] - 2026-08-19
+
+### MCP
+
+#### Changed
+- watch dependencies for advisories, weekly and grouped (#1833)
+
+
+## [0.52.19] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- Panel auto-sync reclaims a provably-abandoned operation lock instead of failing for days; panel_add_node names version skew (pack update + hard tab refresh) when an allowlisted frontend-only type is refused as a missing backend node (#1828)
+
+### MCP
+
+#### Fixed
+- auto-sync reclaims abandoned panel locks; frontend-only add-node errors name version skew (#1830)
+
+
+## [0.52.18] - 2026-08-19
+
+### MCP
+
+#### Added
+- panel_unexpose_subgraph_input/output — remove a subgraph boundary slot by name (#1812)
+
+## [0.52.17] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- call_tool runs when the payload is under parameters instead of args (#1825)
+
+
+## [0.52.16] - 2026-08-19
+
+### MCP
+
+#### Added
+- check_runtime consults the panel-proven frontend virtual registry (#1817)
+
+#### Fixed
+- panel_restart_comfyui refuses an unidentifiable local instance before asking, leaving the tab connected (#1822)
+- a stale graph fence no longer blocks Manager search/install/reboot or mode:current recovery (#1821)
+- empty registry zip installs fail instead of reporting success (#1820)
+
+
+## [0.52.15] - 2026-08-19
+
+### MCP
+
+#### Added
+- Qwen Code CLI as an Agent Panel backend over ACP (#1813)
+- panel_configure_app_mode — set App Mode inputs, outputs, and default mode (#1809)
+- panel_show_media stage:true stages oversized outside files into a served dir (#1810)
+
+#### Fixed
+- matchTitle on Fast Groups no longer pretends the toggle list rebuilt (#1814)
+
+
+## [0.52.14] - 2026-08-19
+
+### Added
+
+- **`minimax-h3-video` plugin skill (#1167).** Local MiniMax H3 (Hailuo) T2V/I2V/R2V
+  in ComfyUI — Comfy-Org INT8 pack, turbo LoRAs, 15 s stereo clips — with a
+  `#1155` `## Sources` block that **links** MiniMax's official prompting guides
+  rather than copying them (Community License includes Documentation). Distinguishes
+  the free local-weights nodes from the paid Hailuo API nodes. Enhancement — do not
+  merge until another agent reviews.
+
+### Fixed
+
+- **`panel_set_property(matchTitle)` on Fast Groups Bypasser/Muter no longer claims a live toggle-list rebuild (#1808).**
+  The write stores the property and the `from`/`to` reply is truthful, but rgthree
+  does not implement `onPropertyChanged` — `refreshWidgets()` runs on its own
+  service tick and leftover-row removal skips every other `Enable` row. A first
+  set can leave a partial list or `widgets:{}` (unbuilt, not "no matches").
+  The tool now says so, appends that note on Fast Groups filter writes, and the
+  rgthree skill / authoring prompt tell the agent to re-read and set again
+  instead of delete+re-add.
+
+- **MiniMax H3 skill load path (#1167 / #1801).** `plugin/skills/minimax-h3-video/SKILL.md`
+  no longer tells the agent to `panel_load_workflow` / `run_template` a Template
+  Library basename. Core `video_minimax_h3_*` graphs open from the frontend
+  Template Library, or from Comfy-Org/workflow_templates via `save_workflow` then
+  `panel_load_workflow path:`. `run_template` is named only as "won't work until
+  a pack exists."
+
+### MCP
+
+#### Added
+- MiniMax H3 local-video skill citing official prompting guides (#1801)
+- canonical flows at MCP initialize (call order, async handles, pre-flight, trust) (#1805)
+
+#### Fixed
+- plugin .mcp.json launches via a warm-path wrapper instead of bare npx (#1807)
+- one-arg panelLauncherPaths keeps windowsStartup under the passed home (#1806)
+
+
+## [0.52.13] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- five ways the launcher fallback could strand or double-serve a user (#1800)
+
+## [0.52.11] - 2026-08-19
+
+### MCP
+
+#### Added
+- split ComfyUI code and data roots via `COMFYUI_CODE_PATH` so pip/venv/core git can target the checkout while pack reads/writes stay on the live `--base-directory` / `COMFYUI_PATH` data root (#1765, thanks @woodenriver05; rebase of #1766)
+
+### MCP
+
+#### Added
+- support split ComfyUI code roots
+
+#### Fixed
+- route pack writes to the live data/base root after #1770
+
+
+## [0.52.10] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- list_templates honors COMFYUI_MCP_HTTP_TIMEOUT_S instead of aborting at 8s (#1795)
+- environment no longer reports packages missing off the Homebrew base python (#1794)
+- refuse Anima regional prompt writes the custom textarea overwrites (#1793)
+- a PINNED extra-paths target says so when the running server reads a different config (#1792)
+- the orchestrator's own /history observation keeps the completion promise panel_run makes — and the rider stops over-promising (#1791)
+
+
+## [0.52.9] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a live graph read with a missing instance stamp now runs (#1787)
+
+#### Changed
+- the 0.52.7 changelog names #1784, which shipped in the tag (#1785)
+
+
+## [0.52.7] - 2026-08-19
+
+### MCP
+
+#### Added
+- skills cite official vs empirical prompting guidance (#1776)
+
+#### Fixed
+- panel_save_workflow corroborates a fence refusal so a save-only retry self-heals (#1782)
+- the widened fence arm must not adopt refusals that merely quote it (#1784)
+
+
+## [0.52.6] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a workflow edit can no longer land silently on the canvas you switched away from: a stamp CARRIED onto a freshly minted tab id is no longer accepted as that tab's advertised identity, so panel_save_workflow and the other active-canvas commands refuse before the socket write and name the documented rebind, instead of passing a gate that compared the carried value against itself (#1775)
+- a pi turn whose session the CLI no longer has drops the dead session id and retries once as a fresh session, instead of failing every turn until you type /new (#1774)
+- three packs whose workflows asked for models their manifests never downloaded now install clean — z-image-xy-plot ships the Q8_0 GGUF its loader actually loads, leaked personal LoRAs are replaced with declared bring-your-own placeholders, and packs:check-models runs as a CI gate instead of never running at all (#1771)
+- adding Lora Loader (LoraManager) from autocomplete names the STRING-socket LoRA Text Loader instead of stalling five seconds and refusing a healthy pack on ComfyUI 1.49+ (#1762)
+- the local-llms docs flag the default :e4b fine-tune as text-only, so nobody picks it expecting the panel to see its own generated images (#1777)
+
+#### Added
+- consult the maintained arena baseline table — model, params, quant, VRAM and score, grouped by 8 GB fit — from the docs without running the benchmark yourself (#1773)
+
+#### Changed
+- the same vision caveat is mirrored into all ten translated local-llms pages, so a non-English reader is warned too (#1779)
+
+
+## [0.52.5] - 2026-08-19
+
+### MCP
+
+#### Added
+- add Atlas Cloud agent provider (#1726)
+- stamp WHICH LLM filed a panel bug report, mechanically (#1753)
+
+#### Fixed
+- opening a save-as copy rebinds dest identity so save and the promoted prompt stick (#1764)
+- set_workflow_target no longer reports a successful reconnect check when the next graph call has no tab (#1763)
+- node_pack authors into the runtime's --base-directory, not the code install root (#1770)
+- a self-nested panel_call_tool unwraps once or names the correct shape (#1769)
+- name a partial install when custom_nodes were never submitted (#1755)
+- restart_comfyui relaunches the Stability Matrix package venv, not Assets CPython (#1761)
+- a download-complete event now means the dest file exists (#1760)
+- report a non-ASCII CIVITAI_API_TOKEN as a credential fault, not a network outage (#1759)
+- panel_remove_mcp + panel_reload drops the removed server (#1758)
+- panel_set_widget summarizes long previous/new echo strings (#1756)
+- drop vrgamedevgirl from z-image-turbo-controlnet to skip llama-cpp-python source builds (#1754)
+
+
+## [0.52.4] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a fence this call REPAIRED is not a fence that was already fine — and the verdict rides in a field (#1740)
+- unwind call_tool when get_system_stats times out mid-decode (#1751)
+- recover panel_restart_comfyui when the crash takes the bridge offline (#1752)
+- recover the turn pin before mode:current claims bound (#1750)
+- do not report a post-crash 502 as a base-URL misconfiguration (#1749)
+- the progress counter runs at Node's default buffer depth again (#1746)
+- graph_* fail fast while a prompt runs; do not clear the fence on an identity-only open (#1745)
+- set a listed promoted subgraph widget (#1743)
+- degrade panel_search_nodes when Manager cache mappings return HTTP 500 (#1742)
+- treat tmp: key/routing_key as fence corroboration identity (#1741)
+- the download progress counter observes bytes instead of pacing them (#1738)
+- a configured COMFYUI_RESTART_COMMAND restarts the externally-managed instance the launch path can't prove (#1737)
+- a fenced graph READ is diagnosed, and a missing stamp is not a wrong one (#1736)
+- a download goes to the extra model root the SERVER named, not an unvouched install (#1734)
+- containment in a root WE picked is not readership — an unvouched destination is UNCONFIRMED, not "in the right place" (#1735)
+- a too-old note with a current disk pack prescribes restart + hard-refresh, not a no-op sync (#1729)
+- panel_show_media's mid-command drop now settles with a re-issue, not an unverifiable check (#1728)
+
+#### Changed
+- lead with the demo, as a poster that links to the video (#1744)
+
+
+## [0.52.3] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a workflow-instance mismatch is diagnosed read-only, so a refused edit can no longer re-aim the fence onto the live canvas the caller did not name (#1646)
+- free_vram on a frozen tab is settled against the ComfyUI server itself instead of left outcome-unknown (#1249)
+- a Manager reboot whose loopback witness saw the down-up cycle reports the restart confirmed, not unconfirmed (#1642)
+- bootstrap finds git in the Git for Windows install roots when the orchestrator's PATH predates the install, and says a full restart is required when git is truly absent (#1640)
+- node_pack scaffold/publish adopt the live workspace install_comfyui already detected instead of refusing that no local install is configured (#1653)
+- apply_manifest stops refusing junctioned model folders, so a StabilityMatrix install resolves every model category (#870)
+- a re-spelled ComfyUI target keeps its self-queue ledger, so a post-reconnect scoped preview is not refused as a duplicate (#1615)
+
+
+## [0.52.2] - 2026-08-18
+
+### MCP
+
+#### Fixed
+- a new session resumes the downloads its predecessor's death orphaned (#1567)
+- upload tools return the subfolder-qualified reference a loader can use (#946)
+- stop shipping a preset library nothing reads (#1597)
+- search_custom_nodes tries the comfyui-prefixed registry id, so repo-name queries like WanVideoWrapper no longer false-empty (#773)
+- automatic previews stop at a per-conversation budget instead of compounding a Codex rollout without bound (#1516)
+- a fence the settling read proved live is reported BOUND, not unrestored (#980)
+- a download destination is judged by the one observation that produced it (#1371)
+
+
+## [0.52.1] - 2026-08-17
+
+### MCP
+
+#### Added
+- Grok 4.6 is now in the Agent Panel catalog (#1494)
+
+#### Fixed
+- re-delivered multi-workflow events inherit the established origin instead of wedging scope routing (#1685)
+- a timed-out clone's lingering git tree is killed so cleanup can remove the husk, and an existing husk is refused rather than reported installed (#1684)
+- a mid-session MCP drop is met with one bounded reconnect, reported either way (#1681)
+- a post-switch panel_* command whose stamp no longer names the routed tab's canvas is refused before dispatch (#1682)
+- restart relaunches the interpreter the healthy server was observed running under (#1680)
+- a landed file the core listing contractually omits is unconfirmed, never "not-visible" (#1679)
+- an unreadable parent PID degrades to a disclosed Desktop restart (#1677)
+- training runs no longer trip the hard stall floor while the server stays alive (#1676)
+- download_model action:"cancel" no longer asserts a live heartbeat it never probed (#1675)
+- resolve list_paths through the live root the OS can see (#1629)
+- Blind gates the Claude backend's native Read/WebFetch with a PreToolUse deny hook (#1643)
+
+
+## [0.52.0] - 2026-08-17
+
+### MCP
+
+#### Added
+- panel MCP autostart — an explicit per-user launcher starts MCP when the panel opens, loopback-only and bearer-authenticated, with live provider discovery (#1590)
+- exact per-action tool allowlist — COMFYUI_MCP_TOOL_ACTION_ALLOW names the tool:action pairs an operator permits, no wildcards (#1452)
+
+#### Fixed
+- get_defaults names the live-preview id the frontend actually reads (#1638)
+- download_civitai sends the per-request auth override instead of dropping it (#1635)
+- a pack's install manifest is readable via list_packs action:"read_manifest" (#1649)
+- panel_search_nodes documents its own limit bound (#1287)
+
+
+## [0.51.57] - 2026-08-16
+
+### MCP
+
+#### Fixed
+- a node read by id returns its full widget value, not a survey clip (#1634)
+- cancel_queued reports the removal it observed, not the one it requested (#1632)
+- a repo filed under a Comfy Registry id is refused, not swapped for another author's (#1624)
+- a run acknowledged after its reply timeout is not an unknown outcome (#1175)
+- a skill description with a colon in it ships with NO description at all (#1620)
+- a tree the server demonstrably reads is not refused over one stray file (#1147)
+- a session that came up without an MCP server says so (#1524)
+- a queued credential respawn waits for in-flight transfers instead of killing them (#1567)
+- a post-open exempt read that got no answer is REPORTED (#1560)
+- refuse the ambiguous from-source install instead of picking a repo (#1616)
+- a refused offer is not a verdict anyone was told (#1327)
+- a git-URL install stops asking a Manager channel nobody chose (#1539)
+- the Manager verdict never asserts more than it observed (#1374)
+- a drained ComfyUI-Manager queue is not evidence the file landed (#1374)
+
+#### Changed
+- rgthree skill — the toggles agents keep getting wrong (#1551)
+
+
+## [0.51.56] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- the restart refusal stops sending you at a server it knows is the wrong one (#1593)
+- pack VRAM tiers say what their own manifest fetches (#1585)
+
+## [0.51.55] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- let the SERVER answer whether a model is installed (#1587)
+- panel_strip_workflow hands back a graph a script can parse (#1589)
+
+## [0.51.54] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- a stale panel MCP session is a session problem, not a bad request (#1524)
+- the loopback MCP reports the port it BOUND, not the one it was asked for
+
+## [0.51.53] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- bound the images a run completion attaches to an agent turn (#1516)
+- account for the unnamed outputs the counts already include
+- the drain CORRECTS the claim, rather than only enforcing the number
+- the preview budget is per TURN — a per-event cap was not a cap
+
+## [0.51.52] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- adopt the instance the load proved, instead of warning about it (#1478)
+- claim — an API load proves a new instance and leaves the fence stale
+
+## [0.51.51] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- the refusal says UNKNOWN where it cannot know reads still work
+- prefer the EXACT (id, target) record over a targetless one
+- a write refusal stops promising that graph reads still work
+- scope identity by (id, target), and stop contradicting the caveat
+- DISCLOSE the disagreement — suppressing it was worse, and inert besides
+- never announce a completion this orchestrator's own status tool contradicts
+
+
+## [0.51.50] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the loader fail first, then append the remedy
+- refuse a stale path with the remedy — never substitute the manifest
+- resolve a pack manifest by NAME, and recognise a path that expired
+
+#### Changed
+- click the logo to go home, not to GitHub (#1581)
+- play the panel demo on the landing page instead of a placeholder (#1580)
+- Korean pilot — five entry pages, and the hreflang gate (#1577)
+
+
+## [0.51.49] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a tab leaves the watch when its restart RESOLVES, not only when dropped
+- a watch can no longer outlive the save that created it
+- only an ARMED credential respawn may speak, and only once
+- take the at-risk snapshot when the respawn FIRES, not when it is queued
+
+#### Changed
+- fix what the docs claim, before translating them into eleven languages (#1558)
+
+
+## [0.51.48] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- bind the own-property test at load, not through the prototype
+- require an OWN property at every hop of the refusal claim
+- retry a PRE-EXECUTOR refusal, keyed on the field the panel publishes
+- wait out a reconnect refusal instead of handing it back
+
+
+## [0.51.47] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a panel too old to help is also too old to say so (#1572)
+
+
+## [0.51.46] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- settle whether an unlisted git repo can install at all (#1566)
+
+
+## [0.51.45] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a Get/Set bus node is not an unknown runtime (#1564)
+
+
+## [0.51.44] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- an INFERRED models root must still be corroborated before a download lands there (#1562)
+
+
+## [0.51.43] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a relative interpreter path no longer sends a LOCAL download to Manager (#1555)
+
+
+## [0.51.42] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the spawned child make the #952 drift comparison (#1553)
+
+
+## [0.51.29] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- take the graph read this refusal prescribes, and report what it found (#1515)
+
+
+## [0.51.28] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- resolve "nightly" by asking the repository, not by guessing (#1513)
+
+
+## [0.51.27] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- name the load as the cause of a workflow-instance mismatch (#1510)
+
+
+## [0.51.26] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- coalesce a burst of run_errors instead of nesting them (#1507)
+
+
+## [0.51.25] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- bound the inline image so a huge render stays inspectable (#1505)
+
+
+## [0.51.24] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- advertise the real version instead of a hardcoded 0.1.0 (#1503)
+
+
+## [0.51.23] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- a paid third-party service node is not "local, no paid credits" (#1501)
+
+
+## [0.51.22] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- report a remote ComfyUI that a restart stopped and nothing brought back (#1497)
+- stop telling users to turn on a setting that does not exist (#1498)
+
+
+## [0.51.21] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- the mismatch guard names a selector an unsaved tab actually has (#1492)
+
+
+## [0.51.20] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- status must not call a PROVEN-dead download 'still streaming' (#1490)
+
+
+## [0.51.19] - 2026-08-12
+
+### MCP
+
+#### Added
+- ship the twelve locale catalogs the runtime has been waiting for (#1486)
+
+#### Fixed
+- refuse a download whose destination the server PROVABLY does not read (#1487)
+
+
+## [0.51.18] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- refuse a download that would exhaust the cache volume (#1482)
+
+
+## [0.51.17] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- name the restart that actually applies an npx update (#1475)
+- show the Manager's own error body, bounded, instead of a bare status line (#1465)
+- say that list_templates reflects what the server REGISTERS, not what is on disk (#1469)
+- stable_audio_3 emits SaveAudioMP3 without required quality, and defaults to a silent sampler pair (#1466)
+- say WHY remove searched fewer roots than list_paths shows (#1476)
+
+
+## [0.51.16] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- an unresolved pack must not read as 'does not exist' on a possibly-stale catalogue (#1463)
+
+
+## [0.51.15] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- workflow navigation has a reader too — name it (#1459)
+
+
+## [0.51.14] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- tell a dropped graph write to verify with a graph READ, not the render queue (#1457)
+
+
+## [0.51.13] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- compare the panel's tool vocabulary at the handshake, not at call time (#1455)
+
+
+## [0.51.12] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- say how long the workflow switch has been holding (#1450)
+
+
+## [0.51.11] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a relay fence stops assuming the panel is served from COMFYUI_URL (#1446)
+
+
+## [0.51.10] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a retarget round-trip says nothing, instead of saying A changed to A (#1444)
+
+
+## [0.51.9] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- an empty download listing stops reading as 'nothing is running' (#1441)
+
+
+## [0.51.8] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a panel message that arrives before boot finishes is no longer dropped (#1439)
+
+
+## [0.51.7] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a preserved fence that still matches is not 'graph tools will keep failing' (#1437)
+
+
+## [0.51.6] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- the injected steering tells a code-mode agent where its panel tools actually are (#1435)
+
+
+## [0.51.5] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- colon-qualified node ids stop being uneditable (and stop resolving to the wrong node) (#1433)
+
+
+## [0.51.4] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a retarget that lands mid-turn tells the agent its tools were stale (#1430)
+
+
+## [0.51.3] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- reserve time to actually SAVE a recovered token (#1426)
+- a human fetching a credential is not a stalled operation (#1424)
+
+
+## [0.51.2] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- ui-bridge.test.ts flakes in isolation, not just under load (#1419)
+
+
+## [0.51.1] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- name the Desktop launch arguments that did not take effect (#1414)
+- the smoke mock implements what it advertises (#1412)
+
+
+## [0.50.115] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- warn before a credential save orphans in-flight downloads (#1406)
+- the smoke mock advertises a panel version, and a ratchet keeps it current (#1410)
+- a completed job no longer matches its own re-entry guard (#1407)
+- verify a .json attachment by parsing it, not by its content-type (#1405)
+- prove the configured base before writing a model into it (#1403)
+
+
+## [0.50.114] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a local download should not need ComfyUI-Manager (#1393)
+
+
+## [0.50.113] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a frontend-only node is not an unknown runtime (#1396)
+
+
+## [0.50.112] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- the live canvas gets its node definitions from its own ComfyUI (#1390)
+
+
+## [0.50.111] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- stat the partial instead of asserting it (#1392)
+
+
+## [0.50.110] - 2026-08-11
+
+### MCP
+
+#### Added
+- panel_remove_widget — remove one dynamic widget row (#1387)
+
+#### Fixed
+- the workflow stamp survives a tab-id migration (#1389)
+- a progress line is not a failure reason (#1386)
+
+
+## [0.50.109] - 2026-08-11
+
+### MCP
+
+#### Added
+- restrict the tool surface — deny/allow lists and presets (#1383)
+- krea2-identity-edit — local outfit swap, on demand (#1376)
+
+
+## [0.50.108] - 2026-08-10
+
+### MCP
+
+#### Added
+- send operational status to the agent, not to the user (#1375)
+
+
+## [0.50.107] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- gate the instance-witness channel too, not just the process probe (#1367)
+
+
+## [0.50.106] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- say what a timed-out secret card actually means (#1364)
+
+
+## [0.50.105] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- say WHICH host the node definitions came from when a remote strip fails (#1362)
+
+
+## [0.50.104] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop telling a code-mode agent its panel tools are absent (#1360)
+
+
+## [0.50.103] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- accept a Desktop bundle whose binary is branded differently (#1358)
+
+
+## [0.50.102] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- clear the fence on the verdict that PROVED identity (#1355)
+
+
+## [0.50.101] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- refresh the node schema and retry the add, once (#1354)
+- consume a control_after_generate slot only when it holds a control mode (#1350)
+
+
+## [0.50.100] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop reporting a lost transport as "the user cancelled" (#1348)
+
+
+## [0.50.99] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- name the remedy that restores a trusted identity, not the one that cannot (#1346)
+
+
+## [0.50.98] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- corroborate a fence mismatch before failing 14 calls closed (#1344)
+
+
+## [0.50.97] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- a re-delivered completion must not disown a run we queued (#1342)
+
+
+## [0.50.96] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- refuse an arbitrary-URL download once, before three requests fail (#1338)
+
+
+## [0.50.95] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- ui-bridge.test.ts is load-sensitive — find the real rejection, don't loosen the assertion (#1336)
+- the prescribed recovery from a lost tab binding is a dead end (#1322)
+
+
+## [0.50.94] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- tell the user the install is damaged, instead of printing a resolver path (#1333)
+
+#### Changed
+- delete a header claim about a caller that does not exist (#1324)
+
+
+## [0.50.93] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- anchor a relative launch script on Windows, where /proc has no equivalent (#1315)
+
+
+## [0.50.92] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop prescribing a rebind that needs the tab we just said is missing (#1317)
+
+
+## [0.50.91] - 2026-08-10
+
+### MCP
+
+#### Changed
+- prove the live-process stub is in force, instead of assuming it (#1314)
+
+
+## [0.50.90] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- resolve the panel base through the OS-observed process on Desktop (#1193)
+
+
+## [0.50.89] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- this repo's own release subject is a release subject (#1310)
+
+
+## [0.50.88] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- say it once — the interactive remedy repeated its own lead (#1307)
+- give an interactive card a disconnect remedy that applies to it (#1305)
+
+
+## [0.50.87] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a proven-irrelevant stale copy no longer vetoes the download (#1298)
+- say why a CivitAI download failed, instead of a bare status (#1303)
+
+#### Changed
+- 0.50.86 (#1304)
+- 0.50.85 (#1302)
+
+
+## [0.50.86] - 2026-08-09
+
+> Covers changes since 0.50.85.
+
+### MCP
+
+#### Fixed
+
+- **A failed model download now says WHY (#1300).** `download_model` reported
+  `Download failed: 404 ` and nothing else, so a missing CivitAI token and a genuinely
+  wrong URL were the same sentence — one reporter needed four attempts to download a
+  single file. The server's own explanation is now carried back (bounded and scrubbed),
+  and for CivitAI the message names the actual cause: no token configured, a token that
+  is invalid or unentitled, or a metadata-query URL that needs the `?fileId=` form.
+
+## [0.50.85] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop reporting a forgotten run as one you never queued (#1301)
+
+#### Changed
+- 0.50.84 (#1297)
+
+
+## [0.50.84] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- absorb the post-restart reconciliation window in mode:"current" (#1292) (#1295)
+
+
+## [0.50.83] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- say 'could not determine' instead of asserting the tab did not reconnect (panel#654) (#1289)
+
+#### Changed
+- fail when a test reaches the live-process probe unstubbed (#1291)
+- 0.50.82 (#1288)
+
+
+## [0.50.82] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a tab id is a bridge ROUTE, not a workflow path (#1287)
+
+
+## [0.50.81] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- an explicit workflow pin must clear an AMBIGUOUS turn pin (panel#888) (#1279)
+
+#### Changed
+- 0.50.80 (#1283)
+
+
+## [0.50.80] - 2026-08-09
+
+### MCP
+
+#### Changed
+- 'unreachable' is a specific claim, not a synonym for 'it failed' (#1281)
+- 0.50.79 (#1280)
+
+
+## [0.50.79] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- persist job records without a panel, so a restart can be survived (#1278)
+- do not adopt an in-flight record whose writer is PROVEN gone (#1275)
+
+#### Changed
+- 0.50.78 — an open that lands on another workflow stops reporting success (panel#887) (#1276)
+
+
+## [0.50.78] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- tell the caller when the post-open read contradicts the open (panel#887) (#1272)
+
+#### Changed
+- 0.50.77 (#1273)
+
+
+## [0.50.77] - 2026-08-09
+
+### MCP
+
+#### Changed
+- a failure message must not name a cause nobody observed (#1271)
+- 0.50.76 (#1270)
+
+
+## [0.50.76] - 2026-08-09
+
+### MCP
+
+#### Changed
+- 'no saved sessions' must not also mean 'could not read them' (#1269)
+- 0.50.75 (#1268)
+
+
+## [0.50.75] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- download-manager-routing depends on state a neighbour primes (#1266)
+- the identity refusal must describe the check it actually ran (#1255)
+
+#### Changed
+- a probe that FAILED must not answer 'no' (#1267)
+- 0.50.74 (#1265)
+
+
+## [0.50.74] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a relaunch that exits 1 must say what the child printed (#1262)
+
+#### Changed
+- 0.50.73 (#1260)
+
+
+## [0.50.73] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- 'latest' is not a git ref — do not check it out (#1258)
+
+#### Changed
+- 0.50.72 (#1256)
+
+
+## [0.50.72] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- investigate #1077 Finding 2 — permanent refusal without a relay backend (#1252)
+
+#### Changed
+- reset the panel-base cache in the five files that never did (#1253)
+- 0.50.71 (#1251)
+
+
+## [0.50.71] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the timeout must not offer a cause it already ruled out (#1247)
+- get_history shows output VALUES, not just their keys (#1229)
+
+#### Changed
+- stop panelRecoveryContext wording depending on which test ran first (#1250)
+- 0.50.70 (#1249)
+- 0.50.69 (#1248)
+
+
+## [0.50.70] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.50.69] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- 127.0.0.1 and localhost are the same host, not a target drift (#1246)
+
+#### Changed
+- 0.50.68 (#1245)
+
+
+## [0.50.68] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the stale-heartbeat note must not tell a Manager dispatch to re-issue (#1242)
+
+#### Changed
+- 0.50.67 (#1241)
+
+
+## [0.50.67] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a relay session can adopt a workflow fence — it knows its own origin (#1240)
+
+
+## [0.50.66] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a CONFIRMED origin mismatch must not be lost inside the proof (#1235)
+
+#### Changed
+- delete civitai-lookup.ts, which nothing has ever imported (#1236)
+- 0.50.65 (#1232)
+
+
+## [0.50.65] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- enforce panel_graph_outline's max_chars when the live panel ignores it (#1228)
+- make an unreachable host say unreachable, not 'nothing found' (#1136)
+
+#### Changed
+- 0.50.63 (#1227)
+
+
+## [0.50.64] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.50.63] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop redacting file paths and module names, and filter the log BEFORE scrubbing (#1225)
+
+#### Changed
+- 0.50.62 (#1224)
+
+
+## [0.50.62] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a 0-node outline right after a restore is not an observation (#1221)
+
+
+## [0.50.61] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- de-flake two timing-dependent tests (#1216)
+
+
+## [0.50.60] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.50.59] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- status must not report a LIVE download as missing (#1213)
+- type three test-only violations so `src/__tests__` can rejoin typechecking (#1204)
+
+
+## [0.50.58] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- scrub /internal/logs before it reaches a tool result (#1209)
+
+
+## [0.50.57] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- download status must not promise survival across an orchestrator restart (#1194)
+
+
+## [0.50.56] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- redact the response body in the enqueue error builders (#1202)
+
+
+## [0.50.55] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a live ComfyUI-Manager download must not be reported INTERRUPTED (#1200)
+
+
+## [0.50.54] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a rebind that fails on an OLD panel says so, and names the version (#1199)
+
+
+## [0.50.53] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a 404 category is an ANSWER, not an unreadable one (#1196)
+
+
+## [0.50.52] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- report the destination ComfyUI-Manager actually chose (#1190)
+
+
+## [0.50.51] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- make the endpoint-specific !res.ok branches reachable (#1187)
+
+
+## [0.50.50] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a BACKGROUNDED phone is not a departed phone (#1185)
+
+
+## [0.50.49] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop the client library's error path eating non-JSON responses (#1178)
+
+
+## [0.50.48] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the refusal names the origin the connected panel is actually on (#1181)
+
+
+## [0.50.47] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a non-JSON /prompt reply states the delivery doubt instead of a parser message (#1179)
+- hold a turn's temp images past the turn, so a deferred read still finds them (#1177)
+
+
+## [0.50.46] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- getHistory names the endpoint instead of leaking a parser message (#1172)
+
+
+## [0.50.45] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an interrupted download leaves a findable record instead of vanishing (#1170)
+
+
+## [0.50.44] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an EMPTY live listing is not evidence of a different install (#1168)
+- a bare JSON parse error names the tool, the likely cause, and the delivery doubt (#1166)
+- accept the video containers this codebase already recognizes (#1165)
+
+
+## [0.50.43] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- stop reporting a live download as FAILED, and stop claiming bytes moved for a 404 (#1163)
+- Save-As and new-workflow trust their OWN reply's proven uuid (#1161)
+- recent_errors:0 returns none, and says the log was not checked (#1162)
+- reopening a tab's OWN tmp: routing_key refreshes the fence (#1157)
+
+
+## [0.50.42] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a filtered empty listing says where else to look (#1158)
+- name the tool that CAN install an unregistered pack (#1156)
+- reject unrecognized argument keys instead of silently dropping them (#1153)
+- stop abandoning a WRITE sooner than a read (#1154)
+
+
+## [0.50.41] - 2026-08-08
+
+### MCP
+
+#### Added
+- attach UI workflow metadata to API-enqueued prompts (#1124)
+
+
+## [0.50.40] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a REFUSED Manager enqueue falls through to the direct git clone (#1143)
+
+
+## [0.50.39] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a RESERVED Manager update is staged, not failed (#1141)
+
+
+## [0.50.38] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- the GitHub Release body is THIS version's changelog, not every PR since forever (#1138)
+- stop telling users to move a model into the folder it is already in (#1137)
+
+
+## [0.50.37] - 2026-08-08
+
+### RunPod image
+
+#### Fixed
+- a hash that could not be COMPUTED is not a hash that DIFFERED (#1123)
+
+### MCP
+
+#### Added
+- report the ComfyUI FRONTEND version — the field #779 turned on (#1126)
+
+#### Fixed
+- REFUSE an auth-gated Manager dispatch instead of writing a corrupt model (#473) (#1134)
+- finish the #796 review — baseline reaches zero, and a comment could switch the gate off (#1125)
+
+#### Changed
+- ask for the ComfyUI FRONTEND version, and say why (#1127)
+
+
+## [0.50.36] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a Manager listing is PLACEMENT, never validity — my 0.50.29 regression (#473) (#1120)
+
+#### Changed
+- the shipped build's data-loss guards must actually guard (#1119)
+- pin the env var our errors tell people to set (#1118)
+- the tunnel-deferral comment named a function that does not exist (#1117)
+
+
+## [0.50.35] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- defer the update-restart while a phone is connected over a tunnel (#875) (#1115)
+
+
+## [0.50.34] - 2026-08-08
+
+### MCP
+
+#### Added
+- gate the "could not determine" → "determined not" collapse (#1110)
+
+#### Fixed
+- persist the phone pair token so a restart stops killing the link (#875) (#1113)
+
+
+## [0.50.33] - 2026-08-08
+
+### MCP
+
+#### Added
+- declare destructive/openWorld hints on the money-spending tools (#1108)
+
+#### Fixed
+- a fence the panel repaired mid-call is no longer reported as failure (#1043) (#1111)
+
+
+## [0.50.32] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an AMBIGUOUS turn is not a dead tab, and not a missing Origin (#1077) (#1107)
+- refuse API/prompt format instead of crashing or lying (#1103)
+
+#### Changed
+- pin that every pack ships a UI workflow, not API/prompt (#1105)
+
+
+## [0.50.31] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a 403 already says WHY — stop dropping it (#1099)
+
+
+## [0.50.30] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a REMOTE no-reboot-endpoint failure now names what will work (#425) (#1100)
+- name the tunnelled-remote case in the panel-restart refusal (#1098)
+
+
+## [0.50.29] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- ask the server whether a Manager dispatch landed (#1086) (#1096)
+
+#### Changed
+- tell callers to add sequentially, and why (#1095)
+
+
+## [0.50.28] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- an unreadable overrides file is preserved, not erased (#796) (#1093)
+
+
+## [0.50.27] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- never overwrite a ~/.claude.json we could not read (#796) (#1091)
+- a Manager dispatch must not promise where the file lands (#1090)
+
+
+## [0.50.26] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a config that could not be loaded is neither empty nor disposable (#796) (#1087)
+
+
+## [0.50.25] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a refused adoption now says WHICH gate refused it (#1077) (#1084)
+- an unreadable settings answer is not an empty one (#796) (#1082)
+- say that `name` is dropped when the slot is reused (#1081)
+
+#### Changed
+- record the first measured arm, and what is still unmeasured (#1083)
+
+
+## [0.50.24] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a store that could not be READ is never overwritten (#796) (#1079)
+- a log that could not be read is not a clean restart (#796) (#1078)
+
+
+## [0.50.23] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- the fence repair was gated behind the one call the wedge blocks (#1075)
+
+
+## [0.50.22] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- the advertise retry loop could not retry (#1073)
+- getSystemStats must be able to fail, and fetchImage must be able to time out (#1072)
+- give the cloud client the timeout ceiling and delivery doubt its twin already had (#1069)
+- a transport failure on a POST no longer implies the POST never arrived (#1068)
+- a reply-timeout on a mutating command no longer reads as "nothing happened" (#1067)
+- two release gates anchored to a frozen retirement baseline instead of the live surface (#1066)
+
+#### Changed
+- verify the published PANEL surface builds too (#1065)
+- verify the published surface REGISTERS, not just that it boots (#1064)
+- the startup probe budget is 60, not 20 — and gate the drift (#1063)
+- COMFYUI_MCP_NO_AUTOSPAWN does not exist — name the control that does (#1062)
+
+
+## [0.50.21] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- the generate_* family reports rejected output branches too (#1060)
+
+#### Changed
+- a remedy never names an action the tool does not have (#1059)
+
+
+## [0.50.20] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- settle before re-issuing a scoped run that lost the stamp race (#1057)
+
+
+## [0.50.19] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- make the character budget reachable (#1055)
+
+
+## [0.50.18] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- I/O dirs follow the CONNECTED ComfyUI, not a second install (#1053)
+
+#### Changed
+- pin that nested "<node>.<combo>.<leaf>" override keys work (#1051)
+
+
+## [0.50.17] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a save's tmp:→wf: rename is one origin, not a mixed batch (#1047)
+
+
+## [0.50.16] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a Save-As re-anchors the session fence too (#1046)
+
+
+## [0.50.15] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a queued prompt can still have had output branches rejected (#1042)
+
+
+## [0.50.14] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- settle the linked-nested placeholder ambiguity by counting the row (#1040)
+
+
+## [0.50.13] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- bound the four process probes that can wedge startup (#1038)
+
+
+## [0.50.12] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- talk to the SAME ComfyUI as every other tool (#1035)
+
+
+## [0.50.11] - 2026-08-07
+
+### MCP
+
+#### Added
+- tool-reach corpus for the consolidated 37-tool surface (#1003)
+
+#### Fixed
+- a ComfyUI call with no budget of its own had no time limit (#1033)
+
+
+## [0.50.10] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- close the swap window — and fix the reproduction that hid it (#1031)
+
+
+## [0.50.9] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- retry a mid-workflow-switch refusal instead of surfacing it (#1029)
+- bound the skill-generator's network calls (#1028)
+
+
+## [0.50.8] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a new canvas gets a new fence (#1024)
+- accept the node ids we print, and say which canvas args were ignored (#1023)
+- accept the todo status spellings agents actually produce (#1022)
+
+
+## [0.50.7] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- say at pair time whether the phone URL survives a restart (#1020)
+- name the panel's ComfyUI origin instead of asking the reader to check (#1019)
+- describe an unparsable category body from what was observed (#1017)
+- an ambiguous routing pin is not a reconnecting panel (#1016)
+- an explicit retry is not a blind re-issue (#1014)
+
+
+## [0.50.6] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- ask PowerShell for UTF-8 before reading a process command line (#1012)
+- the ACTION-level admission refusal owes the same explanation the name-level one got (#1008)
+- scan untracked files too, and say what was skipped (#1009)
+- dedupe the changelog against what it already says (#1007)
+
+
+## [0.50.5] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a render completion is a STEP when a plan is still running (#1002)
+- name our own User-Agent, and stop pushing Windows onto Python (#1000)
+- the Manager route is a routing fallback, not a remote server (#999)
+- say WHY the caller is holding a tool that does not exist (#998)
+
+#### Changed
+- reach the injection call sites three fixes could not (#1004)
+
+
+## [0.50.4] - 2026-08-07
+
+### MCP
+
+#### Added
+- summary_only, so the report costs a report (panel#690(5)) (#992)
+- expose the filter/limit the panel now honours (panel#690(5)) (#990)
+
+#### Fixed
+- list what the server REGISTERS, not 15 hardcoded folder names (#995)
+- a batch queues N runs, so ticket N runs (#994)
+- extend the unapplied-filter guard past `creator` (#993)
+- a run-error notice must not assert who queued the run (#991)
+- a remedy has to work from where the user is reading it (#989)
+- a slice that matches no output node explains why (panel#690(4)) (#986)
+
+
+## [0.50.3] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a path in `filename` is a subfolder request, not a broken upload (#985)
+- two different tabs must not render identically (#984)
+- a painted card is not a loaded image (#982)
+- an untrusted hello must not ERASE the tab's command stamp (#976)
+
+#### Changed
+- stop betting on 25ms to decide when the abort lands (#981)
+
+
+## [0.50.2] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a remote listing is incomplete BY CONSTRUCTION — say so, on every result (#975)
+- don't lead with an update when the disk version was never read (#974)
+- a `git pull` that exits 0 is not proof the checkout moved (#972)
+- a minted prompt_id is a receipt, not a flag (#971)
+- a run is owned by the conversation that queued it, not by the tab id (#969)
+- stop letting "fetch failed" stand in for a diagnosis (#968)
+- stop reporting an unread model list as an empty install (#967)
+- map live-canvas widgets by NAME, and disclose when we can't (#966)
+- publish the admission surface, and stop conflating "excluded" with "unknown" (#965)
+- detect panel/server vocabulary skew at the handshake, not at call time (#964)
+
+
+## [0.50.1] - 2026-08-06
+
+Ten fixes on top of the 0.50.0 consolidation, and most of them are one defect class:
+a tool reporting something it had not actually established.
+
+A restart fenced the endpoint rather than the instance, so a same-URL reaffirmation
+bumped a generation without moving anything. A backend stall reached the agent as a
+USER rejection. `panel_run` could stack a duplicate after a reconnect, because the
+self-queue ledger is prompt-id based and in-memory — so the agent's OWN earlier render
+read as unattributed; the fence now demands PROVEN self-attribution and refuses with the
+override named rather than silently duplicating. A "panel install did NOT land" warning
+fired against a tree the retarget had already corrected. And `self_update` on Windows
+could never succeed at all: the running orchestrator holds its own sharp DLL open, the
+in-place npm replace failed EBUSY, and the error was swallowed.
+
+Also here: the test suite could rewrite the developer's real `~/.comfyui-mcp` state. That
+had been fixed four separate times per-test and kept coming back, so the whole run is now
+redirected before workers fork. And the vocabulary gate was counting mentions by raw
+substring while every other check is token-bounded — where a live name contains a dead one
+(`self_update_action` vs `self_update`) it overcounted and silently denied valid exemptions.
+
+### MCP
+
+#### Fixed
+- a failed clone must not leave something ComfyUI will try to load (#917)
+- redirect every persistent store for the whole run (#930)
+- say where the listing came from, instead of making callers guess (#915)
+- count mentions the way the gate detects them; stop welding doc lines together (#951)
+
+#### Changed
+- warn that Manager's "Nightly" is not nightly, and is routinely older than Latest (#931)
+- self_update on Windows: EBUSY on own sharp dll, npm error swallowed; updater failure + cancelled restart disconnects bridge (#924)
+- VRAM handoff during renders skips the llama.cpp backend (#927)
+- panel run/sync truthfulness: duplicate run after reconnect + false 'panel install did NOT land' warning (#926)
+- turn lifecycle: Claude backend stall still reported as user rejection + turn registry does not survive reconnect (#923)
+- restart fences the endpoint, not the instance + cannot identify local process without start times (#925)
+
+
+## [0.50.0] - 2026-08-06
+
+The tool surface consolidates. Roughly 143 individually-registered tools fold into
+an action-parameterized core (37 tools), cutting what a client sees on `tools/list`
+by well over half — and with the surface small enough to carry, the default flips
+back to FULL, so `--compact` becomes the opt-in rather than the way most clients
+have to run.
+
+Every folded name is redirected rather than removed: calling a retired name reports
+what it became and which action replaces it, instead of failing as an unknown tool.
+That is enforced mechanically — every name that has ever existed and no longer does
+must be declared dead — so a tool cannot quietly vanish and leave rot behind.
+
+The per-slice entries are under **Changed** below.
+
+### MCP
+
+#### Added
+- flip the default to full; --compact becomes the opt-in (#942)
+- arena records VRAM/quant/version axes and flags suspect scenarios
+- audio attachments on the agent turn, and per-model tool mode
+
+#### Fixed
+- sessions are orchestrator-scoped — one agent across all tabs and workflows (#884) (#897)
+- report a retired tool name as retired, not as unpermitted (#911)
+- main is red — a retired name came back in generate_image (#936)
+- gate round 3 — a stale-but-alive sibling also suppresses the tray-row clear (#858)
+- gate round 2 — disclose when the dead record file can't be deleted (#858)
+- stop refusing correct destinations — diffusers contract-empty listing (#844) + in-tree junction escapes (#870)
+- codex gate r2 — positive identification for 'incapable', integer-safe seed bounds
+- gate round 1 — don't claim the tray row was removed; count both live row ids (#858)
+- codex gate r1 — refuse unsafe declared ranges, honest capability claims, sharper tests
+- cancel a stale download once its writer is proven gone + deterministic interference test (#858, #869)
+- seed draws honor declared max, explicit seeds survive, auto-select skips non-txt2img checkpoints
+- teach the dead-name gate the difference between a dead TOOL and a live ACTION (#905)
+- never write our database inside someone else's git tree (#891)
+- serve the retirement ledger on direct tools/call, not only through the facade (#895)
+- the first independent gate on the #842 branch (#880)
+- rename before you inspect — a path read is not an ownership proof
+- once a lock can be taken away, every path must prove it owns it
+- explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765)
+- mixed-version best-of ranges are not one known version
+- suspect analysis pools only one comfyui-mcp version
+- the suspect signal counts distinct models, not leaderboard entries
+- legacy okTools are not selection evidence in the suspect analysis
+- a pending triage may have no job_id — say so (codex gate r2)
+- a live model switch must not be silently ignored on the OpenAI dialect
+- bracket EVERY entry, and stop the guard claiming more than it observed (codex gate r1)
+- a snapshot of the queue is not an exclusion — bracket the merge (codex gate)
+- a live switch rewrites the prompt; the audio table covers real containers
+- codex gate r2 — a malformed historical counter is not 'missing'
+- codex gate r1 — name partial vs incoherent truthfully; drop the false ~5-minute ceiling
+- git-verify a provably-idle incoherent Manager queue; report_issue sets blocking-wait expectation
+- five findings from the seventh gate pass
+- audio survives re-delivery, and the delivery proof is per TURN
+- acceptance proof is per media KIND, and the refusal's remedy is honest
+- the attachment-acceptance proof must not survive a model switch
+- honest delivery boundaries, and drop the ACP path we cannot exercise
+- five more findings from the second gate pass
+- the auto-install gate must name the tree it installs into; sweep "could not determine" folds (#820, #796)
+- five findings from the adversarial gate
+
+#### Changed
+- 0.50.0 slice 13: consolidate install/environment and stats/diagnostics (10 to 2) (#909)
+- 0.50.0 slice 16: consolidate execution, generation and observability (18→3) (#907)
+- 0.50.0 slice 15: consolidate images and assets (12 to 2) (#903)
+- 0.50.0 slice 12: consolidate custom nodes and node authoring (20 to 3) (#904)
+- 0.50.0 slice 14: consolidate workflow authoring and library (20→4) (#906)
+- 0.50.0 slice 11: consolidate models (14→2) (#901)
+- a late probe must not overwrite a newer cache entry (#879)
+- 0.50.0 slice 10: consolidate training (18→3) (#898)
+- 0.50.0 slice 9: consolidate knowledge (9→1) (#896)
+- list_output_images returns [] on a local install whose path comes from the saved workspace (#877) (#883)
+- 0.50.0 slice 7: consolidate process control, API nodes and defaults (10→3) (#894)
+- 0.50.0 slice 8: consolidate runpod (11→2) (#893)
+- remote ComfyUI and secrets: HTML where JSON was promised, and a secret that reports success without reaching the child (#837)
+- path + environment probing: 'could not determine' is not 'determined it is not' (#835)
+- follow-up to #839: fix the three gate findings that merged unaddressed (#882)
+- install_panel git fallback: four claims the concurrency bracket could not establish (follow-up to #840) (#878)
+- node search + install: registry packs that exist on disk read as absent, results that cannot be installed as returned (#834)
+- graph binding after reconnect/retarget: a documented recovery that could not recover (#803, #770, #772) (#833)
+- restart + session reporting: stale launch arguments, a premature failure verdict, and a stale version line (#850)
+- the 20 MB refusal is a dead end for local video (orchestrator half of #648) (#854)
+
+
+## [0.49.8] - 2026-08-05
+
+### MCP
+
+#### Added
+- add --help, deriving every default from the parser rather than restating it (#864)
+
+#### Fixed
+- **a zero-byte pending-ops marker wedged `update_all` permanently (#847).** The wedge was
+  self-perpetuating: `recordPanelPendingOp` threw on any unreadable prior marker, and
+  `JSON.parse("")` throws — so a zero-byte `~/.comfyui-mcp/panel-pending-ops.json` made it
+  throw forever. It runs BEFORE the ComfyUI-Manager handoff by design, so `update_all` could
+  never start again, and the write that would have replaced the bad file was gated behind the
+  same check the bad file failed. Deleting the file by hand was the only escape.
+
+  An empty file and an undecodable one now answer different questions: overwriting an empty
+  one loses nothing (so it is superseded), while content we cannot decode may describe a real
+  queued operation (so it is still refused). Both refusals name the file path, and the two
+  warnings differ in what they tell you to do. Both writers are now atomic (temp + fsync +
+  rename), so a crash can no longer leave a zero-byte file at all, and superseding a
+  pre-existing one carries an indeterminate record forward — the block lifts, the warning
+  does not.
+
+  Also fixed on the way: the test suite was writing live pending-op markers into the real
+  `~/.comfyui-mcp`, where the orchestrator reads them and warns on every pin write about
+  operations that never happened. Third such leak found (after the real `.env` and the real
+  OAuth mirror); a runtime guard covering all of them is tracked in #866.
+- readOAuthStatus threaded home to one of its two halves (#863)
+
+#### Changed
+- .env.example advertised the wrong default, and the README shipped a section twice (#861)
+- tell absent from blocked from undiscoverable — and stop our own messages asserting causes they did not observe (#841)
+- truncated results fit the budget they report, and a library listing that looks in the folders (#807, #810) (#838)
+
+
+## [0.49.7] - 2026-08-05
+
+### MCP
+
+#### Fixed
+- attribute a changelog entry to the PR, not the first issue it cites (#856)
+- the changelog generator silently dropped the entries that mattered most (#855)
+
+#### Changed
+- **panel version floor: blocked mutations with no self-service path, and "up-to-date"
+  that means "meets the minimum" (#832).** A read was being blocked by a WRITE gate: the
+  workflow fence asked "can this reach the wrong workflow's content?" and answered it with
+  a set that exists to answer "is this safe to re-dispatch after a reconnect?". Eight graph
+  commands that are genuine reads were refused as canvas mutations on older panels. There
+  is now a single effect ledger with enforcement a rename cannot step over. Separately,
+  a non-parseable advertised version (`nightly`, which is what ComfyUI-Manager reports for
+  a git-installed pack) was rendered as an observed version and an age verdict; it is now
+  screened by parseability and shown verbatim as evidence. Closes #819, #812, #806, #778;
+  #823 remains partly open.
+- give the suite a real timeout — the "rotating cast of flaky files" was runner starvation (#852) (#853)
+
+
+## [0.49.6] - 2026-08-04
+
+### MCP
+
+#### Fixed
+- **`download_model`: large-file timeouts, no resume, wrong base on Windows portable,
+  and non-unique job ids (#831).** Large HuggingFace downloads timed out at 600s with no
+  way to resume; a resume could silently discard a 96%-complete partial; a remote CivitAI
+  auth/error page could be saved as if it were a model; and `download_status` lost
+  in-flight ids. Destroying a staged file now requires re-proving, immediately before each
+  syscall, that it is still the file the caller checked — so a second download of the same
+  model can no longer delete the first one's resumable bytes or its validator. An
+  unreadable staged file is reported as unknown rather than folded into "absent", which
+  previously let a fresh response truncate an existing partial.
+  Fixes #343, #401, #467, #470, #473, #529, #547, #761, #813, #817, #822.
+- test reliability: a fixture bound a guessed random port and hung ~1 in 8 when that port
+  was already held; it now binds `listen(0)` and reads the assigned port back, and a bind
+  failure reports as a setup failure instead of a timeout in the behaviour under test (#843, #821)
+- preserve AUTOGROW dotted workflow inputs (#763)
+- truncated results name their own remedy — and one that works from where the caller is (#818)
+- never stop a ComfyUI that cannot be proven relaunchable, and attribute a listener without lsof (#814) (#830)
+
+
+## [0.49.5] - 2026-08-04
+
+### MCP
+
+#### Fixed
+- `panel_ask`: a validated answer is now durable and is never delivered across a tab or conversation boundary (#486) (#811)
+- `restart_comfyui`: preserve the launcher environment, and never report ownership or a restart that was not observed (#776) (#785)
+- `install_panel`: the panel swap is crash-safe by ordering, and the status report no longer claims what it never observed (#771) (#793)
+- `strip_workflow` / `panel_flatten_workflow`: preserve dynamic widget values and virtual-node links, and disclose anything dropped (#361) (#805)
+- panel agent: rebind the agent tab across id migration and keep the release fallback starvation-free (#568) (#802)
+
+## [0.49.4] - 2026-08-03
+
+### MCP
+
+#### Fixed
+- poll past the worker's wall clock + surface root-cause clusters (#799)
+- make the completion event durable across automatic goal continuation (#468) (#786)
+- resolve panel_load_workflow relative paths against the live user directory (#202) (#787)
+- resolve the destination from the live server and verify it on disk (#369) (#794)
+- stop root icon requests becoming logged 404s (#783)
+- distinguish watchdog stalls from user cancellations (#782)
+- make stale panel-lock recovery fail closed (#779)
+- list reachable local extra paths without argv main.py (#781)
+- retain stale persisted downloads (#761) (#780)
+- gate the hello retarget on the server-observed origin — never trust the spoofable claim (codex gate)
+- hello veto protects only a healthy target — a ComfyUI restart can no longer pin stale remote state
+- do not capability-mark the no-trusted-identity refusal (codex gate)
+- type the capability refusal; full tab id + hard-refresh recovery
+
+
+## [0.49.3] - 2026-08-03
+
+### MCP
+
+#### Fixed
+- panel_ask and other blocking card tools no longer die at 60s on ollama-family backends — the internal panel MCP client now uses a 315s timeout, above the longest card budget (#325) (#754)
+- list_assets reconciles from ComfyUI history, so panel-dispatched renders and earlier sessions surface — every registered record requires affirmative success evidence (on both the watched and reconcile paths), a non-empty filename, a real output, and a truthfully-sourced completion time (#751) (#753)
+- the too-old panel verdict now quotes both detected panel and MCP versions (#422) (#755)
+
+
+## [0.49.2] - 2026-08-02
+
+### MCP
+
+#### Fixed
+- restart safety: a refuse-safe preflight now runs BEFORE any stop in the panel restart flow — an instance with no provable relaunch (Pinokio-style installs) is refused, never stopped; the preflight validates the immutable tab-fronted instance under a generation-stable target (a monotonic target generation detects mid-flight config/tab changes, including A→B→A retargets) (#742)
+- restart reporting: the decline path no longer asserts "not restarted" blind — a bounded full-window probe distinguishes a restarting server from a genuinely lost one, and causation claims ("a restart initiated earlier…") require a session-held, bound-confirmed, recent dispatch token with an identity-checked lifecycle (#742)
+- turn reliability: the stall watchdog reports exactly one failure per turn (either event order), holds the turn gate until the genuine turn end, and dead-letters straggler emissions from abandoned turns via backend-minted turn markers on every backend (#728)
+- Claude backend: blocking SDK informational messages (hook blocks) surface exactly one error instead of a silent "successful" empty turn; result classification is per-turn (submission-stamped traces, real success/error_* vocabulary); traceless, gap-crossing, or late results fail closed as unverifiable instead of fabricating success (#740)
+- `panel_add_node` documents the frontend-only virtual types (Note/MarkdownNote/Reroute/PrimitiveNode) as the supported way to annotate a workflow (#741)
+- bump sharp to >=0.35.0 (GHSA-f88m-g3jw-g9cj)
+
+### Docs
+- docs proxy worker 301s bare doc paths onto /docs/* (fixes broken internal links on the live site)
+- internal links converted to relative paths for the subpath deployment
+- /packs/* links repointed to their GitHub tree paths
+
+
+## [0.49.1] - 2026-08-02
+
+### MCP
+
+#### Added
+- epoch-first session_epoch frame on every hello (#694) (#713)
+- explicit retry identity (retry_of) for outcome-unknown mutations (#694) (#704)
+- add atomic node editor
+
+#### Fixed
+- un-mangle the double-encoded ⚠️ in the panel sync say texts
+- carry the trusted workflow stamp across proven tab-id migrations
+- update/reinstall require post-op presence proof (no queue-drain trust)
+- codex gate — spawn cwd must be an existing DIRECTORY, not merely exist
+- restart_comfyui spawns with an explicit absolute cwd (no more main.py ENOENT)
+- codex-gate r9 — malformed pending_count is unproven; dialect probe targets the op's own base
+- codex-gate r8 — strict required fields in the proven signature; at-tip result honesty
+- codex-gate r7 — pin the merged rev end-to-end; strict empty-queue signature
+- codex-gate r6 — refuse pulls that would silently overwrite ignored files
+- codex-gate r5 — dialect gate via proven-legacy probe, honest result message
+- 'at upstream tip' requires HEAD === @{upstream} proof
+- the fallback's pre-pull revision gate — never mutate on an unprovable no-op
+- an unreadable post-pull HEAD revision fails closed — never 'at tip'
+- prove the panel dir IS the worktree root before any fallback mutation
+- gate the #724 git fallback on a clean worktree and one bound directory
+- git pull --ff-only fallback when legacy Manager 3.x no-ops a panel update (#724)
+- refresh workflow stamp after open (#716)
+- require at-write workflow fencing (#718)
+- reconcile download tray after restart
+- structure Model Explorer 404s (#363)
+- report stale graph capability after restart
+- sync handshake capability floor (#712)
+- preserve unrelated work on panel pin (#715)
+- pin write cancels pending update_all / snapshot restore (#689) (#702)
+- sync panel skew when desktop tab connects (#710)
+- preserve flatten load failures (#707)
+- use saved workspace for panel management (#705)
+- preserve legacy color compatibility
+- keep edit schemas Codex-compatible
+- align legacy color validation
+- validate edits and preserve legacy commands
+- preserve line breaks in generated tool descriptions (review nit)
+- measure non-string widget values by their real serialization (review nit)
+- route describe facade through call_tool (#693)
+- unclassified versions are never vouched in SFW search (#664 gate)
+
+
+## [0.49.0] - 2026-08-02
+
+### Highlights for 0.49.0
+
+**Tool-surface consolidation begins (BREAKING for removed names).** 0.49.0 starts folding families of single-purpose tools into action-parameterized ones: the five node-bisect tools → `node_bisect` (#644), node snapshots 3→1, batch 4→1, apps 5→1 (#658), and the eight `comfy_cli_*` tools → `comfy_cli` (#684) — **162 tools total, down from 182**. Every removed name is in the `DEAD_NAMES` ledger and calling it returns a specific retired-name error quoting the replacement (#679), never a bare "unknown tool". A CI vocabulary gate fails the build on any live reference to a retired name.
+
+**Compact tool surface by default (BREAKING).** New installs now default to the compact 3-meta-tool facade (`list_tools` / `call_tool` / `describe_tool`) — no more ~70k-token tool dumps into context (#667). Restore the full surface with `--full` or `COMFYUI_MCP_TOOL_MODE=full`; explicit choices propagate correctly to orchestrator children and the Ollama path (#682).
+
+**Interpreter ground truth, end to end.** `get_environment` no longer guesses which Python ComfyUI runs: it resolves the interpreter from observed process identity (PID + creation time for what we launched; command-line correlation against the server's own argv otherwise) and reports `unknown` instead of a confidently wrong answer — the false "Triton: not installed" that made an agent strip working acceleration is dead (#401/#650). Package installs and `update_comfyui` now target that same observed interpreter and **refuse** when it can't be verified, instead of landing in a sibling env the server can't import from (#651/#668).
+
+**Manager dialect cache that heals.** The ComfyUI-Manager 3.x/v4 dialect cache invalidates on restart-at-same-URL and on dialect-mismatch, retries pin to the original target (a mid-flight retarget can't redirect a queued op), and `update_all` goes through the same detection instead of a hardcoded legacy route (#646/#670, #656/#680). Remaining legacy-route bypasses are tracked in #681.
+
+**Node-pack auto-sync skill.** On orchestrator update the agent can now bring the panel pack in sync through the verified install path — with the pin contract: explicit pins are never auto-updated over, pinned-and-behind shows a visible drift warning in every state, and unpin/reset is one tool call away (#657). update_all / snapshot-restore / workflow-deps can no longer side-step the pin guard either.
+
+**Media saves that prove their bytes.** `get_image` saves valid MP4s (and other video/audio) to disk instead of rejecting them (#663) — with a full junk-body gate: declared type, magic-byte structure, format family, and filename extension must all agree, or the save refuses rather than write a corrupt asset.
+
+**Truthful bridge and downloads.** Bridge command retries after a timeout reuse the original rid and the panel dedupes by rid + payload fingerprint, so a retried mutation can't double-apply (#517/#683). Downloads resolve their destination from live config and join category entries correctly (#636). `install_panel` verifies the pack actually moved on disk and fails closed on shadow copies (#639/#641/#647).
+
+**Also:** MiniMax provider, `model_metadata_read` local fallback when the optional Model Explorer node is absent (#363), honest version-skew errors for untabled panel commands (#619), docker-compose example + stdio deployment docs (#660), `@comfyorg/sdk` added for upcoming Comfy API v2 work (#672), and the test suite runs green on machines with ripgrep installed (#655).
+
+### MCP
+
+#### Added
+- pinned drift warning in every state, incl. remote/dev-install
+- agent-driven panel node-pack sync on orchestrator update
+- add pi.dev as a first-class agent backend (#491)
+- add MiniMax as a first-class API-key provider (#355)
+- 0.49.0 guardrails (Phases 0-1) rebased onto 0.48.32 main
+
+#### Fixed
+- drift warning in blocked states; honest install reporting; scan-reliable manifest verify
+- refuse unbound panel mutations
+- an unreliable panel scan blocks the deps install too
+- carry scanReliable in PanelStatus; an unreliable scan blocks sync
+- keep pending and manifest panel checks honest
+- report generic bulk updates as unverified
+- fail closed on stale locks and pending operations
+- close two more pin-bypass doors + make the lock actually safe
+- close the generic-node-tool pin bypass + a real cross-process lock
+- close codex round 3 — honest pin-state reporting, blocked on an incomplete shadow scan
+- close codex round 2 — pin writes take the op lock, no inert-pin claim, strict semver
+- close 4 codex findings — array-settings fail-open, op race, tri-state stillBehind
+- scope OAuth readiness to capable providers
+- respect OAuth capability and stored template ownership
+- fall through unusable stored API keys
+- fall through empty Vertex key to ADC
+- mirror exact Vertex provider precedence
+- mirror current scoped credential precedence
+- scope readiness to selected provider
+- a `null` auth.json breaks pi's auth layer outright (codex round 13)
+- OAuth expiry is ms with a 5-min window; keyless Vertex records (codex round 12)
+- drop two over-strict schema checks (codex round 11)
+- bedrock provider id + cost tiers + present-null (codex round 10)
+- finish the schema transcription (cost/thinkingLevelMap/modelOverrides) — codex round 9
+- transcribe pi's models.json schema instead of approximating it (codex round 8)
+- relative config dir, stored-cloudflare companion, typed schema fields (codex round 7)
+- companion-config + schema precision (codex round 6)
+- match pi's resolver exactly — stored-owns-provider, escapes, agent dir (codex round 5)
+- close remaining false-green readiness paths (codex round 4)
+- readiness precision — match pi's real credential validation (#491)
+- provider-auth codex round 3 (P0a-resume + P1a two-sided)
+- provider-auth codex round 2 (P0a/P1a/P1b/P1c)
+- address codex review (stdout/close, ANSI, .cmd, false-auth, model)
+- require exact resolved path for open recovery
+- require resolved workflow identity for open recovery
+- require open receipt for timeout recovery
+- reuse the original rid on mutation retry + surface late completions (#517) (#683)
+- route remaining callers through detected dialect (#681)
+- probe the ComfyUI venv interpreter, never fabricate "not installed" (#401) (#650)
+- route update_all tool through detectManagerApi (#656) (#680)
+- honor the saved default workspace when COMFYUI_PATH is unset (#648) (#652)
+- retired-name error from the DEAD_NAMES ledger on call_tool (#659) (#679)
+- target the live ComfyUI interpreter (#668)
+- pin dialect retries to original target (#670)
+- disambiguate panel_graph_outline vs visualize_workflow vs panel_query_graph (#557) (#654)
+- route legacy ComfyUI-Manager self-update off the 405 path (#424) (#649)
+- #641 shadow detection — content-first + fail-closed hardening
+- verify the panel actually changed + detect shadow copies (#639, #641)
+- remove NUL-byte percent sentinel + normalize CRLF→LF (file integrity)
+- identity-guard the durable resume + include render-held in the owned-set (#570)
+- clear the superseded destination's render-held queue on a tab-id collision (#570 P0)
+- derive stable-key ownership from the full retained-session SET, not the current-backend mapping (#570 P0)
+- gate stable-key hello.resume by concurrent-tab ownership (#570 P0)
+- reset the superseded destination for ANY state (incl. dormant session) on a tab-id collision (#570 P0)
+- collision handling resets the SUPERSEDED destination (not the source) + clears its bridge buffers (#570 P0)
+- retire the source agent on a tab-id migration collision — no cross-tab leak (#570 P0)
+- rebind ALL backends on a proven tab-id migration, not just the current one (#570 P0)
+- carry the proven source identity across a tab-id migration so the rebound agent survives (#570 P0)
+- fence workflow mutators by RESOLVED TARGET, not raw path presence (#570 P0)
+- make workflow_uuid bridge-owned (non-overridable) at dispatch (#570 P0c)
+- close the empty-path bypass in the active-workflow mutation gate + document scope (#570 P0c)
+- require a trusted uuid stamp (not just the enforcement flag) to dispatch an active-workflow mutation (#570 P0c)
+- retire (not reset) the prior provider on a hello-driven backend switch too (#570 P0)
+- retire (not reset) the prior provider on an explicit backend switch (#570 P0)
+- per-backend identity teardown so a cold-start provider switch can't erase a same-workflow session (#570 P0)
+- extend the fail-closed gate to active-workflow mutators (workflow_close/save/…) (#570 P0c)
+- detach migrated mirror on unproven switch + fail closed for non-enforcing panels (#570 P0a/P0c)
+- stamp each command with its origin workflow uuid so the panel fences a post-switch apply (#570 P0)
+- detach mirror viewers on an unproven same-socket workflow switch (#570 P0)
+- cancel the OLD id's bridge queues on an unproven same-socket switch (#570 P0)
+- reject in-flight bridge commands for a replaced tab (#570 P0)
+- complete per-tab bridge reset — also cancel awaitingReconnect (#570 P0a)
+- invert the identity boundary — unconditional, complete teardown when unproven (#570 P0)
+- drop buffered deliveries before replay on an unproven identity transition (#570 P0)
+- fail closed at the identity boundary — reset unless POSITIVELY proven (#570 P0)
+- re-key held render queues for ALL providers on a proven migration (#570)
+- count failed-start held mail as per-tab state at the identity boundary (#570 P0)
+- tear down ALL per-tab state on an unproven identity transition (#570 P0a/P0b)
+- bind the exact session to the FULL identity (origin+uuid), not just uuid (#570 P0)
+- trust an exact session only when PROVEN to own the identity (incl. identity-less) (#570 P0)
+- fail closed on pre-upgrade exact records with no identity binding (#570 P0)
+- in-place replace resets the LIVE agent, not just disk state (#570 P0)
+- bind the exact session to a durable identity uuid; clear on in-place replace (#570 P0)
+- reject an unowned hello.resume — bind resume to trusted identity (#570 P0)
+- cancel render-queued work across ALL providers on a workflow switch (#570 P0a)
+- fence the old bridge route on an unproven same-socket switch (#570 P0a)
+- disclose (don't silently drop) render-queued messages on a workflow switch (#570 P0a)
+- fail closed on same-socket re-hello without proven identity + no post-retire leak (#570 P0a)
+- don't rebind one workflow's agent onto another on a same-socket switch (#570 P0a)
+- key unsaved-workflow resume on the panel's durable per-instance uuid (#570)
+- resolve destination from the LIVE server's models dir + allow symlinks into registered model roots (#346, #633)
+
+
+## [0.48.32] - 2026-08-01
+
+### MCP
+
+#### Added
+- add panel_set_property MCP tool (#488) (#634)
+
+#### Fixed
+- resume — X-Linked-Etag false-changed across hops deleted valid partial (#467) (#637)
+- bound the restart-confirmation card wait (panel #404) (#635)
+- never file/PR under an ambient gh account unprompted — Worker is the autonomous default (project identity); gh path requires account-awareness + explicit consent (#632)
+
+
+## [0.48.31] - 2026-08-01
+
+### MCP
+
+#### Added
+- panel_civitai_results returns inline sample images so the agent can SEE them (#623) (#628)
+
+#### Fixed
+- resolve local workspace via shared fallback when COMFYUI_PATH unset (#506) (#629)
+- drop superseded-attempt terminal events (panel#489) (#627)
+
+
+## [0.48.30] - 2026-08-01
+
+### Fixed
+- **`panel_refresh_nodes` (and any newer bridge command) against an older panel now returns an actionable "update your panel to ≥X.Y.Z" error instead of the opaque `Unknown command "refresh_nodes"` (#619).** The #608 refresh executor shipped in panel 0.11.28; on a 0.11.20 panel the command was unrecognized, but because `refresh_nodes` wasn't in the min-version table it fell back to the 0.11.4 baseline — which a 0.11.20 panel exceeds — so the false-negative guard mistook it for "new enough" and leaked the raw dispatch error. `refresh_nodes` is now tabled at its true minimum (0.11.28), which both quotes the correct remedy version (naming the connected panel version) AND lets the proactive #392 gate reject the first call before dispatch. Class-wide: the "new enough" guard now trusts ONLY authoritative, command-specific minimums, so any UNTABLED command's `Unknown command` reply maps to an actionable "update the panel pack" message rather than a bare passthrough.
+
+### MCP
+
+#### Fixed
+- route set_todo/open_civitai to desktop canvas when session bound to a headless client (#624) (#625)
+- document panel_open_workflow stale-tab signal (#442 defect 2) (#618)
+
+
+## [0.48.29] - 2026-08-01
+
+### MCP
+
+#### Fixed
+- layer the compact facade onto full mode so a stable call_tool survives panel reconnect (#616) (#620)
+- keep queryApiGraph token-bound so one blob can't starve the node you asked for (#609) (#617)
+- actionable no-panel guidance after a reconnect drop (panel #436, #442) (#615)
+- survive idle-user timeout on the adult-consent card (panel#390) (#610)
+
+## [0.48.28] - 2026-08-01
+
+### Fixed
+- **`panel_reload` no longer crashes with `Cannot read properties of undefined (reading 'conns')` whenever a tab is connected (panel #478).** A regression from the 0.48.25 tab-binding work (#400/#402/#474): `panel_reload`'s multi-tab guard called `ctx.bridge.isHeadless` as an unbound reference, so `this.conns` threw and killed every reload with a live tab. Now called through the bridge receiver via a `typeof`-guarded helper (an identical second site in `panel_set_workflow_target`'s rebind path fixed too).
+- **`panel_set_widget` no longer false-times-out when a fresh `/object_info` takes >6s on a large install (#599).** The refresh-awaiting commands (set_widget / add_node) now get a bounded 30s ack budget instead of the bridge's 6s default, so a slow-but-valid frontend re-register isn't reported as a dead-tab timeout (a genuinely dead tab still fails).
+
+### Added
+- **`panel_refresh_nodes` — force a frontend node-def re-register so a just-staged input is immediately usable (#608).** `stage_output_as_input` registered the file server-side but the loader combos were built at page-load, so `LoadImage` couldn't see it (the Krea2→LTX/WAN chaining flow dead-ended); the new tool (which `stage_output_as_input` now points at) forces the refresh.
+
+### Internal
+- De-flaked the `ui-bridge #486` late-ask_user test (an ECONNREFUSED bind/connect race in the shared test harness — it await's `bridge.whenReady()` now), which had intermittently failed CI merges and a release publish.
+
+## [0.48.27] - 2026-08-01
+
+### Fixed
+- **`panel_update_node` stops surfacing a raw HTTP 405 against a `/v2`-served legacy Manager (panel #464).** A single-pack update POSTed to the unified `/v2/manager/queue/task`, which a bundled-3.x-under-`/v2` build leaves unregistered (405 from the frontend catchall); it now negotiates a 405 → the `/v2/manager/queue/batch` envelope and pins the corrected dialect only after the batch enqueue succeeds (so a proxy/WAF 405 on a genuine v4 host can't poison the cache). v4 unaffected.
+- **`panel_query_graph`/`graph_query` isn't falsely gated "too old" once the connection has already served it (panel #422).** The #392 proactive version-gate rejected the command on a re-hello advertising an undercutting version; a `provenSupportedCmds` set (recorded on success, inherited across reconnect + a same-socket `tmp:→wf:` migration, cleared on a genuine `Unknown command`) now vetoes the gate.
+- **A mutating `panel_*` edit refused before dispatch now names the rebind recovery instead of a bare error (panel #442, defect 4).** A pre-dispatch routing refusal is tagged with the typed `dispatched:false` flag, so the tool layer states nothing was applied — without retrying (no double-apply) — and points at `panel_set_workflow_target({mode:"current"})`; a post-dispatch executor error quoting the same phrase is never mis-classified.
+
+## [0.48.26] - 2026-08-01
+
+### Fixed
+- **`panel_strip_workflow` live-capture fallback fires against a version-skewed panel, and `panel_list_workflows` paths load (panel #413, #414).** The #384 `graph_get_state` fallback was skipped because the bridge rewrites `unknown command` → `too old for "graph_serialize"`; it's now detected structurally via a typed `panelCmdUnsupported` tag (which also covers the new #392 proactive version-gate). And a `panel_list_workflows` key already prefixed `workflows/` was double-prefixed → 404; it now strips one leading prefix, with path-traversal / drive-letter / symlink-escape hardening.
+- **Codex (and other non-Claude backends) get the live `panel_*` graph tools again (panel #291).** ComfyUI's ~250 tools saturated Codex's tool budget and it silently dropped the `panel_*` tools; the non-Claude HTTP lane now spawns the comfyui MCP in **compact** mode (freeing budget), so `panel_*` are advertised and callable. Claude is unaffected; `COMFYUI_MCP_TOOL_MODE=full` opts out (comfyui tools then become `call_tool`-gated for those backends).
+
+## [0.48.25] - 2026-08-01
+
+### Added
+- **`panel_resize_node` sets a node's width/height on the live canvas (#530)** — so an unreadable Note/MarkdownNote can be resized (prefers `setSize()` so min-clamping nodes reflow, undo-enveloped). Also documents driving the LTXDirector timeline via `set_widget` (#314).
+
+### Fixed
+- **Remote CivitAI/Manager downloads warn when the URL is authentication-gated, and the auth-gate probe never leaks a credential (#473).** A model install dispatched to a remote ComfyUI-Manager (which fetches the URL server-side, unauthenticated) can land a login/HTML page as a `.safetensors`; the tool now runs a non-blocking credential-flip probe and surfaces a loud warning when the URL is provably auth-gated. The probe is credential-safe: HF/CivitAI tokens are gated on the **parsed hostname** (never a substring, so `evil.example?ref=huggingface.co` gets nothing) on both the remote-probe and local streaming paths, and all auth headers are stripped on the first cross-origin redirect hop. *(Hardened across a 3-round independent adversarial review that caught and closed three distinct credential-leak vectors.)*
+- **Panel tab binding recovers after a restart/reload (#400, #402, #474).** `panel_restart_comfyui` awaits the tab reconnect before returning (`ready` now means graph-tools-ready, not a tabless window); open/save await a stable binding pre-send and refuse rather than fire into a dead binding; the session reconnects on every soft-reload path (no more connected-chip/dead-bridge wedge).
+- **Nested-subgraph run + safe bypass (#411, #409).** `panel_run` can target an output node inside a nested subgraph (outermost-first `partial_execution_targets` path), and `panel_set_node_mode` refuses an unsafe positional bypass of a multi-input subgraph unless `force:true`.
+
+## [0.48.24] - 2026-08-01
+
+### MCP
+
+#### Fixed
+- **Proactively gate a panel bridge command when the panel's advertised version proves it too old (panel #392).** `panel_query_graph`/`graph_query` (etc.) are refused before dispatch with an honest, correctly-versioned message instead of being exposed and then failing at runtime — gated only on explicitly-listed commands and only when the connected panel actually advertised a too-old version (an omitted-version reconnect never blocks an upgraded panel).
+- **Context-meter denominator tracks the current model's window (#543)** — switching to a smaller-context model no longer leaves the denominator pinned to a stale larger window.
+- **`panel_run`'s queue-backlog warning no longer false-positives on self-queued jobs (#559)** — deliberately batching your own renders no longer warns about (and recommends destructively clearing) a backlog it created; the warning + destructive `clear_pending` recommendation are suppressed for your own in-flight batch.
+- **`panel_screenshot` annotates DOM-overlay nodes (#567)** — a MarkdownNote that renders empty on the LiteGraph canvas is now named in a result note (the faithful DOM composite is a separate panel-side change).
+
+
+## [0.48.23] - 2026-08-01
+
+### MCP
+
+#### Fixed
+- **Session survives a tab-id migration and an interrupt storm (#568), and an unsaved workflow keeps its conversation across an orchestrator restart (#570).** `PanelAgent.tabId` is now updated on migration (no more `panel_*` → "no connected tab"), the interrupt-release fallback is coalesced/armed-before-await so a hammered "send now" can't wedge the agent, and session resume gains a stable `origin+title+backend` index (collision-poisoned) so a reloaded `tmp:<uuid>` tab rebinds its session.
+- **A pinned workflow target actually binds reads + edits, and fails at pin time if unbindable (#556, #571).** `panel_set_workflow_target(mode:"pinned")` no longer accepts a background pin it can't honor and then silently routes graph calls to the active canvas — it validates active-ness up front (tri-state) and fails loudly when a target can't be bound.
+- **Authoritative ComfyUI-Manager v3/v4 detection + GET/POST method negotiation + a v3→v4 recovery path (#551, #553, #555).** A 405 is no longer misread as "legacy v3" (it means wrong method/route for this version); `queue/start` negotiates POST→GET for GET-only v3 builds; arbitrary-URL installs blocked on v3 now surface a precise migration recovery.
+- **`panel_restart_comfyui` relaunches with an absolute launch command/path (#535)** — a relative `COMFYUI_PATH`/command captured from the live process cwd, so a reachable install is no longer refused after the working directory changes.
+- **`panel_graph_outline` version-gate false-negative fixed + description disambiguated (#352, #557).** A new-enough panel is no longer told it's "too old" (the gate is now per-command with the correct minimum, and no longer poisons the unsupported-command cache); the tool description no longer collides with `visualize_workflow` / `panel_query_graph`.
+- **`download_model` completion now emits an agent_event (#547), and `get_history` carries the media type with `get_image` returning a well-formed error (#554).**
+- **`panel_save_workflow` description states Save-As COPY semantics and drops "rename" (#579)** — reporting the outcome (`saved_as`/`copied_from`/`original_on_disk`/`first_save`) rather than a bare `{saved:true}`.
+
+#### Changed
+- Dropped the bundled Civitai MCP from the default agent config (native CivitAI tools cover it) (#539); `model_metadata_fetch_civitai` degrades gracefully when its optional dependency is absent (#541); corrected the flux-txt2img skill's Flux 2 Klein CLIPLoader (#545); fixed skill doc references and added SCAIL-2 character-replacement guidance (#552, #546).
+
+
+## [0.48.22] - 2026-07-31
+
+### MCP
+
+#### Added
+- per-download cancellation + reconnect-adoptable download_status (#515, #529) (#577)
+- disk fallback for panel version when hello omits it (#575)
+- async AI-triage client — versions, upgrade advice, no double-file (#544)
+
+#### Fixed
+- honest bounded restart-confirm + correct ready-banner model (#360, #376) (#576)
+- tolerant default reply timeout for read ops (panel #357) (#574)
+- certify reboot readiness via a concurrent, post-write-gated boot-endpoint observer (#509) (#536)
+- strip [object Object] user-turn artifact + consume panel status base_path (#534, #296) (#573)
+- graph-capture fallback + correct dynamic-widget/Get-Set link mapping (#384, #361) (#522)
+- proactively gate a bridge command once proven unsupported (#236) (#564)
+- allow panel_set_widget to clear a widget to "" (#347) (#561)
+- list_local_models omits .gguf models via REST path (#526) (#549)
+- stale-bug cluster — secret-notice correlation, stall false-positive, load_workflow custom user-dir (#550)
+- TTL-bounded cache so out-of-band ComfyUI restart/install self-heals (#528) (#542)
+- report actual backend in ENVIRONMENT (#358); accurate list_workflow_templates description (#359) (#533)
+- ACE Step 1.5 fields (#501); lock native VAE/UNET loaders (#482); bundled-pack runtime (#464) (#519)
+- never silently substitute comboOpts[0] for a user-staged value + refresh stale loader dropdowns (#504, #499) (#517)
+- fail-fast when no interactive surface (#300); don't drop a late-but-valid answer (#486); saner set_todo deadline (#322) (#525)
+- live-first download target + poll Manager queue instead of 300s false timeout (#490, #463, #489) (#524)
+
+
+## [0.48.21] - 2026-07-30
+
+### Fixed
+- **SEVERE: `download_model` no longer saves an auth/error response body as a model file and reports success (#473).** A remote CivitAI (or any) download that returned an HTML login/auth page or a JSON error — often with a 200 status — was streamed verbatim into a `.safetensors`/`.ckpt`/model file and reported as a successful download, leaving a corrupt file in the models dir. Every finalize path (HTTP stream, cache-hit, coalesced, cloud, direct-fallback) now runs an authoritative content-type/magic-byte gate BEFORE materializing: HTML/JSON payloads are rejected with an actionable error (Content-Type authority for model destinations + body-magic that handles leading whitespace/control bytes), the cloud/direct path fails **closed** when the payload can't be sniffed, and a poisoned cache entry/partial can't be served on reuse (persisted Content-Type + rejected-marker + body re-sniff). Verified to NOT reject legitimate downloads (real safetensors/GGUF/pickle/ONNX/raw-bin stay binary; sidecar-less cached models still served). (#511)
+- **`panel_run` derives its verdict from ComfyUI's reply instead of a bare `queued` flag (#213, #194, #331, #248).** A rejected prompt (top-level error, or non-empty `node_errors`, even alongside a stale `queued:true`) is now surfaced as a FAILURE rather than a false `queued:true`; a root SaveImage run-to-node is accepted (not mis-rejected as a subgraph node); the "you'll be notified" note is only appended on a genuine queue (not when no tab is connected); and a thrown `app.queuePrompt` preserves its error detail. (#521)
+- **`get_workflow` returns the workflow JSON even when there are conversion warnings (#494); `get_image` is binary-safe (#483); `enqueue_workflow` surfaces ComfyUI's 400 validation details (#485).** (#520)
+
+## [0.48.20] - 2026-07-30
+
+### Fixed
+- **`comfy_cli_*` tools resolve the workspace/venv CLI and fall back to the connected server (#506, #403, #360, #487).** Custom-node source tools now resolve the CLI from the saved default workspace when `COMFYUI_PATH` is unset (#506, #403); `comfy_cli_models` falls back to the connected server's API when the CLI is present-but-unsupported (not only absent — #487); and `comfy_cli_jobs` wait accepts the documented singular `promptId` (#360). (#510)
+- **Graph tools resolve a single authoritative workflow-tab target + rebind after reconnect (#478, #481, #459).** Pinned/active/nested-exec graph calls now resolve to the SAME correct tab (canonical `workflow_path` injection, fail-closed, strict rebind) instead of reading/editing a different workflow, and the session rebinds (with node-info cache invalidation) after a reboot/reload. (#512)
+- **Manager client detects and routes to ComfyUI-Manager 3.x-legacy vs v4/Desktop dialects (#423, #424, #425, #371).** Reboot now probes v2-POST → legacy-GET → legacy-POST with an SPA-catchall guard (a `200 text/html` from an unknown GET is no longer mistaken for a fired reboot); `panel_restart_comfyui` falls back to the headless managed restart for a LOCAL server with no working reboot endpoint (never for remote, never during a render); and legacy Manager self-update falls back to `git pull`. (#513)
+
+## [0.48.19] - 2026-07-30
+
+### Fixed
+- **`validate_workflow` no longer contradicts itself or hides authoritative combo errors (#342, #505).** The renderer partitioned issues on `!i.kind`, which stripped the authoritative validator errors (`missing_node_type`, `missing_model`, `value_not_in_list` — all carry a `kind`) from the Errors section, so the tool printed "No issues found — ready to execute" while the header still counted them. Now only graph-health findings are tagged `health:true` and the render partitions on `!i.health`, so combo/model errors stay surfaced and the "ready to execute" verdict is derived from the actual validity — the header and body can never disagree. (#507)
+
+## [0.48.18] - 2026-07-30
+
+### Fixed
+- **`panel_open_workflow` no longer false-fails a switch that actually succeeded (#215, #319, #496).** When the target tab is backgrounded/frozen or the workflow is already open, it may not ACK `workflow_open` within the window even though the switch genuinely happened. On an ack-timeout the tool now polls the authoritative active-workflow signal (a fresh `workflow_list` round-trip, bounded ~6s) and returns success (with a recovered note) if the target became active; a genuinely-failed open (e.g. no matching workflow) is an acked error, not a timeout, so it still fails clearly. Mirrors the #497 restart-readiness pattern. (#502)
+
+## [0.48.17] - 2026-07-30
+
+### Fixed
+- **`download_model` resume no longer silently discards a near-complete `.partial`, and HF Xet/CAS downloads resume safely (#467, #470).** When the Xet/CAS CDN omits `ETag`/`Last-Modified`, no resume validator was ever written, so a restart silently truncated and re-downloaded a multi-GB partial with no signal. Resume is now surfaced honestly via `download_status` (four outcomes: `declined:no-validator` / `declined:full-response` / `declined:etag-changed` / `declined:unverifiable`), and HF Xet partials resume by capturing the content-addressed `X-Linked-Etag` off the resolve 302 and preserving `Range`/`If-Range` across the cross-origin redirect (dropping `Authorization`). The #343 append invariant is hardened throughout: append happens only on a validated 206 with an exact, end-reaching `Content-Range`; a cross-origin 206 additionally requires a matching content-addressed validator; completion fails **closed** (rejects any size ≠ the authoritative total, derives a 206's total from `Content-Range` and a fresh 200's from `max(Content-Length, X-Linked-Size)`, and refuses an unsolicited 206 on a fresh request); materialize + direct-fallback build into a random `O_EXCL` temp and rename atomically (never writing through a destination hardlink into a cache inode); and the cache identity folds in per-request auth and the effective cloud principal so bytes are never served across an auth boundary. (#469)
+
+## [0.48.16] - 2026-07-30
+
+### Fixed
+- **`panel_restart_comfyui` no longer reports a false timeout/failure after a reboot that actually succeeded (#493, #222, #263, #266, #306, #307).** The panel path sends `comfy_reboot` over the UI bridge; because the Manager reboot handler returns the moment it accepts the request, ComfyUI (and the tab it serves) drops before it can ack — and the bridge surfaced that expected drop as a mutating-command `OUTCOME UNKNOWN` failure, which the tool returned verbatim. It now classifies the `comfy_reboot` result (confirmed / expected-drop / refusal): on confirmed-or-drop it resets caches and polls readiness (`nodes_queue_status`, auto-healing onto the reconnected tab) up to a generous wall-clock budget, returning success with recovery timing; a genuine refusal is still returned verbatim, and a server that never comes back within the budget still reports a clear failure. The headless `restart_comfyui` path (#400/#476) is untouched. (#497)
+
+## [0.48.15] - 2026-07-30
+
+### Fixed
+- **`restart_comfyui` relaunches a Desktop-managed ComfyUI via the Manager reboot endpoint instead of killing the Electron shell (#400).** A local Comfy **Desktop** instance was treated like a self-spawned one — killed and re-spawned via `Comfy Desktop.exe`, which never reliably brought the `:8188` Python backend back (`stopped:true, started:false`). `restartComfyUI` now branches on `isDesktopApp` before any kill: a Desktop-managed instance routes through `POST /v2/manager/reboot` and is never killed; if the reboot can't be fired (403/no endpoint) it refuses and leaves the server running. Self-spawned Python installs keep the kill+relaunch path. (#477)
+- **`restart_comfyui` uses live-first script resolution instead of refusing on a stale relative `COMFYUI_PATH` (#476, #426).** After `download_model` wrote successfully into the canonical absolute live install, restart could resolve the server script as a stale relative path (`ComfyUI/main.py`) and refuse — inconsistent with the path download just used. A new `resolveScriptAnchor` resolves live-first (`liveRootFromArgv` → saved-default workspace → configured path, first absolute wins) before anchoring a relative launcher script; the refuse-safe behavior is preserved for a genuinely unresolvable/missing install, and the #400 Desktop branch is untouched. (#479)
+
+## [0.48.14] - 2026-07-30
+
+### Fixed
+- **`missing_node_types` is recomputed after a custom-node install (#444).** The orchestrator memoizes `/object_info`; `validate_workflow`/`diagnose_run` derive the top-level `missing_node_types` from that snapshot. The cache was invalidated on reboot (the #235/#247/#352/#364 cluster) but not on a node install, so a just-installed type stayed listed as missing until a later reboot. A single `withObjectInfoInvalidation()` choke point now wraps `install`/`update`/`reinstall`/`fix` custom-node ops and resets the object-info cache on success (covering cm-cli, Manager HTTP, and git-clone fallback paths). (#471)
+- **`panel_run` tolerates a mid-command panel reconnect instead of hard-failing (#450).** The UI-bridge socket `close` handler rejected every in-flight command with a generic `panel tab disconnected mid-command` — a false failure for an already-queued `graph_run`, and one that invited a blind retry / double render. It now classifies the disconnect: idempotent reads are parked with a bounded, deadline-clamped grace and re-dispatched only if the tab re-hellos (transient reconnect resumes cleanly); every mutating command rejects with an actionable `OUTCOME UNKNOWN` message and is never auto-retried (at-most-once). (#472)
+
+## [0.48.13] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- Gemini backend readiness recognizes API-key auth (GEMINI_API_KEY/GOOGLE_API_KEY, or ~/.gemini/settings.json security.auth.selectedType=gemini-api-key), not just OAuth — so an API-key-authed Gemini no longer shows as "Not signed in" (#456)
+- comfy_cli_models list actions (list-folders/list-folder/search/show) fall back to the connected local server's /models when comfy-cli is absent (mirrors #354), with faithful comfy-cli semantics — type-alias→folder mapping, exact-match show, list-folder limit; mutations still require comfy-cli; pinned workspace / cloud never substituted (#460)
+
+
+## [0.48.12] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- comfy_cli_models download uses a 120s IDLE/liveness timeout (progress resets the clock) instead of a fixed 60s wall-clock, so a long-but-live download isn't killed while a truly stalled one still times out (as a distinct idle_timeout error) (#417)
+- convertUiToApi keeps a declared asset value (unet/ckpt/vae/lora/model_path) and warns instead of silently swapping it for the first installed model when it's not present on the server — so e.g. Krea 2's krea2_turbo_fp8 no longer becomes flux-2-klein-9b; plain enum combos still fall back (#407)
+- download resume hardened (#343 edges): ETag/If-Range-gated resume, strict full Content-Range validation, failure-atomic sidecar handling, plus S3/Azure Content-Length truncation checks and 0-byte cache-hit recovery (#343)
+- built-in ace_step_15 audio template updated to the current comfy_extras nodes_ace schema (unet_name, full TextEncodeAceStepAudio required inputs, SaveAudioMP3 quality) (#448)
+- restart_comfyui/port detection: detect ComfyUI liveness via the reachable server (answered /system_stats) and parse netstat locale-independently, instead of falsely reporting "no process on port" (#449)
+
+
+## [0.48.11] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- the codex run-finished callback serializes a structured final-commit payload to readable text instead of `[object Object]`, and no longer overwrites the already-streamed reply when the final commit is empty/malformed (falls back to the streamed text) (#421 #422) (#443)
+- Krea 2 packs no longer declare ComfyUI-Manager as a custom-node dependency, so apply_manifest stops cloning a duplicate ComfyUI-Manager on Desktop installs where it's already present (#441) (#445)
+
+
+## [0.48.10] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- download resume survives an orchestrator/panel reconnect: a nominally-local session that loses its resolvable ComfyUI base after reconnect now routes the download through the still-connected ComfyUI-Manager instead of failing with "COMFYUI_PATH is not configured"; the in-flight job registry is dual-keyed (route-independent request key + destination) so a Manager<->local route flip can't spawn a duplicate same-file writer (#420) (#440)
+- train_caption_dataset fails fast on a persistent Claude auth failure (not-logged-in / invalid key / expired token) with an actionable message, instead of looping every image re-hitting the same error; transient per-file errors still continue (#438) (#439)
+
+
+## [0.48.9] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- get_environment probes the ComfyUI venv/embedded python (resolved live-first from the running server's argv → COMFYUI_PATH → saved default workspace) instead of a bare PATH python, fixing false capability reports like "Triton: not installed"; remote/unreachable/ambiguous cases report an honest untrusted result rather than a confident wrong one (#401) (#433)
+
+
+## [0.48.8] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- download_model follows the HF Xet CAS redirect and surfaces the real network cause (DNS/proxy/TLS/HF_ENDPOINT) instead of a generic "fetch failed" (#411) (#427)
+- civitai search surfaces distinct upstream/auth(token-aware 401)/403/429/5xx/timeout/non-JSON failures instead of a misleading empty or generic error (WS-6) (#428)
+- crash detector no longer false-positives on a swallowed "Exception ignored in: __del__" finalizer traceback (#341) (#429)
+- get_job_status reports a present-but-empty ShowText/PreviewAny output instead of dropping it (#373) (#430)
+- model_metadata_read gives an actionable message when the optional model-explorer node is absent, instead of leaking a raw 404 (#363) (#431)
+- get_node_info honors the live /object_info registration key when backfilling, so a registered node (e.g. DetectorForNSFW) resolves (#404) (#432)
+- get_template_schema routes through the connected client's base URL + auth and resolves template ids consistently with list_workflow_templates (proxy/auth-safe) (#391) (#434)
+- get_image returns a structured not-found for non-image /view payloads (type=input refs) instead of a corrupt inline image / JSON parse error (#385) (#435)
+
+
+## [0.48.7] - 2026-07-29
+
+### MCP
+
+#### Added
+- report_issue: fix-then-file default plus an async Worker submit/poll client — filing returns a pollable job_id that resolves to the GitHub issue link, and the report-bug skill attempts a local fix before filing (#410)
+
+#### Fixed
+- download_model and verify_custom_node adopt the saved default workspace (or the Manager route) when COMFYUI_PATH is unset, instead of hard-failing or misclassifying a local instance as remote (#415 #416 #386 #409) (#418)
+- route custom-node ops by Manager generation with a live /object_info fallback; comfy_cli_search_nodes falls back to the live server when comfy-cli is absent; apply_manifest adopts a saved default workspace, falls back to `python -m pip` for non-venv interpreters, and hands slow downloads to the background job registry (WS-4) (#354 #362 #377 #390 #408 #412)
+- chat serializes structured error/user payloads as readable text instead of `[object Object]` (WS-9) (#405)
+- invalidate stale objectInfo caches and node snapshots after a restart+edit so tools see the live graph (WS-3) (#402)
+- normalize preferred_models before the set_config change-guard to stop a heartbeat config-repush loop; civitai search now ensures the endpoint is reachable (#398)
+- reject truncated and 0-byte model downloads instead of leaving a corrupt file on disk (#343 #396)
+
+## [0.48.6] - 2026-07-29
+
+### MCP
+
+#### Fixed
+- change-guard set_config to stop a heartbeat feedback loop (#393)
+- surface filter/upstream failures instead of empty results (WS-6) (#381)
+- resolve live ComfyUI base dir for relaunch/model-dirs/extra-paths (WS-2) (#383)
+- auto-heal orphaned workflow-tab binding to prevent cross-tab writes (WS-1) (#382)
+- graceful message for graph_* commands unknown to old panels (WS-0) (#380)
+
+
 ## [0.48.5] - 2026-07-28
 
 ### MCP

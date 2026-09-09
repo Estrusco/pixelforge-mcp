@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { ValidationError } from "../utils/errors.js";
+import { logger } from "../utils/logger.js";
 import { assertAllowedTokenHost, OAUTH_PROVIDERS, redactTokens, type OAuthTokens } from "./oauth-flow.js";
 import {
   setOAuthStatus,
@@ -16,11 +17,31 @@ const OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
 
 const KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
-const KIMI_OAUTH_TOKEN_URL = "https://api.kimi.com/oauth/token";
+/**
+ * Kimi Code's OAuth token endpoint, per REGION (#2534).
+ *
+ * The old constant was `https://api.kimi.com/oauth/token`, which does not exist
+ * — it answers 404 from nginx, so EVERY refresh failed and a Connect landing
+ * inside the 15-minute token's refresh skew (which is most of them) reported
+ * "Kimi Code OAuth refresh failed (404)". The token host is a DIFFERENT host
+ * from the coding API host: `auth.kimi.*`, not `api.kimi.*`, and the path is
+ * `/api/oauth/token`, not `/oauth/token`.
+ *
+ * Verified against both endpoints with the client_id below and this function's
+ * exact form-encoded body: a bogus refresh_token returns
+ * `400 {"error":"invalid_grant"}`, which is the endpoint accepting the grant
+ * TYPE and rejecting only the token — the proof that the request shape is right.
+ * (The same probe sent as JSON returns `unsupported_grant_type`; the body here
+ * is URLSearchParams, so this path was always correctly encoded.)
+ */
+const KIMI_OAUTH_TOKEN_URL_MAINLAND = "https://auth.kimi.com/api/oauth/token";
+const KIMI_OAUTH_TOKEN_URL_GLOBAL = "https://auth.kimi.ai/api/oauth/token";
 
 export const GLM_CODE_DEFAULT_BASE = "https://api.z.ai/api/coding/paas/v4";
 export const KIMI_CODE_DEFAULT_BASE = "https://api.kimi.com/coding/v1";
 export const MOONSHOT_DEFAULT_BASE = "https://api.moonshot.ai/v1";
+export const MINIMAX_DEFAULT_BASE = "https://api.minimax.io/v1";
+export const ATLASCLOUD_DEFAULT_BASE = "https://api.atlascloud.ai/v1";
 
 const TOKEN_REFRESH_SKEW_MS = 120_000;
 
@@ -95,9 +116,35 @@ function codexAuthPath(home = homedir()): string {
   return join(root, "auth.json");
 }
 
+/**
+ * Every place kimi-code may keep its device-code OAuth, most current first.
+ *
+ * EXPORTED because it must have exactly one implementation. It previously had two:
+ * this one, and an independent copy in orchestrator/backend-readiness.ts that still
+ * looked only in the legacy ~/.kimi. The result was a user signed in with the current
+ * CLI getting credentials resolved here and {auth:false, ready:false} reported there —
+ * so the panel told them they were not signed in and could switch away from Kimi.
+ * Divergence was the bug; one function is the fix.
+ *
+ * KIMI_CODE_HOME is the override the current CLI documents; KIMI_SHARE_DIR is the
+ * legacy name this codebase advertised. Both are honoured, current first, because
+ * dropping the old one would silently break anyone already setting it.
+ */
+export function kimiCodeAuthCandidates(home = homedir()): string[] {
+  const codeHome = process.env.KIMI_CODE_HOME?.trim();
+  const shareDir = process.env.KIMI_SHARE_DIR?.trim();
+  if (codeHome) return [join(codeHome, "credentials", "kimi-code.json")];
+  if (shareDir) return [join(shareDir, "credentials", "kimi-code.json")];
+  return [
+    join(home, ".kimi-code", "credentials", "kimi-code.json"), // kimi-code CLI (current)
+    join(home, ".kimi", "credentials", "kimi-code.json"), // legacy kimi-cli (`kimi migrate`)
+  ];
+}
+
 function kimiCodeAuthPath(home = homedir()): string {
-  const share = process.env.KIMI_SHARE_DIR || join(home, ".kimi");
-  return join(share, "credentials", "kimi-code.json");
+  const candidates = kimiCodeAuthCandidates(home);
+  // Falls back to the first candidate so a not-found error names the CURRENT path.
+  return candidates.find((p) => existsSync(p)) ?? candidates[0]!;
 }
 
 function grokAuthPath(home = homedir()): string {
@@ -219,8 +266,87 @@ async function refreshOpenAICodexTokens(
   return { access_token: access, refresh_token: payload.refresh_token?.trim() };
 }
 
+/**
+ * Which region serves this install (#2534).
+ *
+ * The Kimi Code CLI writes its region beside `credentials/` — `mainland-cn` on
+ * the reporter's machine — and splits BOTH hosts on it: `api.kimi.com` +
+ * `auth.kimi.com` for mainland, `api.kimi.ai` + `auth.kimi.ai` for global.
+ *
+ * One resolver for both hosts, deliberately. Deriving only the OAuth host from
+ * the region left a global install refreshing at `auth.kimi.ai` and then sending
+ * the fresh token to the mainland coding API, because the base URL kept its
+ * mainland default (gate r2 P1) — a split-brain pair that is worse than being
+ * consistently wrong.
+ *
+ * Order: an explicit COMFYUI_MCP_KIMI_BASE_URL is operator intent and wins; then
+ * the CLI's own region file, read from the SAME install the credentials came
+ * from, so a KIMI_CODE_HOME / KIMI_SHARE_DIR override cannot pair one install's
+ * tokens with another's region; then mainland, the region of the historical
+ * default base, so an install with neither signal keeps today's hosts.
+ */
+type KimiRegion = "mainland" | "global";
+
+function kimiRegionFromHost(url: string): KimiRegion | null {
+  try {
+    return new URL(url).hostname.toLowerCase().endsWith("kimi.ai") ? "global" : "mainland";
+  } catch {
+    return null; // malformed override — no signal
+  }
+}
+
+function kimiRegion(authPath: string, baseUrlOverride: string | undefined): KimiRegion {
+  if (baseUrlOverride) {
+    const fromOverride = kimiRegionFromHost(baseUrlOverride);
+    if (fromOverride) return fromOverride;
+  }
+  const regionFile = join(dirname(dirname(authPath)), "region");
+  if (existsSync(regionFile)) {
+    try {
+      const region = readFileSync(regionFile, "utf8").trim().toLowerCase();
+      // Match on "cn" rather than the exact string: the CLI's value is
+      // `mainland-cn`, and anything else it may write for the global region
+      // (`global`, `intl`, …) is not enumerable from here. A non-empty region
+      // that is not mainland is global.
+      if (region) return region.includes("cn") ? "mainland" : "global";
+    } catch (err) {
+      // An existing-but-unreadable region file is NOT the same as no region file
+      // (gate r2/r3 P1), and there is no second source to fall back on. Guessing
+      // mainland here sends a GLOBAL install's refresh_token to auth.kimi.com,
+      // which fails as `invalid_grant` — an error that points at the token and
+      // says nothing about the region, leaving the user to debug the wrong
+      // thing. Refuse instead, and name both the file and the way past it.
+      //
+      // Same rule the crash-log reader follows for a log it cannot open: a
+      // signal that was never read must not be reported as a known-good default.
+      // Only reachable on the OAuth path (KIMI_API_KEY returns before this) and
+      // only when the file EXISTS but cannot be read, which is an already-broken
+      // install directory rather than a normal state.
+      throw new ValidationError(
+        `Kimi Code region file ${regionFile} exists but could not be read (${
+          err instanceof Error ? err.message : String(err)
+        }), so the mainland/global region is unknown and a refresh could be sent to the wrong host. ` +
+          `Fix that file's permissions, or set COMFYUI_MCP_KIMI_BASE_URL ` +
+          `(${KIMI_CODE_DEFAULT_BASE} or ${KIMI_CODE_GLOBAL_BASE}) to pin the region explicitly.`,
+      );
+    }
+  }
+  return "mainland";
+}
+
+const KIMI_CODE_GLOBAL_BASE = "https://api.kimi.ai/coding/v1";
+
+function kimiOAuthTokenUrl(region: KimiRegion): string {
+  return region === "global" ? KIMI_OAUTH_TOKEN_URL_GLOBAL : KIMI_OAUTH_TOKEN_URL_MAINLAND;
+}
+
+function kimiCodingBase(region: KimiRegion): string {
+  return region === "global" ? KIMI_CODE_GLOBAL_BASE : KIMI_CODE_DEFAULT_BASE;
+}
+
 async function refreshKimiCodeTokens(
   refreshToken: string,
+  tokenUrl: string,
   deps: CodeProviderAuthDeps,
 ): Promise<KimiCodeAuthFile> {
   const fetchFn = deps.fetch ?? fetch;
@@ -229,7 +355,7 @@ async function refreshKimiCodeTokens(
     refresh_token: refreshToken,
     client_id: KIMI_CODE_CLIENT_ID,
   });
-  const res = await fetchFn(KIMI_OAUTH_TOKEN_URL, {
+  const res = await fetchFn(tokenUrl, {
     method: "POST",
     headers: {
       Accept: "application/json",
@@ -524,6 +650,34 @@ export function resolveMoonshotCredentials(): MoonshotCredentials {
 }
 
 /**
+ * MiniMax platform API key. Env: MINIMAX_API_KEY. OpenAI-compatible
+ * /v1/chat/completions at the global endpoint (https://api.minimax.io/v1);
+ * set COMFYUI_MCP_MINIMAX_BASE_URL to the China-region endpoint
+ * (https://api.minimaxi.com/v1) or any other OpenAI-compatible host. Auth is a
+ * plain Bearer key — the OpenAI-compatible route needs no GroupId.
+ */
+export function resolveMiniMaxCredentials(): MoonshotCredentials {
+  return resolveKeyedCredentials({
+    envKeys: ["MINIMAX_API_KEY"],
+    missingMessage:
+      "MiniMax requires MINIMAX_API_KEY from platform.minimax.io (https://platform.minimax.io/console/api-keys).",
+    baseUrlEnv: "COMFYUI_MCP_MINIMAX_BASE_URL",
+    defaultBaseUrl: MINIMAX_DEFAULT_BASE,
+  });
+}
+
+/** Atlas Cloud OpenAI-compatible LLM API. Env: ATLASCLOUD_API_KEY. */
+export function resolveAtlasCloudCredentials(): MoonshotCredentials {
+  return resolveKeyedCredentials({
+    envKeys: ["ATLASCLOUD_API_KEY"],
+    missingMessage:
+      "Atlas Cloud requires ATLASCLOUD_API_KEY from https://www.atlascloud.ai/console/api-keys.",
+    baseUrlEnv: "COMFYUI_MCP_ATLASCLOUD_BASE_URL",
+    defaultBaseUrl: ATLASCLOUD_DEFAULT_BASE,
+  });
+}
+
+/**
  * Resolve credentials for a simple OpenAI-compatible api-key provider by its
  * registry id (see services/openai-provider-registry). This is the one place
  * that marries a `simpleKeyAuth` registry id to its resolver, so the generic
@@ -533,29 +687,39 @@ export function resolveMoonshotCredentials(): MoonshotCredentials {
 export function resolveOpenAiKeyCredentials(id: string): { apiKey: string; baseUrl: string } {
   if (id === "glm") return resolveGlmCodeCredentials();
   if (id === "moonshot") return resolveMoonshotCredentials();
+  if (id === "minimax") return resolveMiniMaxCredentials();
+  if (id === "atlascloud") return resolveAtlasCloudCredentials();
   throw new ValidationError(`No OpenAI api-key credential resolver for provider "${id}".`);
 }
 
 /**
- * Resolve Kimi Code subscription OAuth from ~/.kimi/credentials/kimi-code.json.
- * Falls back to KIMI_API_KEY when set (pay-per-token / CI).
+ * Resolve Kimi Code subscription OAuth from ~/.kimi-code/credentials/kimi-code.json
+ * (legacy ~/.kimi honored as a fallback). Falls back to KIMI_API_KEY when set
+ * (pay-per-token / CI).
  */
 export async function resolveKimiCodeOAuth(
   deps: CodeProviderAuthDeps = {},
 ): Promise<KimiCodeOAuthCredentials> {
-  const baseUrl =
-    process.env.COMFYUI_MCP_KIMI_BASE_URL?.trim().replace(/\/$/, "") || KIMI_CODE_DEFAULT_BASE;
+  const baseOverride = process.env.COMFYUI_MCP_KIMI_BASE_URL?.trim().replace(/\/$/, "") || undefined;
 
+  // BEFORE any region resolution: a pay-per-token / CI key needs no OAuth, so it
+  // must not be able to fail on an unreadable region file it never consults.
+  // Keeps this path byte-identical to its previous behaviour.
   const apiKey = process.env.KIMI_API_KEY?.trim();
   if (apiKey) {
-    return { accessToken: apiKey, baseUrl };
+    return { accessToken: apiKey, baseUrl: baseOverride ?? KIMI_CODE_DEFAULT_BASE };
   }
 
   const home = deps.home ?? homedir();
   const path = kimiCodeAuthPath(home);
+  // One region decision drives BOTH hosts, so a global install cannot refresh at
+  // auth.kimi.ai and then talk to the mainland coding API (#2534, gate r2).
+  const region = kimiRegion(path, baseOverride);
+  const baseUrl = baseOverride ?? kimiCodingBase(region);
+
   if (!existsSync(path)) {
     throw new ValidationError(
-      "Kimi Code OAuth requires ~/.kimi/credentials/kimi-code.json (from Kimi Code login) or KIMI_API_KEY.",
+      "Kimi Code OAuth requires ~/.kimi-code/credentials/kimi-code.json (run `kimi login`) or KIMI_API_KEY.",
     );
   }
 
@@ -578,7 +742,7 @@ export async function resolveKimiCodeOAuth(
     if (!refreshToken) {
       throw new ValidationError("Kimi Code access token expired and refresh_token is missing. Re-run Kimi Code login.");
     }
-    creds = await refreshKimiCodeTokens(refreshToken, deps);
+    creds = await refreshKimiCodeTokens(refreshToken, kimiOAuthTokenUrl(region), deps);
     await atomicWriteJson(path, creds);
   }
 
@@ -737,7 +901,10 @@ function nativeCliStatus(providerId: string, home = homedir()): OAuthStatusRecor
  *  CLI-authenticated provider never asks the user to sign in a second time.
  *  `home` is injectable so tests never read the developer's real logins. */
 export function readOAuthStatus(home = homedir()): OAuthStatusRecord[] {
-  const mirror = listOAuthStatus();
+  // `home` goes to BOTH halves. It used to reach only `nativeCliStatus` below,
+  // while the mirror read fell through to the real home — so the promise in this
+  // docstring held for the detection half and not the mirror half (#859).
+  const mirror = listOAuthStatus(home);
   const seen = new Set(mirror.map((r) => r.provider));
   for (const providerId of ["codex", "grok", "copilot"]) {
     if (seen.has(providerId)) continue;
@@ -763,6 +930,8 @@ export const __testing = {
   GLM_CODE_DEFAULT_BASE,
   KIMI_CODE_DEFAULT_BASE,
   MOONSHOT_DEFAULT_BASE,
+  MINIMAX_DEFAULT_BASE,
+  ATLASCLOUD_DEFAULT_BASE,
   codexAuthPath,
   kimiCodeAuthPath,
   grokAuthPath,

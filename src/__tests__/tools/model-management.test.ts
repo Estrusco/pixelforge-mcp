@@ -2,6 +2,21 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const downloadModelMock = vi.fn();
 const listLocalModelsMock = vi.fn();
+/** #369 post-landing verification, controlled per test. Default: the honest
+ *  "could not check" verdict, echoing the path back. */
+// #1204 — the RETURN type comes from the real verdict, not from whatever this
+// default happens to contain. Inferring it from the literal made the mock's
+// shape narrower than `verifyLandedModel`'s, so a test overriding it with
+// `verifiedAgainstRoot` (real: model-resolver.ts:1349, read at
+// download-jobs.ts:623) was rejected by an annotation the test itself invented.
+type LandedVerdict = Awaited<ReturnType<typeof import("../../services/model-resolver.js").verifyLandedModel>>;
+const verifyLandedModelMock = vi.fn(async (targetPath: string): Promise<LandedVerdict> => ({
+  verifiedPath: targetPath,
+  liveVisible: "unknown",
+  note: "no live server in this test",
+}));
+/** The models root the connected server reads NOW (stubbed; see the mock). */
+const currentLiveRootMock = vi.fn(async (): Promise<string | undefined> => undefined);
 vi.mock("../../services/model-resolver.js", async () => {
   const actual = await vi.importActual<typeof import("../../services/model-resolver.js")>(
     "../../services/model-resolver.js",
@@ -10,33 +25,85 @@ vi.mock("../../services/model-resolver.js", async () => {
     ...actual,
     downloadModel: (...a: unknown[]) => downloadModelMock(...a),
     listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
+    // #918: the rendering path reads the coverage-carrying entry point. Wrap the
+    // existing mock so a test only has to say what the listing CONTAINS; the
+    // default coverage is the verified-answered case (nothing to caveat).
+    listLocalModelsWithCoverage: async (...a: unknown[]) => ({
+      models: (await listLocalModelsMock(...a)) ?? [],
+      coverage: { answered: ["checkpoints"], unanswered: [], usedFilesystem: false },
+    }),
+    // Deterministic local routing (no live server probe) so startDownloadJob keys
+    // the job locally and threads dispatchToManager=false into downloadModel.
+    shouldDispatchDownloadToManager: async () => false,
+    // startDownloadJob resolves the destination via this before streaming; stub
+    // it so the tool tests don't need a live server to compute a targetPath.
+    resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {
+      const name = filename ?? String(url).split("/").pop() ?? "model.safetensors";
+      return { targetDir: `/m/${sub}`, filename: name, targetPath: `/m/${sub}/${name}` };
+    },
+    verifyLandedModel: (...a: unknown[]) =>
+      verifyLandedModelMock(...(a as [string, string])),
+    // The root the connected server reads NOW. Stub it: the real one probes the
+    // DEVELOPER's machine, and a resolvable root there would invalidate every
+    // verdict these tests assert. Undefined = unknown, which never downgrades.
+    currentLiveModelsRoot: async (): Promise<string | undefined> => currentLiveRootMock(),
   };
 });
 
 import { registerModelManagementTools } from "../../tools/model-management.js";
+import { setProgressDir } from "../../services/download-progress.js";
+import * as progressModule from "../../services/download-progress.js";
+import { listDownloadJobs, resetDownloadJobs, startDownloadJob } from "../../services/download-jobs.js";
+import { downloadCacheIdentity } from "../../services/download-cache.js";
+import { segmentScratchPath } from "../../services/download-segments.js";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   isError?: boolean;
   content: Array<{ type: string; text: string }>;
 }>;
 
+/**
+ * 0.50.0 slice 11 folded these three tools into two action-parameterized ones,
+ * so the behaviour tests below reach them through the dispatcher. Everything
+ * they assert — the #369 placement verdicts, the #822 ambiguous-id handling,
+ * the sidecar rendering — is unchanged by the fold, which is the point of
+ * routing rather than rewriting them.
+ */
 function makeServer() {
   const handlers = new Map<string, ToolHandler>();
   const server = {
-    tool: (name: string, _desc: string, _schema: unknown, handler: ToolHandler) => {
+    // The SDK's `tool()` is overloaded: the callback is the LAST argument, and an
+    // optional annotations object (#1106) sits before it. Resolve by TYPE the way the
+    // real SDK does, so adding annotations to a tool cannot break this fake.
+    tool: (name: string, _desc: string, _schema: unknown, ...rest: unknown[]) => {
+      const handler = rest.find((a) => typeof a === "function") as ToolHandler;
       handlers.set(name, handler);
     },
   };
   registerModelManagementTools(server as never);
+  const download = handlers.get("download_model")!;
+  const inventory = handlers.get("list_local_models")!;
   return {
-    downloadModel: handlers.get("download_model")!,
-    listLocalModels: handlers.get("list_local_models")!,
+    downloadModel: (args: Record<string, unknown>) => download({ ...args, action: "download" }),
+    downloadStatus: (args: Record<string, unknown>) => download({ ...args, action: "status" }),
+    cancelDownload: (args: Record<string, unknown>) => download({ ...args, action: "cancel" }),
+    listLocalModels: (args: Record<string, unknown>) => inventory({ ...args, action: "list" }),
   };
 }
 
 beforeEach(() => {
   downloadModelMock.mockReset();
   listLocalModelsMock.mockReset();
+  verifyLandedModelMock.mockReset();
+  verifyLandedModelMock.mockImplementation(async (targetPath: string) => ({
+    verifiedPath: targetPath,
+    liveVisible: "unknown",
+    note: "no live server in this test",
+  }));
 });
 
 describe("download_model tool", () => {
@@ -61,8 +128,1226 @@ describe("download_model tool", () => {
       "checkpoints",
       "x.safetensors",
       auth,
+      false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
+      expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
+      expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
+      expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
+      expect.any(Function), // onStagedPartialPath callback — records the exact cache identity
+      undefined, // modelRoot — optional explicit extra/primary root (#2499)
     );
     expect(res.isError).toBeFalsy();
+  });
+
+  // -------------------------------------------------------------------------
+  // #369 — success is only ever claimed for a destination that was VERIFIED.
+  // -------------------------------------------------------------------------
+  it("reports the VERIFIED on-disk path when the connected ComfyUI lists the file", async () => {
+    downloadModelMock.mockResolvedValueOnce("/m/checkpoints/x.safetensors");
+    verifyLandedModelMock.mockResolvedValueOnce({
+      // A symlinked models tree: the real location is what must be reported.
+      verifiedPath: "/mnt/models/checkpoints/x.safetensors",
+      liveVisible: "visible",
+      // Confirmation requires the RENDERER to re-establish the verdict, so the
+      // verdict's root and the reader's current root must agree (#369).
+      verifiedAgainstRoot: "/live/models",
+    });
+    currentLiveRootMock.mockResolvedValueOnce("/live/models");
+
+    const { downloadModel } = makeServer();
+    const res = await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const text = res.content[0].text;
+    expect(text).toContain("/mnt/models/checkpoints/x.safetensors");
+    expect(text).toContain("verified on disk");
+    expect(text).toContain("the connected ComfyUI lists it");
+  });
+
+  it("does NOT claim success when the landed file is invisible to the connected ComfyUI", async () => {
+    downloadModelMock.mockResolvedValueOnce("/stale/models/checkpoints/x.safetensors");
+    verifyLandedModelMock.mockResolvedValueOnce({
+      verifiedPath: "/stale/models/checkpoints/x.safetensors",
+      liveVisible: "not-visible",
+      note: "The file IS on disk but the connected ComfyUI does NOT list it.",
+    });
+
+    const { downloadModel } = makeServer();
+    const res = await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const text = res.content[0].text;
+    expect(text).not.toContain("downloaded successfully");
+    expect(text).toContain("NOT usable by the connected ComfyUI");
+    expect(text).toContain("The file IS on disk but the connected ComfyUI does NOT list it.");
+    expect(text).toContain("Do NOT tell the user the model is ready");
+  });
+
+  it("qualifies the result when placement could not be confirmed", async () => {
+    downloadModelMock.mockResolvedValueOnce("/m/checkpoints/x.safetensors");
+    const { downloadModel } = makeServer();
+    const res = await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const text = res.content[0].text;
+    expect(text).not.toContain("downloaded successfully");
+    expect(text).toContain("UNCONFIRMED");
+  });
+
+  it("never claims success while the visibility check is still PENDING (#369 grace-window race)", async () => {
+    // The file lands (commitDone marks it `pending`) but the tool's grace window
+    // expires before verification concludes. A pending verdict must read as
+    // unconfirmed, never as "the connected ComfyUI lists it". A distinct filename
+    // keeps this job's (deliberately unresolved) destination chain to itself.
+    const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+    process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "20";
+    let releaseVerify: (() => void) | undefined;
+    downloadModelMock.mockResolvedValueOnce("/m/checkpoints/pending.safetensors");
+    verifyLandedModelMock.mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          releaseVerify = () =>
+            r({ verifiedPath: "/m/checkpoints/pending.safetensors", liveVisible: "visible" });
+        }),
+    );
+
+    try {
+      const { downloadModel } = makeServer();
+      const res = await downloadModel({
+        url: "https://example.com/pending.safetensors",
+        target_subfolder: "checkpoints",
+        filename: "pending.safetensors",
+      });
+
+      const text = res.content[0].text;
+      expect(text).not.toContain("downloaded successfully");
+      expect(text).not.toContain("lists it");
+      expect(text).toContain("NOT been confirmed yet");
+    } finally {
+      releaseVerify?.();
+      if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+      else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
+    }
+  });
+});
+
+describe('download_model action:"status"', () => {
+  it("uses the writer's authenticated HF-rewrite cache identity (#2356)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-durable-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const url = "https://huggingface.co/Comfy-Org/test/resolve/main/model.safetensors";
+    const id = "status-2356-durable";
+    const progressId = "progress-2356-durable";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    setProgressDir(dir);
+    try {
+      const partial = downloadCacheIdentity(
+        "https://hf-mirror.example/Comfy-Org/test/resolve/main/model.safetensors",
+        { Authorization: "Bearer hf-secret" },
+      ).partialPath;
+      const bareOriginal = downloadCacheIdentity(url).partialPath;
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(partial, Buffer.alloc(100));
+      await writeFile(bareOriginal, Buffer.alloc(900));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-durable",
+          progressId,
+          url,
+          target_subfolder: "text_encoders",
+          status: "downloading",
+          via_manager: false,
+          partialPath: partial,
+          started_at: Date.now() - 60_000,
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "model.safetensors",
+          downloaded: 900,
+          total: 1_000,
+          bytes_per_sec: 10,
+          status: "downloading",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("**downloading**");
+      expect(text).toContain("(10%)");
+      expect(text).not.toContain("(90%)");
+      expect(text).toContain("reconciled to the durable .partial");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a zero-byte staged partial as unavailable and non-resumable (#2356)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-empty-partial-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-empty-partial-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const savedStall = process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+    const url = "https://example.com/empty-partial.safetensors";
+    const id = "status-2356-empty-partial";
+    const progressId = "progress-2356-empty-partial";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = "0";
+    setProgressDir(dir);
+    try {
+      const partial = downloadCacheIdentity(url).partialPath;
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(partial, Buffer.alloc(0));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-empty-partial",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "text_encoders",
+          status: "cancelled",
+          via_manager: false,
+          partial_identity: { version: 1, cache_key: "empty-partial-test", auth_mode: "none" },
+          started_at: Date.now() - 60_000,
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "empty-partial.safetensors",
+          downloaded: 100,
+          total: 1_000,
+          bytes_per_sec: 0,
+          status: "cancelled",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("PROGRESS UNAVAILABLE");
+      expect(text).toContain("exact staged .partial is absent or zero-byte");
+      expect(text).toContain("starts from the beginning");
+      expect(text).not.toContain("0 bytes durable");
+      expect(text).not.toContain("resumes from it");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      if (savedStall === undefined) delete process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+      else process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = savedStall;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("labels byte progress stalled or unavailable instead of presenting a healthy row (#2356)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-stall-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-stall-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const savedStall = process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+    const url = "https://huggingface.co/Comfy-Org/test/resolve/main/stalled.safetensors";
+    const id = "status-2356-stalled";
+    const progressId = "progress-2356-stalled";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = "1";
+    setProgressDir(dir);
+    try {
+      const partial = downloadCacheIdentity(url).partialPath;
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-stalled",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "text_encoders",
+          status: "downloading",
+          via_manager: false,
+          started_at: Date.now() - 600_000,
+          updated: Date.now() - 600_000,
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "stalled.safetensors",
+          downloaded: 100,
+          total: 1_000,
+          bytes_per_sec: 0,
+          status: "downloading",
+          updated: Date.now() - 120_000,
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("PROGRESS STALLED/UNAVAILABLE");
+      expect(text).toContain("no readable durable .partial is present yet");
+      expect(text).toContain("does not cancel the download");
+      expect(text).not.toContain("(10%)");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      if (savedStall === undefined) delete process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+      else process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = savedStall;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("does not call finite age stalled when the watchdog is disabled (#2356)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-disabled-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-disabled-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const savedStall = process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+    const url = "https://example.com/disabled.safetensors";
+    const id = "status-2356-disabled";
+    const progressId = "progress-2356-disabled";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = "0";
+    setProgressDir(dir);
+    try {
+      const partial = downloadCacheIdentity(url).partialPath;
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-disabled",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "text_encoders",
+          status: "downloading",
+          via_manager: false,
+          started_at: Date.now() - 600_000,
+          updated: Date.now() - 600_000,
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "disabled.safetensors",
+          downloaded: 100,
+          total: 1_000,
+          bytes_per_sec: 0,
+          status: "downloading",
+          updated: Date.now() - 120_000,
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("PROGRESS UNAVAILABLE");
+      expect(text).toContain("stall watchdog is disabled");
+      expect(text).not.toContain("PROGRESS STALLED");
+      expect(text).not.toContain("(10%)");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      if (savedStall === undefined) delete process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+      else process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = savedStall;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a stat failure as unavailable, not absent or zero bytes (#2356)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-stat-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-stat-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const savedStall = process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+    const url = "https://example.com/stat-error.safetensors";
+    const id = "status-2356-stat-error";
+    const progressId = "progress-2356-stat-error";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = "0";
+    setProgressDir(dir);
+    try {
+      // Node rejects NUL-containing paths before reaching the filesystem. This
+      // exercises the non-ENOENT stat-error branch portably on Windows and Unix.
+      const partial = `${dir}\\partial\u0000stat-error`;
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-stat-error",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "text_encoders",
+          status: "downloading",
+          via_manager: false,
+          started_at: Date.now() - 600_000,
+          updated: Date.now() - 600_000,
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "stat-error.safetensors",
+          downloaded: 100,
+          total: 1_000,
+          bytes_per_sec: 0,
+          status: "downloading",
+          updated: Date.now() - 120_000,
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("PROGRESS UNAVAILABLE");
+      expect(text).toContain("durable .partial could not be read");
+      expect(text).not.toContain("no readable durable .partial is present yet");
+      expect(text).not.toContain("(10%)");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      if (savedStall === undefined) delete process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+      else process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = savedStall;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("reports live segmented .seg staging instead of withholding progress (#2356 recurrence)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-seg-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const savedStall = process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+    const url = "https://huggingface.co/Comfy-Org/test/resolve/main/segmented.safetensors";
+    const id = "status-2356-seg";
+    const progressId = "progress-2356-seg";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = "0";
+    setProgressDir(dir);
+    try {
+      const partial = downloadCacheIdentity(url).partialPath;
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(segmentScratchPath(partial), Buffer.alloc(1024));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-seg",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "diffusion_models",
+          status: "downloading",
+          via_manager: false,
+          partial_identity: { version: 1, cache_key: "seg-test", auth_mode: "none" },
+          started_at: Date.now() - 32 * 60_000,
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "segmented.safetensors",
+          downloaded: 4.23 * 1024 ** 3,
+          total: 19.53 * 1024 ** 3,
+          bytes_per_sec: 8_000_000,
+          status: "downloading",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("live segmented staging");
+      expect(text).toContain("does not start from the beginning");
+      expect(text).toMatch(/4\.23\/19\.53 GB \(21%\)/);
+      expect(text).not.toContain("PROGRESS UNAVAILABLE");
+      expect(text).not.toContain("no readable durable .partial is present yet");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      if (savedStall === undefined) delete process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+      else process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = savedStall;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps durable .partial as the byte authority when a leftover .seg also exists (#2356)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-partial-wins-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-partial-wins-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const url = "https://example.com/partial-wins.safetensors";
+    const id = "status-2356-partial-wins";
+    const progressId = "progress-2356-partial-wins";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    setProgressDir(dir);
+    try {
+      const identity = downloadCacheIdentity(url);
+      await mkdir(dirname(identity.partialPath), { recursive: true });
+      await writeFile(identity.partialPath, Buffer.alloc(100));
+      await writeFile(segmentScratchPath(identity.partialPath), Buffer.alloc(900));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-partial-wins",
+          progressId,
+          partialPath: identity.partialPath,
+          url,
+          target_subfolder: "checkpoints",
+          status: "downloading",
+          via_manager: false,
+          partial_identity: { version: 1, cache_key: identity.cacheKey, auth_mode: "none" },
+          started_at: Date.now() - 60_000,
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "partial-wins.safetensors",
+          downloaded: 900,
+          total: 1_000,
+          bytes_per_sec: 10,
+          status: "downloading",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("(10%)");
+      expect(text).not.toContain("(90%)");
+      expect(text).toContain("reconciled to the durable .partial");
+      expect(text).not.toContain("live segmented staging");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("cancel recovery with a live .seg does not claim the re-issue starts from zero (#2356 recurrence)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cancel-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cancel-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const url = "https://example.com/seg-cancel.safetensors";
+    const id = "status-2356-seg-cancel";
+    const progressId = "progress-2356-seg-cancel";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    setProgressDir(dir);
+    try {
+      const identity = downloadCacheIdentity(url);
+      const partial = identity.partialPath;
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(partial, Buffer.alloc(0));
+      await writeFile(segmentScratchPath(partial), Buffer.alloc(2048));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-seg-cancel",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "checkpoints",
+          status: "cancelled",
+          via_manager: false,
+          partial_identity: { version: 1, cache_key: identity.cacheKey, auth_mode: "none" },
+          started_at: Date.now() - 60_000,
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("segmented staging is present");
+      expect(text).toContain("does not start from the beginning");
+      expect(text).not.toContain("starts from the beginning");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("action:cancel during segmented staging does not claim a restart from zero (#2356 recurrence)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cancel-live-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = dir;
+    const url = "https://example.com/seg-cancel-live.safetensors";
+    const identity = downloadCacheIdentity(url);
+    const partial = identity.partialPath;
+    setProgressDir(dir);
+    resetDownloadJobs();
+    downloadModelMock.mockImplementationOnce(async (...args: unknown[]) => {
+      (args[10] as (path: string) => void)(partial);
+      const signal = args[6] as AbortSignal;
+      return await new Promise<string>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new DOMException("cancelled", "AbortError")), {
+          once: true,
+        });
+      });
+    });
+    try {
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(partial, Buffer.alloc(0));
+      await writeFile(segmentScratchPath(partial), Buffer.alloc(2048));
+      const { downloadModel, cancelDownload } = makeServer();
+      const downloading = downloadModel({
+        url,
+        target_subfolder: "checkpoints",
+      });
+      await vi.waitFor(() => expect(downloadModelMock).toHaveBeenCalled());
+      const [job] = listDownloadJobs();
+      expect(job).toBeTruthy();
+
+      const cancelled = await cancelDownload({ id: job.id, tray_id: job.trayId });
+      expect(cancelled.content[0].text).toContain("being aborted");
+      expect(cancelled.content[0].text).toContain("segmented staging is present");
+      expect(cancelled.content[0].text).toContain("does not start from the beginning");
+      expect(cancelled.content[0].text).not.toContain("starts from the beginning");
+      const text = (await downloading).content[0].text;
+      expect(text).toContain("segmented staging is present");
+      expect(text).toContain("does not start from the beginning");
+      expect(text).not.toContain("starts from the beginning");
+    } finally {
+      resetDownloadJobs();
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("action:cancel during the grace window does not promise resume from a zero-byte partial (#2358)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2358-cancel-empty-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = dir;
+    const partial = downloadCacheIdentity("https://example.com/cancel-empty.safetensors").partialPath;
+    setProgressDir(dir);
+    resetDownloadJobs();
+    downloadModelMock.mockImplementationOnce(async (...args: unknown[]) => {
+      (args[10] as (path: string) => void)(partial);
+      const signal = args[6] as AbortSignal;
+      return await new Promise<string>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new DOMException("cancelled", "AbortError")), {
+          once: true,
+        });
+      });
+    });
+    try {
+      await writeFile(partial, Buffer.alloc(0));
+      const { downloadModel, cancelDownload } = makeServer();
+      const downloading = downloadModel({
+        url: "https://example.com/cancel-empty.safetensors",
+        target_subfolder: "checkpoints",
+      });
+      await vi.waitFor(() => expect(downloadModelMock).toHaveBeenCalled());
+      const [job] = listDownloadJobs();
+      expect(job).toBeTruthy();
+
+      const cancelled = await cancelDownload({ id: job.id, tray_id: job.trayId });
+      expect(cancelled.content[0].text).toContain("being aborted");
+      const text = (await downloading).content[0].text;
+      expect(text).toContain("exact staged .partial is absent or zero-byte");
+      expect(text).toContain("starts from the beginning");
+      expect(text).not.toContain("resumes from it");
+    } finally {
+      resetDownloadJobs();
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("status selects the current target when local and pod records share id and tray", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-target-select-"));
+    const savedTarget = process.env.COMFYUI_URL;
+    setProgressDir(dir);
+    const id = "status-target-selector";
+    const trayId = "status-target-tray";
+    const base = {
+      id,
+      trayId,
+      progressId: "status-target-progress",
+      url: "https://example.com/status-target.safetensors",
+      target_subfolder: "checkpoints",
+      status: "downloading",
+      started_at: Date.now(),
+    };
+    try {
+      await writeFile(
+        join(dir, `control-job-${id}-local.json`),
+        JSON.stringify({
+          ...base,
+          target: "http://127.0.0.1:8188",
+          owner: "local-session",
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `control-job-${id}-pod.json`),
+        JSON.stringify({
+          ...base,
+          target: "https://pod-3000.proxy.runpod.net",
+          owner: "pod-session",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+      const local = (await downloadStatus({ id, tray_id: trayId })).content[0].text;
+      expect(local).toContain("target: `http://127.0.0.1:8188`");
+      expect(local).not.toContain("target: `https://pod-3000.proxy.runpod.net`");
+
+      process.env.COMFYUI_URL = "https://pod-3000.proxy.runpod.net";
+      const pod = (await downloadStatus({ id, tray_id: trayId })).content[0].text;
+      expect(pod).toContain("target: `https://pod-3000.proxy.runpod.net`");
+      expect(pod).not.toContain("target: `http://127.0.0.1:8188`");
+    } finally {
+      if (savedTarget === undefined) delete process.env.COMFYUI_URL;
+      else process.env.COMFYUI_URL = savedTarget;
+      setProgressDir("");
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("status keeps a live in-memory writer over an older persisted terminal", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-live-order-"));
+    const savedTarget = process.env.COMFYUI_URL;
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    setProgressDir(dir);
+    resetDownloadJobs();
+    downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
+    try {
+      const active = await startDownloadJob(
+        "https://example.com/live-order.safetensors",
+        "checkpoints",
+      );
+      await writeFile(
+        join(dir, `control-job-${active.job.id}-older-terminal.json`),
+        JSON.stringify({
+          id: active.job.id,
+          trayId: active.job.trayId,
+          progressId: active.job.progressId,
+          target: "http://127.0.0.1:8188",
+          url: "https://example.com/live-order.safetensors",
+          target_subfolder: "checkpoints",
+          status: "error",
+          error: "HTTP 503 upstream reset",
+          started_at: Date.now() - 60_000,
+          finished_at: Date.now() - 30_000,
+          owner: "older-terminal",
+          updated: Date.now() - 30_000,
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id: active.job.id })).content[0].text;
+      expect(text).toContain("**downloading**");
+      expect(text).not.toContain("failed: HTTP 503 upstream reset");
+    } finally {
+      resetDownloadJobs();
+      setProgressDir("");
+      if (savedTarget === undefined) delete process.env.COMFYUI_URL;
+      else process.env.COMFYUI_URL = savedTarget;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces a landed-but-invisible download as a WARNING, not a bare 'landed at' (#369)", async () => {
+    downloadModelMock.mockResolvedValueOnce("/stale/models/checkpoints/x.safetensors");
+    verifyLandedModelMock.mockResolvedValueOnce({
+      verifiedPath: "/stale/models/checkpoints/x.safetensors",
+      liveVisible: "not-visible",
+      note: "the running server reads /live/ComfyUI/models instead",
+    });
+
+    const { downloadModel, downloadStatus } = makeServer();
+    await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const res = await downloadStatus({});
+    const text = res.content[0].text;
+    // "landed at" is reserved for a CONFIRMED placement — an unusable file must not
+    // borrow the settled-sounding phrase. (The listing also renders other tests'
+    // jobs, so this is asserted against THIS job's line.)
+    expect(text).not.toMatch(/landed at[^\n]*\/stale\//);
+    expect(text).toContain("written to (verified on disk): /stale/models/checkpoints/x.safetensors");
+    expect(text).toContain("WARNING: NOT VISIBLE to the connected ComfyUI");
+    expect(text).toContain("the running server reads /live/ComfyUI/models instead");
+  });
+
+  it("keeps a heartbeat-stale persisted transfer visible without prompting a concurrent reissue (#761)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-status-"));
+    setProgressDir(dir);
+    try {
+      const id = "status-stale-job";
+      await writeFile(
+        join(dir, `control-job-${id}-other-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "status-stale-tray",
+          progressId: "status-stale-progress",
+          url: "https://example.com/large.safetensors",
+          target_subfolder: "checkpoints",
+          status: "downloading",
+          started_at: Date.now() - 10 * 60 * 1000,
+          owner: "other-session",
+          updated: Date.now() - 5 * 60 * 1000,
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const res = await downloadStatus({});
+      const text = res.content[0].text;
+      expect(text).toContain(id);
+      expect(text).toContain("heartbeat stale for");
+      expect(text).toContain('Do NOT re-issue download_model action:"download" while this warning remains');
+      // #858: the note now names the recovery path — a cancel that closes the
+      // record once the writer is PROVEN gone, and refuses while it cannot be.
+      expect(text).toContain('action:"cancel"');
+      expect(text).toContain("PROVEN gone");
+      expect(text).toContain("refuses while that cannot be proven");
+      expect(text).toContain("Do not report this download as failed or missing.");
+    } finally {
+      setProgressDir("");
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+  // ── #822: a printed handle must identify exactly one row ──────────────────
+  describe("#822 the id is not unique — the rendered handle must still select", () => {
+    /** Two persisted in-flight records with the SAME id (one destination) and
+     *  DIFFERENT source URLs: the exact listing #822 reported. */
+    async function seedCollidingRows(dir: string, id: string): Promise<void> {
+      const common = {
+        id,
+        target_subfolder: "text_encoders",
+        status: "downloading",
+        started_at: Date.now() - 60_000,
+        updated: Date.now(),
+      };
+      await writeFile(
+        join(dir, `control-job-${id}-session-live.json`),
+        JSON.stringify({
+          ...common,
+          trayId: "livetray00000001",
+          progressId: "live-prog",
+          url: "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/q.safetensors",
+          owner: "session-live",
+        }),
+      );
+      await writeFile(
+        join(dir, `control-job-${id}-session-orphan.json`),
+        JSON.stringify({
+          ...common,
+          trayId: "orphantray000001",
+          progressId: "orphan-prog",
+          url: "https://huggingface.co/Aitrepreneur/FLX/resolve/main/q.safetensors",
+          owner: "session-orphan",
+          started_at: Date.now() - 884_000,
+        }),
+      );
+    }
+
+    it("renders the tray id on every row, so the printed handle names ONE download", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-822-"));
+      setProgressDir(dir);
+      try {
+        await seedCollidingRows(dir, "a0b477082f35745c");
+        const { downloadStatus } = makeServer();
+        const text = (await downloadStatus({})).content[0].text;
+
+        // Both rows appear (the status action promises EVERY tracked download)…
+        expect(text).toContain("livetray00000001");
+        expect(text).toContain("orphantray000001");
+        // …each carrying its tray id alongside the shared id, so the two lines are
+        // programmatically distinguishable rather than identical-looking.
+        expect(text).toContain("`a0b477082f35745c` (tray `livetray00000001`)");
+        expect(text).toContain("`a0b477082f35745c` (tray `orphantray000001`)");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("SHOUTS when a listing contains two rows under one id — two writers, one file", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-822-"));
+      setProgressDir(dir);
+      try {
+        await seedCollidingRows(dir, "a0b477082f35745c");
+        const { downloadStatus } = makeServer();
+        const text = (await downloadStatus({})).content[0].text;
+
+        expect(text).toMatch(/name MORE THAN ONE download/);
+        expect(text).toContain("AMBIGUOUS id");
+        // The remedy is stated in terms the caller can act on right now.
+        expect(text).toMatch(/Use the `tray_id`/);
+        expect(text).toMatch(/Pass that same tray_id to `action:"cancel"` to stop THIS one/);
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("status(id) on an ambiguous id names the candidates — it does NOT report 'no download'", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-822-"));
+      setProgressDir(dir);
+      try {
+        await seedCollidingRows(dir, "a0b477082f35745c");
+        const { downloadStatus } = makeServer();
+        const text = (await downloadStatus({ id: "a0b477082f35745c" })).content[0].text;
+
+        // The regression this guards: the id resolved to nothing (ambiguous), and
+        // saying "no download matching" would turn "could not determine WHICH" into
+        // a definite — and false — "it never started".
+        expect(text).not.toMatch(/No download matching/);
+        expect(text).toMatch(/matches 2 DIFFERENT downloads/);
+        expect(text).toContain("livetray00000001");
+        expect(text).toContain("orphantray000001");
+        // Both source URLs are shown, which is what lets a caller tell them apart.
+        expect(text).toContain("Krea-2");
+        expect(text).toContain("Aitrepreneur");
+        expect(text).toMatch(/Re-run download_model `action:"status"` with `tray_id`/);
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("status(id, tray_id) selects exactly one of the colliding rows", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-822-"));
+      setProgressDir(dir);
+      try {
+        await seedCollidingRows(dir, "a0b477082f35745c");
+        const { downloadStatus } = makeServer();
+        const text = (
+          await downloadStatus({ id: "a0b477082f35745c", tray_id: "orphantray000001" })
+        ).content[0].text;
+
+        expect(text).toContain("orphantray000001");
+        expect(text).toContain("Aitrepreneur");
+        // The OTHER row is not reported — the selector actually selected.
+        expect(text).not.toContain("livetray00000001");
+        expect(text).not.toContain("Krea-2");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── #858: a stale download whose writer is PROVEN gone can be cancelled ──────
+  describe("#858 stale-download recovery", () => {
+    /** A pid that is guaranteed dead: a child that already exited. */
+    function deadPid(): number {
+      // spawnSync returns after the child has fully exited.
+      const res = spawnSync(process.execPath, ["-e", ""]);
+      return res.pid;
+    }
+
+    async function seedStaleRecord(
+      dir: string,
+      id: string,
+      extra: Record<string, unknown> = {},
+    ): Promise<void> {
+      await writeFile(
+        join(dir, `control-job-${id}-dead-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "staletray8580000",
+          progressId: "stale-prog-858",
+          url: "https://example.com/large.safetensors",
+          target_subfolder: "checkpoints",
+          status: "downloading",
+          started_at: Date.now() - 10 * 60 * 1000,
+          owner: "dead-session",
+          updated: Date.now() - 5 * 60 * 1000, // heartbeat long stale
+          ...extra,
+        }),
+      );
+    }
+
+    it("cancel CLOSES a stale record whose writer process is proven gone — and status then reports the administrative cancel honestly", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "stale-dead-job-858";
+        await seedStaleRecord(dir, id, { pid: deadPid() });
+
+        const { cancelDownload, downloadStatus } = makeServer();
+        const res = await cancelDownload({ id, tray_id: "staletray8580000" });
+        const text = res.content[0].text;
+        expect(text).toContain("confirmed GONE");
+        expect(text).toContain("closed as **cancelled**");
+        // A dead writer alone is not resume authorization, especially for a
+        // legacy record whose route and exact staged identity are absent.
+        expect(text).toContain("route is UNKNOWN");
+        expect(text).not.toContain("re-issue the same download_model");
+        // And it must NOT claim a live transfer was aborted.
+        expect(text).not.toMatch(/being aborted/);
+
+        // The record now reads as an administrative cancel — not "the partial was
+        // left on disk", which nobody verified.
+        const status = (await downloadStatus({ id })).content[0].text;
+        expect(status).toContain("cancelled");
+        expect(status).toContain("confirmed GONE");
+        expect(status).not.toContain("the partial was left on disk");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("action:cancel reclaim does not promise resume from a zero-byte partial (#2358)", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-2358-reclaim-empty-"));
+      const partial = join(dir, "reclaim-empty.partial");
+      setProgressDir(dir);
+      try {
+        const id = "stale-empty-partial-2358";
+        await writeFile(partial, Buffer.alloc(0));
+        await seedStaleRecord(dir, id, {
+          pid: deadPid(),
+          via_manager: false,
+          partialPath: partial,
+          partial_identity: { version: 1, cache_key: "reclaim-empty-test", auth_mode: "none" },
+        });
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        expect(text).toContain("confirmed GONE");
+        expect(text).toContain("exact staged .partial is absent or zero-byte");
+        expect(text).toContain("starts from the beginning");
+        expect(text).not.toContain("resumes from it");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel REFUSES a stale record whose writer process is still alive", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "stale-live-job-858";
+        // A live pid (this very process) under a FOREIGN owner nonce stands in for
+        // another live session: stale heartbeat, but the process provably exists.
+        await seedStaleRecord(dir, id, { pid: process.pid });
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        expect(text).toContain("STILL RUNNING");
+        expect(text).toContain("refused");
+        expect(text).toContain("panel download tray");
+        // Nothing was closed: the record still reads downloading.
+        expect(text).toContain("status: downloading");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel REFUSES a stale record with no writer identity — unprovable is not dead", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "stale-unknown-job-858";
+        await seedStaleRecord(dir, id); // no pid — a pre-#858 record
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        expect(text).toContain("cannot be proven");
+        expect(text).toContain("panel download tray");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel on a foreign SETTLED record reports the settled state instead of 'cannot be aborted'", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "foreign-done-job-858";
+        await writeFile(
+          join(dir, `control-job-${id}-other-session.json`),
+          JSON.stringify({
+            id,
+            trayId: "donetray85800000",
+            progressId: "done-prog-858",
+            url: "https://example.com/large.safetensors",
+            target_subfolder: "checkpoints",
+            status: "done",
+            path: "/m/checkpoints/large.safetensors",
+            started_at: Date.now() - 10 * 60 * 1000,
+            finished_at: Date.now() - 9 * 60 * 1000,
+            owner: "other-session",
+            updated: Date.now() - 9 * 60 * 1000,
+          }),
+        );
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id })).content[0].text;
+        expect(text).toContain("already **done** — nothing to cancel");
+        expect(text).not.toContain("can't be aborted");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel DISCLOSES when the dead session's record file could not be deleted", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      const removeSpy = vi
+        .spyOn(progressModule, "removePersistedDownloadJobFor")
+        .mockReturnValue(false);
+      try {
+        const id = "stale-undeletable-858";
+        await seedStaleRecord(dir, id, { pid: deadPid() });
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        // The reclaim happened (the terminal record is durable)…
+        expect(text).toContain("closed as **cancelled**");
+        // …but the leftover is disclosed, not hidden behind a clean-close claim.
+        expect(text).toContain("could not be deleted");
+        expect(text).toContain("no longer blocks cancelling or re-issuing");
+      } finally {
+        removeSpy.mockRestore();
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── #1644: cancel must not assert a live heartbeat it never checked ────────
+  describe("#1644 unprobed foreign record", () => {
+    it("cancel REFUSES without claiming liveness — and no longer contradicts status for the SAME id", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-1644-"));
+      setProgressDir(dir);
+      try {
+        // The reporter's shape: the record's heartbeat is still FRESH (the
+        // #858 reclaim gate keys on staleness, so cancel never probes the
+        // writer), yet the recorded pid is already dead — status proves it
+        // gone (#1479) while the old cancel fallback asserted "a live
+        // heartbeat … actively writing" about the SAME id.
+        const id = "fresh-dead-job-1644";
+        const res = spawnSync(process.execPath, ["-e", ""]);
+        await writeFile(
+          join(dir, `control-job-${id}-other-session.json`),
+          JSON.stringify({
+            id,
+            trayId: "freshtray164400",
+            progressId: "fresh-prog-1644",
+            url: "https://example.com/large.safetensors",
+            target_subfolder: "checkpoints",
+            status: "downloading",
+            started_at: Date.now() - 30 * 1000,
+            owner: "other-session",
+            pid: res.pid, // exited before this test runs — provably gone
+            updated: Date.now(), // heartbeat fresh: no reclaim verdict is produced
+          }),
+        );
+
+        const { cancelDownload, downloadStatus } = makeServer();
+
+        // status probes the pid regardless of staleness and reports the truth.
+        const status = (await downloadStatus({ id })).content[0].text;
+        expect(status).toContain("NOT running — the owning process is gone");
+
+        // cancel never probed anything, so it must SAY that — not assert the
+        // opposite of what status just reported.
+        const text = (await cancelDownload({ id, tray_id: "freshtray164400" })).content[0].text;
+        expect(text).toContain("status: downloading");
+        expect(text).not.toContain("live heartbeat");
+        expect(text).not.toContain("actively writing");
+        expect(text).toContain("could not be established from here");
+        // Status can prove liveness, but it cannot authorize a resume without
+        // the exact persisted path/identity proof and required credentials.
+        expect(text).toContain('action:"status"');
+        expect(text).toContain("exact persisted partial path and matching identity proof");
+        expect(text).not.toContain("adopts the record and resumes from the .partial");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("the explicit reclaim-denied verdicts keep their established wording", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-1644-"));
+      setProgressDir(dir);
+      try {
+        // owner-alive: stale heartbeat, but the pid probe PROVES a live owner —
+        // only there is "stop it from the panel download tray" the right remedy.
+        const id = "stale-live-job-1644";
+        await writeFile(
+          join(dir, `control-job-${id}-other-session.json`),
+          JSON.stringify({
+            id,
+            trayId: "livetray1644000",
+            progressId: "live-prog-1644",
+            url: "https://example.com/large.safetensors",
+            target_subfolder: "checkpoints",
+            status: "downloading",
+            started_at: Date.now() - 10 * 60 * 1000,
+            owner: "other-session",
+            pid: process.pid, // a live process stands in for the other session
+            updated: Date.now() - 5 * 60 * 1000,
+          }),
+        );
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "livetray1644000" })).content[0].text;
+        expect(text).toContain("STILL RUNNING");
+        expect(text).toContain("panel download tray");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
 

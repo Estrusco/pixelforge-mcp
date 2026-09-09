@@ -4,9 +4,11 @@ import type {
   NodeInputSpec,
   WorkflowJSON,
 } from "../comfyui/types.js";
+import { FRONTEND_ONLY_NODE_TYPES } from "./workflow-converter.js";
+import { frontendVirtualTypesFor } from "./frontend-virtual-types.js";
 import { getObjectInfo } from "../comfyui/client.js";
 import { enqueueWorkflow } from "./workflow-executor.js";
-import { config } from "../config.js";
+import { config, getComfyUIBaseUrl } from "../config.js";
 import { ValidationError } from "../utils/errors.js";
 
 /**
@@ -44,12 +46,22 @@ export interface ApiNodesDeps {
       disable_random_seed?: boolean;
       extra_data?: Record<string, unknown>;
     },
-  ) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
+  /** #1400 — the node types a connected panel has PROVEN frontend-virtual on the
+   *  ComfyUI this process targets (its registered classes set `isVirtualNode ===
+   *  true`, the flag ComfyUI's own serializer reads to keep a node out of the
+   *  prompt). The headless classifier cannot see the frontend's registry, so the
+   *  orchestrator pulls it over the panel bridge and republishes it through the
+   *  progress-dir channel (services/frontend-virtual-types.ts). Optional: absent
+   *  (a plain MCP server with no panel, a stale record) means "no proof", and
+   *  the classification keeps its cautious pre-#1400 "unknown" for those types. */
+  getFrontendVirtualTypes?: () => ReadonlySet<string>;
 }
 
 const defaultDeps: ApiNodesDeps = {
   getObjectInfo,
   enqueue: enqueueWorkflow,
+  getFrontendVirtualTypes: () => frontendVirtualTypesFor(getComfyUIBaseUrl()),
 };
 
 /** True if a node definition is a hosted partner/API node. */
@@ -57,6 +69,292 @@ export function isApiNode(def: ComfyUINodeDef): boolean {
   if (def.api_node === true) return true;
   const category = (def.category ?? "").toLowerCase();
   return category === API_CATEGORY_PREFIX || category.startsWith(`${API_CATEGORY_PREFIX}/`);
+}
+
+/**
+ * #1483 — THIRD-PARTY PACKS THAT CALL A PAID EXTERNAL SERVICE.
+ *
+ * `isApiNode` recognises ComfyUI's PARTNER marker, and measured against a live
+ * /object_info (4304 nodes) **not one of the 3464 custom-node-registered classes carries
+ * `api_node: true`** — all 220 marked nodes are core. So the marker cannot fire for any
+ * third-party pack, and a pack whose whole job is to bill a remote API was reported as
+ * `local` / "no paid credits". That is the one verdict this classifier exists to prevent.
+ *
+ * WHY NOT THE OBVIOUS FIXES. Both were measured and both fail:
+ *
+ *  - "registered by a custom node, so unclassifiable" flags 3464 of 4304 nodes — Impact
+ *    Pack, KJNodes, RES4LYF. It would turn ~every real workflow into "possibly paid",
+ *    which trains the reader to click through the warning and protects nobody.
+ *  - "takes an api-key input" is the appealing structural signal and it is NOT sufficient
+ *    on its own: the pack in the report (`ComfyUI-fal-API`) reads its credential from the
+ *    ENVIRONMENT, so its NanoBanana classes expose only `prompt`/`aspect_ratio`/`seed`.
+ *    Shipping just this would have closed #1483 with the reporter's own graph still
+ *    reported as free.
+ *
+ * So it takes three signals, and they cover different populations: the registry catches
+ * packs whose nodes advertise nothing at all, the credential signal catches packs nobody
+ * has enumerated yet (49 classes on the measured install — Novita, Gemini, joyCaption…),
+ * and an explicit `external_api_node` / `EXTERNAL_API_NODE` opt-in on the node def lets
+ * the next env-only pack mark itself without a code change here (#2543).
+ *
+ * DELIBERATELY SEPARATE FROM `isApiNode`, not folded into it: that predicate also drives
+ * `listApiNodes` and the 3D-generation picker, which enumerate COMFY PARTNER nodes and
+ * hand their schemas to callers that assume Comfy's auth model. A FAL node is paid, but it
+ * is not a partner node, and merging the two would quietly change what those tools return.
+ */
+
+/**
+ * Packs whose nodes bill a remote service. Matched on `python_module` — the pack's own
+ * identity — with the category as a secondary, because a category string is cosmetic and
+ * a pack can restyle it between releases while the module path stays put.
+ *
+ * ENUMERATED, NOT A KEYWORD PATTERN, on purpose. A `/fal/i` regex over categories reads as
+ * broad coverage and is wrong in both directions at once: it misses a pack that does not
+ * put the vendor in its category, and it catches `FAL/Utils` — local helpers that resize an
+ * image before upload and spend nothing. A named list is auditable and each entry is a
+ * claim someone can check.
+ */
+interface ExternalServicePack {
+  /** Lower-cased substring matched against `python_module`. */
+  module: string;
+  /** Lower-cased category prefixes that identify this pack's nodes even when the module
+   *  path does not. A user who clones the pack into a differently-named directory changes
+   *  `python_module` and nothing else (codex P1) — the category is baked into the pack's
+   *  own source, so it survives the rename. */
+  categoryPrefixes?: readonly string[];
+  /** Lower-cased category prefixes within the pack that are genuinely local (helpers,
+   *  utilities) and must NOT be flagged — the false-positive direction costs a real
+   *  confirmation prompt on a free node. */
+  localCategoryPrefixes?: readonly string[];
+  /** Who bills the user. Named in the guidance, because "that provider" tells a reader
+   *  nothing they can act on and they cannot check a balance they cannot name. */
+  provider: string;
+}
+
+const EXTERNAL_SERVICE_PACKS: readonly ExternalServicePack[] = [
+  {
+    module: "comfyui-fal-api",
+    categoryPrefixes: ["fal"],
+    localCategoryPrefixes: ["fal/utils"],
+    provider: "fal.ai",
+  },
+  { module: "comfyui-pvl-fal-nodes", localCategoryPrefixes: ["fal/utils"], provider: "fal.ai" },
+  { module: "comfyui_fal_api", localCategoryPrefixes: ["fal/utils"], provider: "fal.ai" },
+  { module: "comfyui-fal-api-flux", provider: "fal.ai" },
+  // #1855 — PoYo's OFFICIAL pack (github.com/PoyoAPI/poyo-comfyui) for its hosted
+  // image/video/music/3D API, which requires an account API key created at
+  // poyo.ai/dashboard/api-key. Every generic signal says "free" here: the pack keeps
+  // the credential OUT of its workflow inputs, so declaresCredentialInput() cannot see
+  // it, and api_node is false — so check_runtime called it local while the node spends
+  // the user's balance. The category prefix carries the match through a directory
+  // rename the way the fal entries do.
+  { module: "poyo-comfyui", categoryPrefixes: ["poyo ai"], provider: "PoYo" },
+  // #2416 — FloyoAI/ComfyUI-Seed-API, direct BytePlus ModelArk nodes. Same shape as
+  // PoYo above: the key lives in config.ini or BYTEPLUS_API_KEY, never in a workflow
+  // input, so declaresCredentialInput() sees nothing and api_node is false — and
+  // check_runtime answered `local` / free for nodes spending the user`s BytePlus balance.
+  //
+  // `Seed/Video` is EXEMPT and is not a typo for Seed/VideoGeneration. It holds one node,
+  // VideoToFrames, which takes a video_url, requests.get()s it and shells out to ffmpeg —
+  // no credential, no ModelArk call, so billing it would report a free node as paid. The
+  // reported fix listed only the three paid prefixes and would have swept this one in
+  // through the `module` match, which catches the whole pack on its own.
+  //
+  // The two prefixes cannot collide: the exemption test is `category === p ||
+  // category.startsWith(`${p}/`)`, and "seed/videogeneration" is neither equal to
+  // "seed/video" nor prefixed by "seed/video/". Verified against the pack`s own sources,
+  // not the report: CATEGORY is Seed/ImageGeneration, Seed/VideoGeneration, Seed/Chat and
+  // Seed/Video.
+  {
+    module: "comfyui-seed-api",
+    categoryPrefixes: ["seed/imagegeneration", "seed/videogeneration", "seed/chat"],
+    localCategoryPrefixes: ["seed/video"],
+    provider: "BytePlus",
+  },
+  // #2543 — Nicole Social env-auth backends (the report's own category is
+  // "Nicole Social/backends"). GEMINI_API_KEY / WAVESPEED_API_KEY live in the
+  // environment, never as workflow inputs, and api_node is absent — so every
+  // generic signal says free while the nodes spend the user's Google Gemini /
+  // WaveSpeed balance. The category prefix carries the match through a directory
+  // rename the way the fal and PoYo entries do.
+  //
+  // Two entries so a graph that uses the pack names BOTH providers rather than a
+  // slash-joined string. They share the match on purpose: /object_info does not
+  // distinguish which env var a class reads. Deliberately NOT a generic "gemini"
+  // / "wavespeed" match — that is the keyword-regex hole #1483 refused, and it
+  // would flag local packs (Impact, KJNodes, Comfy-WaveSpeed's local optimizer)
+  // plus any merely similar category. Official Comfy partner Gemini nodes stay
+  // isApiNode (`api_node: true`) and never enter this list.
+  {
+    module: "nicole-social",
+    categoryPrefixes: ["nicole social"],
+    provider: "Google Gemini",
+  },
+  {
+    module: "nicole-social",
+    categoryPrefixes: ["nicole social"],
+    provider: "WaveSpeed",
+  },
+  { module: "nicole_social", provider: "Google Gemini" },
+  { module: "nicole_social", provider: "WaveSpeed" },
+];
+
+/**
+ * Input names that mean the node authenticates to a service the user pays for.
+ *
+ * Widened past `api_key` (codex P1): a paid node is just as likely to ask for `api_token`,
+ * `client_secret` or camelCase `apiToken`, and `/i` folds case but not word shape — so the
+ * name is normalised to snake_case before matching rather than the pattern being asked to
+ * cover every spelling.
+ *
+ * Bare `secret_key` was tried and REMOVED (codex P2): a local hashing/crypto node
+ * legitimately takes one, and flagging it would report a free graph as `api`. Every term
+ * kept here names a REMOTE-service credential specifically (`api_*`, `client_secret`,
+ * bearer/access/auth tokens), so authentication that is not obviously to a service does
+ * not, on its own, spend the user's confirmation budget.
+ */
+const CREDENTIAL_INPUT_RE =
+  /^(?:.*_)?(?:api_key|api_token|api_secret|access_token|auth_token|bearer_token|client_secret)$/;
+
+/** camelCase/PascalCase → snake_case, so `apiToken` and `api_token` match the same rule. */
+function normalizeInputName(name: string): string {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function declaresCredentialInput(def: ComfyUINodeDef): boolean {
+  const input = (def as { input?: { required?: unknown; optional?: unknown } }).input;
+  if (!input || typeof input !== "object") return false;
+  for (const group of [input.required, input.optional]) {
+    if (!group || typeof group !== "object") continue;
+    for (const name of Object.keys(group as Record<string, unknown>)) {
+      if (CREDENTIAL_INPUT_RE.test(normalizeInputName(name))) return true;
+    }
+  }
+  return false;
+}
+
+function packMatches(pack: ExternalServicePack, category: string, pythonModule: string): boolean {
+  if (pack.module && pythonModule.includes(pack.module)) return true;
+  return (
+    pack.categoryPrefixes?.some((p) => category === p || category.startsWith(`${p}/`)) === true
+  );
+}
+
+/**
+ * Every known paid pack this node belongs to — empty if none.
+ *
+ * EVERY matching entry is considered, and any one that does NOT exempt the node counts
+ * (codex P1). Returning on the first match let `ComfyUI-fal-API-Flux` bind to the broader
+ * `comfyui-fal-api` entry and inherit ITS `FAL/Utils` exemption, so a paid Flux node in
+ * that category answered "free" while the stricter entry written for that very pack was
+ * never reached. Resolving toward PAID is also the correct direction for a money guard:
+ * disagreement between two entries is not evidence of free.
+ *
+ * #2543 — a pack that hosts more than one vendor (Nicole Social bills Google Gemini AND
+ * WaveSpeed from the same category) contributes every distinct provider, so guidance can
+ * name both balances rather than the first entry's alone.
+ */
+function matchingPaidPacks(def: ComfyUINodeDef): ExternalServicePack[] {
+  const category = (def.category ?? "").toLowerCase();
+  const pythonModule = (def.python_module ?? "").toLowerCase();
+  const paid: ExternalServicePack[] = [];
+  for (const pack of EXTERNAL_SERVICE_PACKS) {
+    if (!packMatches(pack, category, pythonModule)) continue;
+    const exempt = pack.localCategoryPrefixes?.some(
+      (p) => category === p || category.startsWith(`${p}/`),
+    );
+    if (!exempt) paid.push(pack);
+  }
+  return paid;
+}
+
+function externalServicePackFor(def: ComfyUINodeDef): ExternalServicePack | null {
+  return matchingPaidPacks(def)[0] ?? null;
+}
+
+type ExternalApiFields = {
+  external_api_node?: unknown;
+  EXTERNAL_API_NODE?: unknown;
+  externalApiNode?: unknown;
+  external_api_provider?: unknown;
+  EXTERNAL_API_PROVIDER?: unknown;
+  externalApiProvider?: unknown;
+};
+
+function markerValue(value: unknown): { marked: boolean; provider: string | null } {
+  if (value === true) return { marked: true, provider: null };
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return { marked: false, provider: null };
+    if (s.toLowerCase() === "true") return { marked: true, provider: null };
+    if (s.toLowerCase() === "false") return { marked: false, provider: null };
+    return { marked: true, provider: s };
+  }
+  return { marked: false, provider: null };
+}
+
+function namedProvider(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  return s.length > 0 ? s : null;
+}
+
+/**
+ * #2543 — explicit opt-in on the node def. Env-only packs cannot put a credential
+ * widget on the workflow just to satisfy classification; they set EXTERNAL_API_NODE
+ * (optionally with a provider) instead. Absence is not evidence of free — the
+ * enumerated registry and credential-input catch still apply.
+ */
+function externalApiMark(def: ComfyUINodeDef): { marked: boolean; provider: string | null } {
+  const rec = def as ComfyUINodeDef & ExternalApiFields;
+  let marked = false;
+  let provider: string | null = null;
+  for (const value of [rec.external_api_node, rec.EXTERNAL_API_NODE, rec.externalApiNode]) {
+    const parsed = markerValue(value);
+    if (!parsed.marked) continue;
+    marked = true;
+    if (parsed.provider) provider = parsed.provider;
+  }
+  if (!marked) return { marked: false, provider: null };
+  for (const value of [rec.external_api_provider, rec.EXTERNAL_API_PROVIDER, rec.externalApiProvider]) {
+    const named = namedProvider(value);
+    if (named) provider = named;
+  }
+  return { marked, provider };
+}
+
+/**
+ * True when a node runs on a PAID EXTERNAL SERVICE without carrying Comfy's partner
+ * marker. Never returns true for a node `isApiNode` already claims — the caller keeps the
+ * two lists distinct so a reader can tell a Comfy partner node from a third-party one.
+ */
+export function isExternalServiceNode(def: ComfyUINodeDef): boolean {
+  if (isApiNode(def)) return false;
+  if (externalApiMark(def).marked) return true;
+  if (externalServicePackFor(def)) return true;
+  // The general catch: a node that asks for a service credential cannot be CONFIRMED free,
+  // whichever pack it came from.
+  return declaresCredentialInput(def);
+}
+
+/** Distinct providers that bill for `def`, when a marker or known pack names them. */
+function externalServiceProviders(def: ComfyUINodeDef): string[] {
+  if (isApiNode(def)) return [];
+  const mark = externalApiMark(def);
+  if (mark.provider) return [mark.provider];
+  const named: string[] = [];
+  for (const pack of matchingPaidPacks(def)) {
+    if (!named.includes(pack.provider)) named.push(pack.provider);
+  }
+  return named;
+}
+
+/** The provider that bills for `def`, when a known pack or marker identifies one. */
+export function externalServiceProvider(def: ComfyUINodeDef): string | null {
+  return externalServiceProviders(def)[0] ?? null;
 }
 
 export interface ApiNodeSummary {
@@ -183,6 +481,19 @@ export interface WorkflowRuntime {
   usesApiNodes: boolean | null;
   /** The class_types in the workflow that are hosted API/partner nodes. */
   apiNodes: string[];
+  /** #1483 — class_types that bill a PAID EXTERNAL SERVICE but carry none of Comfy's
+   *  partner markers (a third-party pack like fal.ai, or any node asking for a service
+   *  credential). Kept separate from `apiNodes` because these are NOT Comfy partner nodes
+   *  and do not share its auth model — but they count the same way for `usesApiNodes` and
+   *  `runtime`, because the caller's question is "will this spend money", not "whose API
+   *  is it". ALWAYS PRESENT, empty when there are none (codex): the tool documents it as
+   *  an array, and a reader that follows the documented shape must not have to guard for
+   *  it going missing on exactly the graphs that look safe. */
+  externalApiNodes: string[];
+  /** Who bills for the `externalApiNodes`, when a known pack names them (e.g. "fal.ai").
+   *  Omitted when nothing recognised a provider — a node caught only by its credential
+   *  input proves it authenticates somewhere, not to whom. */
+  externalProviders?: string[];
   /** All class_types found in the workflow. */
   classTypes: string[];
   /** class_types not present in the connected server's /object_info (can't be
@@ -200,40 +511,125 @@ export interface WorkflowRuntime {
  * node class_types against the connected ComfyUI's /object_info (the same signal
  * isApiNode uses). Works on UI or API/prompt format graphs.
  */
+export interface CheckWorkflowRuntimeOptions {
+  /** The graph is one of the repo's BUNDLED installer packs, which are
+   *  guaranteed local-GPU/free (no hosted API nodes). When set, class_types that
+   *  aren't in the connected server's /object_info (uninstalled custom nodes) are
+   *  trusted as LOCAL instead of collapsing the verdict to "unknown" — as long as
+   *  NO recognized API node is present. This resolves the contradiction where a
+   *  known-local pack read back as "unknown" merely because its custom nodes
+   *  weren't installed (issue #464). Arbitrary/ad-hoc graphs must NOT set this. */
+  bundledLocalPack?: boolean;
+}
+
 export async function checkWorkflowRuntime(
   graph: unknown,
   deps: ApiNodesDeps = defaultDeps,
+  opts: CheckWorkflowRuntimeOptions = {},
 ): Promise<WorkflowRuntime> {
   const classTypes = extractWorkflowClassTypes(graph);
   const objectInfo = await deps.getObjectInfo();
+  // #1400 — the SECOND source of frontend-only proof, alongside the static
+  // FRONTEND_ONLY_NODE_TYPES: the types a connected panel observed this
+  // frontend's registry prove virtual (`isVirtualNode === true` on the
+  // registered class — covering third-party virtual nodes like rgthree's Label /
+  // Fast Groups toggles that no static list may name). Read ONCE per call; an
+  // absent/unreadable channel is an empty set, and a type it names is still
+  // classified from its /object_info def whenever the server registers one (the
+  // def-first rule below applies to both sources identically).
+  let frontendVirtual: ReadonlySet<string>;
+  try {
+    frontendVirtual = deps.getFrontendVirtualTypes?.() ?? new Set();
+  } catch {
+    // A broken source is "no proof", never a failure of the classification it
+    // was only narrowing.
+    frontendVirtual = new Set();
+  }
   const apiNodes: string[] = [];
+  const externalApiNodes: string[] = [];
+  const externalProviders: string[] = [];
   const unknownNodes: string[] = [];
   for (const ct of classTypes) {
+    // A FRONTEND-ONLY NODE IS NOT AN UNKNOWN ONE (#1372). MarkdownNote, Note, Reroute and
+    // PrimitiveNode are LiteGraph-native: the frontend registers them, /object_info never
+    // lists them, and they are stripped before a prompt is queued.
+    //
+    // The "unknown" verdict exists to express a specific doubt — this class_type is absent
+    // from the server's registry, so it COULD be a paid partner node the server does not
+    // expose, and claiming "local/free" would be a guess with someone's money on it. That
+    // caution is right and stays. It just cannot apply to a node that does not execute at
+    // all: a virtual node can no more be a paid API node than it can be a checkpoint
+    // loader, so it earns none of the doubt while collapsing the whole verdict to
+    // "unknown" and stopping the safety flow to ask an unanswerable question.
+    //
+    // The set is IMPORTED from the converter rather than restated here. It already had to
+    // know which types never reach the backend, and a second copy drifting from the first
+    // is exactly how this bug happened.
     const def = objectInfo[ct];
+    // …but ONLY when the server does not register it (codex P1). The skip used to run
+    // BEFORE this lookup, which meant a third-party backend node legitimately named `Note`
+    // or `PrimitiveNode` — and registered with api_node:true — was skipped unexamined and
+    // the workflow reported "local / usesApiNodes:false". That tells the agent the run is
+    // confirmed free and skips the credit confirmation, which is the one outcome this
+    // classifier exists to prevent. A safety check that can be bypassed by a name
+    // collision is worse than the false "unknown" it was fixing.
+    //
+    // Absence from /object_info is not a heuristic for "virtual", it is the definition:
+    // the frontend registers these, the backend does not. So a REGISTERED node of the same
+    // name is a real node and is classified as one. The #1400 panel-observed set is
+    // consulted under the SAME rule: it exempts only what the server does not register.
+    if (!def && (FRONTEND_ONLY_NODE_TYPES.has(ct) || frontendVirtual.has(ct))) continue;
     if (!def) {
       unknownNodes.push(ct);
       continue;
     }
     if (isApiNode(def)) apiNodes.push(ct);
+    // #1483 — a paid third-party node is not a partner node, but it spends the user's
+    // money just the same, so it must reach the same verdict.
+    else if (isExternalServiceNode(def)) {
+      externalApiNodes.push(ct);
+      for (const provider of externalServiceProviders(def)) {
+        if (!externalProviders.includes(provider)) externalProviders.push(provider);
+      }
+    }
   }
-  const hasApiNodes = apiNodes.length > 0;
+  const paidNodes = [...apiNodes, ...externalApiNodes];
+  const hasApiNodes = paidNodes.length > 0;
   // "api" only if EVERY classifiable node is an API node; "mixed" if some are.
-  const classifiable = classTypes.length - unknownNodes.length;
+  // Virtual nodes are not classifiable EITHER WAY, so they leave the denominator too —
+  // otherwise a workflow of one KSampler plus three Notes reads as 1-of-4 API and reports
+  // "mixed" when it is entirely local.
+  const virtualCount = classTypes.filter(
+    (ct) => !objectInfo[ct] && (FRONTEND_ONLY_NODE_TYPES.has(ct) || frontendVirtual.has(ct)),
+  ).length;
+  const classifiable = classTypes.length - unknownNodes.length - virtualCount;
   let runtime: "local" | "api" | "mixed" | "unknown";
   let usesApiNodes: boolean | null;
   if (hasApiNodes) {
-    runtime = apiNodes.length >= classifiable && classifiable > 0 ? "api" : "mixed";
+    runtime = paidNodes.length >= classifiable && classifiable > 0 ? "api" : "mixed";
     usesApiNodes = true;
-  } else if (unknownNodes.length > 0) {
+  } else if (unknownNodes.length > 0 && !opts.bundledLocalPack) {
     // No recognized API nodes, but some class_types aren't in /object_info — they
     // COULD be paid API/partner nodes the server doesn't expose. Don't claim free.
     runtime = "unknown";
     usesApiNodes = null;
   } else {
+    // Either everything classified as local, OR this is a bundled pack (declared
+    // local/free) whose only unclassifiable nodes are its own uninstalled custom
+    // nodes — never API nodes. Trust the pack's local guarantee (#464).
     runtime = "local";
     usesApiNodes = false;
   }
-  return { runtime, usesApiNodes, apiNodes, classTypes, unknownNodes, subgraphCount: countSubgraphs(graph) };
+  return {
+    runtime,
+    usesApiNodes,
+    apiNodes,
+    externalApiNodes,
+    ...(externalProviders.length > 0 ? { externalProviders } : {}),
+    classTypes,
+    unknownNodes,
+    subgraphCount: countSubgraphs(graph),
+  };
 }
 
 export interface ApiNodeInputDescriptor {
@@ -271,23 +667,42 @@ function describeInputs(
   return Object.entries(specs).map(([name, spec]) => {
     // Spec shape: [type, config?] where type is a string (e.g. "STRING") or a
     // string[] of enum options (e.g. ["fast", "quality"]).
-    const type = Array.isArray(spec) ? spec[0] : (spec as unknown as string);
+    const type = Array.isArray(spec) ? spec[0] : spec;
     const config = (Array.isArray(spec) ? spec[1] : undefined) ?? {};
     return {
       name,
-      type: type as string | string[],
+      type,
       required,
       config: config as Record<string, unknown>,
     };
   });
 }
 
-/** Return the input schema for a given API node (from its /object_info entry). */
-export async function getApiNodeSchema(
-  classType: string,
-  deps: ApiNodesDeps = defaultDeps,
-): Promise<ApiNodeSchema> {
-  const objectInfo = await deps.getObjectInfo();
+/**
+ * Project an /object_info entry into the schema shape. No API-node guard — the
+ * auto-added output sink (see OUTPUT_SINKS) is a plain CORE node and needs the
+ * same input description to resolve its own widget defaults.
+ */
+function nodeSchemaFrom(classType: string, def: ComfyUINodeDef): ApiNodeSchema {
+  return {
+    class_type: classType,
+    display_name: def.display_name || classType,
+    category: def.category ?? "",
+    description: def.description ?? "",
+    is_api_node: isApiNode(def),
+    is_output_node: def.output_node === true,
+    inputs: [
+      ...describeInputs(def.input?.required, true),
+      ...describeInputs(def.input?.optional, false),
+    ],
+    hidden_inputs: def.input?.hidden ? Object.keys(def.input.hidden) : [],
+    output: Array.isArray(def.output) ? def.output : [],
+    output_name: Array.isArray(def.output_name) ? def.output_name : [],
+  };
+}
+
+/** Resolve an API node's schema against an already-fetched /object_info. */
+function apiNodeSchemaFrom(objectInfo: ObjectInfo, classType: string): ApiNodeSchema {
   const def = objectInfo[classType];
 
   if (!def) {
@@ -303,21 +718,15 @@ export async function getApiNodeSchema(
     );
   }
 
-  return {
-    class_type: classType,
-    display_name: def.display_name || classType,
-    category: def.category ?? "",
-    description: def.description ?? "",
-    is_api_node: true,
-    is_output_node: def.output_node === true,
-    inputs: [
-      ...describeInputs(def.input?.required, true),
-      ...describeInputs(def.input?.optional, false),
-    ],
-    hidden_inputs: def.input?.hidden ? Object.keys(def.input.hidden) : [],
-    output: Array.isArray(def.output) ? def.output : [],
-    output_name: Array.isArray(def.output_name) ? def.output_name : [],
-  };
+  return nodeSchemaFrom(classType, def);
+}
+
+/** Return the input schema for a given API node (from its /object_info entry). */
+export async function getApiNodeSchema(
+  classType: string,
+  deps: ApiNodesDeps = defaultDeps,
+): Promise<ApiNodeSchema> {
+  return apiNodeSchemaFrom(await deps.getObjectInfo(), classType);
 }
 
 // ── V3 dynamic-combo (dotted widget) serialization ──────────────────────────
@@ -487,6 +896,113 @@ export function buildApiNodeInputs(
   return { inputs, consumed };
 }
 
+// ── Terminal output sinks ───────────────────────────────────────────────────
+//
+// ComfyUI only executes graphs that reach an OUTPUT_NODE; a bare non-output API
+// node fails /prompt validation with "prompt_no_outputs". Most API nodes are NOT
+// output nodes, so `generate` has to terminate the graph itself.
+//
+// #2686: that termination used to be "wire a SaveImage, or give up", which left
+// every non-IMAGE API node un-runnable. Measured by AST-scanning comfy_api_nodes/
+// on ComfyUI 0.33: of 241 non-output API nodes, 173 have no IMAGE output — VIDEO
+// is 112 of them, STRING ~25, AUDIO 10 (the reported ByteDanceSeedAudio), SVG 5,
+// File3D ~16. So dispatch on the node's DECLARED output type instead; that takes
+// the table to 219 of the 241. The remaining 22 return custom handle types
+// (voice selectors, Gemini input files) that no core output node consumes, and
+// keep the explanatory note.
+//
+// The chosen sink must be one the CONNECTED server registers: ComfyUI versions
+// differ on which savers exist (SaveAudioAdvanced is current, SaveAudio/-MP3/
+// -Opus are deprecated-but-still-registered, older builds have neither), and
+// naming a class the server has never heard of turns a "no outputs" 400 into a
+// "node type not found" 400 — no better. Checking /object_info, which we have
+// already fetched to resolve the API node itself, lets an older ComfyUI degrade
+// to the explanatory note instead.
+
+interface OutputSink {
+  /** Core output node that terminates the graph. */
+  class_type: string;
+  /** The sink input the API node's output link is wired into. */
+  link_input: string;
+  /** Seeds for the sink's own widgets, matching its core schema defaults. */
+  defaults?: Record<string, unknown>;
+}
+
+/**
+ * Output type → candidate sinks. BOTH lists are in preference order.
+ *
+ * Types are searched first, media before text, so a node declaring
+ * ("VIDEO", "STRING") saves the video rather than the response text. Within a
+ * type, candidates run current → deprecated → preview-only, so we write to
+ * output/ when we can and only fall back to a temp-dir preview when we can't.
+ */
+const OUTPUT_SINKS: ReadonlyArray<{ type: string; sinks: readonly OutputSink[] }> = [
+  {
+    type: "IMAGE",
+    sinks: [
+      { class_type: "SaveImage", link_input: "images", defaults: { filename_prefix: "ComfyUI" } },
+    ],
+  },
+  {
+    type: "VIDEO",
+    sinks: [
+      { class_type: "SaveVideo", link_input: "video", defaults: { filename_prefix: "video/ComfyUI" } },
+    ],
+  },
+  {
+    type: "AUDIO",
+    sinks: [
+      { class_type: "SaveAudioAdvanced", link_input: "audio", defaults: { filename_prefix: "audio/ComfyUI" } },
+      { class_type: "SaveAudio", link_input: "audio", defaults: { filename_prefix: "audio/ComfyUI" } },
+      { class_type: "PreviewAudio", link_input: "audio" },
+    ],
+  },
+  {
+    type: "SVG",
+    sinks: [
+      { class_type: "SaveSVGNode", link_input: "svg", defaults: { filename_prefix: "svg/ComfyUI" } },
+    ],
+  },
+  // SaveGLB's `mesh` is a MultiType accepting the whole File3D family, so one
+  // sink serves every 3D API node (Hunyuan3D/Tripo/Rodin/Meshy…). These are the
+  // io_type WIRE strings ("FILE_3D_GLB"), not the python class names.
+  ...(["FILE_3D_GLB", "FILE_3D_OBJ", "FILE_3D_FBX", "FILE_3D"] as const).map((type) => ({
+    type,
+    sinks: [
+      { class_type: "SaveGLB", link_input: "mesh", defaults: { filename_prefix: "3d/ComfyUI" } },
+    ],
+  })),
+  // Text last: it is the fallback for nodes that return only a response string,
+  // and for media nodes whose media sink this server does not register.
+  {
+    type: "STRING",
+    sinks: [
+      { class_type: "SaveText", link_input: "text", defaults: { filename_prefix: "ComfyUI" } },
+    ],
+  },
+];
+
+/**
+ * Pick the output node to terminate `schema`'s graph with: the first preferred
+ * output type the node declares that has a candidate sink this server registers.
+ * Returns the sink, its /object_info entry, and the API-node output slot to wire.
+ */
+function pickOutputSink(
+  schema: ApiNodeSchema,
+  objectInfo: ObjectInfo,
+): { sink: OutputSink; def: ComfyUINodeDef; slot: number } | null {
+  const outputs = schema.output.map((o) => String(o).toUpperCase());
+  for (const { type, sinks } of OUTPUT_SINKS) {
+    const slot = outputs.indexOf(type);
+    if (slot < 0) continue;
+    for (const sink of sinks) {
+      const def = objectInfo[sink.class_type];
+      if (def) return { sink, def, slot };
+    }
+  }
+  return null;
+}
+
 export interface GenerateWithApiNodeArgs {
   class_type: string;
   inputs: Record<string, unknown>;
@@ -494,7 +1010,7 @@ export interface GenerateWithApiNodeArgs {
   /**
    * Extra supporting nodes to merge into the enqueued workflow (e.g. a
    * LoadImage feeding the API node's IMAGE link input). The API node itself is
-   * always node "1", and "2" may be used for an auto-added SaveImage — extra
+   * always node "1", and "2" may be used for an auto-added output node — extra
    * node ids must avoid both.
    */
   extra_nodes?: WorkflowJSON;
@@ -503,6 +1019,10 @@ export interface GenerateWithApiNodeArgs {
 export interface GenerateWithApiNodeResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   /** The minimal single-node workflow that was enqueued. */
   workflow: WorkflowJSON;
   /** Non-fatal guidance (e.g. unknown inputs, auth reminder). */
@@ -519,7 +1039,10 @@ export async function generateWithApiNode(
   args: GenerateWithApiNodeArgs,
   deps: ApiNodesDeps = defaultDeps,
 ): Promise<GenerateWithApiNodeResult> {
-  const schema = await getApiNodeSchema(args.class_type, deps);
+  // One fetch, two readers: the API node's own schema and the output-sink pick
+  // both come out of this /object_info snapshot.
+  const objectInfo = await deps.getObjectInfo();
+  const schema = apiNodeSchemaFrom(objectInfo, args.class_type);
   const notes: string[] = [];
 
   const provided = args.inputs ?? {};
@@ -567,7 +1090,7 @@ export async function generateWithApiNode(
   if (missingRequired.length > 0) {
     notes.push(
       `Missing required input(s): ${missingRequired.join(", ")}. ` +
-        `The server may reject the job. Use get_api_node_schema for details.`,
+        `The server may reject the job. Use list_api_nodes (action:"schema") for details.`,
     );
   }
 
@@ -593,26 +1116,38 @@ export async function generateWithApiNode(
 
   // ComfyUI only executes graphs that reach a terminal OUTPUT_NODE; a bare
   // non-output API node fails validation with "prompt_no_outputs". If the API
-  // node isn't itself an output node, wire its IMAGE output into a SaveImage.
+  // node isn't itself an output node, terminate it with a sink that matches the
+  // type it actually returns (#2686 — this was IMAGE-only).
   if (!schema.is_output_node) {
-    const imageIdx = schema.output.findIndex(
-      (o) => String(o).toUpperCase() === "IMAGE",
-    );
-    if (imageIdx >= 0) {
+    const picked = pickOutputSink(schema, objectInfo);
+    if (picked) {
+      const { sink, def, slot } = picked;
+      // Resolve the sink's OWN widget values from its /object_info entry rather
+      // than hardcoding them: SaveVideo and SaveAudioAdvanced both take a
+      // REQUIRED v3 dynamic combo (`format`), which the server rebuilds from the
+      // dotted `format` + `format.<nested>` keys buildApiNodeInputs emits.
+      // Sending only the link would 400 with required_input_missing instead.
+      const { inputs: sinkInputs } = buildApiNodeInputs(nodeSchemaFrom(sink.class_type, def), {
+        [sink.link_input]: ["1", slot],
+        ...(sink.defaults ?? {}),
+      });
       workflow["2"] = {
-        class_type: "SaveImage",
-        inputs: { images: ["1", imageIdx], filename_prefix: "ComfyUI" },
-        _meta: { title: "Save Image" },
+        class_type: sink.class_type,
+        inputs: sinkInputs,
+        _meta: { title: def.display_name || sink.class_type },
       };
       notes.push(
-        "Added a SaveImage output node — ComfyUI requires a terminal output node " +
-          "for the prompt to execute.",
+        `Added a ${sink.class_type} output node wired to the ${
+          schema.output[slot]
+        } output — ComfyUI requires a terminal output node for the prompt to execute.`,
       );
     } else {
+      const declared = schema.output.length > 0 ? schema.output.join(", ") : "nothing";
       notes.push(
-        `"${args.class_type}" is not an output node and has no IMAGE output, so no ` +
-          "output node was auto-added; the prompt may fail with 'prompt_no_outputs'. " +
-          "Wire a terminal output node yourself if needed.",
+        `"${args.class_type}" is not an output node and returns ${declared}, which this ` +
+          "ComfyUI has no registered output node for, so none was auto-added; the prompt " +
+          "may fail with 'prompt_no_outputs'. Pass a terminal output node via extra_nodes " +
+          "if you need one.",
       );
     }
   }
@@ -641,6 +1176,7 @@ export async function generateWithApiNode(
   return {
     prompt_id: result.prompt_id,
     queue_remaining: result.queue_remaining,
+    rejectedOutputs: result.rejectedOutputs,
     workflow,
     notes,
   };

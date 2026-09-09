@@ -1,6 +1,6 @@
 // Secure bridge: when `connect` (or the panel orchestrator) drives a REMOTE
 // https ComfyUI (e.g. a RunPod pod), the pod's HTTPS panel page cannot open a
-// plain `ws://127.0.0.1:9180` to the local bridge — browsers block insecure
+// plain `ws://127.0.0.1:<bridge>` to the local bridge — browsers block insecure
 // (ws://) sockets from a secure (https://) page (mixed-content) and gate
 // public→loopback access (Private Network Access). This module makes it work
 // transparently, via one of two backends:
@@ -23,10 +23,11 @@
 // (see UiBridge).
 
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { startQuickTunnel, type QuickTunnel } from "./tunnel.js";
 import { RelayClient } from "./relay-client.js";
 import { logger } from "../utils/logger.js";
-import { getComfyUIAuthHeaders } from "../config.js";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 import type { UiBridge } from "./ui-bridge.js";
 
 export interface SecureBridge {
@@ -52,27 +53,46 @@ function maskToken(url: string): string {
   return url.replace(/token=[^&]+/, "token=…");
 }
 
+/** Per-attempt ceiling for the advertise POST. Deliberately well under the retry
+ *  budget: three attempts plus backoff must still finish in a bounded time, and a
+ *  pod route that has not answered in ten seconds is not about to. */
+const ADVERTISE_TIMEOUT_MS = 10_000;
+
 /**
  * POST the bridge URL to the pod's panel pack so its browser panel can fetch it.
  * Retries a few times — the orchestrator may advertise before the pod route is
  * warm. Returns true on the first 2xx.
  */
-export async function advertiseBridge(comfyuiUrl: string, wssUrl: string, shouldAdvertise?: (target: string) => boolean): Promise<boolean> {
+export async function advertiseBridge(
+  comfyuiUrl: string,
+  wssUrl: string,
+  shouldAdvertise?: (target: string) => boolean,
+  localUrl?: string,
+): Promise<boolean> {
   let endpoint: string;
   try {
     endpoint = new URL("/comfyui_mcp_panel/advertise_bridge", comfyuiUrl).toString();
   } catch {
     return false;
   }
+  const body: { url: string; local_url?: string } = { url: wssUrl };
+  if (localUrl) body.local_url = localUrl;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     // Re-check per attempt: the target may have moved DURING the retry sequence
     // — a stale pod must never receive the bridge URL (codex finding).
     if (shouldAdvertise && !shouldAdvertise(comfyuiUrl)) return false;
     try {
-      const res = await fetch(endpoint, {
+      const res = await comfyuiFetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...getComfyUIAuthHeaders() },
-        body: JSON.stringify({ url: wssUrl }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        // Without this the retry loop could not retry: a pod behind a proxy that
+        // accepts the connection and then answers nothing (the characteristic
+        // RunPod-route failure this function's own comment describes as "not warm
+        // yet") left attempt 1 awaiting forever, so attempts 2 and 3 never ran and
+        // bridge exposure hung with no error. A ceiling turns that hang into the
+        // retry the loop was written to perform.
+        signal: AbortSignal.timeout(ADVERTISE_TIMEOUT_MS),
       });
       if (res.ok) return true;
       logger.warn(`[secure-bridge] advertise got HTTP ${res.status} from the pod panel`);
@@ -86,6 +106,95 @@ export async function advertiseBridge(comfyuiUrl: string, wssUrl: string, should
   return false;
 }
 
+/**
+ * GET the panel's status route to learn where ComfyUI lives on THIS machine.
+ *
+ * The sidebar panel serves `/comfyui_mcp_panel/status` with a `base_path` — the
+ * ComfyUI install root the panel is running inside (panel commit f45054e). The
+ * orchestrator consumes it as a LAST-RESORT source of the local ComfyUI base for
+ * an embedded loopback session that has no CLI-configured workspace (COMFYUI_PATH
+ * unset AND auto-detect empty), so the path-dependent LOCAL surface still works —
+ * the comfyui MCP runs in LOCAL mode (download_model / apply_manifest / model
+ * scans) and panel_load_workflow's local fallback can resolve names (#296).
+ *
+ * Best-effort and time-bounded: returns undefined on ANY failure (unreachable,
+ * non-2xx, non-JSON, missing/blank field) so it can only ADD a path — it must
+ * NEVER throw or stall session start. Sent with the same auth headers as
+ * advertiseBridge so a token-gated panel answers. Disk validation is the caller's
+ * job (this returns the panel's raw claim).
+ */
+export async function fetchPanelBasePath(
+  comfyuiUrl: string,
+  timeoutMs = 2500,
+): Promise<string | undefined> {
+  let endpoint: string;
+  try {
+    endpoint = new URL("/comfyui_mcp_panel/status", comfyuiUrl).toString();
+  } catch {
+    return undefined;
+  }
+  try {
+    const res = await comfyuiFetch(endpoint, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return undefined;
+    const data = (await res.json()) as unknown;
+    if (!data || typeof data !== "object") return undefined;
+    // Current panel builds publish this as `comfyui_path` (the live
+    // folder_paths.base_path). Keep the original `base_path` spelling and the
+    // camelCase alias for older/interoperating panel builds.
+    const raw =
+      (data as { comfyui_path?: unknown }).comfyui_path ??
+      (data as { base_path?: unknown }).base_path ??
+      (data as { basePath?: unknown }).basePath;
+    if (typeof raw === "string" && raw.trim()) return raw.trim();
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the effective LOCAL ComfyUI base directory for a session target,
+ * consulting the panel's status route as a LAST-RESORT fallback (#296).
+ *
+ * Decision order — kept in ONE place so startup and the panel-`hello` retarget
+ * path can never disagree about where ComfyUI lives:
+ *   1. A CLI-configured / auto-detected local path (`localPath`) wins, but ONLY
+ *      for a loopback, non-force-remote target (a REMOTE/force-remote target must
+ *      never adopt a local dir — it isn't the remote host).
+ *   2. Remote / force-remote target → undefined (routes through the Manager).
+ *   3. Otherwise (loopback, non-force-remote, but NO local path) → GET the panel's
+ *      `/comfyui_mcp_panel/status` `base_path` and adopt it, but ONLY if that path
+ *      actually EXISTS on this machine (a bogus / remote-looking claim must not
+ *      poison LOCAL mode).
+ *
+ * `fetchBasePath`/`exists` are injectable purely for tests; production uses the
+ * real status fetch + `fs.existsSync`. Best-effort — never throws.
+ */
+export async function resolveComfyuiPathForTarget(opts: {
+  target: string;
+  localPath: string | undefined;
+  forceRemote: boolean;
+  isLoopback: boolean;
+  fetchBasePath?: (url: string) => Promise<string | undefined>;
+  exists?: (p: string) => boolean;
+}): Promise<string | undefined> {
+  const { target, localPath, forceRemote, isLoopback } = opts;
+  if (!forceRemote && isLoopback && localPath) return localPath;
+  if (forceRemote || !isLoopback) return undefined;
+  const fetchBasePath = opts.fetchBasePath ?? fetchPanelBasePath;
+  const exists = opts.exists ?? existsSync;
+  let fromPanel: string | undefined;
+  try {
+    fromPanel = await fetchBasePath(target);
+  } catch {
+    return undefined; // bulletproof — a broken fetch must not break session start
+  }
+  if (fromPanel && exists(fromPanel)) return fromPanel;
+  return undefined;
+}
+
 export interface SetupSecureBridgeOpts {
   bridgePort: number;
   comfyuiUrl: string;
@@ -97,6 +206,9 @@ export interface SetupSecureBridgeOpts {
    *  later retarget must not hand the bridge URL to a stale pod — codex).
    *  Receives each candidate target URL. */
   shouldAdvertise?: (target: string) => boolean;
+  /** Loopback `ws://127.0.0.1:<bound-port>` so the pack's `/bridge_url` can
+   *  follow the orchestrator off 9180 (#2030, panel#1596). */
+  localUrl?: string;
 }
 
 /**
@@ -120,6 +232,27 @@ export async function setupSecureBridge(opts: SetupSecureBridgeOpts): Promise<Se
  * bridge.attachRelayConnection, making it indistinguishable from a direct
  * loopback socket to the rest of the orchestrator.
  */
+/**
+ * The identity origin for a relay-attached panel connection (#1077).
+ *
+ * `scheme://host[:port]`, lowercased and port-normalised, matching the shape a
+ * browser sends as `Origin` and `workflowIdentityParts()` expects. Returns
+ * undefined when the URL cannot be parsed rather than inventing a string: a
+ * WRONG origin is worse than none, because none refuses adoption visibly while a
+ * wrong one scopes the fence to an identity no other transport will reproduce.
+ */
+export function relayIdentityOrigin(comfyuiUrl: string | undefined): string | undefined {
+  if (typeof comfyuiUrl !== "string" || !comfyuiUrl.trim()) return undefined;
+  try {
+    // `new URL().origin` already omits a default port and lowercases the host,
+    // which is exactly the normalisation the loopback path's header goes through.
+    const origin = new URL(comfyuiUrl.trim()).origin;
+    return origin && origin !== "null" ? origin.toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function setupRelayBridge(opts: SetupSecureBridgeOpts): Promise<SecureBridge> {
   const { comfyuiUrl, token, bridge } = opts;
   const relayUrl = process.env.COMFYUI_MCP_RELAY_URL?.trim();
@@ -138,7 +271,20 @@ async function setupRelayBridge(opts: SetupSecureBridgeOpts): Promise<SecureBrid
     sessionId,
     token,
     accessKey: process.env.COMFYUI_MCP_RELAY_KEY?.trim() || undefined,
-    onAttach: (sock) => bridge.attachRelayConnection(sock),
+    // #1077 — the workflow-instance fence is scoped to the connection's
+    // server-observed Origin, and a relay socket has no handshake to observe one
+    // from: `attachRelayConnection` passed none, so `workflowIdentityParts()`
+    // refused, and every relay-backend session was PERMANENTLY unable to adopt a
+    // fence. The reporter refreshed, closed and reopened the tab, and traced it
+    // to source before finding that nothing could have helped.
+    //
+    // It does not need the relay protocol to forward the browser's Origin. The
+    // Origin identifies WHERE THE PANEL PAGE IS SERVED FROM, and that is the
+    // ComfyUI this session is already pointed at — which the orchestrator holds
+    // right here. It is DERIVED rather than observed, so it asserts what the
+    // loopback path proves; in a single-machine session those are the same fact,
+    // and the alternative is a fence nobody can ever adopt.
+    onAttach: (sock) => bridge.attachRelayConnection(sock, relayIdentityOrigin(comfyuiUrl)),
   });
   client.start();
   try {
@@ -154,7 +300,7 @@ async function setupRelayBridge(opts: SetupSecureBridgeOpts): Promise<SecureBrid
   logger.info(`[secure-bridge] bridge exposed via relay at ${maskToken(wssUrl)}`);
 
   const advertise = async (target: string): Promise<boolean> => {
-    const ok = await advertiseBridge(target, wssUrl, opts.shouldAdvertise);
+    const ok = await advertiseBridge(target, wssUrl, opts.shouldAdvertise, opts.localUrl);
     if (ok) {
       logger.info(`[secure-bridge] advertised the secure bridge URL to the pod panel`);
     } else {
@@ -200,7 +346,7 @@ async function setupCloudflaredBridge(opts: SetupSecureBridgeOpts): Promise<Secu
   logger.info(`[secure-bridge] bridge exposed securely at ${maskToken(wssUrl)}`);
 
   const advertise = async (target: string): Promise<boolean> => {
-    const ok = await advertiseBridge(target, wssUrl, opts.shouldAdvertise);
+    const ok = await advertiseBridge(target, wssUrl, opts.shouldAdvertise, opts.localUrl);
     if (ok) {
       logger.info(`[secure-bridge] advertised the secure bridge URL to the pod panel`);
     } else {

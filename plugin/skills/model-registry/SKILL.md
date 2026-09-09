@@ -1,21 +1,23 @@
 ---
 name: model-registry
-description: Curated download URLs and target directories for every model the comfyui-mcp skills reference — checkpoints, VAEs, text encoders, LoRAs — organized by family (Flux, WAN, LTX, Qwen, Z-Image, SD15/SDXL). Use when downloading models with download_model / download_civitai_model, when a workflow fails with a missing-model error, or when setting up a new machine.
+description: Curated download URLs and target directories, organized by family (Flux, WAN, LTX, Qwen, Z-Image, SD15/SDXL), for every model the comfyui-mcp skills reference, covering checkpoints, VAEs, text encoders, and LoRAs. Use when downloading models with download_model (action:"download" / action:"download_civitai"), when a workflow fails with a missing-model error, or when setting up a new machine.
 ---
 
 # Model Registry
 
 One table per family: filename → source URL → target subdir under
-`<COMFYUI>/models/`. Use with `download_model(url, target_subfolder, filename)`.
-This registry grows with every release — if a model you need is missing, use
-`search_models` (HuggingFace) or `download_civitai_model` and consider
+`<COMFYUI>/models/`. Use with `download_model({ action: "download", url, target_subfolder, filename })`.
+This registry grows with every release. If a model you need is missing, use
+`action:"search"` (HuggingFace) or `action:"download_civitai"` and consider
 contributing the row.
+
+**Quant column (kitchen).** Filenames in this registry are mostly bf16 / fp8. NVFP4 and MXFP8 siblings, when a vendor publishes them, are the same stem with `nvfp4` / `mxfp8` in the name and belong in `diffusion_models/` too. `kitchen` action:"assess" only offers an NVFP4 swap when that sibling is **already listed locally** — it does not guess a URL from the filename. Blackwell (SM ≥ 10.0) is the GPU that can run NVFP4 / MXFP8 compute.
 
 **Conventions**
 - HF "resolve" URLs download directly: `https://huggingface.co/<repo>/resolve/main/<path>`
-- 🔒 = gated repo — needs `HUGGINGFACE_TOKEN` (accept the license on the HF page first)
-- CivitAI model-page URLs need `download_civitai_model` (resolves version → file); raw `civitai.com/api/download/...` URLs work with `download_model` + `CIVITAI_API_TOKEN`
-- Always verify the exact filename a workflow's loader expects — `model-compatibility` skill covers which VAE/CLIP pairs with which architecture
+- 🔒 = gated repo, needs `HUGGINGFACE_TOKEN` (accept the license on the HF page first)
+- CivitAI model-page URLs need `download_model` `action:"download_civitai"` (resolves version → file); raw `civitai.com/api/download/...` URLs work with `action:"download"` + `CIVITAI_API_TOKEN`
+- Always verify the exact filename a workflow's loader expects. The `model-compatibility` skill covers which VAE/CLIP pairs with which architecture
 
 ## Shared VAEs & text encoders (download these once)
 
@@ -47,7 +49,7 @@ Comfy-Org repackages everything: `huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repac
 | `wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors` | `split_files/loras/` | `loras/` |
 | `wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors` | `split_files/loras/` | `loras/` |
 | Magical-morph I2V LoRAs (high/low) | `huggingface.co/NikolaSigmoid/wan2.2-i2v-loras-magical-morph` | `loras/` |
-| SkinMorph Redmond I2V 14B | `civitai.com/models/2210162` (use `download_civitai_model`) | `loras/` |
+| SkinMorph Redmond I2V 14B | `civitai.com/models/2210162` (use `action:"download_civitai"`) | `loras/` |
 
 ## LTX-2 19B video (see `ltxv2-video` skill)
 
@@ -70,6 +72,22 @@ Comfy-Org repackages everything: `huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repac
 | Qwen-Image-Edit 2511 Lightning LoRA | `huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning` | `loras/` |
 | Qwen-Image 2512 Turbo LoRA | `huggingface.co/Wuli-art/Qwen-Image-2512-Turbo-LoRA` | `loras/` |
 
+## MiniMax H3 video (see `minimax-h3-video` skill)
+
+Comfy-Org INT8 pack: `huggingface.co/Comfy-Org/MiniMax-H3`. Local weights are
+under the MiniMax H3 Community License (territory-restricted). Prefer the
+filenames the Comfy-Org templates already name.
+
+| File | Source | Target |
+|---|---|---|
+| `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `diffusion_models/` |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | same repo, `diffusion_models/` | `diffusion_models/` |
+| `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | same repo, `text_encoders/` | `text_encoders/` |
+| `minimax_h3_video_vae_fp16.safetensors` | same repo, `vae/` | `vae/` |
+| `minimax_h3_audio_vae_fp32.safetensors` | same repo, `vae/` | `vae/` |
+| `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | `huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | `loras/` |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` | `huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` | `loras/` |
+
 ## Z-Image (see `z-image-txt2img` skill)
 
 | File | Source | Target |
@@ -80,22 +98,27 @@ Comfy-Org repackages everything: `huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repac
 
 ## SDXL / SD1.5 community checkpoints (CivitAI)
 
-Use `download_civitai_model(model_id)` — it resolves the latest version and
+Use `download_model({ action: "download_civitai", model_id })`. It resolves the latest version and
 handles auth:
 
 | Model | CivitAI |
 |---|---|
 | RedCraft RedZ ImageDX | `civitai.com/models/958009` |
-| (2027494 entry in model-settings.json) | `civitai.com/models/2027494` |
+| Qwen Ultimate Realism v1.1 | `civitai.com/models/2027494` |
 | Copax Timeless | `civitai.com/models/copaxTimeless` (search by name) |
 
 ## Failure modes
 
-- **404 on an HF resolve URL** — the repo restructured. Open the repo page,
+- **404 on an HF resolve URL.** The repo restructured. Open the repo page,
   find the file under "Files", and rebuild the resolve URL.
-- **401/403** — gated repo: set `HUGGINGFACE_TOKEN` after accepting the
+- **401/403.** Gated repo. Set `HUGGINGFACE_TOKEN` after accepting the
   license, or `CIVITAI_API_TOKEN` for early-access CivitAI files.
-- **Wrong dropdown after download** — file landed in the wrong `models/`
+- **Wrong dropdown after download.** The file landed in the wrong `models/`
   subdir; check the Target column and `model-compatibility`.
-- Downloads resume automatically on retry (HTTP Range) — re-run the same
+- Downloads resume on retry (HTTP Range), so re-run the same
   `download_model` call after a network drop.
+
+## Sources
+
+- **Official:** Hugging Face resolve-URL convention https://huggingface.co/<repo>/resolve/main/<path>; kitchen NVFP4/MXFP8 hardware gates in ComfyUI `comfy/model_management.py` and quant metadata in `comfy/quant_ops.py`.
+- **Empirical:** the curated list and Civitai notes are ours, not a vendor catalog.

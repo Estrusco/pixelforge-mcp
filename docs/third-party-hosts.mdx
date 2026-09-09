@@ -4,7 +4,7 @@ description: "Build your own front-end (Blender panel, browser extension, anothe
 icon: "plug"
 ---
 
-The Agent Panel, the [mobile app](/mobile), and any tool that pairs with a running
+The Agent Panel, the [mobile app](./mobile), and any tool that pairs with a running
 session all speak **one small WebSocket protocol** to the orchestrator's pairing
 listener. A **third-party host** is any client you build on that protocol — a
 Blender panel, a browser extension, a CLI, another editor — that **attaches to a
@@ -43,26 +43,32 @@ second session.
 ## Endpoints
 
 The pairing listener is derived from the bridge port (`COMFYUI_MCP_BRIDGE_PORT`,
-default **9180**):
+default **9199**):
 
 | Port | Purpose |
 |---|---|
-| `bridge` (9180) | The panel ⇄ orchestrator UI bridge (the desktop's own connection). |
-| `bridge + 1` (9181) | The `panel_*` HTTP-MCP surface — **not** this protocol. |
-| **`bridge + 2` (9182)** | **The pairing / remote-control listener you connect to.** Token-gated, bound on `0.0.0.0` (LAN-reachable). |
+| `bridge` (9199) | The panel ⇄ orchestrator UI bridge (the desktop's own connection). |
+| `bridge − 1` (9198) | The `panel_*` HTTP-MCP surface — **not** this protocol. |
+| **`bridge − 2` (9197)** | **The pairing / remote-control listener you connect to.** Token-gated, bound on `0.0.0.0` (LAN-reachable). |
 
 **Pairing URL:**
 
 ```
-ws://<desktop-machine-ip>:9182/?token=<PAIR_TOKEN>
+ws://<desktop-machine-ip>:9197/?token=<PAIR_TOKEN>
 ```
+
+9180-era URLs (bridge **+ 2**, default pairing **9182**) still pair: a session that
+was already on 9180 keeps that block across self-restart, so a phone that saved
+`ws://…:9182/?token=…` does not need to re-pair.
 
 - The token is either **pinned** by the user via `COMFYUI_MCP_PAIR_TOKEN`
   (always-on pairing) or **minted per session** and handed out through the
   panel's QR / pair flow. Your host obtains it the same way the mobile app does:
   the user pairs it once.
-- Bound to the LAN only. There is no built-in public exposure — if a user wants
-  remote reach they front it with their own tunnel, and the token still gates it.
+- **LAN-bound by default**, but public exposure is built in when the user asks for
+  it: the panel's pair modal offers an **Internet** mode that opens an encrypted
+  cloudflared quick tunnel, and enterprises can route it through a self-hosted
+  relay (`COMFYUI_MCP_TUNNEL_BACKEND=relay`). The token gates it either way.
 
 ## Message shapes
 
@@ -128,7 +134,7 @@ a client from hijacking a session it never paired to.
 
 ```js
 const token = "<PAIR_TOKEN>";            // obtained via the user's pair flow
-const ws = new WebSocket(`ws://192.168.1.50:9182/?token=${token}`);
+const ws = new WebSocket(`ws://192.168.1.50:9197/?token=${token}`);
 let cid = 0;
 
 ws.onopen = () => {
@@ -166,8 +172,9 @@ session. Build the adapter for THIS platform: <describe your platform, e.g. a
 Blender sidebar panel / a Chrome extension / a Neovim plugin>.
 
 CONNECTION
-- WebSocket to:  ws://<desktop-ip>:9182/?token=<PAIR_TOKEN>
-  (port = bridge port + 2; bridge default 9180. Token is provided by the user via
+- WebSocket to:  ws://<desktop-ip>:9197/?token=<PAIR_TOKEN>
+  (port = bridge port − 2; bridge default 9199. 9180-era URLs still pair:
+  port = bridge + 2, default 9182. Token is provided by the user via
   their pairing flow — NEVER hardcode, embed, or auto-provision it.)
 - On open, send:  {"type":"hello","tab_id":"<your-unique-id>","headless":true}
 

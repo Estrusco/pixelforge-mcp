@@ -53,7 +53,7 @@ install nodes + models on a live ComfyUI. So one file drives two things:
   rest of the server.
 - **The double-click scripts** — `npm run packs:gen` reads the manifest and
   emits `install-windows.bat` *and* `install-runpod.sh`. The beloved UX
-  survives; the duplication doesn't. Edit the manifest, regenerate, done.
+  survives; the duplication doesn't. Edit the manifest, rebuild, done.
 
 Bundled fixes travel with the pack, too — the LTX-2.3 pack ships the kornia
 import patch as **both** `fix-ltxvideo-kornia.bat` and `.sh`, so the Linux user
@@ -81,9 +81,14 @@ than it sounds:
   delegates to Manager).
 - **Target the ComfyUI venv, not system Python.** Installing a node's deps into the
   wrong interpreter is the *other* way a node "installs" but won't load. The scripts
-  now resolve `.venv/Scripts/python.exe` (Windows) or `.venv/bin/python` (Linux),
-  then the portable `python_embeded`, then `$PYTHON` — and echo which one they chose
-  so it's auditable.
+  now walk a fixed order and **echo which one they chose**, so it's auditable:
+
+  - **Linux/RunPod:** `$PYTHON` if you set it (an explicit override wins over
+    everything), then `.venv/bin/python`, `venv/bin/python`, the portable
+    `../python_embeded/python`, and finally `python3`.
+  - **Windows:** `.venv\Scripts\python.exe`, then `venv\Scripts\python.exe`, then
+    `..\python_embeded\python.exe`, then whatever `python` is on PATH. There is no
+    `$PYTHON` hook on this path.
 
 The `pip:` list stays as an explicit net for deps no node lists (and for
 already-cloned nodes, since the requirements step only fires on a fresh clone). But

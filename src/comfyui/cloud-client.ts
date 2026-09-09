@@ -12,7 +12,26 @@
 // keep working in cloud mode.
 
 import { getApiKey, getCloudUrl } from "../config.js";
-import { ComfyUIError, ConnectionError } from "../utils/errors.js";
+// Shared with the headless client on purpose: one ceiling, one delivery-doubt
+// rule. The cloud client is a parallel implementation, and the last two rounds of
+// hardening (the 0.50.11 timeout ceiling, the delivery-doubt disclosure) reached
+// only its twin — which is exactly how a parallel implementation rots.
+import {
+  comfyHttpTimeoutSeconds,
+  defaultComfyTimeoutSignal,
+  deliveryDoubt,
+  isTimeoutAbort,
+} from "./fetch.js";
+import {
+  BoundedResponseError,
+  clampViewResponseBytes,
+  MAX_HISTORY_RESPONSE_BYTES,
+  MAX_VIEW_RESPONSE_BYTES,
+  readResponseBodyBounded,
+} from "./bounded-response.js";
+import { bodyPrefixOf, describeStatus, readComfyJson } from "./json-guard.js";
+import { splitUploadTarget } from "./upload-target.js";
+import { ComfyUIError, ConnectionError, describeFetchFailure } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import type { HistoryEntry } from "./client.js";
 import type { ObjectInfo, QueueStatus, SystemStats } from "./types.js";
@@ -39,12 +58,27 @@ async function cloudFetch(
     ...authHeaders(baseHeaders),
     ...((init?.headers as Record<string, string> | undefined) ?? {}),
   };
+  const method = String(init?.method ?? "GET").toUpperCase();
+  // A CEILING, not a policy — the same one comfyuiFetch got in 0.50.11, which this
+  // client never inherited. Without it a cloud request that never answers hangs the
+  // tool call forever: no timeout, no error, nothing for the caller to act on. A
+  // caller's own signal always wins.
+  const signal = init?.signal ?? defaultComfyTimeoutSignal();
   try {
-    const res = await fetch(url, { ...init, headers });
+    const res = await fetch(url, { ...init, headers, signal });
     if (!res.ok) {
+      // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+      // HTTP status is reported either way, so an unreadable body costs detail in the
+      // text, never a wrong conclusion. Verified there is no branch on this value.
       const body = await res.text().catch(() => "");
+      // #1191 — same raw-500-byte exposure as the local /prompt builder, on the
+      // path that carries a CLOUD API KEY. A gateway that reflects the request
+      // can echo it in the body it answers with, and this string lands in a tool
+      // result users paste into bug reports. bodyPrefixOf redacts by shape as
+      // well as by known value and withholds entirely when it cannot substitute
+      // safely; describeStatus does the same for the reason phrase.
       throw new ComfyUIError(
-        `Cloud API error: ${res.status} ${res.statusText} — ${body.slice(0, 500)}`,
+        `Cloud API error: ${describeStatus(res.status, res.statusText)} — ${bodyPrefixOf(body)}`,
         "CLOUD_API_ERROR",
         { url, status: res.status },
       );
@@ -52,9 +86,27 @@ async function cloudFetch(
     return res;
   } catch (err) {
     if (err instanceof ComfyUIError) throw err;
-    throw new ConnectionError(
-      `Failed to reach Comfy Cloud at ${url}: ${err instanceof Error ? err.message : err}`,
+    // Our own ceiling firing is not the same event as a caller's abort, and must
+    // not be reported as one. Only rewrite when WE supplied the signal.
+    if (init?.signal === undefined && isTimeoutAbort(err)) {
+      throw new ConnectionError(
+        `No reply from Comfy Cloud within ${comfyHttpTimeoutSeconds()}s — while requesting ` +
+          `${url} (${method}).` +
+          deliveryDoubt(undefined, method) +
+          ` Raise COMFYUI_MCP_HTTP_TIMEOUT_S if the cloud is simply slow.`,
+      );
+    }
+    // "Failed to reach" was a claim, not an observation. A transport error on a
+    // POST to /api/prompt does not establish that the submission never landed —
+    // and a blind retry there bills a SECOND cloud render. Same three states as
+    // the headless client: delivered, definitely not delivered, unknown.
+    const { message, code } = describeFetchFailure(err);
+    const wrapped = new ConnectionError(
+      `Could not complete the ${method} to Comfy Cloud at ${url}: ${message}.` +
+        deliveryDoubt(code, method),
     );
+    if (code) (wrapped as { code?: string }).code = code;
+    throw wrapped;
   }
 }
 
@@ -67,11 +119,15 @@ export interface CloudJobStatus {
 export async function enqueuePrompt(
   workflow: Record<string, unknown>,
   extraData?: Record<string, unknown>,
+  opts?: { partialExecutionTargets?: readonly string[] },
 ): Promise<{ prompt_id: string; queue_remaining?: number }> {
   logger.info("Cloud: submitting workflow to Comfy Cloud");
   const body: Record<string, unknown> = { prompt: workflow };
   if (extraData && Object.keys(extraData).length > 0) {
     body.extra_data = extraData;
+  }
+  if (opts?.partialExecutionTargets?.length) {
+    body.partial_execution_targets = [...opts.partialExecutionTargets];
   }
   const res = await cloudFetch("/api/prompt", {
     method: "POST",
@@ -84,13 +140,20 @@ export async function enqueuePrompt(
 
 export async function getHistory(
   promptId?: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<Record<string, HistoryEntry>> {
   if (!promptId) {
     logger.warn("Cloud: getHistory() without prompt_id returns {} (no global history endpoint)");
     return {};
   }
-  const res = await cloudFetch(`/api/history_v2/${promptId}`);
-  const data = await res.json();
+  const path = `/api/history_v2/${promptId}`;
+  const res = await cloudFetch(path, options.signal ? { signal: options.signal } : {});
+  const data = await readComfyJson<unknown>(res, {
+    url: path,
+    maxBytes: MAX_HISTORY_RESPONSE_BYTES,
+    bodyTimeoutMs: Math.round(comfyHttpTimeoutSeconds() * 1000),
+    signal: options.signal,
+  });
   if (data && typeof data === "object") {
     if ((data as Record<string, unknown>)[promptId]) {
       return data as Record<string, HistoryEntry>;
@@ -100,12 +163,48 @@ export async function getHistory(
   return {};
 }
 
+/** HTTP statuses that mean "this cloud has no such endpoint" rather than "the
+ *  request failed". Only these may fall back to the placeholder. */
+const ENDPOINT_ABSENT_STATUSES = new Set([404, 405, 501]);
+
+/**
+ * #1070 — the catch here used to swallow EVERYTHING and return an invented
+ * device, so an expired API key, a 402, a DNS failure, a timeout and a network
+ * partition all came back looking like a successful health check.
+ *
+ * That mattered more than a mislabelled outcome usually does, for two reasons.
+ * `get_system_stats (action:"health")` is the remedy our own error messages send
+ * people to — it is named in describeComfyFetchFailure, in the timeout text, and
+ * in this file's messages — so in cloud mode the remedy could not return a
+ * negative result. And health-check.ts / local-models-fallback.ts both call this
+ * as a REACHABILITY PROBE, which the placeholder answered "yes" to unconditionally.
+ *
+ * It also fabricated data rather than merely mislabelling it: `vram_total: 0` is
+ * not a reading, and a caller sizing a job against it is reading an invention.
+ *
+ * Three states now, not two:
+ *   - answered              → return what the endpoint said
+ *   - endpoint ABSENT (404) → the placeholder, which is the case this was written
+ *                             for, but named so a reader can see it is not a reading
+ *   - could not ask         → propagate, because that is a real failure
+ */
 export async function getSystemStats(): Promise<SystemStats> {
   try {
     const res = await cloudFetch("/system_stats");
-    return (await res.json()) as unknown as SystemStats;
-  } catch {
-    logger.info("Cloud: /system_stats unavailable, returning placeholder");
+    return (await res.json()) as SystemStats;
+  } catch (err) {
+    const status =
+      err instanceof ComfyUIError && err.details && typeof err.details === "object"
+        ? (err.details as { status?: unknown }).status
+        : undefined;
+    if (typeof status !== "number" || !ENDPOINT_ABSENT_STATUSES.has(status)) {
+      // Auth, billing, transport, timeout — a real failure. The caller asked
+      // whether the cloud is reachable; inventing a GPU is not an answer.
+      throw err;
+    }
+    logger.info("Cloud: /system_stats not implemented by this cloud, returning placeholder", {
+      status,
+    });
     return {
       system: {
         os: "cloud",
@@ -115,7 +214,9 @@ export async function getSystemStats(): Promise<SystemStats> {
       },
       devices: [
         {
-          name: "Comfy Cloud GPU",
+          // Named, not silent: these are placeholders, not measurements. The
+          // "Comfy Cloud GPU" prefix is kept so anything matching on it still does.
+          name: "Comfy Cloud GPU (no stats endpoint — values below are placeholders, not readings)",
           type: "cloud",
           index: 0,
           vram_total: 0,
@@ -145,14 +246,14 @@ export async function interrupt(promptId?: string): Promise<void> {
 
 export async function deleteQueueItem(_id: string): Promise<void> {
   throw new ComfyUIError(
-    "delete_queue_item is not supported in Comfy Cloud mode. Use cancel_job with a prompt_id.",
+    "delete_queue_item is not supported in Comfy Cloud mode. Use queue (action:\"cancel\") with a prompt_id.",
     "CLOUD_UNSUPPORTED",
   );
 }
 
 export async function clearQueue(): Promise<void> {
   throw new ComfyUIError(
-    "clear_queue is not supported in Comfy Cloud mode.",
+    "queue (action:\"clear\") is not supported in Comfy Cloud mode.",
     "CLOUD_UNSUPPORTED",
   );
 }
@@ -164,7 +265,7 @@ export async function getJobStatus(promptId: string): Promise<CloudJobStatus> {
 
 export async function getObjectInfo(): Promise<ObjectInfo> {
   throw new ComfyUIError(
-    "get_node_info (object_info) is not available in Comfy Cloud mode.",
+    "create_workflow (action:\"node_info\"), which reads /object_info, is not available in Comfy Cloud mode.",
     "CLOUD_UNSUPPORTED",
   );
 }
@@ -229,11 +330,39 @@ export async function fetchImage(
   filename: string,
   type: "output" | "input" | "temp" = "output",
   subfolder = "",
+  options: { signal?: AbortSignal; maxBytes?: number } = {},
 ): Promise<{ base64: string; mimeType: string }> {
   const params = new URLSearchParams({ filename, type, subfolder });
   const url = cloudUrl(`/api/view?${params.toString()}`);
-  // /api/view returns either bytes or a 302 to a signed URL.
-  const res = await fetch(url, { headers: authHeaders(), redirect: "follow" });
+  // /api/view returns either bytes or a 302 to a signed URL, which is why this
+  // does NOT go through cloudFetch: it needs redirect-following and raw bytes
+  // rather than the JSON envelope. That exemption is also how it kept the bare,
+  // signal-less `fetch` that #1069 removed from cloudFetch one call over — a
+  // download from a wedged cloud hung the tool call with nothing to act on.
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: authHeaders(),
+      redirect: "follow",
+      signal: options.signal ?? defaultComfyTimeoutSignal(),
+    });
+  } catch (err) {
+    if (isTimeoutAbort(err)) {
+      throw new ConnectionError(
+        `No reply from Comfy Cloud within ${comfyHttpTimeoutSeconds()}s while downloading ` +
+          `"${filename}" — ${url} (GET). Nothing was learned about the image from this: a ` +
+          `timeout is not a "not found". Raise COMFYUI_MCP_HTTP_TIMEOUT_S if the cloud is ` +
+          `simply slow.`,
+      );
+    }
+    // A read, so no delivery doubt applies — re-requesting an image is safe.
+    const { message, code } = describeFetchFailure(err);
+    const wrapped = new ConnectionError(
+      `Could not download "${filename}" from Comfy Cloud at ${url}: ${message}.`,
+    );
+    if (code) (wrapped as { code?: string }).code = code;
+    throw wrapped;
+  }
   if (!res.ok) {
     throw new ComfyUIError(
       `Cloud /api/view ${res.status} for "${filename}"`,
@@ -243,8 +372,36 @@ export async function fetchImage(
   }
   const contentType = res.headers.get("content-type") ?? "image/png";
   const mimeType = contentType.split(";")[0].trim();
-  const arrayBuffer = await res.arrayBuffer();
-  const base64 = Buffer.from(arrayBuffer).toString("base64");
+  const limit = clampViewResponseBytes(options.maxBytes);
+  let bytes: Buffer;
+  try {
+    // Cloud /api/view is reached by every automatic history availability probe.
+    // Read it through the same bounded stream consumer as the headless client;
+    // arrayBuffer() would let one oversized response become an oversized base64
+    // tool result before the caller can reject it.
+    bytes = await readResponseBodyBounded(
+      res,
+      Math.round(comfyHttpTimeoutSeconds() * 1000),
+      limit,
+      options.signal,
+    );
+  } catch (error) {
+    if (error instanceof BoundedResponseError) {
+      if (error.kind === "too-large") {
+        throw new ComfyUIError(
+          `Cloud /api/view response for "${filename}" exceeds the ${limit / 1024 ** 2} MB safety limit.`,
+          "VIEW_TOO_LARGE",
+          { filename, maxBytes: limit },
+        );
+      }
+      throw new ConnectionError(
+        `No reply from Comfy Cloud within ${comfyHttpTimeoutSeconds()}s while downloading ` +
+          `"${filename}" — the response body did not finish in time.`,
+      );
+    }
+    throw error;
+  }
+  const base64 = bytes.toString("base64");
   return { base64, mimeType };
 }
 
@@ -252,12 +409,19 @@ export async function uploadImageHttp(
   filename: string,
   data: Buffer,
   mimeType = "image/png",
+  overwrite = true,
 ): Promise<{ name: string; subfolder: string; type: string }> {
+  // #946 — same split as client.ts's uploadImageHttp: a `filename` carrying a
+  // path ("assets/clip.mp4") is a subfolder request, and the API takes that as
+  // its own form field. This twin kept the original defect until now — the rot
+  // the header above warns about.
+  const { subfolder, name } = splitUploadTarget(filename);
   const formData = new FormData();
   const blob = new Blob([data], { type: mimeType });
-  formData.append("image", blob, filename);
+  formData.append("image", blob, name);
   formData.append("type", "input");
-  formData.append("overwrite", "true");
+  formData.append("overwrite", String(overwrite));
+  if (subfolder) formData.append("subfolder", subfolder);
   // multipart sets its own Content-Type; skip the JSON header.
   const res = await cloudFetch("/upload/image", {
     method: "POST",

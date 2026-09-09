@@ -12,6 +12,10 @@ vi.mock("../../config.js", () => {
     config,
     isLocalMode: () => Boolean(config.comfyuiPath),
     isRemoteMode: () => !config.comfyuiPath,
+    // #1374 — the route decision stamps the target it was made against, so this mock
+    // has to provide it. Faked rather than spread from the real config: these suites
+    // control `config` themselves and a real base URL would not match what they set.
+    getComfyUIBaseUrl: () => `http://127.0.0.1:8188`,
   };
 });
 
@@ -23,6 +27,7 @@ vi.mock("node:fs/promises", () => ({
   link: vi.fn(),
   mkdir: vi.fn(),
   readdir: vi.fn(),
+  realpath: (p: string) => Promise.resolve(p), // identity — no symlinks in these tests
   rename: vi.fn(),
   rm: vi.fn(),
   stat: (...a: unknown[]) => statMock(...a),
@@ -32,6 +37,15 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 const downloadModelMock = vi.fn();
+const resolveModelsDirWithBasesMock = vi.hoisted(() => vi.fn());
+vi.mock("../../services/output-dir.js", async (importOriginal) => {
+  const actual = await importOriginal() as typeof import("../../services/output-dir.js");
+  return {
+    ...actual,
+    resolveModelsDirWithBases: (...a: unknown[]) => resolveModelsDirWithBasesMock(...a),
+  };
+});
+
 vi.mock("../../services/model-resolver.js", async () => {
   const actual = await vi.importActual<typeof import("../../services/model-resolver.js")>(
     "../../services/model-resolver.js",
@@ -39,6 +53,12 @@ vi.mock("../../services/model-resolver.js", async () => {
   return {
     ...actual,
     downloadModel: (...a: unknown[]) => downloadModelMock(...a),
+    // startDownloadJob resolves the destination via this before streaming; stub
+    // it so these tests don't need a live server to compute a targetPath.
+    resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {
+      const name = filename ?? String(url).split("/").pop() ?? "model.safetensors";
+      return { targetDir: `/m/${sub}`, filename: name, targetPath: `/m/${sub}/${name}` };
+    },
   };
 });
 
@@ -70,32 +90,41 @@ vi.mock("../../services/extra-paths.js", () => ({
 }));
 
 import { config } from "../../config.js";
-import { registerModelExtrasTools } from "../../tools/model-extras.js";
+import {
+  downloadCivitaiModelAction,
+  removeModelAction,
+  searchCivitaiCreatorsAction,
+  searchCivitaiModelsAction,
+} from "../../tools/model-extras.js";
 
 // Build the models root the same way the product does (resolve against
 // config.comfyuiPath) so paths match on Windows (drive-qualified, backslashes)
 // as well as POSIX.
 const MODELS_ROOT = resolve("/comfy", "models");
 
-type ToolHandler = (args: Record<string, unknown>) => Promise<{
+type ToolHandler = (args: any) => Promise<{
   isError?: boolean;
   content: Array<{ type: string; text: string }>;
 }>;
 
-/** Minimal fake McpServer that captures registered tool handlers. */
-function makeServer() {
-  const handlers = new Map<string, ToolHandler>();
-  const server = {
-    tool: (name: string, _desc: string, _schema: unknown, handler: ToolHandler) => {
-      handlers.set(name, handler);
-    },
-  };
-  registerModelExtrasTools(server as never);
+/**
+ * 0.50.0 slice 11 retired these four tools into actions of `download_model` /
+ * `list_local_models`; the HANDLERS are unchanged and still live here, so these
+ * behaviour tests call them directly. Dispatch (which action reaches which of
+ * these, and which arguments the per-action guards require) is covered
+ * separately in models-consolidated.test.ts.
+ */
+function makeServer(): {
+  removeModel: ToolHandler;
+  downloadCivitai: ToolHandler;
+  searchCivitai: ToolHandler;
+  searchCreators: ToolHandler;
+} {
   return {
-    removeModel: handlers.get("remove_model")!,
-    downloadCivitai: handlers.get("download_civitai_model")!,
-    searchCivitai: handlers.get("search_civitai_models")!,
-    searchCreators: handlers.get("search_civitai_creators")!,
+    removeModel: removeModelAction,
+    downloadCivitai: downloadCivitaiModelAction,
+    searchCivitai: searchCivitaiModelsAction,
+    searchCreators: searchCivitaiCreatorsAction,
   };
 }
 
@@ -112,9 +141,15 @@ beforeEach(() => {
   fetchCivitaiTopCreatorsMock.mockReset();
   config.comfyuiPath = "/comfy";
   config.civitaiApiToken = undefined;
+  resolveModelsDirWithBasesMock.mockReset().mockResolvedValue({
+    modelsDir: MODELS_ROOT,
+    baseDirs: [],
+    snapshot: { reachable: true, argv: ["python", "main.py"] },
+    source: "live-root",
+  });
 });
 
-describe("remove_model path safety", () => {
+describe('list_local_models action:"remove" path safety', () => {
   it("removes a file inside the models directory", async () => {
     statMock.mockResolvedValueOnce({ isFile: () => true, size: 2 * 1024 * 1024 });
     unlinkMock.mockResolvedValueOnce(undefined);
@@ -206,7 +241,7 @@ describe("remove_model path safety", () => {
   });
 });
 
-describe("download_civitai_model", () => {
+describe('download_model action:"download_civitai"', () => {
   it("resolves a model id and downloads via downloadModel", async () => {
     resolveCivitaiModelMock.mockResolvedValueOnce({
       downloadUrl: "https://civitai.com/api/download/models/201",
@@ -227,6 +262,14 @@ describe("download_civitai_model", () => {
       "checkpoints",
       "cool.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
+      expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
+      expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
+      expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
+      expect.any(Function), // onStagedPartialPath callback — persists the writer's cache identity (#2356)
+      undefined, // modelRoot — optional explicit extra/primary root (#2499)
     );
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("Cool Model");
@@ -250,6 +293,14 @@ describe("download_civitai_model", () => {
       "loras",
       "v.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
+      expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
+      expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
+      expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
+      expect.any(Function), // onStagedPartialPath callback — persists the writer's cache identity (#2356)
+      undefined, // modelRoot — optional explicit extra/primary root (#2499)
     );
     expect(res.isError).toBeFalsy();
   });
@@ -287,6 +338,44 @@ describe("download_civitai_model", () => {
       "loras",
       "custom.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
+      expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
+      expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
+      expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
+      expect.any(Function), // onStagedPartialPath callback — persists the writer's cache identity (#2356)
+      undefined, // modelRoot — optional explicit extra/primary root (#2499)
+    );
+  });
+
+  it("forwards a per-request `auth` override to the download job (#1635)", async () => {
+    // The reported bug: `auth` was accepted by the tool schema but dropped on this
+    // path, so a caller holding a valid CivitAI token still got a 401.
+    const auth = { type: "bearer", token: "civ-token" } as const;
+    resolveCivitaiModelVersionMock.mockResolvedValueOnce({
+      downloadUrl: "https://civitai.com/api/download/models/55",
+      filename: "v.safetensors",
+      versionId: 55,
+    });
+    downloadModelMock.mockResolvedValueOnce(join(MODELS_ROOT, "loras", "v.safetensors"));
+
+    const { downloadCivitai } = makeServer();
+    await downloadCivitai({ model_version_id: 55, target_subfolder: "loras", auth });
+
+    expect(downloadModelMock).toHaveBeenCalledWith(
+      "https://civitai.com/api/download/models/55",
+      "loras",
+      "v.safetensors",
+      auth,
+      false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
+      expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
+      expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
+      expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
+      expect.any(Function), // onStagedPartialPath callback — persists the writer's cache identity (#2356)
+      undefined, // modelRoot — optional explicit extra/primary root (#2499)
     );
   });
 
@@ -355,7 +444,7 @@ describe("download_civitai_model", () => {
   });
 });
 
-describe("search_civitai_models creator filter", () => {
+describe('download_model action:"search_civitai" creator filter', () => {
   it("errors when neither query nor creator is given", async () => {
     const { searchCivitai } = makeServer();
     const res = await searchCivitai({});
@@ -384,13 +473,13 @@ describe("search_civitai_models creator filter", () => {
     expect(res.content[0].text).not.toContain("scan cap");
   });
 
-  it("no-hits message points at search_civitai_creators for a creator miss", async () => {
+  it('no-hits message points at action:"search_creators" for a creator miss', async () => {
     searchCivitaiModelsMock.mockResolvedValueOnce({ hits: [] });
     const { searchCivitai } = makeServer();
     const res = await searchCivitai({ creator: "nobody" });
 
     expect(res.isError).toBeFalsy();
-    expect(res.content[0].text).toContain("search_civitai_creators");
+    expect(res.content[0].text).toContain('action:"search_creators"');
   });
 
   it("surfaces the bounded-scan cap so a capped miss is never presented as definitive", async () => {
@@ -408,7 +497,7 @@ describe("search_civitai_models creator filter", () => {
   });
 });
 
-describe("search_civitai_creators", () => {
+describe('download_model action:"search_creators"', () => {
   it("no query → leaderboard mode (default 'overall'), ranked lines + models hand-off", async () => {
     fetchCivitaiTopCreatorsMock.mockResolvedValueOnce([
       {
@@ -433,7 +522,7 @@ describe("search_civitai_creators", () => {
     expect(res.content[0].text).toContain('"overall" leaderboard');
     expect(res.content[0].text).toContain("1. **alcaitiff**");
     expect(res.content[0].text).toContain("https://civitai.com/user/alcaitiff");
-    expect(res.content[0].text).toContain('search_civitai_models {"creator"');
+    expect(res.content[0].text).toContain('{"action": "search_civitai", "creator"');
   });
 
   it("query → username-search mode with model counts", async () => {

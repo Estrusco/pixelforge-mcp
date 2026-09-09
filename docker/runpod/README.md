@@ -30,7 +30,7 @@ just `mkdir -p` the data dirs and launches ComfyUI (~**30-60s** ComfyUI init).
    npx -y comfyui-mcp@latest connect https://<pod-id>-3000.proxy.runpod.net
    ```
 4. Open the pod's ComfyUI, open the **Agent Panel** sidebar, enable the
-   external-orchestrator toggle, hit **Connect**, and drive the graph in natural
+   hit **Connect**, and drive the graph in natural
    language.
 
 The agent's brain (the **panel orchestrator**) runs **locally on your machine**
@@ -175,16 +175,22 @@ So SSH + Jupyter + nginx come from the base; **our hook adds everything else**.
   volume.
 * **`--input-directory` / `--output-directory`** — inputs and generated images on
   the volume.
+* **`--models-directory /workspace/models`** — makes ComfyUI's
+  `folder_paths.models_dir` the persistent volume root. This is required for
+  ComfyUI-Manager's explicit relative `save_path` values; `is_default` only
+  changes the ordering of category search paths.
 * **`--extra-model-paths-config`** — points every model category at
   `/workspace/models` (see below). MODELS persist on the volume.
 * **We deliberately do NOT use `--base-directory`.** It would relocate
   `custom_nodes` (and temp) onto the volume too — but we want `custom_nodes` to
-  stay **in the image**. The per-dir flags + `extra_model_paths.yaml` give us
-  exactly the split we want (data on the volume, software in the image).
+  stay **in the image**. The per-dir flags, explicit `--models-directory`, and
+  `extra_model_paths.yaml` give us exactly the split we want (data on the
+  volume, software in the image).
 
 > **Flag verification.** These flag names were verified against ComfyUI `master`
-> (`comfy/cli_args.py`): `--user-directory`, `--input-directory`,
-> `--output-directory`, `--base-directory`, and `--extra-model-paths-config` all
+> (`comfy/cli_args.py`): `--user-directory`, `--models-directory`,
+> `--input-directory`, `--output-directory`, `--base-directory`, and
+> `--extra-model-paths-config` all
 > exist with these exact spellings, and `--base-directory`'s own help text states
 > it sets the base for "models, custom_nodes, input, output, temp, and user
 > directories" — confirming why we avoid it. **Assumption to confirm at build:**
@@ -198,10 +204,10 @@ So SSH + Jupyter + nginx come from the base; **our hook adds everything else**.
 ## Model paths (`extra_model_paths.yaml`)
 
 `extra_model_paths.yaml` is baked at `/opt/ComfyUI/extra_model_paths.yaml` and
-loaded via `--extra-model-paths-config`. It maps **every** model category to a
-subfolder under `/workspace/models`, with `is_default: true` so the volume is the
-**primary** (download) location — i.e. Manager's install-model writes there and
-the files persist.
+loaded via `--extra-model-paths-config`. It maps every model category **this
+image knows about** to a subfolder under `/workspace/models`, with
+`is_default: true` so the volume is the **primary** (download) location — i.e.
+Manager's install-model writes there and the files persist.
 
 ```yaml
 comfyui_mcp_volume:
@@ -239,15 +245,22 @@ comfyui_mcp_volume:
     geometry_estimation: models/geometry_estimation/
     optical_flow: models/optical_flow/
     detection: models/detection/
+
+    # registered by the node packs themselves, not by ComfyUI core:
+    ultralytics: models/ultralytics/          # Impact Subpack
+    ultralytics_bbox: models/ultralytics/bbox/
+    ultralytics_segm: models/ultralytics/segm/
+    sams: models/sams/                       # Impact Pack (SAMLoader)
 ```
 
 Notes:
 
-* **`is_default: true`** is the load-bearing line. ComfyUI's
+* **`is_default: true`** keeps the volume category paths first for lookup. ComfyUI's
   `add_model_folder_path(..., is_default=True)` **inserts** the path at the front
-  of each category's list, so `/workspace/models/<cat>` becomes the default
-  download target. Without it, the image's `/opt/ComfyUI/models/<cat>` (ephemeral)
-  would stay first and Manager downloads would **not** persist.
+  of each category's list, so `/workspace/models/<cat>` is preferred for lookup.
+  The launch's explicit `--models-directory /workspace/models` is the separate
+  guarantee that Manager's explicit relative `save_path` writes also land on the
+  volume; `is_default` alone cannot change `folder_paths.models_dir`.
 * **No `custom_nodes:` key** — on purpose. Mapping `custom_nodes` to the volume
   would break the fast-restart contract.
 * `base_path: /workspace` with `models/...` relative subpaths mirrors ComfyUI's
@@ -255,8 +268,28 @@ Notes:
 * The category **keys** match ComfyUI's `folder_names_and_paths` keys (verified
   against `master`'s `folder_paths.py`). The category list mirrors the example's
   full set; harmless if a future ComfyUI renames one.
+* **Custom node packs register their own categories, and those are NOT in ComfyUI's
+  example.** A category absent from this file has no `/workspace` entry at all, so
+  `/opt/ComfyUI/models/<cat>` stays its only path and downloads land on the ephemeral
+  image layer - no error, just gone after the next rebuild (#2302). Adding the key is
+  sufficient and order-independent: packs register via a helper that calls
+  `add_model_folder_path` **without** `is_default`, i.e. it appends behind whatever this
+  file already put at the front. Impact Pack also registers `onnx` (read from its
+  source, deliberately left out of #2302's fix as it is a deprecated provider);
+  `insightface`, `facerestore_models` and `rembg` are the same shape but have NOT
+  been audited — do that before adding them.
 * `/post_start.sh` pre-creates the matching subfolders under `/workspace/models`
   so they exist on a cold volume.
+* **This file does not reach a node pack's OWN installer.** It adds *search* paths;
+  it does not move `folder_paths.models_dir`, which is what Impact Pack's and Impact
+  Subpack's `install.py` derive their download directory from (Subpack has no
+  `folder_paths` fallback at all). So `post_start.sh` also exports
+  `COMFYUI_MODEL_PATH=/workspace/models` before launching ComfyUI - pack installers
+  read that first, and Manager runs them as children of the ComfyUI process, so they
+  inherit it. Without it, installing Impact Subpack drops `face_yolov8m.pt` into
+  `/opt/ComfyUI/models/ultralytics/bbox` and Impact Pack drops `sam_vit_b_01ec64.pth`
+  into `/opt/ComfyUI/models/sams`, both on the ephemeral layer. ComfyUI core never
+  reads `COMFYUI_MODEL_PATH`, so this redirects only the packs' installers.
 
 ### Warm model volume (skip the cold HF pull)
 
@@ -353,7 +386,7 @@ image still boots ComfyUI fine.
 
 ### Dead-man switch (#269)
 
-Pods **created via `runpod_pod_create`** carry a billing dead-man switch. The
+Pods **created via `runpod` / `action: "create"`** carry a billing dead-man switch. The
 in-process idle auto-stop dies with the orchestrator (crash / closed laptop);
 without a pod-side guard the pod would bill forever. So:
 
@@ -366,8 +399,8 @@ without a pod-side guard the pod would bill forever. So:
 
 The stop is authorized by the **pod-scoped `RUNPOD_API_KEY` RunPod auto-injects
 into every pod** — the owner's account-wide key never leaves the orchestrator.
-Arming is signaled by the pod env carrying `DEADMAN_TOKEN` (injected by
-`runpod_pod_create`; a sha256 of key + unique deploy name, authorizes
+Arming is signaled by the pod env carrying `DEADMAN_TOKEN` (injected by the
+`create` action; a sha256 of key + unique deploy name, authorizes
 heartbeats **only** — it is not an API key and cannot stop the pod).
 Console-deployed pods have no token, so their watchdog stays inert. Opt out of
 arming with `deadman:false` / `RUNPOD_DEADMAN=0` at create, or
@@ -617,8 +650,8 @@ page is served over `https://`, `connect` automatically opens a secure, token-ga
 the pod's panel that URL — so the HTTPS page reaches your local agent with **no
 browser prompt, in any browser** (a secure page can't open a plain `ws://` socket
 to your box). Then open the pod's ComfyUI, open the **Agent Panel**, enable the
-**external-orchestrator** toggle, and click **Connect**. (Add **`--insecure-bridge`**
-to force the plain `ws://127.0.0.1:9180` loopback instead — e.g. when you reach the
+click **Connect**. (Add **`--insecure-bridge`**
+to force the plain `ws://127.0.0.1:9199` loopback instead — e.g. when you reach the
 pod via an SSH port-forward.)
 
 If you're on a build that predates the `connect` subcommand, the equivalents are:

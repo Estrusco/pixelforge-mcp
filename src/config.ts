@@ -1,11 +1,20 @@
 import { z } from "zod";
-import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, resolve, join } from "path";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { isIP } from "node:net";
-import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
+import { normalizeInstallPathEnv } from "./utils/install-path-env.js";
+import {
+  formatComfyUIHost,
+  formatComfyUIUrl,
+  parseComfyUIUrl,
+  type ComfyUITarget,
+} from "./transport/comfyui-url.js";
+import { describeFetchFailure, isBareFetchFailure } from "./utils/errors.js";
+import { resetManagerApiCache } from "./services/manager-api-cache.js";
+import { comfyuiEnvFilePath, freshSecretValue, loadEnvFileIntoProcess } from "./env-file.js";
+import { localComfyuiPort } from "./services/advertised-origin.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -33,7 +42,12 @@ try {
 } catch {
   // best-effort migration; real env vars and an existing home .env still work
 }
-dotenv.config({ path: homeEnvPath });
+// Load the canonical dotenv (path resolution — including the COMFYUI_MCP_ENV_FILE
+// override — lives in env-file.ts so the WRITER, services/panel-secrets.ts, and
+// every reader can never disagree about which file "the token was saved" means).
+// This also records which keys were seeded FROM the file, which is what lets
+// freshSecretValue() supersede them on a later re-read (#826).
+loadEnvFileIntoProcess();
 
 /**
  * Does `p` look like a real ComfyUI install root? A ComfyUI Desktop-installer
@@ -219,7 +233,106 @@ const LOOPBACK_HOSTS = new Set([
   "::1",
   "localhost",
   "0.0.0.0",
+  "::", // IPv6 wildcard bind — reachable on loopback (::1)
+  "0000:0000:0000:0000:0000:0000:0000:0000",
 ]);
+
+/**
+ * True when `host` is an address THIS machine answers on — loopback, or any
+ * literal IP currently bound to one of its own interfaces (#742).
+ *
+ * `isLoopbackHost` answers a narrower question than most of its callers need.
+ * Loopback proves the ROUTE is local; it does not follow that a non-loopback
+ * address is a different machine. A ComfyUI on this very host addressed as
+ * `http://192.168.1.50:8188` — which is how anyone reaches it from a phone, or
+ * how Pinokio and several launchers advertise it — is not loopback and is not
+ * remote either. The recurrence on #742 is exactly that: the restart guard read
+ * "not loopback" as "not ours", skipped its refuse-safe check, and stopped a
+ * server it then could not bring back.
+ *
+ * NO DNS. A hostname is compared as a string against the literal addresses the
+ * interfaces report, so it simply never matches — `comfy.lan` returns false even
+ * if it resolves here. That is deliberate, not a gap: resolving would mean a DNS
+ * round trip on a path that must not block, and a name can resolve differently —
+ * or be made to — between this check and the action it authorizes. This gates a
+ * REFUSAL, so "cannot prove it is ours" is the safe answer; it leaves today's
+ * behaviour exactly as it was.
+ *
+ * (An earlier version guarded the comparison with an explicit is-this-a-literal-IP
+ * test. Mutation testing showed removing it changed no outcome — the equality
+ * below already refuses names — so it was a check that could never fire, next to
+ * a comment claiming it was what enforced the rule.)
+ *
+ * Not cached. `networkInterfaces()` is a cheap syscall, and a laptop that
+ * changes networks would keep answering from a stale snapshot — wrong in the
+ * direction that matters, since the whole point is to be right about which
+ * machine we are talking to right now.
+ */
+export function isOwnHostAddress(host: string | undefined): boolean {
+  if (isLoopbackHost(host)) return true;
+  const h = canonicalHostForCompare(host);
+  // An empty host must never fall through to the comparison: an interface that
+  // reported an empty address would then match it.
+  if (!h) return false;
+  try {
+    for (const addrs of Object.values(networkInterfaces())) {
+      for (const a of addrs ?? []) {
+        if (canonicalHostForCompare(a.address) === h) return true;
+      }
+    }
+  } catch {
+    // Enumerating interfaces can fail in a locked-down container. Unknown is
+    // not proof, and this gates a refusal — fall through to false.
+  }
+  return false;
+}
+
+/**
+ * One canonical spelling for an address, so equality means "same address"
+ * rather than "same characters" (#742 review).
+ *
+ * Textual comparison alone is wrong in the direction that keeps the bug: an
+ * interface reports `2600:1700:5892:bc10::22` while a config may carry the same
+ * address written `2600:1700:5892:BC10:0:0:0:22`, and a plain `===` calls those
+ * different machines. `URL` already implements the canonicalization — it
+ * lowercases, collapses to the `::` form, and rewrites IPv4-mapped addresses —
+ * so both sides are run through it rather than hand-rolling the rules.
+ *
+ * IPv4-mapped IPv6 (`::ffff:192.168.1.179`) is folded to its dotted IPv4 form
+ * FIRST, because that is the form `networkInterfaces()` reports; left alone,
+ * `URL` canonicalizes it to `::ffff:c0a8:1b3` and it still would not match.
+ *
+ * No zone-suffix handling: `new URL("http://[fe80::1%eth0]/")` throws, so a
+ * scoped address cannot reach here through a configured target at all. An
+ * earlier version stripped `%eth0` and had a test for it — which passed while
+ * exercising something production could never deliver.
+ */
+function canonicalHostForCompare(host: string | undefined): string {
+  const raw = (host ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!raw) return "";
+  if (!raw.includes(":")) return raw; // IPv4 or a name — already canonical
+  let canon: string;
+  try {
+    // URL canonicalizes IPv6 and re-brackets it; strip the brackets back off.
+    canon = new URL(`http://[${raw}]/`).hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return raw; // not a valid IPv6 literal — compare as written
+  }
+  // The IPv4-mapped fold happens AFTER canonicalization, not before, and that
+  // ordering is the whole point (round-2 review). URL rewrites EVERY mapped
+  // spelling to the same hex form — `::ffff:192.168.1.179`,
+  // `0:0:0:0:0:ffff:c0a8:1b3` and `::FFFF:C0A8:1B3` all become
+  // `::ffff:c0a8:1b3` — so folding here catches all of them with one rule.
+  // Folding beforehand caught only the dotted spelling and left the rest
+  // classified as somebody else's machine.
+  const m = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canon);
+  if (m) {
+    const hi = parseInt(m[1], 16);
+    const lo = parseInt(m[2], 16);
+    return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
+  return canon;
+}
 
 /** True when a hostname is loopback (or absent → assume local). Bracketed IPv6
  *  (`[::1]`, as URL parsing stores it) is normalized first so every consumer
@@ -241,9 +354,12 @@ export function isLoopbackHost(host: string | undefined): boolean {
  * COMFYUI_PATH env var still wins.
  */
 function resolveComfyUIPath(
-  envPath: string | undefined,
+  rawEnvPath: string | undefined,
   opts: { remoteUrl: boolean; cloud: boolean; remoteHost?: string },
 ): string | undefined {
+  // #1512 — normalize BEFORE the truthy check, so a whitespace-only value falls
+  // through to auto-detection instead of being adopted as a real (unusable) path.
+  const { path: envPath } = normalizeInstallPathEnv(rawEnvPath);
   if (envPath) {
     if (opts.remoteUrl) {
       console.error(
@@ -298,30 +414,50 @@ export function detectLocalComfyUIPath(): string | undefined {
  * Returns the first port that responds, or the default if none found.
  */
 async function detectComfyUIPort(host: string): Promise<number> {
-  const ports = [8188, 8000];
+  const ports = [...new Set([localComfyuiPort(), 8188, 8000])];
 
   for (const port of ports) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1000);
+    const protocol = parsedConfig.comfyuiSsl ? "https" : "http";
+    const target = `${protocol}://${formatComfyUIHost(host)}:${port}/system_stats`;
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1000);
-      const protocol = parsedConfig.comfyuiSsl ? "https" : "http";
-      const res = await fetch(`${protocol}://${host}:${port}/system_stats`, {
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      let res: Response;
+      try {
+        // Probe the configured literal first. Only a bare ECONNREFUSED proves
+        // that no HTTP request reached it and permits the IPv6-capable alias.
+        res = await fetch(target, {
+          signal: controller.signal,
+        });
+      } catch (err) {
+        const fallback = formatComfyUIUrl(target);
+        if (
+          fallback === target ||
+          !isBareFetchFailure(err) ||
+          describeFetchFailure(err).code !== "ECONNREFUSED"
+        ) {
+          throw err;
+        }
+        res = await fetch(fallback, {
+          signal: controller.signal,
+        });
+      }
       if (res.ok) {
+        clearTimeout(timeout);
         console.error(`[comfyui-mcp] Found ComfyUI on port ${port}`);
         return port;
       }
     } catch {
       // Port not responding, try next
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
   console.error(
-    `[comfyui-mcp] ComfyUI not detected on ports ${ports.join(", ")}. Defaulting to 8188.`,
+    `[comfyui-mcp] ComfyUI not detected on ports ${ports.join(", ")}. Defaulting to ${ports[0]}.`,
   );
-  return 8188;
+  return ports[0];
 }
 
 /**
@@ -370,6 +506,19 @@ const configSchema = z.object({
   comfyuiSsl: z.coerce.boolean().default(false),
   comfyuiBasePath: z.string().default(""),
   comfyuiPath: z.string().optional(),
+  /**
+   * Optional checkout/code root for split installs where COMFYUI_PATH is the
+   * server's data/base directory. Code-facing tools (git, comfy-cli,
+   * custom_nodes provenance) use this path without moving input/output/user or
+   * models away from COMFYUI_PATH.
+   */
+  comfyuiCodePath: z.string().optional(),
+  // COMFYUI_RESTART_COMMAND (panel#1262): the exact shell command that restarts an
+  // EXTERNALLY-MANAGED ComfyUI (a container, a systemd unit, a launcher) — e.g.
+  // `docker restart comfyui`. When set, restart runs THIS instead of the
+  // kill+relaunch that needs the install's launch path resolvable from here
+  // (which is exactly what an externally managed install does not offer).
+  comfyuiRestartCommand: z.string().optional(),
   comfyuiApiKey: z.string().optional(),
   comfyuiCloudUrl: z.string().default("https://cloud.comfy.org"),
   // Generic auth for self-hosted ComfyUI behind a reverse proxy / API gateway
@@ -449,7 +598,12 @@ const parsedConfig = configSchema.parse({
     cloud: cloudActive,
     remoteHost: urlOverride?.host ? `${urlOverride.host}:${urlOverride.port}` : undefined,
   }),
+  comfyuiCodePath: (() => {
+    const { path } = normalizeInstallPathEnv(process.env.COMFYUI_CODE_PATH);
+    return path ? descendToNestedRoot(path, "COMFYUI_CODE_PATH (env)") : undefined;
+  })(),
   comfyuiApiKey: cloudApiKey,
+  comfyuiRestartCommand: process.env.COMFYUI_RESTART_COMMAND?.trim() || undefined,
   comfyuiCloudUrl: process.env.COMFYUI_CLOUD_URL,
   comfyuiAuthHeader: process.env.COMFYUI_AUTH_HEADER,
   comfyuiAuthScheme: process.env.COMFYUI_AUTH_SCHEME,
@@ -477,6 +631,59 @@ if (cloudActive) {
 }
 
 export const config: Config = { ...parsedConfig, resolvedPort };
+
+// ── LAZY RUNTIME CREDENTIALS (#826, #2085) ──────────────────────────────────
+// The download tokens and gateway credentials above are snapshotted from
+// process.env at MODULE LOAD, and the canonical .env is read exactly once at
+// boot. In the comfyui MCP CHILD
+// that is fatal: `panel_request_secret` writes the token to ~/.comfyui-mcp/.env
+// and then relies on the orchestrator RESPAWNING this process to inject it. When
+// that respawn does not fire, a snapshotted credential is invisible forever —
+// every download keeps returning 401 while a valid token sits on disk, and
+// nothing distinguishes "no token configured" from "token present but never
+// injected", so an agent following the tool's own advice loops.
+//
+// Resolve them at ACCESS time instead. A real environment variable still wins;
+// otherwise the canonical .env is re-read now (freshSecretValue also handles the
+// revoke case, so clearing the slot takes effect without a respawn too). One
+// getter covers every consumer of config.civitaiApiToken / config.huggingfaceToken,
+// so no call site changes. This removes the structural dependency on the respawn
+// rather than papering over it; the respawn remains, as a second path, not the
+// only one.
+// An EXPLICIT assignment still wins and still works. These fields were plain
+// writable properties before, and code (and tests) assign them; a getter-only
+// descriptor would make every such assignment throw in strict mode. The override
+// is remembered here and cleared by assigning undefined.
+const credentialOverrides: { civitaiApiToken?: string; huggingfaceToken?: string } = {};
+
+Object.defineProperty(config, "civitaiApiToken", {
+  get: () => credentialOverrides.civitaiApiToken ?? freshSecretValue("CIVITAI_API_TOKEN"),
+  set: (v: string | undefined) => {
+    credentialOverrides.civitaiApiToken = v;
+  },
+  enumerable: true,
+  configurable: true,
+});
+Object.defineProperty(config, "huggingfaceToken", {
+  // HF_TOKEN is the canonical var the huggingface_hub libs read; HUGGINGFACE_TOKEN
+  // is a legacy alias we still honor as a fallback (same order as the boot parse).
+  // freshSecretValue resolves each alias FULLY before the next, so the canonical
+  // name wins whichever side it came from.
+  get: () =>
+    credentialOverrides.huggingfaceToken ?? freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN"),
+  set: (v: string | undefined) => {
+    credentialOverrides.huggingfaceToken = v;
+  },
+  enumerable: true,
+  configurable: true,
+});
+
+/** The canonical dotenv path this process reads credentials from. Re-exported so
+ *  the orchestrator can name the file it wrote in a user-facing message without
+ *  duplicating the resolution rule. Contains no secret. */
+export function credentialEnvFilePath(): string {
+  return comfyuiEnvFilePath();
+}
 
 // Process-start ComfyUI target, captured before any runtime retarget (RunPod
 // connect / panel "Local" switch), so a "switch back to local" can restore it.
@@ -580,7 +787,43 @@ if (!bootLocalTarget && !isRunpodProxyHost(bootComfyui.host) && process.env.COMF
  *  back to the loopback default only when nothing non-pod is known (#269:
  *  forcing 127.0.0.1 broke rigs whose local ComfyUI lives on another LAN host). */
 export function getLocalComfyuiUrl(): string {
-  return lastNonPodTarget ?? "http://127.0.0.1:8188";
+  return lastNonPodTarget ?? `http://127.0.0.1:${localComfyuiPort()}`;
+}
+
+/**
+ * The orchestrator's PROCESS-START local ComfyUI base URL, captured at boot from
+ * COMFYUI_URL/argv/defaults and NEVER mutated by a runtime retarget (a panel
+ * `hello` calls setComfyuiTarget, which does NOT touch this snapshot). Returns null
+ * unless boot pointed at a LOOPBACK instance with a resolved port. Use this — not
+ * getComfyUIBaseUrl(), which a client `hello` can steer — as the SERVER-AUTHORIZED
+ * target for a self-probe that must not be client-influenced (#509 security).
+ */
+export function getBootLocalComfyUIBaseUrl(): string | null {
+  if (!isLoopbackHost(bootComfyui.host) || !(bootComfyui.port > 0)) return null;
+  return `${bootComfyui.ssl ? "https" : "http"}://${bootComfyui.host}:${bootComfyui.port}${bootComfyui.basePath}`;
+}
+
+/** #1909: COMFYUI_URL / --comfyui-url may be assigned after this module's init
+ *  (boot.ts `connect` writes it after the static import). Re-read so a loopback
+ *  host on a non-default port is persisted as that origin, not :8188. This is
+ *  still process-start — rescope runs once before hellos, and setComfyuiTarget
+ *  still cannot mutate bootComfyui. */
+function adoptLiveConfiguredLocalTarget(): void {
+  const live = resolveUrlOverride();
+  if (!live || !isLocalOrLanHost(live.host) || !(live.port > 0)) return;
+  const liveUrl = `${live.ssl ? "https" : "http"}://${live.host}:${live.port}${live.basePath}`;
+  lastNonPodTarget = liveUrl;
+  if (!isLoopbackHost(live.host)) return;
+  // The configured loopback origin IS the process-start local instance.
+  bootComfyui.host = live.host;
+  bootComfyui.port = live.port;
+  bootComfyui.ssl = live.ssl;
+  bootComfyui.basePath = live.basePath;
+  config.comfyuiHost = live.host;
+  config.comfyuiPort = live.port;
+  config.resolvedPort = live.port;
+  config.comfyuiSsl = live.ssl;
+  config.comfyuiBasePath = live.basePath;
 }
 
 /** Orchestrator startup hook: re-point the saved-target file (port-scoped, so
@@ -607,6 +850,9 @@ export function rescopeLocalTargetFile(path: string): void {
     // finding: a headless session's global save defeated the port isolation).
     lastNonPodTarget = readSavedLocalTarget();
   }
+  // A live loopback/LAN COMFYUI_URL is not a pod URL, so this will not clobber
+  // a pod boot's scoped LAN restore above.
+  adoptLiveConfiguredLocalTarget();
   if (lastNonPodTarget !== null) {
     // Persist into the scoped file so the next restart restores it — a direct
     // LAN boot otherwise lives in memory only and the pod-inherited restart
@@ -632,6 +878,23 @@ export function isTargetingLocal(): boolean {
 // local and a RunPod pod — the UI must never lie about where a job runs.
 type ComfyuiTargetListener = (url: string, isLocal: boolean) => void;
 const comfyuiTargetListeners = new Set<ComfyuiTargetListener>();
+
+// ── Target generation (#742 r11/r12) ─────────────────────────────────────────
+// Monotonic epoch bumped in setComfyuiTarget BEFORE the mutation is
+// observable, so any observer of the new target value (including synchronous
+// target-change listeners) always sees the new generation with it — the
+// target-generation contract. A final-state base comparison (A vs A) cannot
+// detect an intervening A→B→A mutation, so consumers that read the mutable
+// target across an await (e.g. the panel restart's refuse-safe preflight)
+// must instead require the GENERATION to be unchanged after the await — any
+// mutation, including a round trip back to the same base, bumps it.
+let comfyuiTargetGeneration = 0;
+
+/** The current target generation — increments on every successful setComfyuiTarget. */
+export function getComfyuiTargetGeneration(): number {
+  return comfyuiTargetGeneration;
+}
+
 export function onComfyuiTargetChanged(cb: ComfyuiTargetListener): () => void {
   comfyuiTargetListeners.add(cb);
   return () => comfyuiTargetListeners.delete(cb);
@@ -679,6 +942,30 @@ export function isForceRemoteFlagSet(): boolean {
   return forceRemote;
 }
 
+/**
+ * True when the configured ComfyUI target is provably on THIS machine (#742).
+ *
+ * Distinct from `isLocalMode()`, which reports the classification. This reports
+ * the physical question that classification stands in for, and the two disagree
+ * for exactly one case: a local instance addressed by one of this host's own
+ * non-loopback addresses. That case is `isRemoteMode() === true` and
+ * `targetIsOnThisMachine() === true`, and it is the #742 recurrence.
+ *
+ * `--force-remote` / `COMFYUI_MCP_FORCE_REMOTE` wins outright. A tunnel or
+ * port-forward makes the address say "here" about an instance that is
+ * elsewhere, and the flag exists for the user to say so; an inference must not
+ * overrule it. (This is the mirror of the note in panel-tools about a cloud pod
+ * fronted at 127.0.0.1.)
+ */
+export function targetIsOnThisMachine(): boolean {
+  if (forceRemote) return false;
+  try {
+    return isOwnHostAddress(new URL(getComfyUIBaseUrl()).hostname);
+  } catch {
+    return false; // unparseable target — cannot prove it is ours
+  }
+}
+
 /** Filesystem-safe id for the target instance — scopes per-instance data (e.g. generations DB). */
 export function getInstanceSlug(): string {
   if (isCloudMode()) return "comfy-cloud";
@@ -703,8 +990,8 @@ export function getApiKey(): string {
  * Retarget the shared `config` (and thus getComfyUIApiHost()/getClient()) to a new
  * ComfyUI URL at runtime. The panel orchestrator calls this from applyComfyuiUrl when
  * the desktop `hello` points at a different ComfyUI, so the orchestrator's OWN
- * in-process client — the direct call_tool path used by the mobile app (list_workflows,
- * get_image, …) — follows the retarget instead of staying pinned to the process-start
+ * in-process client — the direct call_tool path used by the mobile app
+ * (get_workflow, get_image, …) — follows the retarget instead of staying pinned to the process-start
  * ComfyUI. Callers MUST resetClient() afterwards so the cached client rebuilds against
  * the new host. Returns false on a malformed URL (target left unchanged).
  */
@@ -715,6 +1002,14 @@ export function setComfyuiTarget(url: string): boolean {
   } catch {
     return false;
   }
+  // Bump the target generation BEFORE the mutation is observable (#742 r12):
+  // the contract is that ANY observer of the new target value — including a
+  // synchronous target-change listener fired below — sees the new generation
+  // with it. The reverse ordering (new target fanned out with the old epoch)
+  // is the violation; a post-parse failure leaving the epoch advanced is
+  // harmless by comparison (consumers like the #742 r10 check simply refuse
+  // conservatively), and nothing past this point can fail the retarget anyway.
+  comfyuiTargetGeneration += 1;
   config.comfyuiHost = t.host;
   config.comfyuiPort = t.port;
   config.resolvedPort = t.port;
@@ -751,13 +1046,20 @@ export function setComfyuiTarget(url: string): boolean {
   // from COMFYUI_URL, and a runtime retarget must not leave them pinning the
   // process-start host (codex finding).
   process.env.COMFYUI_URL = url;
+  // We are pointed at a DIFFERENT ComfyUI now, so the detected ComfyUI-Manager
+  // dialect describes the previous one. It is normally keyed by base URL and
+  // would simply miss — but a round trip (local → pod → local) can land back on
+  // an identical base string whose server was restarted meanwhile, which is
+  // exactly the stale-dialect case #646 is about. Drop it at the canonical
+  // retarget choke point rather than relying on the key.
+  resetManagerApiCache("comfyui target changed");
   // Tell the control panels where renders run now (local ⇄ pod).
   emitComfyuiTargetChanged();
   return true;
 }
 
 export function getComfyUIApiHost(): string {
-  return `${config.comfyuiHost}:${config.resolvedPort}`;
+  return `${formatComfyUIHost(config.comfyuiHost)}:${config.resolvedPort}`;
 }
 
 export function getComfyUIProtocol(): "http" | "https" {
@@ -775,7 +1077,7 @@ export function getComfyUIBasePath(): string {
  * this so reverse-proxied / path-prefixed instances route correctly.
  */
 export function getComfyUIBaseUrl(): string {
-  return `${getComfyUIProtocol()}://${getComfyUIApiHost()}${config.comfyuiBasePath}`;
+  return `${getComfyUIProtocol()}://${formatComfyUIHost(config.comfyuiHost)}:${config.resolvedPort}${config.comfyuiBasePath}`;
 }
 
 /**
@@ -788,14 +1090,19 @@ export function getComfyUIBaseUrl(): string {
  */
 export function getComfyUIAuthHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
-  const token = config.comfyuiAuthToken?.trim();
+  // panel_request_secret writes these fixed keys to the canonical .env after
+  // config.ts has loaded. Resolve them at request time so the orchestrator's
+  // own ComfyUI/Manager requests pick up a save or revoke without a restart.
+  // The key names stay explicit: this does not turn arbitrary environment
+  // variables into request headers or alter the child/agent secret boundary.
+  const token = freshSecretValue("COMFYUI_AUTH_TOKEN")?.trim();
   if (token) {
-    const header = config.comfyuiAuthHeader?.trim() || "Authorization";
+    const header = freshSecretValue("COMFYUI_AUTH_HEADER")?.trim() || "Authorization";
     // An unset/empty scheme defaults to "Bearer" for the Authorization header and
     // to none (raw token) for any custom header. Set COMFYUI_AUTH_SCHEME to force
     // a specific scheme (e.g. "Token").
     const scheme =
-      config.comfyuiAuthScheme?.trim() ||
+      freshSecretValue("COMFYUI_AUTH_SCHEME")?.trim() ||
       (header.toLowerCase() === "authorization" ? "Bearer" : "");
     headers[header] = scheme ? `${scheme} ${token}` : token;
   }
@@ -803,8 +1110,8 @@ export function getComfyUIAuthHeaders(): Record<string, string> {
   // so a half-configured token never produces a broken request. Additive: works
   // alongside or instead of COMFYUI_AUTH_TOKEN, and applies to every ComfyUI
   // endpoint (harmless on endpoints not behind Cloudflare Access — they ignore it).
-  const cfId = config.cfAccessClientId?.trim();
-  const cfSecret = config.cfAccessClientSecret?.trim();
+  const cfId = freshSecretValue("CF_ACCESS_CLIENT_ID")?.trim();
+  const cfSecret = freshSecretValue("CF_ACCESS_CLIENT_SECRET")?.trim();
   if (cfId && cfSecret) {
     headers["CF-Access-Client-Id"] = cfId;
     headers["CF-Access-Client-Secret"] = cfSecret;

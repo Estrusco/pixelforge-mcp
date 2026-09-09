@@ -12,3 +12,30 @@
 # with upstream" section in CLAUDE.md documents this as step 0 of every sync.
 CLAUDE.md merge=ours
 README.md merge=ours
+
+# The 0.49.0 tool-surface ratchet SHA-256-pins these files' exact bytes
+# (BASELINE_SHA256 / PANEL_BASELINE_SHA256 in src/tools/vocabulary.ts, and the
+# vocab:export --check comparison). With core.autocrlf they would check out as
+# CRLF on Windows and hash differently than the LF form CI produces, breaking
+# the gate for Windows contributors. Force LF so the pinned bytes are identical
+# on every platform.
+docs/design/tool-surface.txt text eol=lf
+docs/design/panel-surface.txt text eol=lf
+docs/design/tool-vocabulary.json text eol=lf
+
+# Same reasoning, one gate later. `locales/en/main.json` is GENERATED from the
+# `tr()` call sites (scripts/i18n-build-en.mjs) and a test compares the committed
+# file to a fresh build byte for byte. `core.autocrlf` is on for most Windows
+# developers, so without this the checked-out file is CRLF, the build writes LF,
+# and that test fails on a clean clone for a reason nothing about it would
+# suggest. The translations are pinned alongside it so every catalog in the
+# directory is the same shape on every platform.
+locales/**/*.json text eol=lf
+
+# Shebang .mjs files imported by vitest fail to COLLECT on Windows when
+# core.autocrlf checks them out as CRLF (#1857). The transform treats
+# `#!/usr/bin/env node\r` as a syntax error; the file reports "1 failed /
+# Tests no tests" and the tests that exist never run. `node --check` is
+# fine either way — it strips shebangs itself. CI is Linux, so the hole
+# is invisible there. Force LF the same way we do for the ratchet files.
+*.mjs text eol=lf

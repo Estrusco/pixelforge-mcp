@@ -9,7 +9,7 @@
 // PanelAgent keeps all provider-agnostic orchestration (queue, turn-gate, bridge
 // push, self-restart) and drives this backend via
 // `for await (const ev of backend.run({...}))`. See
-// docs/design/agent-backend-injection.md.
+// design/agent-backend-injection.md.
 //
 // PROTOCOL MAPPING (AgentBackend ↔ ACP, per agentclientprotocol.com + the
 // Gemini CLI docs/cli/acp-mode.md):
@@ -65,6 +65,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import { createRequire } from "node:module";
 import readline from "node:readline";
 import { logger } from "../utils/logger.js";
+import { errorText, promptText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -73,11 +74,12 @@ import {
   type ModelChoice,
   type NeutralTurn,
   GEMINI_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /**
@@ -824,6 +826,7 @@ export class GeminiBackend implements AgentBackend {
     };
 
     // Process the neutral channel one turn at a time.
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
       // LIVE MODEL SWITCH (P1): PanelAgent treats setModel as live and does NOT
       // restart run() for a model-only change, so the persistent loop adopts it
@@ -841,7 +844,7 @@ export class GeminiBackend implements AgentBackend {
           ...(this.model ? { model: this.model } : {}),
         };
       }
-      yield* this.runTurn(this.client, turn, opts.onActivity);
+      yield* stampTurn(this.runTurn(this.client, turn, opts.onActivity), ++turnSeq);
     }
   }
 
@@ -1033,11 +1036,11 @@ export class GeminiBackend implements AgentBackend {
     // FIRST-TURN PERSONA: ACP session/new has no instructions field, so the panel
     // system prompt is prepended to the first turn's prompt as a clearly-marked
     // system/context preamble (later turns send plain text). Mirrors codex.
-    let turnText = turn.text;
+    let turnText = promptText(turn.text);
     if (this.needsSystemPreamble && this.deps.systemAppend) {
       turnText =
         `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${turn.text}`;
+        `The user's first message follows.\n\n${turnText}`;
       this.needsSystemPreamble = false;
     }
 

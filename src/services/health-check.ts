@@ -6,7 +6,9 @@
 
 import { ConnectionError } from "../utils/errors.js";
 import { isCloudMode } from "../config.js";
-import { getClient, getQueue, getSystemStats } from "../comfyui/client.js";
+import { getQueue, getSystemStats, comfyApiFetch } from "../comfyui/client.js";
+import type { SystemStats } from "../comfyui/types.js";
+import { scrubLogLines } from "../comfyui/json-guard.js";
 
 const CRITICAL_MODEL_CATS = [
   "checkpoints",
@@ -22,6 +24,42 @@ export interface HealthCheckOptions {
   recentErrors?: number;
 }
 
+/**
+ * The ComfyUI FRONTEND package version, as reported by /system_stats.
+ *
+ * ComfyUI gives this two ways and they can disagree, which is itself worth
+ * seeing: `comfy_package_versions[comfyui-frontend-package].installed` is what is
+ * actually loaded, and `required_frontend_version` is what this ComfyUI asked
+ * for. A mismatch means someone pinned or overrode the frontend — exactly the
+ * situation in panel#779, where `--front-end-version …@1.47.12` was the fix.
+ *
+ * Returns "?" when neither is present rather than inventing one. An unknown
+ * version must not read as an absent problem.
+ */
+function describeFrontendVersion(stats: Record<string, any>): string {
+  // Both fields live under `system`, verified against a live ComfyUI 0.30.2 —
+  // the first draft read them off the top level and silently produced "?" on a
+  // server that reports them perfectly well. Top-level is still accepted in case
+  // another build puts them there, but `system` is where they actually are.
+  const pkgs = Array.isArray(stats?.system?.comfy_package_versions)
+    ? stats.system.comfy_package_versions
+    : Array.isArray(stats?.comfy_package_versions)
+      ? stats.comfy_package_versions
+      : [];
+  const fe = pkgs.find((p: any) => p?.name === "comfyui-frontend-package");
+  const installed = typeof fe?.installed === "string" ? fe.installed : undefined;
+  const required =
+    typeof stats?.system?.required_frontend_version === "string"
+      ? stats.system.required_frontend_version
+      : typeof stats?.required_frontend_version === "string"
+        ? stats.required_frontend_version
+        : undefined;
+  if (installed && required && installed !== required) {
+    return `${installed} (this ComfyUI expects ${required} — pinned or overridden)`;
+  }
+  return installed ?? required ?? "?";
+}
+
 export async function runHealthCheck(
   options: HealthCheckOptions = {},
 ): Promise<string> {
@@ -30,9 +68,9 @@ export async function runHealthCheck(
   const lines: string[] = ["## Health Check\n"];
 
   try {
-    const stats = (await getSystemStats()) as unknown as Record<string, any>;
-    const sys = stats.system ?? {};
-    const dev = stats.devices?.[0] ?? {};
+    const stats = await getSystemStats({ diagnosticContext: "health" });
+    const sys: Partial<SystemStats["system"]> = stats.system ?? {};
+    const dev: Partial<SystemStats["devices"][number]> = stats.devices?.[0] ?? {};
     const vramTotalGB = dev.vram_total
       ? (dev.vram_total / 1024 ** 3).toFixed(1)
       : "?";
@@ -44,6 +82,13 @@ export async function runHealthCheck(
       : "?";
     lines.push(
       `**ComfyUI**: ${sys.comfyui_version ?? "?"} | ` +
+        // panel#779 — the FRONTEND package version, which /system_stats reports and
+        // nothing here read. That outage (a blank agent panel on a fresh install)
+        // turned entirely on it: ComfyUI 0.30.0 was identical between the broken
+        // and working machines, and the frontend was 1.50.3 vs 1.47.12. A reporter
+        // had to be asked for it after an hour of eliminating everything else, and
+        // "ComfyUI version" alone will keep hiding this class of skew.
+        `frontend ${describeFrontendVersion(stats)} | ` +
         `Python ${(sys.python_version ?? "").split(" ")[0] || "?"} | ` +
         `PyTorch ${sys.pytorch_version ?? "?"}`,
     );
@@ -74,12 +119,11 @@ export async function runHealthCheck(
     return lines.join("\n");
   }
 
-  const client = getClient();
   const modelLines: string[] = [];
   let totalModelsSeen = 0;
   for (const cat of categories) {
     try {
-      const res = await client.fetchApi(`/models/${cat}`);
+      const res = await comfyApiFetch(`/models/${cat}`);
       if (!res.ok) {
         modelLines.push(`- ${cat}: REST ${res.status}`);
         continue;
@@ -107,23 +151,183 @@ export async function runHealthCheck(
 
   // Recent custom-node errors from /internal/logs (best-effort; older
   // ComfyUI versions and remote-only deployments may not expose it).
-  try {
-    const res = await client.fetchApi("/internal/logs");
-    if (res.ok) {
-      const text = await res.text();
-      const errLines = text
-        .split("\n")
-        .filter((l) => /traceback|error|exception/i.test(l))
-        .slice(-recentErrors);
-      if (errLines.length > 0) {
-        lines.push(`\n**Recent errors** (last ${errLines.length}):`);
-        for (const e of errLines) lines.push(`  ${e.trim()}`);
-      } else {
-        lines.push(`\n**Recent errors**: none in /internal/logs`);
+  // #1146 — recent_errors:0 means "show me none", and it returned EVERYTHING.
+  //
+  // `slice(-0)` is `slice(0)`: -0 === 0 in JS, so the negative-index reading
+  // never happens and the whole array comes back. A reporter asking for zero got
+  // the full historical ComfyUI log and a response truncated at ~12k tokens —
+  // the opposite of the request, from the one argument value meant to suppress
+  // it. Any non-positive limit takes the explicit branch instead.
+  //
+  // And it is reported as NOT REQUESTED, not as "none in /internal/logs". The
+  // log was never read for content, so claiming it is clean would assert an
+  // absence nobody observed — a caller trying to shrink a response would be told
+  // their server is healthy as a side effect of asking for a shorter answer.
+  if (recentErrors <= 0) {
+    lines.push(`\n**Recent errors**: not requested (recent_errors=${recentErrors}) — the log was NOT checked, which is not the same as it being clean.`);
+  } else {
+    try {
+      const res = await comfyApiFetch("/internal/logs");
+      if (res.ok) {
+        const rawText = await res.text();
+        // /internal/logs returns a JSON-wrapped string. Parse it to get the actual logs.
+        let text: string;
+        try {
+          const parsed = JSON.parse(rawText);
+          // Ensure the parsed value is a string, not an object or other type
+          text = typeof parsed === "string" ? parsed : rawText;
+        } catch {
+          // If not JSON, use the raw text
+          text = rawText;
+        }
+
+        // #1206 — these lines go straight into the health report, which is a
+        // DIAGNOSTIC users paste into bug reports. A custom node logging the URL
+        // it fetched can put a CivitAI/HF token in one, so scrub before emitting.
+        // Per line, and fail-closed VISIBLY, for the same reasons as getLogs.
+        //
+        // #2329 — match severity on the line itself, not a bare substring. A log
+        // line containing "error" in a message like "0 errors found" is not an
+        // actual error. Only lines with [ERROR]/[EXCEPTION] markers or starting
+        // with "Traceback" are errors. Keep traceback continuation lines (indented).
+        // #2347 — severity is matched on the entry BODY, after the timestamp prefix.
+        // /internal/logs joins each record as `l["t"] + " - " + l["m"]`
+        // (api_server/routes/internal/internal_routes.py), so every line begins with a
+        // timestamp. #2329 matched `^Traceback` against the raw line, which therefore
+        // could never fire: measured on a live 105-line log, 0 lines start with
+        // "Traceback".
+        //
+        // #2355 — and something STILL sits between the prefix and the anchor.
+        // ColoredFormatter (app/logger.py:35-45) prepends its own tag before it
+        // delegates, so ColoredFormatter("%(message)s") does NOT mean message-only:
+        //
+        //     level_tag = f"{bold}{color}[{record.levelname}]{ANSI_RESET} "
+        //     return level_tag + super().format(record)
+        //
+        // and setup_logger swaps sys.stdout/sys.stderr for LogInterceptor BEFORE it
+        // builds the handlers (app/logger.py:107-108 vs :120), so what reaches the
+        // in-memory deque — and therefore /internal/logs — is
+        //
+        //     2026-... - ESC[1mESC[31m[ERROR]ESC[0m !!! Exception during processing !!! ...
+        //
+        // Measured on ComfyUI 0.34.0 by driving its own app/logger.py, NOT by
+        // reconstructing the format from its description — that reconstruction is
+        // exactly how #2347 shipped two anchors that could never fire.
+        //
+        // ANSI is stripped. The `[LEVEL]` tag deliberately is NOT: discarding it
+        // would disarm the `[ERROR]`/`[EXCEPTION]` clause below, which is the only
+        // cover for the Manager and file-handler shapes. The anchors tolerate the
+        // tag instead of the body losing it.
+        const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+        const bodyOf = (line: string): string => stripAnsi(line.replace(/^\S+ - /, ""));
+
+        // The tag is `[` + record.levelname + `]`, so it is one of Python's level
+        // names plus DETAIL, which ComfyUI adds (comfy/internal_logging.py). Spelled
+        // once: four copies of this alternation is four places for it to drift.
+        const LEVEL = String.raw`(?:\[(?:CRITICAL|ERROR|EXCEPTION|WARNING|INFO|DETAIL|DEBUG)\]\s*)?`;
+
+        // A traceback's last line is `Name: message` — or, when the exception was
+        // raised with no argument, just `Name`. #2347 required the colon, so a real
+        // KeyboardInterrupt and a bare `raise RuntimeError` (rows D and E of #2355,
+        // both measured against the live formatter) produced a group whose exception
+        // was never named. Accepting `:` OR end-of-line takes those without matching
+        // prose like "Exit code 0". Case-sensitive, as before, so that it cannot fire
+        // on "0 errors found".
+        const EXCEPTION_TAIL = new RegExp(
+          `^${LEVEL}[A-Za-z0-9_.]*(?:Error|Exception|Interrupt|Exit)\\s*(?::|$)`,
+        );
+
+        // What stock ComfyUI actually emits. #2329 keyed on `[ERROR]`/`[EXCEPTION]`,
+        // which its in-memory handler never writes — app/logger.py formats the memory
+        // handler with ColoredFormatter("%(message)s"), message only. The bracketed
+        // forms come from ComfyUI-Manager printing its own prefix, which is why a live
+        // test appeared to pass: it was reading Manager lines, not ComfyUI ones.
+        //
+        // The consequence was worse than the blob it replaced: execution.py's
+        // "!!! Exception during processing !!!", the traceback that follows it, and
+        // "Got an OOM, unloading all loaded models." were all invisible, so a crashed
+        // render reported byte-identically to a healthy server in the diagnostic users
+        // paste into bug reports.
+        //
+        // #2355 — the body reaching these begins `[ERROR] !!! Exception...`, not
+        // `!!! Exception...`, so the two anchored patterns take the optional tag.
+        // WARNING is what makes this reachable rather than cosmetic: a custom-node
+        // import failure is logged at WARNING (nodes.py:2335-2336), and the
+        // `[ERROR]` clause below gives that no cover at all.
+        const ERROR_HEADERS: readonly RegExp[] = [
+          new RegExp(`^${LEVEL}!!!\\s*Exception during processing`, "i"), // execution.py:637
+          new RegExp(`^${LEVEL}Traceback\\s*\\(`, "i"),                     // a Python traceback header
+          /\[ERROR\]|\[EXCEPTION\]/i,               // ComfyUI-Manager / file handler
+        ];
+        const ERROR_SIGNALS: readonly RegExp[] = [
+          ...ERROR_HEADERS,
+          EXCEPTION_TAIL,                           // a bare exception tail
+          /\bGot an OOM\b/i,                        // model_management OOM notice
+          /\bAllocation on device\b/i,              // torch allocator OOM
+          /\bCUDA out of memory\b/i,
+          /\b(ERROR|EXCEPTION)\s*:/,                // an explicit level prefix
+        ];
+        const isHeader = (body: string): boolean => ERROR_HEADERS.some((re) => re.test(body));
+        const isSignal = (body: string): boolean => ERROR_SIGNALS.some((re) => re.test(body));
+
+        const allLines = text.split("\n");
+        const bodies = allLines.map(bodyOf);
+        const errorGroups: string[][] = [];
+        const processed = new Set<number>();
+
+        for (let i = 0; i < allLines.length; i++) {
+          if (processed.has(i) || !isSignal(bodies[i])) continue;
+
+          // Walk BACKWARDS to the header this line belongs to. #2329 only extended
+          // forwards, so matching an exception TAIL ("RuntimeError: ...") dropped every
+          // frame above it and the "!!! Exception during processing !!!" header with
+          // them — the caller saw the exception name and nothing that located it.
+          let first = i;
+          if (!isHeader(bodies[i])) {
+            for (let j = i - 1; j >= 0 && i - j <= 200; j--) {
+              if (processed.has(j)) break;
+              const b = bodies[j];
+              if (isHeader(b)) { first = j; break; }
+              // Frames are indented; anything else ends the traceback above us.
+              if (!/^[ \t]/.test(b) && b.trim() !== "") break;
+            }
+          }
+
+          const group: string[] = [];
+          for (let k = first; k <= i; k++) { group.push(allLines[k]); processed.add(k); }
+
+          // Then forwards through the frames and the exception tail below.
+          for (let j = i + 1; j < allLines.length; j++) {
+            const b = bodies[j];
+            if (isHeader(b)) break;
+            if (/^[ \t]/.test(b) || b.trim() === "") { group.push(allLines[j]); processed.add(j); continue; }
+            // A bare exception tail closes the traceback it belongs to; take it and
+            // stop. The SAME regex as the signal list — a second copy of it is how
+            // the two drift apart and the tail silently stops being taken.
+            if (EXCEPTION_TAIL.test(b)) {
+              group.push(allLines[j]); processed.add(j);
+            }
+            break;
+          }
+          errorGroups.push(group);
+        }
+        // Take the last N error groups, then flatten them into lines for scrubbing
+        const recentErrorGroups = errorGroups.slice(-recentErrors);
+        const errorLines = recentErrorGroups.flat();
+        // #2355 — strip ANSI on the way OUT too. These lines land in a diagnostic
+        // the user pastes into a bug report, where raw escape bytes are noise, and
+        // they would otherwise be what scrubSecretShapedText reasons about.
+        const errLines = scrubLogLines(errorLines.map(stripAnsi));
+        if (errLines.length > 0) {
+          lines.push(`\n**Recent errors** (last ${errLines.length}):`);
+          for (const e of errLines) lines.push(`  ${e.trim()}`);
+        } else {
+          lines.push(`\n**Recent errors**: none in /internal/logs`);
+        }
       }
+    } catch {
+      // Logs endpoint unavailable — silent.
     }
-  } catch {
-    // Logs endpoint unavailable — silent.
   }
 
   return lines.join("\n");

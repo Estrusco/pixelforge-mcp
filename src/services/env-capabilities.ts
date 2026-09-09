@@ -15,12 +15,24 @@
 //     is unit-tested and omits unknown fields cleanly.
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { platform, release, totalmem, cpus } from "node:os";
-import { join } from "node:path";
 import { isForceRemoteFlagSet } from "../config.js";
+import { resolveComfyuiPython, pythonVersionsAgree, torchVersionsAgree } from "./workspace-env.js";
+import { resolveLiveInterpreter } from "./live-interpreter.js";
+import { parsePyproject } from "./node-authoring.js";
+import { compareSemver, detectInstallMode } from "./self-update.js";
+import { logger } from "../utils/logger.js";
+import { parseKitchenLog } from "./kitchen.js";
+
+// The interpreter resolver lives in workspace-env (which owns ComfyUI-base
+// resolution) so the environment read and this panel probe share ONE live-first
+// implementation and can never disagree (#401 / PR #433). Re-export for
+// back-compat with existing importers/tests.
+export { resolveComfyuiPython };
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,13 +59,38 @@ export interface EnvCapabilities {
   manager?: "v4" | "legacy" | "unknown";
   triton?: TriState;
   sageattention?: TriState;
-  backend?: "Claude" | "Codex" | "Gemini"; // active provider (human label)
+  backend?: string; // active provider (human label, e.g. "Claude" / "Grok" / "unknown")
   otherBackendAvailable?: boolean; // is the OTHER provider resolvable?
-  mcpVersion?: string; // comfyui-mcp package version, e.g. "0.48.4"
+  /**
+   * The comfyui-mcp version this process is actually RUNNING, e.g. "0.48.4" — read
+   * from the package.json beside the `dist/` these modules were loaded from, at
+   * MODULE LOAD (the closest observable moment to "the build that was loaded"; the
+   * caller supplies it, see MCP_VERSION_RUNNING). A running process cannot hot-swap
+   * its own code, so this stays true for its whole life; `mcpVersionInstalled` is
+   * the one that moves.
+   */
+  mcpVersion?: string;
+  /**
+   * The comfyui-mcp version installed ON DISK right now, re-read at each refresh.
+   *
+   * #846: only `mcpVersion` was ever carried, so the ENV line reported a version
+   * captured once at orchestrator startup as though it were still the current state
+   * of the machine. After an in-place upgrade the two diverge, and BOTH readings are
+   * separately true — the process really is running the old build, and the newer one
+   * really is installed. Reporting either alone is what misleads: a bug filed from
+   * that session gets version-pinned to a build nobody is running, and triage chases
+   * it against the wrong code.
+   *
+   * Carried so the line can DISCLOSE the drift instead of picking a side. Equal to
+   * `mcpVersion` in the ordinary case, where nothing is rendered.
+   */
+  mcpVersionInstalled?: string;
   panelVersion?: string; // sidebar panel version from the panel's hello, e.g. "0.11.3" / "nightly"
+  /** Compact kitchen line, omitted when the log/probe did not establish presence. */
+  kitchen?: string;
 }
 
-// Shape of the bits of /system_stats we read (mirrors get_environment).
+// Shape of the bits of /system_stats we read (mirrors the environment read).
 interface SystemStatsLike {
   system?: {
     os?: string;
@@ -62,6 +99,8 @@ interface SystemStatsLike {
     // Newer ComfyUI reports these; tolerated when absent.
     pytorch_version?: string;
     argv?: string[];
+    cwd?: string;
+    embedded_python?: boolean;
   };
   devices?: Array<{
     name?: string;
@@ -83,6 +122,9 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined>
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race<T | undefined>([
+      // unknown-ok: undefined IS the unknown value for this helper by design — the
+      // timeout branch below resolves to exactly the same thing, and every caller
+      // treats it as "this probe did not answer".
       p.catch(() => undefined),
       new Promise<undefined>((resolve) => {
         timer = setTimeout(() => resolve(undefined), ms);
@@ -174,6 +216,28 @@ async function probeManagerGeneration(
 /** Is the COMFYUI_URL host loopback? → LOCAL, else REMOTE. Unknown URL → LOCAL
  *  (the panel's overwhelming default; never block on an unparseable URL).
  *  --force-remote overrides this, keeping it in sync with isRemoteMode(). */
+/** The host of a ComfyUI base URL, or undefined. */
+function hostFromUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The TCP port of a ComfyUI base URL (defaulting by scheme), or undefined. */
+function portFromUrl(url: string | undefined): number | undefined {
+  if (!url) return undefined;
+  try {
+    const u = new URL(url);
+    if (u.port) return Number(u.port);
+    return u.protocol === "https:" ? 443 : 80;
+  } catch {
+    return undefined;
+  }
+}
+
 function classifyLocation(url: string | undefined): "LOCAL" | "REMOTE" {
   if (!url) return "LOCAL";
   if (isForceRemoteFlagSet()) return "REMOTE";
@@ -189,7 +253,7 @@ function classifyLocation(url: string | undefined): "LOCAL" | "REMOTE" {
 }
 
 // ---------------------------------------------------------------------------
-// /system_stats fetch (direct HTTP — no client dependency, mirrors get_environment)
+// /system_stats fetch (direct HTTP — no client dependency, mirrors the environment read)
 // ---------------------------------------------------------------------------
 
 async function fetchSystemStats(
@@ -269,13 +333,13 @@ async function fetchSystemStatsWithRetry(
 async function detectAttentionFromComfyLog(
   comfyuiUrl: string,
   timeoutMs: number,
-): Promise<{ triton?: TriState; sageattention?: TriState }> {
+): Promise<{ triton?: TriState; sageattention?: TriState; kitchen?: string }> {
   const base = comfyuiUrl.replace(/\/+$/, "");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
   try {
-    const res = await fetch(`${base}/internal/logs`, { signal: controller.signal });
+    const res = await comfyuiFetch(`${base}/internal/logs`, { signal: controller.signal });
     if (!res.ok) return {};
     const data = (await res.json()) as unknown;
     // /internal/logs returns { entries: [{ t, m }] } (m = message) on recent
@@ -288,10 +352,12 @@ async function detectAttentionFromComfyLog(
       : typeof data === "string"
         ? data
         : JSON.stringify(data);
-    const out: { triton?: TriState; sageattention?: TriState } = {};
+    const out: { triton?: TriState; sageattention?: TriState; kitchen?: string } = {};
     if (/Using sage attention/i.test(text)) out.sageattention = "installed";
     if (/Enabling comfy-kitchen triton backend|Found triton \d/i.test(text))
       out.triton = "installed";
+    const kitchenLog = parseKitchenLog(text);
+    if (kitchenLog.version.status === "known") out.kitchen = `Kitchen: ${kitchenLog.version.value}`;
     return out;
   } catch {
     return {};
@@ -305,60 +371,41 @@ async function detectAttentionFromComfyLog(
 // ---------------------------------------------------------------------------
 
 /**
- * Locate the python that ComfyUI actually runs on, the way the
- * triton-sageattention skill describes: prefer the standalone-env / python_embeded
- * / .venv interpreter under COMFYUI_PATH (or the install root inferred from the
- * running server's argv main.py), then fall back to PATH python. Returns the
- * first candidate that exists on disk, or a PATH name as a last resort.
+ * Back-compat shim: returns just the interpreter path (LIVE-first resolution lives
+ * in workspace-env.resolveComfyuiPython). Prefer resolveComfyuiPython when the caller
+ * needs to know whether the interpreter is the LIVE server's own (issue #401).
  */
 export function findComfyuiPython(
   comfyuiPath: string | undefined,
   statsArgv: string[] | undefined,
 ): string | undefined {
-  const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
-  const roots: string[] = [];
-  if (comfyuiPath) roots.push(comfyuiPath);
-  // Infer the install root from the running server's argv (…/main.py).
-  if (Array.isArray(statsArgv)) {
-    const mainPy = statsArgv.find((a) => typeof a === "string" && /main\.py$/i.test(a));
-    if (mainPy) {
-      const root = mainPy.replace(/[\\/]+main\.py$/i, "");
-      if (root && !roots.includes(root)) roots.push(root);
-    }
-  }
-
-  const candidates: string[] = [];
-  for (const root of roots) {
-    if (IS_WIN) {
-      candidates.push(join(root, "standalone-env", "python.exe"));
-      candidates.push(join(root, "python_embeded", "python.exe"));
-      candidates.push(join(root, ".venv", "Scripts", "python.exe"));
-      candidates.push(join(root, "venv", "Scripts", "python.exe"));
-      // Desktop app keeps the embedded python a level up beside the install.
-      candidates.push(join(root, "..", "python_embeded", "python.exe"));
-    } else {
-      candidates.push(join(root, ".venv", "bin", "python3"));
-      candidates.push(join(root, ".venv", "bin", "python"));
-      candidates.push(join(root, "venv", "bin", "python3"));
-      candidates.push(join(root, "venv", "bin", "python"));
-    }
-  }
-
-  for (const c of candidates) {
-    // Skip UNC / network roots (\\server\share) — a dead/slow network path makes
-    // existsSync() block for seconds and we gather env at startup. Local drive
-    // paths are instant. (Linux/Mac UNC isn't a thing; this is the Windows risk.)
-    if (/^\\\\/.test(c)) continue;
-    try {
-      if (existsSync(c)) return c;
-    } catch {
-      // ignore and continue
-    }
-  }
-  // Last resort: a PATH-resolved interpreter (may not be ComfyUI's, but better
-  // than nothing for the import probe).
-  return names[0];
+  return resolveComfyuiPython(comfyuiPath, statsArgv).python;
 }
+
+/**
+ * The exact python source the capability probe runs. Exported so a test can assert
+ * on the SOURCE: the guarantee that matters most here is a NEGATIVE one — that we
+ * never import torch inside a 5s budget — and no behavioural assertion can notice a
+ * future edit that quietly puts the import back.
+ */
+export const TRITON_PROBE_SOURCE = [
+  "import importlib.util as u, sys",
+  "print('python', ' '.join(sys.version.split()))",
+  "print('triton', u.find_spec('triton') is not None)",
+  "print('sageattention', u.find_spec('sageattention') is not None)",
+  "ts = u.find_spec('torch')",
+  "print('torch', ts is not None)",
+  "tv = ''",
+  "if ts is not None:",
+  "    try:",
+  "        import importlib.metadata as md",
+  "        tv = md.version('torch')",
+  "    except Exception:",
+  // torch present but with no dist-info (a hand-copied tree). "installed" still
+  // stands; only the version comparison is skipped.
+  "        tv = ''",
+  "print('torch_version', tv)",
+].join("\n");
 
 /**
  * Probe whether triton + sageattention are importable in the ComfyUI python.
@@ -370,22 +417,48 @@ export function findComfyuiPython(
 export function probeTritonSage(
   pythonExe: string | undefined,
   timeoutMs = 5000,
-): Promise<{ triton: TriState; sageattention: TriState }> {
+): Promise<{
+  triton: TriState;
+  sageattention: TriState;
+  torch: TriState;
+  torchVersion?: string;
+  pythonVersion?: string;
+}> {
   return new Promise((resolve) => {
     if (!pythonExe) {
-      resolve({ triton: "unknown", sageattention: "unknown" });
+      resolve({ triton: "unknown", sageattention: "unknown", torch: "unknown" });
       return;
     }
     // Print a clear per-package marker so we can tell which imported, even if one
-    // succeeds and the other fails (avoids an all-or-nothing answer).
-    const code =
-      "import importlib.util as u;" +
-      "print('triton', u.find_spec('triton') is not None);" +
-      "print('sageattention', u.find_spec('sageattention') is not None)";
+    // succeeds and the other fails (avoids an all-or-nothing answer). Also print
+    // the interpreter's own major.minor so the caller can confirm we probed the
+    // SAME python the running ComfyUI reports (#401 — a mismatch means we're
+    // looking at the wrong environment and any negative is untrustworthy).
+    // Print the FULL `sys.version` banner (single line) — the same string
+    // /system_stats reports — so the caller can spot a build/compiler disagreement,
+    // not just a major.minor one (#401 review).
+    // torch is the 0.52.1 discriminator: a venv and its Homebrew/uv base share a
+    // python banner, but only the venv has the torch /system_stats reports.
+    //
+    // The version comes from DIST METADATA, never `import torch`. Importing torch
+    // initializes CUDA/MPS and loads a stack of native libraries: measured at 1.89s
+    // warm on a local NVMe RTX box, i.e. 38% of this probe's entire 5s budget, and
+    // multiples of that cold or on a network-mounted venv. Blowing the budget is not
+    // a partial loss — CPython block-buffers stdout when it is a pipe, so the kill
+    // discards the triton/sageattention lines that had ALREADY been computed, and
+    // the caller's `if (!out.trim())` branch reports everything as "unknown". That
+    // would degrade a working `Triton: installed` to unknown on exactly the
+    // heavy-CUDA machines #401 is about. `importlib.metadata.version` returns the
+    // identical string ("2.10.0+cu130" both ways, measured) for 43ms.
+    //
+    // Written with real newlines because the metadata lookup needs a try/except,
+    // which has no inline form. `-u` keeps stdout unbuffered so that if the child
+    // is killed anyway, the lines printed before the kill still reach us.
+    const code = TRITON_PROBE_SOURCE;
     let done = false;
     const child = execFile(
       pythonExe,
-      ["-c", code],
+      ["-u", "-c", code],
       { timeout: timeoutMs, windowsHide: true },
       (err, stdout) => {
         if (done) return;
@@ -393,7 +466,7 @@ export function probeTritonSage(
         // Spawn failure (ENOENT) or non-import error with no output → unknown.
         const out = (stdout || "").toString();
         if (!out.trim()) {
-          resolve({ triton: "unknown", sageattention: "unknown" });
+          resolve({ triton: "unknown", sageattention: "unknown", torch: "unknown" });
           return;
         }
         const read = (name: string): TriState => {
@@ -401,18 +474,163 @@ export function probeTritonSage(
           if (!m) return "unknown";
           return m[1] === "True" ? "installed" : "not-installed";
         };
+        const pyMatch = out.match(/^python\s+(.+)$/m);
+        const torchVer = out.match(/^torch_version\s+(\S+)/m)?.[1];
         // If python ran but errored AFTER printing partial output, still trust
         // whatever lines we got; missing lines stay "unknown".
         void err;
-        resolve({ triton: read("triton"), sageattention: read("sageattention") });
+        resolve({
+          triton: read("triton"),
+          sageattention: read("sageattention"),
+          torch: read("torch"),
+          torchVersion: torchVer || undefined,
+          pythonVersion: pyMatch ? pyMatch[1].trim() : undefined,
+        });
       },
     );
     child.on?.("error", () => {
       if (done) return;
       done = true;
-      resolve({ triton: "unknown", sageattention: "unknown" });
+      resolve({ triton: "unknown", sageattention: "unknown", torch: "unknown" });
     });
   });
+}
+
+/**
+ * Packages the RUNNING server's own launch flags PROVE are importable in whatever
+ * environment it is actually using (#401 recurrence, 0.49.4).
+ *
+ * This is an observation, not an inference. ComfyUI does not merely *prefer* these
+ * backends — it calls `exit(-1)` during startup when the flag is given and the module
+ * cannot be imported (`comfy/ldm/modules/attention.py`: "To use the
+ * `--use-sage-attention` feature, the `sageattention` package must be installed
+ * first."). So a server that is UP, answering `/system_stats`, and reporting the flag in
+ * its OWN `sys.argv` has already demonstrated the import succeeded. `argv` here is the
+ * server's self-report, which is exactly the right question — "what is the process that
+ * answered me running with?" — not a layout guess.
+ *
+ * Only flags with that hard fail-fast contract belong here. A flag that merely enables an
+ * optional path would make this fabricate a positive.
+ */
+const ARGV_PROVEN_PACKAGES: ReadonlyArray<{
+  pkg: "triton" | "sageattention";
+  flag: string;
+}> = [{ pkg: "sageattention", flag: "--use-sage-attention" }];
+
+/**
+ * Which of the packages we report are proven present by the running server's argv.
+ *
+ * EXACT token match only — the RAW argv string, not a trimmed or lower-cased version of
+ * it. `sys.argv` is what argparse itself parsed: `" --use-sage-attention "` and
+ * `"--USE-SAGE-ATTENTION"` are tokens ComfyUI did NOT recognise as the flag, so the
+ * server did not enable the backend and nothing was proven. Normalising them here would
+ * manufacture the positive out of a token that had no effect.
+ *
+ * Earlier versions also split on `=` to accept `--flag=value`; that spelling cannot occur
+ * for an argparse `store_true` flag, so the leniency bought nothing and only widened what
+ * could be mistaken for the flag. This function's whole job is to assert a POSITIVE, and
+ * a fabricated positive reads to an agent as "the acceleration is there" — the exact
+ * false report in the other direction from the one #401 is about.
+ */
+export function packagesProvenByServerArgv(
+  argv: string[] | undefined,
+): Set<"triton" | "sageattention"> {
+  const proven = new Set<"triton" | "sageattention">();
+  if (!Array.isArray(argv)) return proven;
+  const tokens = argv.filter((t): t is string => typeof t === "string");
+  for (const { pkg, flag } of ARGV_PROVEN_PACKAGES) {
+    if (tokens.includes(flag)) proven.add(pkg);
+  }
+  return proven;
+}
+
+/**
+ * Did the interpreter we probed CONTRADICT something the running server proved?
+ *
+ * Returns the name of the first contradicted package, or undefined. A contradiction is
+ * decisive evidence about the SOURCE, not just about that one datum: an interpreter that
+ * reports "sageattention is absent" for a server that could not have started without
+ * sageattention is provably not the environment the server imports from, so every
+ * negative it produced is worthless — including the ones nothing happens to contradict.
+ *
+ * This is the hole the 0.49.4 recurrence fell through. The previous guard cross-checked
+ * the probe's python version against `/system_stats`, but a venv reports the SAME
+ * `sys.version` as the base interpreter it was created from — by construction. So the
+ * version check can never separate a venv from its base, which is precisely the confusion
+ * that produces a wrong-environment probe, and "versions agree" was read as corroboration
+ * when it carried no information at all.
+ */
+export function contradictedPackage(
+  probe:
+    | {
+        triton: TriState;
+        sageattention: TriState;
+        torch?: TriState;
+        torchVersion?: string;
+      }
+    | undefined,
+  proven: Set<"triton" | "sageattention">,
+  serverTorch?: string,
+): "triton" | "sageattention" | "torch" | undefined {
+  if (!probe) return undefined;
+  for (const pkg of proven) {
+    if (probe[pkg] === "not-installed") return pkg;
+  }
+  // /system_stats.pytorch_version is what the RUNNING server imported. A probe
+  // that finds no torch — or a different build — is looking at the base
+  // interpreter, not the venv. Python versions agree in that case by
+  // construction, so this is the discriminator the version check cannot be
+  // (#401 recurrence, 0.52.1). An honest "unknown" (we could not ask) is not
+  // a contradiction.
+  const reported = serverTorch?.trim();
+  if (reported) {
+    if (probe.torch === "not-installed") return "torch";
+    if (probe.torchVersion && !torchVersionsAgree(probe.torchVersion, reported)) return "torch";
+  }
+  return undefined;
+}
+
+/**
+ * Reconcile a raw import-probe tri-state against how much we trust the interpreter
+ * we probed (#401). A definitive "not-installed" is only believable when we probed
+ * ComfyUI's OWN python — i.e. the LIVE interpreter resolved from the running server's
+ * argv root, whose major.minor also matches what /system_stats reports. When the
+ * interpreter is NOT the live one (a bare PATH fallback, or a different/persisted
+ * workspace) or its version disagrees with the running ComfyUI, we are looking at the
+ * wrong environment, so a "not-installed" is downgraded to "unknown" rather than
+ * emitted as a false negative that would make an agent disable working acceleration.
+ * Positives pass through unchanged (a positive can't be a harmful false negative).
+ */
+export function reconcileProbeState(
+  state: TriState | undefined,
+  opts: {
+    /** We OBSERVED which interpreter the server runs (we launched it, or the OS told
+     *  us) — see live-interpreter.ts. Layout inference does NOT count. */
+    observed: boolean;
+    runningPython?: string;
+    probePython?: string;
+  },
+): TriState {
+  const s = state ?? "unknown";
+  // Compares the FULL `sys.version` banner when both sides carry one (build date and
+  // compiler included), degrading to the dotted version at whatever precision both
+  // supply. A CONTRADICTION check only — cloned venvs report identical banners.
+  const versionMismatch = !!(
+    opts.runningPython &&
+    opts.probePython &&
+    !pythonVersionsAgree(opts.runningPython, opts.probePython)
+  );
+  // Only an OBSERVED interpreter may state a negative. Nothing inferred from install
+  // layout qualifies, however plausible: a sole .venv under the server's own root, a
+  // matching python, a matching torch build — all of those are satisfied by a sibling
+  // environment that is not the one ComfyUI is running, and a wrong guess is exactly
+  // what produced the false "Triton: not installed" that made an agent strip working
+  // acceleration (#401). Everything else degrades to "unknown".
+  //
+  // The asymmetry is deliberate: positives ALWAYS pass through. A package we can see
+  // installed is really installed, whichever environment we happened to look at.
+  const trustworthy = opts.observed && !versionMismatch;
+  return s === "not-installed" && !trustworthy ? "unknown" : s;
 }
 
 // ---------------------------------------------------------------------------
@@ -431,11 +649,41 @@ function canResolve(specifier: string): boolean {
 }
 
 /**
+ * Human labels for every panel backend id (PANEL_AGENT_BACKEND / per-tab
+ * selection). The env block reports the ACTUAL active provider for the turn — an
+ * unrecognized id degrades to "unknown" rather than being silently mislabeled as
+ * "Claude" (#358: a Grok turn must NOT say "Backend: Claude"). Keep in sync with
+ * the BackendId union in orchestrator/agent-backend.ts.
+ */
+export const BACKEND_LABELS: Record<string, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  chatgpt: "ChatGPT",
+  gemini: "Gemini",
+  antigravity: "Antigravity",
+  pi: "Pi",
+  grok: "Grok",
+  glm: "GLM",
+  kimi: "Kimi",
+  moonshot: "Kimi K3 (Moonshot)",
+  minimax: "MiniMax",
+  atlascloud: "Atlas Cloud",
+  ollama: "Ollama",
+  openrouter: "OpenRouter",
+  copilot: "Copilot",
+  lmstudio: "LM Studio",
+  llamacpp: "llama.cpp",
+  custom: "Custom endpoint",
+};
+
+/**
  * Determine the active backend label and whether ANY other provider is available.
- * activeBackendId is "claude" | "codex" | "gemini" (from PANEL_AGENT_BACKEND).
+ * activeBackendId is a PANEL_AGENT_BACKEND / per-tab backend id (e.g. "claude",
+ * "codex", "gemini", "grok", "ollama"…). An unknown id resolves to "unknown" so
+ * the env block never reports a WRONG specific provider (#358).
  */
 export function resolveBackends(activeBackendId: string): {
-  backend: "Claude" | "Codex" | "Gemini";
+  backend: string;
   otherBackendAvailable: boolean;
 } {
   const id = activeBackendId.toLowerCase();
@@ -445,14 +693,17 @@ export function resolveBackends(activeBackendId: string): {
   // the cheap, synchronous signal we use here (a PATH-only CLI reads as absent).
   const codexAvailable = canResolve("@openai/codex");
   const geminiAvailable = canResolve("@google/gemini-cli");
-  const backend = id === "codex" ? "Codex" : id === "gemini" ? "Gemini" : "Claude";
-  // "Other available" = any provider other than the active one is resolvable.
+  // Own-property lookup ONLY — a plain-object index would resolve inherited keys
+  // like "constructor"/"__proto__" to prototype members (a function/object),
+  // wrongly labeling those ids instead of degrading to "unknown".
+  const backend = Object.hasOwn(BACKEND_LABELS, id) ? BACKEND_LABELS[id] : "unknown";
+  // "Other available" = one of the three SDK/CLI-resolvable providers OTHER than
+  // the active one is present. (A cheap synchronous signal; the full provider set
+  // is larger, but these three are the ones we can detect without I/O.)
   const otherBackendAvailable =
-    backend === "Claude"
-      ? codexAvailable || geminiAvailable
-      : backend === "Codex"
-        ? claudeAvailable || geminiAvailable
-        : claudeAvailable || codexAvailable;
+    (claudeAvailable && id !== "claude") ||
+    (codexAvailable && id !== "codex") ||
+    (geminiAvailable && id !== "gemini");
   return { backend, otherBackendAvailable };
 }
 
@@ -465,13 +716,121 @@ export interface GatherOptions {
   comfyuiPath?: string;
   /** "claude" | "codex" — the active PANEL_AGENT_BACKEND. */
   backendId?: string;
-  /** comfyui-mcp package version (caller supplies; kept out of this module). */
+  /** comfyui-mcp package version this process is RUNNING (caller supplies; kept out
+   *  of this module). */
   mcpVersion?: string;
+  /**
+   * Read the comfyui-mcp version currently INSTALLED on disk (#846). Injectable
+   * for tests; defaults to the live package read.
+   *
+   * This is GATHERED here rather than supplied by the caller, and that placement
+   * is the fix. `mcpVersion` is the caller's own build — a constant for the life
+   * of its process — so it is passed in. The installed version is a fact about the
+   * MACHINE that can change while we run, which makes it a probe like every other
+   * one in this module, refreshed on every gather by construction. The bug was a
+   * caller reading it ONCE at startup beside the version it was legitimately
+   * caching; there is now no place left to cache it by accident.
+   */
+  readInstalledMcpVersion?: () => string | undefined;
   /** Sidebar panel version, learned from the panel's `hello` frame. */
   panelVersion?: string;
+  /** Port the connected ComfyUI listens on — used to find the server PROCESS and read
+   *  the interpreter it is actually running (#401). Defaults to the port in
+   *  `comfyuiUrl`, which is the live target and may change at runtime. */
+  port?: number;
   /** Override probe timeouts (tests). */
   statsTimeoutMs?: number;
   tritonTimeoutMs?: number;
+}
+
+// The panel's known custom_nodes dir names (registry unpack vs repo name), kept
+// in sync with panel-installer's FAST_PATH_DIRS.
+//
+// Canonical Registry name FIRST (panel #1515). The order is no longer the thing
+// that decides the answer — `readInstalledPanelVersion` now picks the NEWEST of
+// the copies it finds — but it is still the tie-break when two copies carry
+// versions that cannot be compared, and the Registry install is the one the
+// installer manages.
+const PANEL_DIR_NAMES = ["comfyui-agent-panel", "comfyui-mcp-panel"] as const;
+// pyproject `[project].name` — the AUTHORITATIVE panel identity (a dir may be
+// squatted; the project name is not). Mirrors panel-installer's PANEL_REGISTRY_ID.
+const PANEL_PROJECT_NAME = "comfyui-agent-panel";
+
+/**
+ * Fallback panel version from DISK. The panel version normally rides the panel's
+ * `hello`, but a stale (browser-cached) panel — one loaded before the panel began
+ * advertising its version — omits it, leaving the agent's ENV line `panel=?` and
+ * bug reports unable to version-match the panel. Read the INSTALLED panel's
+ * version from its `pyproject.toml` under ComfyUI's custom_nodes.
+ *
+ * Parsing is delegated to the shipped `parsePyproject` (the same minimal reader
+ * that gates panel install/reinstall) so there is ONE pyproject convention, not
+ * two. We only accept a version whose `[project].name` is authoritatively the
+ * panel's — a non-panel pyproject squatting a known dir name yields undefined,
+ * never a wrong version. Best-effort: returns undefined on any failure, never
+ * throws.
+ *
+ * NEWEST WINS, NOT FIRST-LISTED (panel #1515).
+ *
+ * The pack can be installed TWICE — a git clone at `custom_nodes/comfyui-mcp-panel`
+ * alongside a Manager/Registry install at `custom_nodes/comfyui-agent-panel`. That
+ * is not hypothetical: it is the documented #1269 / #641 two-panels state, and
+ * panel-recovery's own PANEL_DIR_NAMES comment exists to stop this module's advice
+ * from manufacturing it. Both dirs carry the same authoritative `[project].name`,
+ * so the name screen passes for BOTH and the loop returned whichever the hardcoded
+ * list happened to name first.
+ *
+ * In panel #1515 that read `0.7.3` off an abandoned clone while the live pack was
+ * `0.15.24`, and stamped 0.7.3 onto the agent's ENVIRONMENT line — the surface bug
+ * reports version-match against. A list's order is not evidence about which copy
+ * ComfyUI serves, so it may not decide the answer.
+ *
+ * The tie-break is NEWEST, and it is the panel's own rule rather than a guess: the
+ * bundle guard added for #1269 arbitrates the page so the newer copy runs and the
+ * older stands down ("A stale copy must never win just because its directory sorts
+ * first" — web/js/lib/duplicate-panel-guard.js). Reporting the newest install
+ * therefore names the bundle the browser will actually run.
+ *
+ * Two versions that cannot be compared (compareSemver answers 0 for anything that
+ * is not `major.minor.patch`) keep the first-found copy, which is the pre-existing
+ * behaviour and PANEL_DIR_NAMES' remaining job.
+ */
+export function readInstalledPanelVersion(comfyuiPath?: string): string | undefined {
+  if (!comfyuiPath) return undefined;
+  let best: string | undefined;
+  for (const name of PANEL_DIR_NAMES) {
+    try {
+      const toml = readFileSync(
+        join(comfyuiPath, "custom_nodes", name, "pyproject.toml"),
+        "utf8",
+      );
+      const parsed = parsePyproject(toml);
+      if (parsed.projectName !== PANEL_PROJECT_NAME || !parsed.version) continue;
+      // Keep scanning after a hit: the FIRST readable copy is not evidence that
+      // it is the live one.
+      if (best === undefined || compareSemver(parsed.version, best) > 0) best = parsed.version;
+    } catch {
+      /* try the next known dir name */
+    }
+  }
+  return best;
+}
+
+/**
+ * The comfyui-mcp version INSTALLED on disk right now (#846) — undefined when it
+ * cannot be read.
+ *
+ * Distinct from the version the calling process is RUNNING, which cannot change
+ * while it runs (a Node process cannot hot-swap its own code) and is therefore
+ * passed in. After an in-place upgrade the two diverge, and reporting only the
+ * cached one described a moment that had passed.
+ */
+export function readInstalledMcpVersion(): string | undefined {
+  try {
+    return detectInstallMode().currentVersion ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCapabilities> {
@@ -479,7 +838,17 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
 
   // --- our own build versions (caller-supplied; panel version rides the hello) ---
   caps.mcpVersion = opts.mcpVersion;
-  caps.panelVersion = opts.panelVersion;
+  // Re-read EVERY gather (#846). Guarded: a failed read must leave the line saying
+  // nothing about drift, never invent a mismatch out of a missing reading.
+  try {
+    caps.mcpVersionInstalled = (opts.readInstalledMcpVersion ?? readInstalledMcpVersion)();
+  } catch {
+    caps.mcpVersionInstalled = undefined;
+  }
+  // Prefer the live hello's panel version; fall back to the INSTALLED panel's
+  // pyproject version so a stale (cached) panel that omits it from the hello
+  // still gets the agent's ENV line stamped (report_issue can version-match).
+  caps.panelVersion = opts.panelVersion ?? readInstalledPanelVersion(opts.comfyuiPath);
 
   // --- cheap, synchronous local machine facts (node os) ---
   caps.os = friendlyOs();
@@ -503,9 +872,24 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
     : undefined;
 
   let statsArgv: string[] | undefined;
+  let statsCwd: string | undefined;
+  let statsEmbedded: boolean | undefined;
+  // RAW sys.version banner — caps.python is truncated to major.minor for DISPLAY, so
+  // the contradiction check needs the untruncated string (#401 review).
+  let statsPythonRaw: string | undefined;
+  // RAW pytorch_version — caps.torch is cleaned for DISPLAY; contradiction needs
+  // the string the server actually reported (#401 recurrence, 0.52.1).
+  let statsTorchRaw: string | undefined;
   if (stats) {
     applyStats(caps, stats);
     statsArgv = stats.system?.argv;
+    statsCwd = stats.system?.cwd;
+    statsPythonRaw = stats.system?.python_version?.trim() || undefined;
+    statsTorchRaw = stats.system?.pytorch_version?.trim() || undefined;
+    statsEmbedded =
+      typeof stats.system?.embedded_python === "boolean"
+        ? stats.system.embedded_python
+        : undefined;
   }
 
   // --- ComfyUI-Manager API generation (v4 vs released 3.x) ---
@@ -516,12 +900,87 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
     ).then((m) => m ?? "unknown");
   }
 
-  // --- triton + sageattention (find python, import-probe, ~5s cap) ---
-  const python = findComfyuiPython(opts.comfyuiPath, statsArgv);
-  const tritonTimeout = opts.tritonTimeoutMs ?? 5000;
-  const ts = await withTimeout(probeTritonSage(python, tritonTimeout), tritonTimeout + 1000);
-  caps.triton = ts?.triton ?? "unknown";
-  caps.sageattention = ts?.sageattention ?? "unknown";
+  // --- triton + sageattention (resolve the LIVE python, import-probe, ~5s cap) ---
+  // In REMOTE mode the local python-import probe can't reach the server's host, and a
+  // coincident LOCAL path is NOT the remote interpreter — probing it risks BOTH a
+  // false negative and a false positive for the remote server. So skip the probe
+  // entirely and rely solely on the ComfyUI-log positive markers below (#401 round 3).
+  const remote = caps.location === "REMOTE";
+  let observed = false;
+  let ts: Awaited<ReturnType<typeof probeTritonSage>> | undefined;
+  if (!remote) {
+    // GROUND TRUTH first (we launched it / the OS says so); otherwise probe the layout
+    // GUESS, whose positives are still real but whose negatives can never stand.
+    const live = resolveLiveInterpreter({
+      port: opts.port ?? portFromUrl(opts.comfyuiUrl) ?? 8188,
+      host: hostFromUrl(opts.comfyuiUrl),
+      remote,
+      serverArgv: statsArgv,
+    });
+    observed = !!live;
+    const python =
+      live?.python ??
+      resolveComfyuiPython(opts.comfyuiPath, statsArgv, {
+        cwd: statsCwd,
+        remote,
+        embeddedPython: statsEmbedded,
+      }).python;
+    const tritonTimeout = opts.tritonTimeoutMs ?? 5000;
+    ts = await withTimeout(probeTritonSage(python, tritonTimeout), tritonTimeout + 1000);
+  }
+
+  // A definitive "not-installed" requires that we OBSERVED which interpreter the
+  // server runs (we launched it, or the OS told us) AND that it does not contradict
+  // the running instance's python. Everything else — a bare PATH fallback, a
+  // different workspace, a Desktop bundle whose layout we merely guessed at, or a
+  // REMOTE server we cannot observe at all — degrades to "unknown" rather than emit
+  // the false negative that made an agent disable working acceleration (#401).
+  // A positive ("installed") always passes through: it can't be a harmful false
+  // negative, and the log-marker check below only ever reinforces a positive.
+  //
+  // Before any of that: if the probe contradicts something the SERVER's own launch flags
+  // prove, the probe is looking at the wrong environment and every negative it produced
+  // is void — not just the contradicted one. That is the 0.49.4 recurrence exactly: a
+  // server running with --use-sage-attention (which it could not have started without)
+  // while the probed interpreter reported BOTH sageattention and triton absent. Voiding
+  // only sageattention would have left the false "Triton: not installed" standing, which
+  // is the finding that made an agent strip working acceleration in the first place.
+  // …and a contradiction discredits the SOURCE, so its POSITIVES go too. The
+  // pass-positives-through asymmetry is right for an interpreter that is merely
+  // UNOBSERVED — a package really is installed somewhere, and saying so is harmless.
+  // It is wrong once we have proof the interpreter is not the server's environment:
+  // "Triton: installed" read off the wrong venv tells an agent to enable triton kernels
+  // on a server that may not have them, which fails the render. That is the SAME false
+  // capability report as #401 with the sign flipped, and voiding one direction while
+  // keeping the other would be believing a witness we have just caught being wrong.
+  // The genuinely observed positives survive anyway: the argv-proven flag is re-applied
+  // immediately below, and the ComfyUI-log markers after it.
+  const provenByArgv = packagesProvenByServerArgv(statsArgv);
+  const contradicted = contradictedPackage(ts, provenByArgv, statsTorchRaw);
+  if (contradicted) {
+    logger.info(
+      "Discarding this interpreter's capability results entirely: it contradicts the running ComfyUI's own launch flags",
+      {
+        contradicted,
+        probePython: ts?.pythonVersion ?? "(unreported)",
+        runningPython: statsPythonRaw ?? "(unreported)",
+      },
+    );
+  }
+  const reconcile = (state: TriState | undefined): TriState =>
+    contradicted
+      ? "unknown"
+      : reconcileProbeState(state, {
+          observed,
+          runningPython: statsPythonRaw ?? caps.python,
+          probePython: ts?.pythonVersion,
+        });
+  caps.triton = reconcile(ts?.triton);
+  caps.sageattention = reconcile(ts?.sageattention);
+  // The launch flag is a stronger observation than any local import probe — it is the
+  // running process telling us what it loaded. Applied after reconcile so it can only
+  // ever raise a state to "installed", never lower one.
+  for (const pkg of provenByArgv) caps[pkg] = "installed";
 
   // A positive signal from the ComfyUI HOST's log wins over the local python probe:
   // in remote mode (pod) the probe can't reach the host, and even locally the log
@@ -535,6 +994,7 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
     );
     if (fromLog?.sageattention) caps.sageattention = fromLog.sageattention;
     if (fromLog?.triton) caps.triton = fromLog.triton;
+    if (fromLog?.kitchen) caps.kitchen = fromLog.kitchen;
   }
 
   return caps;
@@ -574,10 +1034,24 @@ export function applyStats(caps: EnvCapabilities, stats: SystemStatsLike): void 
 // formatEnvBlock — PURE: caps → compact single-line block (unit tested)
 // ---------------------------------------------------------------------------
 
+/**
+ * Render one capability tri-state for the banner.
+ *
+ * "unknown" USED to be omitted, which is where the whole three-state model was thrown
+ * away: an omitted Triton line and a Triton line that says "absent" are the same text to
+ * the reader, and the guidance sentence below tells the agent that absence means "default
+ * to sdpa + no torch.compile". So every careful degrade-to-unknown upstream landed on the
+ * agent as the false negative it was avoiding. "unknown" is now SAID, and said in a form
+ * that cannot be skimmed as a negative.
+ *
+ * `undefined` (the field was never populated at all) is still omitted — that is a
+ * different thing from a probe that ran and could not decide.
+ */
 function triLabel(state: TriState | undefined): string | undefined {
   if (state === "installed") return "installed";
   if (state === "not-installed") return "not installed";
-  return undefined; // unknown → omit
+  if (state === "unknown") return "UNKNOWN (probe could not verify — NOT a negative)";
+  return undefined;
 }
 
 /**
@@ -620,6 +1094,7 @@ export function formatEnvBlock(caps: EnvCapabilities): string {
   if (triton) parts.push(`Triton: ${triton}`);
   const sage = triLabel(caps.sageattention);
   if (sage) parts.push(`SageAttention: ${sage}`);
+  if (caps.kitchen) parts.push(caps.kitchen);
 
   if (caps.backend) {
     // With three providers the specific "other" isn't single-valued, so name them
@@ -630,8 +1105,22 @@ export function formatEnvBlock(caps: EnvCapabilities): string {
 
   // Our own build versions — so the agent can stamp them into bug reports without
   // digging (report-bug skill requires both).
+  //
+  // #846: the version named FIRST is the one this process is RUNNING, because that
+  // is the build whose behaviour the agent is about to describe in a bug report. An
+  // upgrade that landed while the orchestrator was up does not change that, and
+  // silently reporting the newer on-disk number instead would pin every issue to
+  // code nobody executed. So the drift is DISCLOSED, with the action that resolves
+  // it — a restart is the only thing that makes the two agree.
+  const upgradeClause =
+    caps.mcpVersion &&
+    caps.mcpVersionInstalled &&
+    caps.mcpVersionInstalled !== caps.mcpVersion
+      ? ` (this process is RUNNING ${caps.mcpVersion}; ${caps.mcpVersionInstalled} is now installed on disk` +
+        " — restart the orchestrator to load it, and report bugs against the RUNNING version)"
+      : "";
   const versions = [
-    caps.mcpVersion && `comfyui-mcp ${caps.mcpVersion}`,
+    caps.mcpVersion && `comfyui-mcp ${caps.mcpVersion}${upgradeClause}`,
     caps.panelVersion && `panel ${caps.panelVersion}`,
   ].filter(Boolean);
   if (versions.length) parts.push(versions.join(" · "));
@@ -641,8 +1130,12 @@ export function formatEnvBlock(caps: EnvCapabilities): string {
   const head = `ENVIRONMENT (live, this machine): ${parts.join(" · ")}.`;
   const guidance =
     " Use this for model/precision/VRAM choices, OS-correct install commands, and the" +
-    " acceleration decision — if Triton/SageAttention are absent, default to sdpa + no" +
-    " torch.compile (see the triton-sageattention skill) and offer to install.";
+    " acceleration decision — default to sdpa + no torch.compile (see the" +
+    " triton-sageattention skill) and offer to install ONLY where this line says" +
+    " \"not installed\". \"UNKNOWN\" means the probe could not verify which interpreter the" +
+    " running ComfyUI uses; it is NOT a report of absence. Never disable Triton/" +
+    `SageAttention or edit a user's workflow on an UNKNOWN — call install_comfyui (action:"environment")` +
+    " (python_probe_reason says what could not be established) or ask the user first.";
   return head + guidance;
 }
 

@@ -1,8 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// #1204 — import the REAL progress type instead of restating a narrower one.
+// The local shape omitted `loss`, which `training-jobs.ts:1654` actually reads,
+// so six tests were passing a field their own annotation said could not exist.
+import type { TrainingProgress } from "../../services/ai-toolkit.js";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { itWithSymlinks } from "../helpers/platform.js";
+// The envelope `command` label these fakes must reproduce. Imported rather than
+// spelled: it is RETURN-SHAPE data whose value is frozen at the pre-0.50.0 tool
+// name (see TRAINER_COMMAND's note), and a literal here would read as a live
+// reference to a retired tool.
+import { TRAINER_COMMAND } from "../../services/ai-toolkit.js";
 
 // The registry is module-level state keyed off COMFYUI_MCP_TRAINING_DIR, so each
 // test gets a fresh module (vi.resetModules) pointed at a fresh temp dir. All
@@ -244,6 +253,67 @@ describe("startTrainingJob", () => {
     expect(done.result!.previewFile).toBe("loras-test-job.png");
   });
 
+  it("a failed CATALOG upsert does not fail a job whose LoRA was published (#796)", async () => {
+    // The LoRA copy lands BEFORE the catalog write, so a catalog that throws
+    // (a corrupt on-disk catalog it refuses to overwrite) is a disclosure on
+    // a completed job — never "output handoff failed" for a published model.
+    const d = deferred<{ code: number; tail: string }>();
+    const catalog = fakeCatalog();
+    catalog.upsert = () => {
+      throw new Error("Refusing to overwrite it — inspect or repair the file manually.");
+    };
+    const lorasDir = join(root, "loras");
+    const job = await startWith({
+      startTraining: (opts) => {
+        const outDir = join(opts.outputDir, "test_job");
+        mkdirSync(outDir, { recursive: true });
+        writeFileSync(join(outDir, "test_job.safetensors"), "weights");
+        setTimeout(() => d.resolve({ code: 0, tail: "" }), 5);
+        return fakeHandle(d);
+      },
+      lorasDir: () => lorasDir,
+      catalog,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const done = (await mod.getJob(job.id))!;
+    expect(done.status).toBe("completed");
+    expect(done.result!.loraPath).toBe(join(lorasDir, "test_job.safetensors"));
+    expect(existsSync(done.result!.loraPath)).toBe(true);
+    expect(done.result!.catalogId).toBeUndefined();
+    expect(done.result!.catalogError).toMatch(/Refusing to overwrite/);
+    expect(done.error).toBeUndefined();
+  });
+
+  it("a failed PREVIEW handoff is disclosed on the completed job, not dropped (#796)", async () => {
+    // setPreview can fail AFTER writing the preview file (it discloses exactly
+    // that). Silently logging it would report a completed job with neither
+    // previewFile nor error while the preview sits unreconciled.
+    const d = deferred<{ code: number; tail: string }>();
+    const catalog = fakeCatalog();
+    catalog.setPreview = () => {
+      throw new Error("The preview image was already written to /x.png, but recording it in the catalog FAILED");
+    };
+    const lorasDir = join(root, "loras");
+    const job = await startWith({
+      startTraining: (opts) => {
+        const outDir = join(opts.outputDir, "test_job");
+        mkdirSync(join(outDir, "samples"), { recursive: true });
+        writeFileSync(join(outDir, "test_job.safetensors"), "weights");
+        writeFileSync(join(outDir, "samples", "0001.png"), "sample");
+        setTimeout(() => d.resolve({ code: 0, tail: "" }), 5);
+        return fakeHandle(d);
+      },
+      lorasDir: () => lorasDir,
+      catalog,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const done = (await mod.getJob(job.id))!;
+    expect(done.status).toBe("completed");
+    expect(done.result!.catalogId).toBe("loras-test-job");
+    expect(done.result!.previewFile).toBeUndefined();
+    expect(done.result!.catalogError).toMatch(/preview:.*already written/);
+  });
+
   it("marks the job failed when the container exits non-zero", async () => {
     const d = deferred<{ code: number; tail: string }>();
     const job = await startWith({
@@ -311,7 +381,7 @@ describe("startTrainingJob", () => {
     vi.useFakeTimers();
     try {
       const d = deferred<{ code: number; tail: string }>();
-      let tick: ((p: { step?: number; totalSteps?: number; raw: string }) => void) | undefined;
+      let tick: ((p: TrainingProgress) => void) | undefined;
       const dataset = join(mod.datasetsRoot(), "dataset");
       mkdirSync(dataset, { recursive: true });
       makeImage(dataset, "img_00001.png");
@@ -360,7 +430,7 @@ describe("cancelJob", () => {
         startTraining: () => fakeHandle(d),
         stopTraining: async (name) => {
           stopped.push(name);
-          return { ok: true, command: "train_cancel", data: { stopped: name } };
+          return { ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } };
         },
         lorasDir: () => join(root, "loras"),
         catalog: fakeCatalog(),
@@ -369,7 +439,7 @@ describe("cancelJob", () => {
     const cancelled = await mod.cancelJob(job.id, {
       stopTraining: async (name) => {
         stopped.push(name);
-        return { ok: true, command: "train_cancel", data: { stopped: name } };
+        return { ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } };
       },
       containerRunning: async () => false,
     });
@@ -383,7 +453,7 @@ describe("cancelJob", () => {
 
   it("ignores progress ticks that arrive after a cancel (no resurrection)", async () => {
     const d = deferred<{ code: number; tail: string }>();
-    let tick: ((p: { step?: number; totalSteps?: number; raw: string }) => void) | undefined;
+    let tick: ((p: TrainingProgress) => void) | undefined;
     const dataset = join(mod.datasetsRoot(), "dataset");
     mkdirSync(dataset, { recursive: true });
     makeImage(dataset, "img_00001.png");
@@ -399,7 +469,7 @@ describe("cancelJob", () => {
       },
     );
     await mod.cancelJob(job.id, {
-      stopTraining: async (name) => ({ ok: true, command: "train_cancel", data: { stopped: name } }),
+      stopTraining: async (name) => ({ ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } }),
       containerRunning: async () => false,
     });
     // A late tqdm line flushes while docker stop is in flight — must be ignored.
@@ -414,7 +484,7 @@ describe("cancelJob", () => {
     vi.useFakeTimers();
     try {
       const d = deferred<{ code: number; tail: string }>();
-      let tick: ((p: { step?: number; totalSteps?: number; raw: string }) => void) | undefined;
+      let tick: ((p: TrainingProgress) => void) | undefined;
       const dataset = join(mod.datasetsRoot(), "dataset");
       mkdirSync(dataset, { recursive: true });
       makeImage(dataset, "img_00001.png");
@@ -457,7 +527,7 @@ describe("cancelJob", () => {
     vi.useFakeTimers();
     try {
       const d = deferred<{ code: number; tail: string }>();
-      let tick: ((p: { step?: number; totalSteps?: number; raw: string }) => void) | undefined;
+      let tick: ((p: TrainingProgress) => void) | undefined;
       const catalog = fakeCatalog();
       const lorasDir = join(root, "loras");
       const dataset = join(mod.datasetsRoot(), "dataset");
@@ -513,7 +583,7 @@ describe("cancelJob", () => {
       { startTraining: () => fakeHandle(d), lorasDir: () => join(root, "loras"), catalog: fakeCatalog() },
     );
     const after = await mod.cancelJob(job.id, {
-      stopTraining: async () => ({ ok: false, command: "train_cancel", error: { code: "stop_failed", message: "daemon unreachable" } }),
+      stopTraining: async () => ({ ok: false, command: TRAINER_COMMAND.cancel, error: { code: "stop_failed", message: "daemon unreachable" } }),
       containerRunning: async () => true,
     });
     expect(after.status).toBe("running");
@@ -576,7 +646,7 @@ describe("cancelJob", () => {
       stopTraining: async (name) => {
         stopped.push(name);
         alive = false;
-        return { ok: true, command: "train_cancel", data: { stopped: name } };
+        return { ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } };
       },
     });
     expect(stopped).toEqual(["comfyui-train-tzombie1"]);
@@ -585,7 +655,7 @@ describe("cancelJob", () => {
     // And when the retry ALSO fails, the job goes back to running (honest).
     const after2 = await mod.cancelJob("tzombie1", {
       containerRunning: async () => true,
-      stopTraining: async () => ({ ok: false, command: "train_cancel", error: { code: "stop_failed", message: "timeout" } }),
+      stopTraining: async () => ({ ok: false, command: TRAINER_COMMAND.cancel, error: { code: "stop_failed", message: "timeout" } }),
     });
     expect(after2.status).toBe("running");
     expect(after2.error).toContain("cancel retry failed");
@@ -610,7 +680,7 @@ describe("cancelJob", () => {
       containerRunning: async () => false,
       stopTraining: async (name) => {
         stops++;
-        return { ok: true, command: "train_cancel", data: { stopped: name } };
+        return { ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } };
       },
     });
     expect(after.status).toBe("cancelled");
@@ -636,7 +706,7 @@ describe("cancelJob", () => {
       containerRunning: async () => null, // daemon unreachable — can't tell
       stopTraining: async (name) => {
         stops++;
-        return { ok: false, command: "train_cancel", error: { code: "stop_failed", message: "daemon unreachable" } };
+        return { ok: false, command: TRAINER_COMMAND.cancel, error: { code: "stop_failed", message: "daemon unreachable" } };
       },
     });
     expect(stops).toBe(1); // stop attempted, not skipped on "unknown"
@@ -777,7 +847,7 @@ describe("independent review fixes (PR #237)", () => {
     return record;
   }
 
-  it("train_status NEVER hands off in the healthy-owner window (read-only)", async () => {
+  it("the status action NEVER hands off in the healthy-owner window (read-only)", async () => {
     // Container just exited; the OWNER PROCESS IS ALIVE (ppid here) and about
     // to run its own finalize. A status poll must NOT recover/hand off/persist
     // anything (independent review finding #1).
@@ -1051,7 +1121,7 @@ describe("independent review fixes (PR #237)", () => {
       containerRunning: async () => true,
       stopTraining: async (name: string) => {
         stops++;
-        return { ok: true, command: "train_cancel", data: { stopped: name } } as never;
+        return { ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } } as never;
       },
       lockBudgetMs: 300,
     };
@@ -1070,7 +1140,7 @@ describe("independent review fixes (PR #237)", () => {
       stopTraining: async (name: string) => {
         stops++;
         alive = false;
-        return { ok: true, command: "train_cancel", data: { stopped: name } } as never;
+        return { ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } } as never;
       },
     });
     expect(r3.status).toBe("cancelled");
@@ -1079,7 +1149,7 @@ describe("independent review fixes (PR #237)", () => {
 
   it("progress during a pending cancel does NOT reconcile memory back to running", async () => {
     const d = deferred<{ code: number; tail: string }>();
-    let tick: ((p: { step?: number; totalSteps?: number; raw: string }) => void) | undefined;
+    let tick: ((p: TrainingProgress) => void) | undefined;
     const dataset = join(mod.datasetsRoot(), "dataset");
     mkdirSync(dataset, { recursive: true });
     makeImage(dataset, "img_00001.png");
@@ -1155,7 +1225,7 @@ describe("independent review fixes (PR #237)", () => {
 
   it("a live snapshot never overwrites a terminal disk record", async () => {
     const d = deferred<{ code: number; tail: string }>();
-    let tick: ((p: { step?: number; totalSteps?: number; raw: string }) => void) | undefined;
+    let tick: ((p: TrainingProgress) => void) | undefined;
     const dataset = join(mod.datasetsRoot(), "dataset");
     mkdirSync(dataset, { recursive: true });
     makeImage(dataset, "img_00001.png");
@@ -1273,7 +1343,7 @@ describe("independent review fixes (PR #237)", () => {
       stopTraining: async (name) => {
         stopped.push(name);
         alive = false;
-        return { ok: true, command: "train_cancel", data: { stopped: name } };
+        return { ok: true, command: TRAINER_COMMAND.cancel, data: { stopped: name } };
       },
     });
     expect(stopped).toEqual([job.containerName]);
@@ -1533,7 +1603,7 @@ describe("pod target (P4)", () => {
 
   it("reconcileStaleTrainingJobs terminalizes a dead-owner pod job so it stops suppressing auto-stop (#263 money)", async () => {
     // A persisted running pod record whose owner pid is dead — the harness
-    // crashed mid-run. Nothing ever calls train_status; before the fix this
+    // crashed mid-run. Nothing ever polls the status action; before the fix this
     // record suppressed the pod idle auto-stop (and its billing) forever.
     mkdirSync(mod.jobsRoot(), { recursive: true });
     const jobDir = join(mod.jobsRoot(), "tpodgone1");
@@ -1609,7 +1679,7 @@ describe("pod target (P4)", () => {
       },
       stopTraining: async (name: string, remoteConfigPath?: string) => {
         stoppedWith.push(remoteConfigPath);
-        return { ok: true as const, command: "train_cancel" as const, data: { stopped: name } };
+        return { ok: true as const, command: TRAINER_COMMAND.cancel, data: { stopped: name } };
       },
     });
     // Cancel stuck — NOT reverted to running by the unrelated run.py.
@@ -1681,7 +1751,7 @@ describe("native local start (#275)", () => {
     const stopCalls: unknown[][] = [];
     const deps = {
       startNativeTraining: () => fakeHandle(d),
-      stopTraining: async (...a: unknown[]) => { stopCalls.push(a); return { ok: true, command: "train_cancel" }; },
+      stopTraining: async (...a: unknown[]) => { stopCalls.push(a); return { ok: true, command: TRAINER_COMMAND.cancel }; },
       containerRunning: async () => true,
       lorasDir: () => join(root, "loras"),
       catalog: fakeCatalog(),

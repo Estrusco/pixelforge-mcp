@@ -8,7 +8,8 @@ import {
 } from "node:fs";
 import { platform } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { config } from "../config.js";
+import { freshSecretValue } from "../env-file.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { ComfyUIError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -249,26 +250,51 @@ function toClassName(slug: string): string {
 }
 
 /**
- * Resolve the custom_nodes root, throwing a clear error in remote mode where
- * there is no local install path to write into.
+ * Resolve the custom_nodes root, throwing a clear error when there is no local
+ * install path to write into. Resolves the effective LOCAL ComfyUI base the same
+ * way every other filesystem-backed tool does (node-dev, node-verify): COMFYUI_PATH
+ * first, then the saved default workspace (set via workspace action:"set_default") when
+ * COMFYUI_PATH is unset and we are not targeting a remote ComfyUI. This is what
+ * install_comfyui (action:"environment") / workspace action:"get" already report, so scaffold/publish no longer
+ * reject a loopback session that has a saved default workspace as if it were remote
+ * (#506). Returns undefined only in remote mode or when no local install is known —
+ * then we refuse with a clear, actionable error.
+ *
+ * `resolvedBase` is the caller's ASYNC, live-aware scan-root resolution
+ * (`resolveCustomNodesScanBaseLive`, #1653/#1715/#2031) and is AUTHORITATIVE
+ * when given: that resolver already encodes the full precedence — the live
+ * server's `--base-directory` (where folder_paths scans custom_nodes/ from
+ * when the flag is set, #1715), else the live main.py checkout on a split
+ * install that has no `--base-directory` (the data workspace is not scanned
+ * unless the flag said so, #2031), then configuration. Re-preferring
+ * configuration here would resurrect either the Desktop split-root bug
+ * (scaffold under the code install root while the runtime loaded from its
+ * base directory) or the portable split-root bug (scaffold under the data
+ * workspace while the runtime loaded from the checkout). The sync
+ * configured-only resolution remains the fallback for callers that never
+ * resolved one.
  */
-function customNodesRoot(): string {
-  if (!config.comfyuiPath) {
+function customNodesRoot(resolvedBase?: string): string {
+  const base = resolvedBase ?? resolveEffectiveComfyUIBase();
+  if (!base) {
     throw new ValidationError(
-      "This operation needs a local ComfyUI install, but config.comfyuiPath is " +
-        "not set (running in remote --comfyui-url mode). Set COMFYUI_PATH to your " +
-        "local ComfyUI directory to scaffold or publish custom nodes.",
+      "This operation needs a local ComfyUI install, but none could be resolved: " +
+        "COMFYUI_PATH is unset, no default workspace is saved, and no running " +
+        "LOCAL ComfyUI could be adopted from the connected server (or this " +
+        "session targets a remote --comfyui-url instance). Set COMFYUI_PATH, " +
+        "save a default workspace (workspace action:\"set_default\"), or connect " +
+        "to a running local ComfyUI to scaffold or publish custom nodes.",
     );
   }
-  return join(config.comfyuiPath, "custom_nodes");
+  return join(base, "custom_nodes");
 }
 
 /**
  * Resolve and confirm a target pack directory is strictly inside custom_nodes/.
  * Defends against traversal even if validation upstream were bypassed.
  */
-function resolvePackDir(name: string): string {
-  const root = customNodesRoot();
+function resolvePackDir(name: string, resolvedBase?: string): string {
+  const root = customNodesRoot(resolvedBase);
   const dir = resolve(root, name);
   const rel = relative(root, dir);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel) || rel.includes(`..${sep}`)) {
@@ -442,12 +468,13 @@ jobs:
 }
 
 // ---------------------------------------------------------------------------
-// scaffold_custom_node
+// node_pack action:"scaffold"
 // ---------------------------------------------------------------------------
 
 export function scaffoldCustomNode(
   options: ScaffoldOptions,
   deps: AuthoringDeps = defaultDeps,
+  resolvedBase?: string,
 ): ScaffoldResult {
   const name = validatePackName(options.name);
   const displayName = (options.displayName ?? "").trim() || name;
@@ -460,7 +487,7 @@ export function scaffoldCustomNode(
   const withFrontend = options.withFrontend ?? false;
   const className = toClassName(name);
 
-  const packDir = resolvePackDir(name);
+  const packDir = resolvePackDir(name, resolvedBase);
 
   // Refuse to clobber an existing pack unless explicitly allowed.
   if (deps.isNonEmptyDir(packDir) && !options.overwrite) {
@@ -518,7 +545,7 @@ export function scaffoldCustomNode(
       (publisherId === "your-publisher-id"
         ? `Set [tool.comfy].PublisherId in pyproject.toml before publishing. `
         : ``) +
-      `Restart ComfyUI (restart_comfyui) to load it, then publish with publish_custom_node.`,
+      `Restart ComfyUI (restart_comfyui) to load it, then publish with node_pack (action:"publish").`,
   };
 }
 
@@ -574,7 +601,7 @@ export function parsePyproject(toml: string): ParsedPyproject {
 }
 
 // ---------------------------------------------------------------------------
-// publish_custom_node
+// node_pack action:"publish"
 // ---------------------------------------------------------------------------
 
 /** Parse a registry URL out of comfy-cli publish output, if present. */
@@ -586,6 +613,7 @@ export function extractRegistryUrl(output: string): string | undefined {
 export function publishCustomNode(
   options: PublishOptions,
   deps: AuthoringDeps = defaultDeps,
+  resolvedBase?: string,
 ): PublishResult {
   // Resolve the pack directory from either an explicit path or a name.
   let packDir: string;
@@ -597,7 +625,7 @@ export function publishCustomNode(
     // resolvePackDir, which fails clearly when there is no local install.
     packDir = resolve(options.path.trim());
   } else if (options.name && options.name.trim()) {
-    packDir = resolvePackDir(validatePackName(options.name));
+    packDir = resolvePackDir(validatePackName(options.name), resolvedBase);
   } else {
     throw new ValidationError(
       "Provide either `name` (a pack under custom_nodes/) or an explicit `path`.",
@@ -638,7 +666,10 @@ export function publishCustomNode(
   // Require the registry token. comfy-cli reads --token; we pass it via env so
   // it never lands in argv (which we log) — comfy-cli falls back to the
   // REGISTRY_ACCESS_TOKEN env var when --token is absent.
-  const token = process.env.REGISTRY_ACCESS_TOKEN;
+  // Access-time resolution against the canonical ~/.comfyui-mcp/.env (#826) so a
+  // token the panel saved after this process started is actually seen, instead of
+  // reporting "not set" forever against a token that is on disk.
+  const token = freshSecretValue("REGISTRY_ACCESS_TOKEN");
   if (!token || !token.trim()) {
     throw new ValidationError(
       "REGISTRY_ACCESS_TOKEN is not set. Create an API key at " +

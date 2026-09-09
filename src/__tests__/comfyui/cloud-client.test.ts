@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fakeFetch } from "../helpers/fake-fetch.js";
+import { MAX_PREVIEW_SOURCE_BYTES, MAX_VIEW_RESPONSE_BYTES } from "../../comfyui/bounded-response.js";
 
 // Stub config helpers BEFORE importing the module under test.
 vi.mock("../../config.js", async () => {
@@ -23,7 +25,9 @@ const {
   getSamplers,
   getSchedulers,
   interrupt,
+  uploadImageHttp,
 } = await import("../../comfyui/cloud-client.js");
+const { enqueuePrompt: dispatchEnqueuePrompt } = await import("../../comfyui/client.js");
 
 describe("cloud-client", () => {
   const originalFetch = global.fetch;
@@ -31,14 +35,13 @@ describe("cloud-client", () => {
 
   beforeEach(() => {
     calls = [];
-    global.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : (input as Request).url ?? String(input);
+    global.fetch = fakeFetch(async (url, init) => {
       calls.push({ url, init });
       return new Response("{}", {
         status: 200,
         headers: { "content-type": "application/json" },
       });
-    }) as unknown as typeof fetch;
+    });
   });
 
   afterEach(() => {
@@ -64,6 +67,16 @@ describe("cloud-client", () => {
     expect(body.extra_data).toEqual({ api_key_comfy_org: "x" });
   });
 
+  it("preserves partial execution targets for scoped cloud enqueues", async () => {
+    await dispatchEnqueuePrompt(
+      { "380": { class_type: "VHS_VideoCombine", inputs: {} } } as never,
+      undefined,
+      { partialExecutionTargets: ["10:15:380"] },
+    );
+    const body = JSON.parse((calls[0]?.init?.body as string) ?? "{}");
+    expect(body.partial_execution_targets).toEqual(["10:15:380"]);
+  });
+
   it("returns empty history (no global endpoint) when no prompt_id", async () => {
     const result = await getHistory();
     expect(result).toEqual({});
@@ -75,7 +88,7 @@ describe("cloud-client", () => {
       new Response(JSON.stringify({ outputs: { "9": { images: [] } } }), {
         status: 200,
       }),
-    ) as unknown as typeof fetch;
+    );
     const result = await getHistory("abc-123");
     expect(result["abc-123"]).toBeDefined();
     expect(result["abc-123"]).toMatchObject({ outputs: { "9": { images: [] } } });
@@ -114,7 +127,7 @@ describe("cloud-client", () => {
       new Response(JSON.stringify({ status: "in_progress", prompt_id: "x" }), {
         status: 200,
       }),
-    ) as unknown as typeof fetch;
+    );
     const s = await getJobStatus("x");
     expect(s.status).toBe("in_progress");
   });
@@ -126,18 +139,100 @@ describe("cloud-client", () => {
         status: 200,
         headers: { "content-type": "image/png" },
       }),
-    ) as unknown as typeof fetch;
+    );
     const r = await fetchImage("out.png");
     expect(r.mimeType).toBe("image/png");
     expect(r.base64).toBe(Buffer.from(bytes).toString("base64"));
   });
 
+  it("bounds a Cloud /api/view body before converting it to base64", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(MAX_VIEW_RESPONSE_BYTES + 1));
+        controller.close();
+      },
+    });
+    global.fetch = vi.fn(async () =>
+      new Response(body, { status: 200, headers: { "content-type": "image/png" } }),
+    );
+
+    await expect(fetchImage("oversized.png")).rejects.toMatchObject({
+      code: "VIEW_TOO_LARGE",
+      details: { filename: "oversized.png", maxBytes: MAX_VIEW_RESPONSE_BYTES },
+    });
+  });
+
+  it("accepts a 33 MB Cloud /api/view body when the preview-source cap is requested (#2785)", async () => {
+    const size = MAX_VIEW_RESPONSE_BYTES + 1;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(size));
+        controller.close();
+      },
+    });
+    global.fetch = vi.fn(async () =>
+      new Response(body, { status: 200, headers: { "content-type": "image/png" } }),
+    );
+
+    const r = await fetchImage("big.png", "output", "", { maxBytes: MAX_PREVIEW_SOURCE_BYTES });
+    expect(r.mimeType).toBe("image/png");
+    expect(Buffer.from(r.base64, "base64").length).toBe(size);
+  });
+
+  it("still refuses a body over the 64 MB preview-source hard cap (#2785)", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(MAX_PREVIEW_SOURCE_BYTES + 1));
+        controller.close();
+      },
+    });
+    global.fetch = vi.fn(async () =>
+      new Response(body, { status: 200, headers: { "content-type": "image/png" } }),
+    );
+
+    await expect(fetchImage("huge.png", "output", "", { maxBytes: 1024 ** 4 })).rejects.toMatchObject({
+      code: "VIEW_TOO_LARGE",
+      details: { filename: "huge.png", maxBytes: MAX_PREVIEW_SOURCE_BYTES },
+    });
+  });
+
   it("wraps non-2xx responses in a ComfyUIError with status code", async () => {
     global.fetch = vi.fn(async () =>
       new Response("forbidden", { status: 403, statusText: "Forbidden" }),
-    ) as unknown as typeof fetch;
+    );
     await expect(getHistory("abc")).rejects.toMatchObject({
       code: "CLOUD_API_ERROR",
     });
+  });
+
+  // #946 — the twin split: a path in `filename` is a subfolder request, sent
+  // as the form field the API has. The self-hosted client got this fix first;
+  // this twin kept the original defect (the whole path as the multipart
+  // filename) until the split was shared.
+  it("uploadImageHttp splits a path filename into the subfolder form field", async () => {
+    await uploadImageHttp("assets/clip.mp4", Buffer.from("x"), "video/mp4");
+    const form = calls.at(-1)?.init?.body as FormData;
+    expect(form.get("subfolder")).toBe("assets");
+    expect((form.get("image") as File).name).toBe("clip.mp4");
+  });
+
+  it("uploadImageHttp sends NO subfolder field for a plain filename", async () => {
+    await uploadImageHttp("clip.mp4", Buffer.from("x"), "video/mp4");
+    const form = calls.at(-1)?.init?.body as FormData;
+    expect(form.has("subfolder")).toBe(false);
+    expect((form.get("image") as File).name).toBe("clip.mp4");
+  });
+
+  it("can request a unique name instead of overwriting an existing input", async () => {
+    await uploadImageHttp("clip.mp4", Buffer.from("x"), "video/mp4", false);
+    const form = calls.at(-1)?.init?.body as FormData;
+    expect(form.get("overwrite")).toBe("false");
+  });
+
+  it("uploadImageHttp refuses a traversal before anything is sent", async () => {
+    await expect(uploadImageHttp("../escape.png", Buffer.from("x"))).rejects.toThrow(
+      /walks outside/,
+    );
+    expect(calls).toHaveLength(0);
   });
 });

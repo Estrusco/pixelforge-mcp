@@ -4,18 +4,31 @@
 
 The developer uses `npm link` so that `npx comfyui-mcp` resolves to the local build at `C:\Users\klutt\code\comfyui-mcp\dist\`.
 
-**DO NOT modify `plugin/.mcp.json`** to point to a local path. It must stay as:
+**DO NOT modify `plugin/.mcp.json`** to point to a local path. Since the 2026-09-09 upstream sync
+(upstream #1447) it must stay as:
 ```json
 {
-  "comfyui": {
-    "command": "npx",
-    "args": ["-y", "comfyui-mcp"]
+  "pixelforge": {
+    "command": "node",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch-server.mjs", "--full"],
+    "env": { "CIVITAI_API_TOKEN": "" }
   }
 }
 ```
-This works for both:
-- **Public users**: `npx` downloads from npm
-- **Developer**: `npm link` makes `npx` resolve to the local build
+`plugin/scripts/launch-server.mjs` replaced the bare `npx -y comfyui-mcp` command: a cold npx
+cache can download the whole dependency tree inside the MCP client's handshake timeout, killing
+the connection before anything is persisted (upstream issue #1447). The wrapper resolves in this
+order:
+- **Warm path**: a global install (`npm root -g`/`comfyui-mcp/dist/index.js`) — this is also what
+  `npm link` resolves to, so the developer workflow below is unaffected (and is now faster: no
+  `npx` shim indirection).
+- **Cold path** (first-run public users with no global install): falls back to the same
+  `npx -y comfyui-mcp` as before, but proxies the MCP handshake so a slow install can't time it
+  out — it answers `initialize` itself and hands over to the real server once it's up.
+
+The `"pixelforge"` key must match `plugin/.claude-plugin/plugin.json`'s `name` field — `plugin/hooks/hooks.json`'s
+matchers (`mcp__plugin_pixelforge_pixelforge__...`) depend on it. (This drifted to `"mcp"` for
+about a month, 2026-08-03 to 2026-09-09, silently breaking those hooks — fixed during the sync.)
 
 After code changes: `npm run build` then `/mcp` reconnect in Claude Code.
 

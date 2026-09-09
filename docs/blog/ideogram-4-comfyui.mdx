@@ -1,5 +1,5 @@
 ---
-title: "How to Run Ideogram 4 Locally in ComfyUI (2026 Guide)"
+title: "How to Run Ideogram 4 Locally in ComfyUI"
 description: "Run Ideogram 4 — the 9.3B open-weight text-to-image model — locally in ComfyUI. Install, VRAM tips, JSON area prompting, and flawless readable text."
 keywords:
   - Ideogram 4 ComfyUI
@@ -24,7 +24,7 @@ self-host today for **text-in-image and graphic-design layout**.
 Below: what it's genuinely best at (with receipts), how it stacks up against Flux
 / Qwen / Z-Image / ERNIE, the VRAM you need, and the fastest way to get it running
 — a one-command install with [comfyui-mcp](https://github.com/artokun/comfyui-mcp)
-and the [sidebar Panel](/panel), instead of hand-downloading ~50 GB of weights and
+and the [sidebar Panel](../panel), instead of hand-downloading ~50 GB of weights and
 hand-typing JSON coordinates.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `ideogram` pack
@@ -83,6 +83,21 @@ Where rivals win: photoreal portraits (Ideogram trails), raw speed and low VRAM
 output is flat pixels, not layers. Each of those models gets its own post in this
 series; Ideogram 4 earns the spotlight for **information-carrying images**.
 
+## Licensing
+
+**Ideogram 4 is open-weight but NOT open-source, and commercial use is not permitted
+without a separate license.** The model card declares
+`ideogram-non-commercial-model-agreement` — read that name literally.
+
+You can download the weights, run them locally, and experiment freely. You cannot
+ship the output in a commercial product, sell generations, or host it behind a paid
+service on these terms. Ideogram sells commercial licensing separately.
+
+This is the sharpest licensing difference in the model-highlight series. If your work
+is commercial and you want comparable text and layout quality, look at
+[ERNIE-Image](./ernie-image-comfyui) (Apache 2.0) or
+[Z-Image](./z-image-comfyui) (Apache 2.0) instead — both permit it outright.
+
 ## System & VRAM requirements
 
 The full FP8 release is two ~13.8 GB diffusion models plus the encoder — **~50 GB
@@ -130,11 +145,11 @@ packs/ideogram/install-runpod.sh        # RunPod / Linux
 ```
 
 Then load `packs/ideogram/workflow.json`. Because the pack ships with the
-[plugin](/plugin), your **own Claude session can drive the live graph through the
-[Panel](/panel)** — add/wire nodes, set widgets, and iterate on prompts
+[plugin](../plugin), your **own Claude session can drive the live graph through the
+[Panel](../panel)** — add/wire nodes, set widgets, and iterate on prompts
 conversationally, with full Ctrl+Z undo and no extra API keys. Every model URL in
 the pack is CI-validated for reachability and size, so a link never quietly rots
-([here's why that matters](/blog/installer-packs-that-cant-rot)).
+([here's why that matters](./installer-packs-that-cant-rot)).
 
 ## Structured JSON prompting (the part that sets Ideogram apart)
 
@@ -248,12 +263,12 @@ model's core design goal, not an afterthought.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`ideogram` pack** — nodes + ~50 GB of models land in the right folders, validated.
-3. Open the [Panel](/panel) and let the panel's agent build area-prompts and wire the graph for you.
+3. Open the [Panel](../panel) and let the panel's agent build area-prompts and wire the graph for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **That wraps the
 model-highlight series** — nine local ComfyUI setups, each one command away. Browse
-them all on the [blog index](/blog), or start from the top with
-[WAN 2.2 in ComfyUI](/blog/wan-2.2-comfyui).
+them all on the [blog index](./), or start from the top with
+[WAN 2.2 in ComfyUI](./wan-2.2-comfyui).

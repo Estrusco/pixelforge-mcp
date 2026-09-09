@@ -4,7 +4,7 @@
 // A job ties together: a dataset dir (staged by prepareDataset), a generated
 // ai-toolkit config (training-config.ts), and a running docker container
 // (ai-toolkit.ts). Jobs persist a small JSON record under
-// <trainingRoot>/jobs/<id>.json so `train_status`/`train_cancel` still work
+// <trainingRoot>/jobs/<id>.json so train_start's status/cancel actions still work
 // after an MCP restart (the container keeps running; we re-read the record).
 //
 // On success the final `.safetensors` is copied into ComfyUI models/loras/ and
@@ -36,6 +36,7 @@ import {
   startTraining,
   stopNativeByConfig,
   stopTraining,
+  TRAINER_COMMAND,
   type TrainingHandle,
   type TrainingProgress,
 } from "./ai-toolkit.js";
@@ -63,7 +64,7 @@ import {
 import { reportDownloadProgress } from "./download-progress.js";
 import { getLoraCatalog } from "./lora-catalog.js";
 import { resolveModelSubfolder } from "./model-resolver.js";
-import { getInstanceSlug } from "../config.js";
+import { config, getInstanceSlug } from "../config.js";
 import { logger } from "../utils/logger.js";
 
 export type TrainingJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -97,7 +98,7 @@ export interface TrainingJob {
   podId?: string;
   /** Pid of the MCP process that launched the container — the ONLY process
    *  allowed to finalize it. Other processes may recover an orphaned job only
-   *  when this owner is provably dead (train_status stays side-effect-free for
+   *  when this owner is provably dead (the status action stays side-effect-free for
    *  healthy-owner states; independent review finding #1). */
   ownerPid?: number;
   /** Host dataset dir mounted at /dataset (writable — ai-toolkit caches into it). */
@@ -106,7 +107,7 @@ export interface TrainingJob {
   jobDir: string;
   /** Host output dir mounted at /output. */
   outputDir: string;
-  /** Recent log lines (ring buffer, max 50) for train_status. */
+  /** Recent log lines (ring buffer, max 50) for train_start (action:"status"). */
   log: string[];
   error?: string;
   /** models/loras dir resolved at START — persisted so a mid-run ComfyUI
@@ -125,6 +126,9 @@ export interface TrainingJob {
      *  or pod-only delivery). */
     catalogId?: string;
     previewFile?: string;
+    /** The catalog entry failed although the LoRA itself was published —
+     *  disclosed, never allowed to mark the job failed after the fact. */
+    catalogError?: string;
     /** Pod jobs: path inside the pod's models/loras (when delivered there). */
     podLoraPath?: string;
   };
@@ -280,7 +284,7 @@ function persist(job: TrainingJob): boolean {
 
 // ---- per-job CAS lock ---------------------------------------------------------
 // Recovery (owner-dead handoff), owner finalization, and cancel all mutate the
-// same record across processes. Without a lock, a mobile train_status poll and
+// same record across processes. Without a lock, a mobile status poll and
 // the owner's finalize can both hand off, and a cancel can land between a
 // finalizer's cancel-check and its handoff (independent review findings #1/#2).
 // The lock is a file created exclusively; holders re-read the record inside it.
@@ -683,7 +687,7 @@ async function persistLiveStateLocked(job: TrainingJob): Promise<void> {
 
 /**
  * Merge the on-disk records into the in-memory map. Runs on EVERY read: the
- * orchestrator's long-lived in-process client (mobile `train_status`) is a
+ * orchestrator's long-lived in-process client (a mobile status poll) is a
  * different process from the one running `train_start`, so a load-once
  * registry would show stale/empty state forever (codex finding #1).
  *
@@ -698,7 +702,7 @@ async function persistLiveStateLocked(job: TrainingJob): Promise<void> {
  */
 /**
  * Merge the on-disk records into the in-memory map. Runs on EVERY read: the
- * orchestrator's long-lived in-process client (mobile `train_status`) is a
+ * orchestrator's long-lived in-process client (a mobile status poll) is a
  * different process from the one running `train_start`, so a load-once
  * registry would show stale/empty state forever (codex finding #1).
  *
@@ -730,6 +734,9 @@ async function refreshRegistry(deps: TrainingJobDeps = {}): Promise<void> {
     if (handles.has(job.id)) { jobs.set(job.id, jobs.get(job.id) ?? job); continue; } // live here — memory wins
     if ((job.status === "running" || job.status === "queued") && job.containerName) {
       const probe = deps.containerRunning ?? defaultContainerProbe;
+      // unknown-ok: only a probed `false` acts. null is UNKNOWN and takes no action —
+      // the guard below tests `=== false` / `!== false` precisely so an unreachable
+      // daemon can never be read as "the container is gone".
       const running = await probe(job.containerName, jobProbeConfigPath(job)).catch(() => null);
       if (running === false && (!ownerAlive(job) || ownerLeaseStale(job))) {
         // Container gone AND (owner provably dead OR its liveness lease
@@ -745,7 +752,7 @@ async function refreshRegistry(deps: TrainingJobDeps = {}): Promise<void> {
     }
     jobs.set(job.id, job);
   }
-  // Prune ids whose record files are GONE (train_delete_job removed them) —
+  // Prune ids whose record files are GONE (train_start action:"delete" removed them) —
   // otherwise every long-lived sibling process keeps serving deleted jobs
   // from cache and can act on their stale jobDir (codex r3 MAJOR: a later
   // delete could wipe outputs previously spared with keep_outputs). Ids this
@@ -895,7 +902,7 @@ export function defaultTrainingStop(name: string, remoteConfigPath?: string): Re
   if (name.startsWith("native-")) {
     return remoteConfigPath
       ? stopNativeByConfig(remoteConfigPath)
-      : Promise.resolve({ ok: false as const, command: "train_cancel", error: { code: "no_config", message: `native job stop needs the job's config path (got none for ${name})` } });
+      : Promise.resolve({ ok: false as const, command: TRAINER_COMMAND.cancel, error: { code: "no_config", message: `native job stop needs the job's config path (got none for ${name})` } });
   }
   return stopTraining(name);
 }
@@ -923,7 +930,7 @@ export function hasActiveTrainingJob(target?: "pod", podId?: string): boolean {
 }
 
 /** Money guard (codex #263): a running/queued record whose OWNER process died
- *  mid-run stays "running" on disk forever if nobody calls train_status —
+ *  mid-run stays "running" on disk forever if nobody calls the status action —
  *  and hasActiveTrainingJob (a blind file scan, above) then suppresses the
  *  pod idle auto-stop indefinitely, billing the pod until a human notices.
  *  This reconciler probes ONLY dead-owner / stale-lease records (a healthy
@@ -939,6 +946,9 @@ export async function reconcileStaleTrainingJobs(deps: TrainingJobDeps = {}): Pr
     if (handles.has(job.id)) continue; // live in THIS process — the owner is us
     if (ownerAlive(job) && !ownerLeaseStale(job)) continue; // healthy owner — not ours to touch
     const probe = deps.containerRunning ?? defaultContainerProbe;
+    // unknown-ok: only a probed `false` acts. null is UNKNOWN and takes no action —
+    // the guard below tests `=== false` / `!== false` precisely so an unreachable
+    // daemon can never be read as "the container is gone".
     const running = await probe(job.containerName, jobProbeConfigPath(job)).catch(() => null);
     if (running !== false) continue; // alive or unknown → err toward "busy" (never stop a live run)
     await recoverOrphanedJob(job.id, deps);
@@ -1299,34 +1309,60 @@ async function handoffToComfyUI(job: TrainingJob, deps: TrainingJobDeps): Promis
     return;
   }
 
-  const catalog = deps.catalog ?? getLoraCatalog();
-  const entry = catalog.upsert({
-    relPath: `loras/${job.name}.safetensors`,
-    displayName: job.name.replace(/_/g, " "),
-    description: `Character LoRA trained ${job.target === "pod" ? "on a RunPod pod" : "locally"} on FLUX.1-dev via ostris ai-toolkit (comfyui-mcp trainer, job ${job.id}).`,
-    setupInstructions:
-      "Load with LoraLoaderModelOnly on a FLUX.1-dev checkpoint" +
-      (job.trigger ? ` and include the trigger word "${job.trigger}" in the prompt.` : "."),
-    keywords: job.trigger ? [job.trigger] : [],
-    baseModels: ["FLUX.1-dev"],
-    strengthDefault: 1.0,
-    tags: ["trained-locally", "character", ...(job.target === "pod" ? ["trained-on-pod"] : [])],
-    // Explicitly clear the flag — retraining a LoRA whose entry was marked
-    // missing must become visible again (upsert otherwise preserves it).
-    missing: false,
-  });
-
-  // Best-effort: newest sample image becomes the catalog preview.
+  // The LoRA itself was ALREADY copied to dest above — what follows only
+  // records it in the catalog. Refuse-vs-disclose: a catalog failure must
+  // never bounce back as "output handoff failed" for a model that IS
+  // published, so it is caught here and disclosed on the result instead.
+  let catalogId: string | undefined;
   let previewFile: string | undefined;
-  const samples = findSamples(job.outputDir, job.name, 1);
-  if (samples.length > 0) {
-    try {
-      previewFile = catalog.setPreview(entry.id, samples[0]).previewFile;
-    } catch (err) {
-      logger.debug(`[training-jobs] preview copy skipped: ${err instanceof Error ? err.message : String(err)}`);
+  let catalogError: string | undefined;
+  try {
+    const catalog = deps.catalog ?? getLoraCatalog();
+    const entry = catalog.upsert({
+      relPath: `loras/${job.name}.safetensors`,
+      displayName: job.name.replace(/_/g, " "),
+      description: `Character LoRA trained ${job.target === "pod" ? "on a RunPod pod" : "locally"} on FLUX.1-dev via ostris ai-toolkit (comfyui-mcp trainer, job ${job.id}).`,
+      setupInstructions:
+        "Load with LoraLoaderModelOnly on a FLUX.1-dev checkpoint" +
+        (job.trigger ? ` and include the trigger word "${job.trigger}" in the prompt.` : "."),
+      keywords: job.trigger ? [job.trigger] : [],
+      baseModels: ["FLUX.1-dev"],
+      strengthDefault: 1.0,
+      tags: ["trained-locally", "character", ...(job.target === "pod" ? ["trained-on-pod"] : [])],
+      // Explicitly clear the flag — retraining a LoRA whose entry was marked
+      // missing must become visible again (upsert otherwise preserves it).
+      missing: false,
+    });
+    catalogId = entry.id;
+
+    // Best-effort: newest sample image becomes the catalog preview. A failure
+    // here can come AFTER the file was written (setPreview discloses exactly
+    // that) — so it is recorded, not just logged: a completed job must not
+    // report neither previewFile nor error while the preview sits unreconciled.
+    const samples = findSamples(job.outputDir, job.name, 1);
+    if (samples.length > 0) {
+      try {
+        previewFile = catalog.setPreview(entry.id, samples[0]).previewFile;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[training-jobs] preview copy skipped: ${msg}`);
+        catalogError = catalogError ?? `preview: ${msg}`;
+      }
     }
+  } catch (err) {
+    catalogError = err instanceof Error ? err.message : String(err);
+    logger.warn(
+      `[training-jobs] the LoRA was published to ${dest} but recording it in the catalog failed: ${catalogError}`,
+    );
   }
-  job.result = { loraPath: dest!, loraRelPath: `loras/${job.name}.safetensors`, catalogId: entry.id, previewFile, podLoraPath };
+  job.result = {
+    loraPath: dest!,
+    loraRelPath: `loras/${job.name}.safetensors`,
+    catalogId,
+    previewFile,
+    podLoraPath,
+    ...(catalogError ? { catalogError } : {}),
+  };
 }
 
 async function finalizeJob(job: TrainingJob, code: number, tail: string, deps: TrainingJobDeps): Promise<void> {
@@ -1394,7 +1430,7 @@ async function finalizeJob(job: TrainingJob, code: number, tail: string, deps: T
     // the rig BEFORE the usual handoff so findSamples/findProducedLora see it
     // (samples mirror to panel/mobile through the same rig-local paths).
     const pulled = await pullPodOutput(job, deps);
-    // Surface the generated samples in train_status regardless of outcome —
+    // Surface the generated samples in train_start (action:"status") regardless of outcome —
     // ai-toolkit prints only "Generating Images" bars (no saved-file lines), so
     // onProgress never sees sample paths (codex finding; confirmed by the E2E).
     const samples = findSamples(job.outputDir, job.name, 4);
@@ -1623,7 +1659,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
     job.updatedAt = new Date().toISOString();
     reportProgress(job, "downloading");
     // Throttled disk snapshot so OTHER processes (orchestrator call_tool
-    // client → mobile train_status) see live progress, not just the final
+    // client → a mobile status poll) see live progress, not just the final
     // state (codex finding: progress was memory-only until finalize).
     const last = lastProgressPersistAt.get(id) ?? 0;
     if (Date.now() - last >= PROGRESS_PERSIST_MS) {
@@ -1639,7 +1675,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
     job.updatedAt = new Date().toISOString();
     // Log lines also snapshot (same throttle): during the long first-run
     // model download there are NO progress ticks, so without this a
-    // cross-process train_status sees an empty, apparently stalled record
+    // a cross-process status poll sees an empty, apparently stalled record
     // (codex finding).
     const last = lastProgressPersistAt.get(id) ?? 0;
     if (Date.now() - last >= PROGRESS_PERSIST_MS) {
@@ -1653,7 +1689,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
         containerName: job.containerName!,
         remoteConfigPath: podPaths!.configPath,
         hfCacheDir: podPaths!.hfCacheDir,
-        hfToken: process.env.HF_TOKEN?.trim() || undefined,
+        hfToken: config.huggingfaceToken?.trim() || undefined,
         onProgress,
         onLog,
       });
@@ -1668,7 +1704,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
         datasetPath,
         outputDir,
         hfCacheDir: hfCacheRoot(),
-        hfToken: process.env.HF_TOKEN?.trim() || undefined,
+        hfToken: config.huggingfaceToken?.trim() || undefined,
         onProgress,
         onLog,
       });
@@ -1679,7 +1715,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
         datasetPath,
         outputDir,
         hfCacheDir: hfCacheRoot(),
-        hfToken: process.env.HF_TOKEN?.trim() || undefined,
+        hfToken: config.huggingfaceToken?.trim() || undefined,
         onProgress,
         onLog,
       });
@@ -1744,6 +1780,8 @@ export async function cancelJob(id: string, deps: TrainingJobDeps = {}): Promise
     if (!job.containerName) return job;
     const probe = deps.containerRunning ?? defaultContainerProbe;
     const cfgPath = jobProbeConfigPath(job);
+    // unknown-ok: null is the UNKNOWN state here, deliberately distinct from a
+    // probed `false`, and the branch below acts on that distinction.
     const alive = await probe(job.containerName, cfgPath).catch(() => null);
     // Only a definitive "gone" short-circuits; unknown (daemon temporarily
     // unreachable) still attempts the stop so a live container can't keep
@@ -1755,6 +1793,9 @@ export async function cancelJob(id: string, deps: TrainingJobDeps = {}): Promise
     // daemon honored the stop (codex finding). Only when liveness is unknown
     // do we fall back to the stop command's own result. The probe is scoped to
     // THIS job's config path so an unrelated run.py can't fake still-running.
+    // unknown-ok: null is UNKNOWN and falls through to the stop command's own result
+    // (`probed ?? res.ok === false`), which is the documented intent above — a probe
+    // that could not answer must not overrule what the stop reported.
     const probed = await probe(job.containerName, cfgPath).catch(() => null);
     const stillRunning = probed ?? res.ok === false;
     if (stillRunning === true) {
@@ -1835,6 +1876,9 @@ async function cancelJobBody(id: string, job: TrainingJob, deps: TrainingJobDeps
     const probe = deps.containerRunning ?? defaultContainerProbe;
     // Probe after the stop regardless of its exit status (see above), scoped to
     // THIS job's config path so an unrelated run.py can't fake still-running.
+    // unknown-ok: null is UNKNOWN and falls through to the stop command's own result
+    // (`probed ?? res.ok === false`), which is the documented intent above — a probe
+    // that could not answer must not overrule what the stop reported.
     const probed = await probe(job.containerName, cfgPath).catch(() => null);
     const stillRunning = probed ?? res.ok === false;
     if (stillRunning === true) {
@@ -1876,15 +1920,18 @@ export async function deleteJob(
   const job = await getJob(id, deps);
   if (!job) throw new Error(`no training job ${id}`);
   if (job.status === "running" || job.status === "queued") {
-    throw new Error(`job ${id} is ${job.status} — cancel it first (train_cancel), then delete`);
+    throw new Error(`job ${id} is ${job.status} — cancel it first (train_start action:"cancel"), then delete`);
   }
   if (job.status === "cancelled" && job.containerName) {
     const probe = deps.containerRunning ?? defaultContainerProbe;
+    // unknown-ok: only a probed `false` acts. null is UNKNOWN and takes no action —
+    // the guard below tests `=== false` / `!== false` precisely so an unreachable
+    // daemon can never be read as "the container is gone".
     const alive = await probe(job.containerName, jobProbeConfigPath(job)).catch(() => null);
     if (alive !== false) {
       throw new Error(
         `job ${id} is marked cancelled but its container state is unconfirmed — it may still be running. ` +
-          `Re-run train_cancel first (it re-stops and verifies), then delete.`,
+          `Re-run train_start (action:"cancel") first (it re-stops and verifies), then delete.`,
       );
     }
   }

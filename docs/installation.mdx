@@ -11,7 +11,7 @@ icon: "download"
     The easiest way to get a managed install on macOS / Windows.
   </Card>
   <Card title="From source" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
-    Clone and run manually — or use the [`install_comfyui`](/tools/install-environment) tool.
+    Clone and run manually — or use the [`install_comfyui`](./tools/install-environment) tool.
   </Card>
 </CardGroup>
 
@@ -52,9 +52,10 @@ ComfyUI MCP ships on npm as `comfyui-mcp` and runs via `npx` — no global insta
     ```
 
     <Note>
-      Local-only tools (installing ComfyUI/custom nodes, removing model files, reading logs)
-      need a local install path and will return a clear error in remote mode. See
-      [How it works](/concepts).
+      Most tools work fine against a remote ComfyUI — installing custom nodes included, via
+      the ComfyUI-Manager HTTP API. What genuinely needs a local install path is installing
+      ComfyUI itself, comfy-cli-backed operations, reading logs, and removing model files;
+      those return a clear error in remote mode. See [How it works](./concepts).
     </Note>
   </Tab>
   <Tab title="Comfy Cloud">
@@ -79,24 +80,109 @@ ComfyUI MCP ships on npm as `comfyui-mcp` and runs via `npx` — no global insta
 
     <Note>
       Cloud mode skips local `COMFYUI_PATH` auto-detection and uses the cloud's own model
-      library — `list_local_models`, `apply_manifest`, and other local-only tools throw
-      `CLOUD_UNSUPPORTED`. See the [Configuration](/configuration#deployment-modes) page
-      for the full feature-parity matrix.
+      library. Tools that reach for a local process or the filesystem throw
+      `CLOUD_UNSUPPORTED`; others degrade instead of throwing — `list_local_models` returns
+      an empty list, and `apply_manifest` reports per-item `skipped`/`failed` rather than
+      erroring outright. See the [Configuration](./configuration#deployment-modes) page for
+      the full feature-parity matrix.
     </Note>
     <Note>
-      **Cloud-only?** [Comfy-Org's official Comfy Cloud MCP](https://docs.comfy.org/development/cloud/mcp-server) (invite-only beta) is the canonical choice when it goes GA. Use `comfyui-mcp`'s cloud-mode if you want a single MCP across local / remote / cloud, or you need cloud support today.
+      **Cloud-only?** [Comfy-Org's Comfy Cloud MCP](https://docs.comfy.org/agent-tools) (public beta) is the canonical choice — see [Local vs. Comfy Cloud](./local-vs-comfy-cloud). Use `comfyui-mcp`'s cloud-mode if you want a single MCP across local / remote / cloud, or you need cloud support today.
+    </Note>
+  </Tab>
+  <Tab title="Managed / enterprise Claude Code">
+    On an organization-managed Claude Code there is no `claude` CLI to run `claude mcp add`
+    with, and the administrator-controlled **Managed MCP servers** list will test a server
+    successfully and then refuse to save it. **Developer settings → Edit config** opens a
+    `claude_desktop_config.json` that the Code tab never reads. Two routes do work.
+
+    **Option A — HTTP.** Run the server yourself and add it as a *remote* connector:
+
+    ```bash
+    npx -y comfyui-mcp@latest --http
+    ```
+
+    That serves streamable-HTTP at `http://127.0.0.1:9100/mcp` — override the bind with
+    `--host` / `--port`. Add that URL as a remote connector, transport HTTP, authentication
+    none. The process must keep running for as long as you use the tools, and a managed org
+    list may still refuse to persist the entry — if it does, use Option B.
+
+    **Option B — stdio from your user config.** Claude spawns the server itself, so nothing
+    has to stay running. Install it globally **with Claude Code fully closed**, or Windows
+    holds the files open and leaves a half-deleted package that `npm ls -g` reports with no
+    version:
+
+    ```bash
+    npm install -g comfyui-mcp
+    npm root -g
+    ```
+
+    Then add a **top-level** `mcpServers` block to `~/.claude.json` — on Windows,
+    `C:\Users\YOUR_NAME\.claude.json` — pointing `node` at the path `npm root -g` printed:
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "node",
+          "args": ["C:/Users/YOUR_NAME/AppData/Roaming/npm/node_modules/comfyui-mcp/dist/index.js"]
+        }
+      }
+    }
+    ```
+
+    Then restart Claude Code **completely, including the system-tray icon** — otherwise the
+    config is never re-read.
+
+    <Note>
+      **Verify by asking the agent what tools it has.** On a managed build no UI surface
+      reliably reflects a working MCP server, so the functional test is the only one that
+      does not lie.
+    </Note>
+    <Note>
+      The Claude-side menu names and paths above were observed on one managed build — treat
+      them as what to look for, not as exact labels. Keep the HTTP endpoint on loopback: if
+      you bind it to a non-loopback host, the server refuses to start unless you set a shared
+      secret with `--token`. See [Remote connector](./remote-connector).
     </Note>
   </Tab>
 </Tabs>
 
 Then run `/mcp` in Claude Code to connect.
 
-## 3. (Optional) Tokens
+## 3. Starting the panel orchestrator
+
+Only needed for the **sidebar panel**. Skip this if you are driving ComfyUI from Claude
+Code or another MCP client — that path uses the MCP server configured above.
+
+The panel is a pure-frontend ComfyUI extension: it cannot start a process on your machine,
+so **you start the orchestrator yourself** and the panel connects to it.
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+That is sugar for `--panel-orchestrator`. It auto-targets the ComfyUI your browser is on,
+serves the bridge on `ws://127.0.0.1:9199` (override with `COMFYUI_MCP_BRIDGE_PORT`), and
+must keep running while you use the panel. Then open the **Agent** tab, pick a provider,
+and click **Connect**.
+
+Driving a **remote** ComfyUI — a cloud pod or another box on your LAN? Run the same command
+on **your own machine**, not the remote one, and pass the URL:
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+Your provider login and the agent stay local; nothing is installed on the remote host. See
+[Cloud deployment](./cloud-deployment) for the tunnel details.
+
+## 4. (Optional) Tokens
 
 Some tools use API tokens. The easiest way to set one is the `set_secret` tool once
 you're connected (e.g. `set_secret {"slot": "civitai", "value": "..."}` — call
 `get_secrets` first to see every slot and its current masked status). Tokens can
-also be set directly in the server's `env` block (see [Configuration](/configuration)),
+also be set directly in the server's `env` block (see [Configuration](./configuration)),
 or in `~/.comfyui-mcp/.env`:
 
 - `CIVITAI_API_TOKEN` — gated CivitAI downloads

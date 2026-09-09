@@ -4,6 +4,19 @@ import { getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  detectManagerApi,
+  enqueueManagerTaskForExternal,
+  managerApiPrefixFor,
+  startManagerQueueForExternal,
+  type ManagerApi,
+} from "./node-management.js";
+import { targetsPanelPackExactly, withPanelPinGuard } from "./panel-pin-guard.js";
+import {
+  MANAGER_CATALOGUE_CURRENCY_CAVEAT,
+  managerCatalogueCurrencyUnverified,
+} from "./manager-catalogue-currency.js";
+import { extractWorkflowClassTypes } from "./api-nodes.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -73,6 +86,23 @@ export interface ExtractDepsResult {
   missingPacks: string[];
   /** class_types that could not be mapped to any pack. */
   unresolved: string[];
+  /**
+   * #1136 — set when the Manager MAPPINGS lookup did not actually answer, which
+   * makes `unresolved` unsafe to read as "not known to ComfyUI-Manager".
+   *
+   * Stronger evidence than the getlist case: there we infer from an empty list,
+   * here we caught a real exception and logged it, then asserted absence anyway.
+   */
+  mappings_unavailable?: string;
+  /**
+   * panel#890 — set when `unresolved` came from a Manager catalogue whose CURRENCY
+   * could not be established, which is every populated one: Manager serves a copy
+   * bundled in its own package when the registry is unreachable, and does not report
+   * which source answered. Weaker than the two fields above — they report an OBSERVED
+   * failure; this reports the absence of evidence — so it is set only when neither of
+   * those is.
+   */
+  catalogue_currency_unverified?: string;
 }
 
 export interface InstallDepsResult {
@@ -84,6 +114,26 @@ export interface InstallDepsResult {
   unresolved: string[];
   /** Queue status after processing, if available. */
   queue?: ManagerQueueStatus;
+  /**
+   * #1136 — set when the Manager catalogue came back EMPTY on a non-local
+   * channel, which makes `unresolved` unsafe to read as "these packs do not
+   * exist". Callers rendering `unresolved` must surface this instead of, or
+   * alongside, "not found in ComfyUI-Manager".
+   */
+  catalogue_unavailable?: string;
+  /** panel#890 — see the same field on WorkflowDepsAnalysis. */
+  catalogue_currency_unverified?: string;
+  /**
+   * panel#890 (codex round 4) — the analysis's `mappings_unavailable`, carried through.
+   *
+   * It had nowhere to live on this shape, so an install whose MAPPINGS lookup threw
+   * emitted `unresolved` with no caveat of any kind: the strong one could not be
+   * represented, and the currency caveat deliberately yields to it. Yielding to a
+   * caveat that never arrives is the worst of both — it suppresses the weaker
+   * disclosure AND loses the stronger one, so the reader sees a bare list in the case
+   * we know the most about.
+   */
+  mappings_unavailable?: string;
 }
 
 export interface ManagerQueueStatus {
@@ -107,7 +157,7 @@ export interface WorkflowDepsDeps {
    * in the Manager response) alongside pack metadata, so installs are queued
    * against the same channel the list came from.
    */
-  fetchManagerList: () => Promise<{ channel?: string; packs: ManagerNodePack[] }>;
+  fetchManagerList: () => Promise<{ channel?: string; packs: ManagerNodePack[]; directInstall?: boolean }>;
   /** POST a single pack install task to the Manager queue (against `channel`). */
   queueInstall: (pack: ManagerNodePack, channel: string) => Promise<void>;
   /** POST to reset the Manager queue (clears stale pending tasks before a run). */
@@ -127,8 +177,9 @@ const managerBase = (): string => getComfyUIBaseUrl();
 async function managerFetch(
   path: string,
   init?: RequestInit,
+  base = managerBase(),
 ): Promise<Response> {
-  const url = `${managerBase()}${path}`;
+  const url = `${base}${path}`;
   logger.debug("Manager API request", { url, method: init?.method ?? "GET" });
   let res: Response;
   try {
@@ -141,6 +192,9 @@ async function managerFetch(
     );
   }
   if (!res.ok) {
+    // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+    // HTTP status is reported either way, so an unreadable body costs detail in the
+    // text, never a wrong conclusion. Verified there is no branch on this value.
     const body = await res.text().catch(() => "");
     throw new ComfyUIError(
       `ComfyUI-Manager ${path} returned ${res.status} ${res.statusText}`,
@@ -153,15 +207,28 @@ async function managerFetch(
 
 /** Default dependency wiring backed by live HTTP + the ComfyUI client. */
 export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
+  // installWorkflowDependencies invokes reset → N enqueues → start → status as
+  // one Manager transaction. Keep that entire sequence on the target selected
+  // by reset, including a dialect self-heal, so a panel retarget cannot split
+  // a queue across two ComfyUI instances (#670).
+  let queueOperation: { base: string; api?: ManagerApi } | undefined;
   return {
     fetchObjectInfo: () => getObjectInfo(),
     fetchManagerMappings: async () => {
-      const res = await managerFetch("/customnode/getmappings?mode=nickname");
+      const base = managerBase();
+      const api = await detectManagerApi(base);
+      const res = await managerFetch(`${managerApiPrefixFor(api)}/customnode/getmappings?mode=nickname`, undefined, base);
       return (await res.json()) as ManagerMappings;
     },
     fetchManagerList: async () => {
       // skip_update=true avoids slow per-pack git checks; we only need metadata.
-      const res = await managerFetch("/customnode/getlist?mode=cache&skip_update=true");
+      const base = managerBase();
+      const api = await detectManagerApi(base);
+      // v4 deliberately dropped getlist; its registry-first install task does
+      // not need the legacy catalog descriptor.  Keep the legacy list path for
+      // 3.x and let callers resolve against Manager mappings on v4.
+      if (api !== "legacy") return { packs: [], directInstall: true };
+      const res = await managerFetch("/customnode/getlist?mode=cache&skip_update=true", undefined, base);
       const data = (await res.json()) as ManagerListResponse | ManagerNodePack[];
       if (Array.isArray(data)) return { packs: data };
       const packs = data.node_packs ?? {};
@@ -175,10 +242,8 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
       // A plain/non-registry pack (git URL, no registry version) must route on
       // version === "unknown"; a registry pack installs its catalog version.
       const isUnknown = !pack.version || pack.version === "unknown";
-      await managerFetch("/manager/queue/install", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const base = queueOperation?.base ?? managerBase();
+      const used = await enqueueManagerTaskForExternal("install", {
           id: pack.id,
           version: isUnknown ? "unknown" : pack.version,
           selected_version:
@@ -188,18 +253,36 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
           channel: pack.channel ?? channel,
           mode: pack.mode ?? "cache",
           ui_id: pack.id ?? pack.title ?? pack.reference,
-        }),
-      });
+      }, base);
+      if (queueOperation) queueOperation.api = used;
     },
     resetQueue: async () => {
-      await managerFetch("/manager/queue/reset", { method: "POST" });
+      const base = managerBase();
+      const api = await detectManagerApi(base);
+      await managerFetch(`${managerApiPrefixFor(api)}/manager/queue/reset`, { method: "POST" }, base);
+      queueOperation = { base, api };
     },
     startQueue: async () => {
-      await managerFetch("/manager/queue/start", { method: "POST" });
+      const base = queueOperation?.base ?? managerBase();
+      const api = queueOperation?.api ?? await detectManagerApi(base);
+      // Some legacy Manager 3.x builds expose /manager/queue/start as GET-only,
+      // returning HTTP 405 to our POST (#551). A 405 on a Manager route is a
+      // METHOD mismatch for this endpoint, not an unreachable Manager — retry the
+      // same path with GET before failing so GET-only builds still start. Guard
+      // the GET against ComfyUI's frontend catchall, which 200s an UNREGISTERED
+      // GET with a page of HTML: that HTML is NOT a real queue start (codex
+      // review), so treat it as the route not accepting our request.
+      await startManagerQueueForExternal(api, base);
     },
     queueStatus: async () => {
-      const res = await managerFetch("/manager/queue/status");
-      return (await res.json()) as ManagerQueueStatus;
+      const base = queueOperation?.base ?? managerBase();
+      const api = queueOperation?.api ?? await detectManagerApi(base);
+      try {
+        const res = await managerFetch(`${managerApiPrefixFor(api)}/manager/queue/status`, undefined, base);
+        return (await res.json()) as ManagerQueueStatus;
+      } finally {
+        queueOperation = undefined;
+      }
     },
   };
 }
@@ -208,25 +291,15 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
  * Collect the distinct, sorted class_types referenced by a workflow. Handles
  * both the API format (object keyed by node id, each `{ class_type }`) and the
  * UI/"full" format (a `nodes` array whose entries carry a `type` field).
+ *
+ * Subgraph-aware via extractWorkflowClassTypes: a UI node whose `type` is a
+ * subgraph definition id is an instance, not a class_type, and inner nodes
+ * from `definitions.subgraphs[].nodes` are walked instead.
  */
 export function collectClassTypes(
   workflow: WorkflowJSON | { nodes?: unknown },
 ): string[] {
-  const set = new Set<string>();
-  const uiNodes = (workflow as { nodes?: unknown }).nodes;
-  if (Array.isArray(uiNodes)) {
-    for (const node of uiNodes) {
-      const t = (node as { type?: unknown } | null)?.type;
-      if (typeof t === "string" && t) set.add(t);
-    }
-    return [...set].sort();
-  }
-  for (const node of Object.values(workflow as WorkflowJSON)) {
-    if (node && typeof node.class_type === "string" && node.class_type) {
-      set.add(node.class_type);
-    }
-  }
-  return [...set].sort();
+  return extractWorkflowClassTypes(workflow).sort();
 }
 
 /**
@@ -314,12 +387,40 @@ export async function extractWorkflowDependencies(
     exact: new Map(),
     patterns: [],
   };
+  // #1136 — this catch used to be the whole story: log at warn, carry on, and
+  // let every unmapped class_type render as "neither installed nor known to
+  // ComfyUI-Manager". We KNOW Manager was never consulted -- we are holding the
+  // exception -- and we asserted absence anyway. A warn line is not a user-
+  // facing answer; the caller reads the tool result.
+  let mappingsUnavailable: string | undefined;
   try {
-    mappingIndex = buildMappingIndex(await deps.fetchManagerMappings());
+    const raw = await deps.fetchManagerMappings();
+    mappingIndex = buildMappingIndex(raw);
+    if (mappingIndex.exact.size === 0 && mappingIndex.patterns.length === 0) {
+      // A 200 carrying nothing is the same situation with no exception to hold:
+      // Manager answered, but with no mappings to match against.
+      // Distinguish "the response was empty" from "we could not read it".
+      // buildMappingIndex skips any entry whose value is not an Array, so a v4
+      // shape difference yields an empty index from a NON-empty body -- and
+      // calling that "came back EMPTY" asserts something about the response we
+      // never checked, which is this issue's own defect class one endpoint over.
+      const empty = !raw || typeof raw !== "object" || Object.keys(raw).length === 0;
+      mappingsUnavailable = empty
+        ? "The ComfyUI-Manager node mappings came back EMPTY, so nothing below was matched against " +
+          "the catalogue. This is NOT evidence that these node types are unknown to Manager."
+        : "The ComfyUI-Manager node mappings response carried no usable entries, so nothing below " +
+          "was matched against the catalogue. This is NOT evidence that these node types are " +
+          "unknown to Manager.";
+    }
   } catch (err) {
     logger.warn("ComfyUI-Manager mappings unavailable; relying on /object_info only", {
       error: err instanceof Error ? err.message : String(err),
     });
+    mappingsUnavailable =
+      `The ComfyUI-Manager node mappings could not be fetched (${err instanceof Error ? err.message : String(err)}), ` +
+      `so nothing below was matched against the catalogue. This is NOT evidence that these node types ` +
+      `are unknown to Manager -- only /object_info was consulted. Manager reaches the registry from the ` +
+      `ComfyUI host, so a blocked or filtered network there looks exactly like "not found" here.`;
   }
 
   const dependencies: NodeDependency[] = [];
@@ -377,6 +478,18 @@ export async function extractWorkflowDependencies(
     requiredPacks: [...requiredPackSet].sort(),
     missingPacks: [...missingPackSet].sort(),
     unresolved: unresolved.sort(),
+    ...(mappingsUnavailable && unresolved.length > 0
+      ? { mappings_unavailable: mappingsUnavailable }
+      : {}),
+    // panel#890 — the third state. The two caveats above fire on an OBSERVED failure
+    // (empty list, caught exception); a catalogue served from Manager's bundled copy
+    // presents as success, so neither fires and `unresolved` used to go out bare.
+    ...(managerCatalogueCurrencyUnverified({
+      unresolvedCount: unresolved.length,
+      mappingsUnavailable,
+    })
+      ? { catalogue_currency_unverified: MANAGER_CATALOGUE_CURRENCY_CAVEAT }
+      : {}),
   };
 }
 
@@ -399,12 +512,64 @@ export async function installWorkflowDependencies(
       installed: [],
       alreadyInstalled: analysis.requiredPacks,
       unresolved: analysis.unresolved,
+      // panel#890 (codex round 2, P1) — this early return emits `unresolved` too, and
+      // it used to emit it BARE. Nothing is installed on this path, so it reads as the
+      // most settled answer of the three, and "not found in ComfyUI-Manager" with no
+      // qualification is exactly the reading the caveat exists to prevent. Carried over
+      // from the analysis rather than recomputed: the analysis is where the catalogue
+      // was actually consulted.
+      ...(analysis.catalogue_currency_unverified
+        ? { catalogue_currency_unverified: analysis.catalogue_currency_unverified }
+        : {}),
+      // The STRONGER caveat too (codex round 4). The currency one yields to it, so
+      // dropping it here left this path with neither.
+      ...(analysis.mappings_unavailable
+        ? { mappings_unavailable: analysis.mappings_unavailable }
+        : {}),
     };
   }
 
+  // A dependency install can name the panel exactly like a generic node tool.
+  // Hold the shared guard across the entire queue transaction whenever that is
+  // true: a one-off assert here would reopen the same check-then-queue race the
+  // generic mutation services fixed. Non-panel workflows intentionally do not
+  // take this lock, so ordinary dependency installs do not contend with pins.
+  const panelTarget = analysis.missingPacks.find(targetsPanelPackExactly);
+  if (panelTarget) {
+    return withPanelPinGuard("install workflow dependencies including", panelTarget, () =>
+      installWorkflowDependenciesForAnalysis(analysis, deps),
+    );
+  }
+  return installWorkflowDependenciesForAnalysis(analysis, deps);
+}
+
+export async function installWorkflowDependenciesForAnalysis(
+  analysis: ExtractDepsResult,
+  deps: WorkflowDepsDeps,
+): Promise<InstallDepsResult> {
+
   // Match missing packs to concrete Manager list entries for install payloads,
   // capturing the channel the list resolved against.
-  const { channel = "default", packs } = await deps.fetchManagerList();
+  const { channel = "default", packs, directInstall = false } = await deps.fetchManagerList();
+  // #1136 — an EMPTY legacy catalogue is not "these packs do not exist".
+  //
+  // Manager's /customnode/getlist returns dict(channel, node_packs) with no
+  // error and no staleness field, and it is called with mode=cache +
+  // skip_update=true, so a user whose registry is blocked or filtered gets a
+  // healthy HTTP 200 carrying an empty cache. We cannot see their DNS failure:
+  // it happened inside ComfyUI's process.
+  //
+  // What we CAN see is that a healthy legacy catalogue carries thousands of
+  // entries, so zero on a non-local channel is a strong local signal. Without
+  // this, every pack falls to `unresolved` and renders as "neither installed
+  // nor known to ComfyUI-Manager" / "Not found in ComfyUI-Manager" -- the
+  // reported harm verbatim, in the surface the reporting user was sent to
+  // three times.
+  //
+  // Deliberately NOT phrased as a diagnosis of their network. We do not know
+  // it is blocked; we know the catalogue is empty and that this is not the
+  // same fact as absence.
+  const catalogueEmpty = !directInstall && channel !== "local" && packs.length === 0;
   const byKey = new Map<string, ManagerNodePack>();
   for (const p of packs) {
     for (const key of [p.id, p.title, p.reference]) {
@@ -415,15 +580,46 @@ export async function installWorkflowDependencies(
   const toInstall: ManagerNodePack[] = [];
   const installed: string[] = [];
   const unresolved = [...analysis.unresolved];
-
+  // The sidebar panel pack NEVER goes through this transaction. The Manager
+  // target resolved for a workflow dependency may differ from the local root
+  // used to establish which panel the browser serves; accepting either one as
+  // proof would permit an unverified update or fabricate success. Keep it
+  // unresolved and require install_comfyui(action:'panel') on the selected ComfyUI host instead.
+  const panelTargets: string[] = [];
+  const panelNotes: string[] = [];
   for (const pack of analysis.missingPacks) {
+    if (targetsPanelPackExactly(pack)) {
+      panelTargets.push(pack);
+      unresolved.push(pack);
+      continue;
+    }
     const entry = byKey.get(pack);
     if (!entry) {
+      // Manager v4 removed the legacy getlist catalog endpoint. Its task API
+      // resolves a registry/repository id directly, so an empty catalog is the
+      // v4 signal to enqueue that id rather than falsely claim it is unresolved.
+      if (directInstall) {
+        toInstall.push({ id: pack, version: "latest" });
+        installed.push(pack);
+        continue;
+      }
       unresolved.push(pack);
       continue;
     }
     toInstall.push(entry);
     installed.push(pack);
+  }
+
+  // Even under the outer pin guard, this workflow transaction cannot bind its
+  // Manager target to a served-panel root. Do not re-add panel targets to the
+  // generic queue (especially in remote mode), and do not inspect/mutate the
+  // process-global panel root for a possibly different Manager target.
+  for (const pack of panelTargets) {
+    panelNotes.push(
+      `"${pack}" is the sidebar panel pack: workflow dependency installation does not queue or mutate it ` +
+        `because this Manager transaction cannot prove the same served-panel target. ` +
+        `Use install_comfyui(action:'panel') on the selected ComfyUI host.`,
+    );
   }
 
   let queue: ManagerQueueStatus | undefined;
@@ -452,5 +648,32 @@ export async function installWorkflowDependencies(
     alreadyInstalled: analysis.requiredPacks.filter((p) => !missingSet.has(p)),
     unresolved: [...new Set(unresolved)].sort(),
     queue,
+    // Gated on there being something to mislead about. Round 3 caught a comment
+    // here claiming this gate existed when it did not -- the field's own
+    // docblock says callers rendering `unresolved` must surface it, so setting
+    // it with an empty `unresolved` contradicts the contract.
+    ...(catalogueEmpty && unresolved.length > 0
+      ? {
+          catalogue_unavailable:
+            `The ComfyUI-Manager catalogue came back EMPTY (channel "${channel}"), so nothing below ` +
+            `was actually looked up. A healthy catalogue carries thousands of entries, so this is ` +
+            `almost certainly a catalogue that could not be refreshed -- NOT evidence that these ` +
+            `packs do not exist. Manager fetches the registry from the ComfyUI host itself, so a ` +
+            `blocked or filtered network there looks exactly like an empty result here. Refresh the ` +
+            `Manager list on that host before concluding anything from "not found".`,
+        }
+      : {}),
+    ...(managerCatalogueCurrencyUnverified({
+      unresolvedCount: unresolved.length,
+      catalogueUnavailable: catalogueEmpty ? "empty" : undefined,
+      mappingsUnavailable: analysis.mappings_unavailable,
+    })
+      ? { catalogue_currency_unverified: MANAGER_CATALOGUE_CURRENCY_CAVEAT }
+      : {}),
+    // Same gap on this path: the analysis's mappings failure never reached the reply.
+    ...(analysis.mappings_unavailable
+      ? { mappings_unavailable: analysis.mappings_unavailable }
+      : {}),
+    ...(panelNotes.length ? { panel_notes: panelNotes } : {}),
   };
 }

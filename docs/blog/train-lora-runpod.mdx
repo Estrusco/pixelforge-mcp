@@ -1,5 +1,5 @@
 ---
-title: "Train a FLUX LoRA in the Cloud on RunPod (2026 Guide)"
+title: "Train a FLUX LoRA in the Cloud on RunPod"
 description: "Train a FLUX.1-dev character LoRA on a RunPod cloud GPU — no 24GB card required. Upload your dataset by SSH and get a ComfyUI-ready .safetensors file."
 keywords:
   - train LoRA cloud GPU
@@ -20,14 +20,14 @@ Short answer to the question everyone asks: **no, you don't need a 24GB card to
 train a FLUX LoRA anymore.** You rent one for the hour or two the run takes,
 train on it by asking the agent, and get the `.safetensors` back on your own
 machine. This is P4 — the cloud sequel to
-[the local LoRA trainer (P1)](/blog/lora-trainer-p1) — and it runs the exact same
+[the local LoRA trainer (P1)](./lora-trainer-p1) — and it runs the exact same
 `train_*` tools, just pointed at rented hardware.
 
 ## How much VRAM does FLUX LoRA training need?
 
 FLUX.1-dev LoRA training is greedy. Even with quantization on, a real character
 run wants roughly **24 GB of VRAM** — RTX 4090 class. That's the wall a lot of
-people hit the moment they read [P1](/blog/lora-trainer-p1): the flow is a
+people hit the moment they read [P1](./lora-trainer-p1): the flow is a
 conversation, the trainer is proven, the handoff is honest… and their local card
 is a 12 GB laptop GPU that can't fit the model. Training simply doesn't start.
 
@@ -44,8 +44,8 @@ sitting in `models/loras/` that loads on any GPU big enough to *infer* with it
 (far less than training needs).
 
 comfyui-mcp already knows how to talk to RunPod: it's the same pods the
-[RunPod connector](/blog/runpod-comfyui) uses for remote rendering, and the same
-`RUNPOD_API_KEY` you set once in the [panel](/panel)'s API-Keys card.
+[RunPod connector](./runpod-comfyui) uses for remote rendering, and the same
+`RUNPOD_API_KEY` you set once in the [panel](../panel)'s API-Keys card.
 P4 teaches the trainer to borrow that hardware for a training run.
 
 ## How the pod bootstrap works
@@ -67,6 +67,19 @@ Every step streams its logs back to you and is **persisted under the training
 root** on the pod, so a reconnect picks up where you were instead of starting
 over. Nothing about ai-toolkit itself changes — same unmodified `run.py`, same
 presets. It's the *transport* that's new, not the trainer.
+
+<Note>
+  Since this post was published, 0.50.0 consolidated the eighteen `train_*` tools into
+  three action-parameterized ones, so the names below are the tools **as they shipped
+  at the time**. The work is unchanged; the calls moved. Preflight and setup are now
+  `train_doctor` with `action: "doctor"` / `"build_image"` / `"bootstrap"`. Job
+  lifecycle and discovery are `train_start` with `action: "start"` / `"status"` /
+  `"cancel"` / `"delete"` / `"list_flows"` / `"job_config"` / `"preview_config"`.
+  Datasets are `train_prepare_dataset` with `action: "prepare"` / `"list"` /
+  `"detail"` / `"update"` / `"delete"` / `"file"` / `"caption_image"` /
+  `"caption_dataset"`. Same services, same behaviour — the rest of the post still
+  applies.
+</Note>
 
 ## How to train a FLUX LoRA on RunPod
 
@@ -98,9 +111,13 @@ If you already know the P1 flow, you already know this one.
 The mechanics of getting bits to and from the pod:
 
 - **Dataset up.** The SSH transport resolves the pod's SSH endpoint — RunPod
-  exposes container port 22 as a public `ip:port` — and **rsyncs your staged
-  dataset up** to the training root. rsync means a re-send only moves what
-  changed.
+  exposes container port 22 as a public `ip:port` — and **uploads your staged
+  dataset** to the training root as `tar -czf - | ssh … tar -xzf -`. No rsync
+  binary is needed on either side, which is the point: Windows rigs have `tar`
+  and `ssh` but usually no `rsync`. It borrows rsync's *semantics* — the remote
+  directory is removed and recreated so a re-staged dataset can't inherit files
+  you deleted locally — but not its **delta transfer**. Every send is the whole
+  dataset, so stage what you need and expect a re-send to cost full upload time.
 - **Training runs over SSH**, streaming the same step/loss ticks P1 parses, so
   the progress you watch is real training progress (a step count is only trusted
   when it arrives with a loss reading — dataset-scan progress bars never do).
@@ -120,25 +137,25 @@ The honest notes, because rented GPUs come with real trade-offs:
   owner process is **provably dead**. A run keyed on its final save, not on
   intermediate checkpoints — checkpoints prove a run *reached* a step, not that
   it *finished*.
-- **Your dataset leaves your machine.** It goes up to the pod over rsync/ssh.
+- **Your dataset leaves your machine.** It goes up to the pod over ssh.
   That's inherent to renting someone else's GPU; if that's a dealbreaker for a
-  given dataset, [train it locally](/blog/lora-trainer-p1) instead.
+  given dataset, [train it locally](./lora-trainer-p1) instead.
 
 ## RunPod FLUX LoRA training setup
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-   [Panel](/panel). Set your `RUNPOD_API_KEY` **once** in the panel's API-Keys
-   card — the same key the [RunPod connector](/blog/runpod-comfyui) already uses.
+   [Panel](../panel). Set your `RUNPOD_API_KEY` **once** in the panel's API-Keys
+   card — the same key the [RunPod connector](./runpod-comfyui) already uses.
 2. Make sure an `HF_TOKEN` with FLUX.1-dev access is in the MCP server env
    (FLUX.1-dev is gated; the pod downloads it on the first run).
 3. Ask: *"train a character LoRA from these photos on a RunPod pod."* The agent
    runs `train_doctor` against the pod, bootstraps ai-toolkit if needed, walks
-   you through dataset and trigger-word choices, rsyncs the dataset up, launches
+   you through dataset and trigger-word choices, uploads the dataset, launches
    the run, and streams progress until your `.safetensors` is sitting in
    `models/loras/`.
 
 That's the whole pitch of P4: the local trainer from
-[P1](/blog/lora-trainer-p1) proved the flow; the cloud transport removes the one
+[P1](./lora-trainer-p1) proved the flow; the cloud transport removes the one
 requirement not everyone can meet. You no longer need to *own* a 24GB GPU to
 train a FLUX LoRA — you just need to borrow one for an hour.
 

@@ -7,7 +7,7 @@
 // PanelAgent keeps all provider-agnostic orchestration (queue, turn-gate, bridge
 // push, self-restart) and drives this backend via
 // `for await (const ev of backend.run({...}))`. See
-// docs/design/agent-backend-injection.md.
+// design/agent-backend-injection.md.
 //
 // PROTOCOL MAPPING (port → app-server):
 //   - session            = a Codex THREAD (`thread/start` new | `thread/resume` by id)
@@ -19,6 +19,8 @@
 //   - result              ← `turn/completed` ({threadId, turn:{status}})
 //   - error               ← `error` notification ({error:{message}})
 //   - interrupt()         → `turn/interrupt` ({threadId, turnId})
+//   - recoverStalledTurn()→ `turn/steer` (an explicit harness-stall notice;
+//                            never misrepresented as a user cancellation)
 //   - listModels()        ← `config/read` (or a sensible static fallback)
 //
 // FULL PARITY with Claude: the Codex backend now drives the live ComfyUI canvas
@@ -37,11 +39,13 @@
 
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createRequire } from "node:module";
-import { promises as fsp } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { logger } from "../utils/logger.js";
+import { errorText, messageText, promptText } from "./error-text.js";
+import { formatCodexTurnError } from "./codex-error.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -50,11 +54,78 @@ import {
   type ModelChoice,
   type NeutralTurn,
   CODEX_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
+import { MAX_SESSION_PREVIEW_BYTES, previewByteBudgetLabel } from "./preview-budget.js";
+import {
+  inspectMcpServers,
+  reconnectableMcpStatus,
+  recoveredMcpNotice,
+  reportedFromCodexMcpListing,
+  unrecoveredMcpNotice,
+  type CodexMcpServerListing,
+  type DegradedMcpServer,
+} from "./mcp-session-health.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
+}
+
+function normalizedHttpMcpEndpoint(value: string): { origin: string; pathname: string; search: string } | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return {
+      origin: url.origin,
+      pathname: decodeURIComponent(url.pathname),
+      search: url.search,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Codex wraps a failed request to the orchestrator-hosted HTTP MCP in its
+ * WorkerTransport error. The URL is part of the trusted panel registration;
+ * without this association, an unrelated configured HTTP MCP failure could be
+ * mistaken for the panel and cause a panel reload.
+ */
+export function isCodexPanelMcpTransportFailure(message: string, panelUrl: string): boolean {
+  if (
+    !/Transport send error\s*(?::\s*(?:EventNotificationTransport\s+)?WorkerTransport\b|;\s*)/i.test(message)
+  ) {
+    return false;
+  }
+  const failedUrl = message.match(/HTTP request failed sending request to\s+(https?:\/\/\S+)/i)?.[1];
+  if (!failedUrl) return false;
+  const observed = normalizedHttpMcpEndpoint(failedUrl);
+  const configured = normalizedHttpMcpEndpoint(panelUrl);
+  return (
+    observed !== undefined &&
+    configured !== undefined &&
+    observed.origin === configured.origin &&
+    observed.pathname === configured.pathname &&
+    observed.search === configured.search
+  );
+}
+
+/** Keep a WorkerTransport failure self-contained: PanelAgent's generic turn
+ * failure text says "Nothing was lost — try again", which is unsafe when a
+ * mutation's dispatch/outcome was not established at this boundary. */
+function panelMcpTransportFailureNotice(message: string, retriedRead: boolean): string {
+  const retryNote = retriedRead
+    ? `The orchestrator retried this read once, but that retry also failed; the original transport error is preserved.`
+    : `The orchestrator did not retry the request.`;
+  return (
+    `The local panel MCP connection failed before a tool result was returned. ` +
+    `${retryNote} For a render or other mutation, ` +
+    `treat the first attempt's outcome as UNKNOWN until you inspect queue ` +
+    `(action:"list") or get_history; do not re-run panel_run blindly. The panel MCP ` +
+    `connection is being reloaded for the next turn. If it remains unavailable, ` +
+    `reconnect the orchestrator (Disconnect → Connect) before retrying. (${message})`
+  );
 }
 
 const configuredInterruptTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_INTERRUPT_TIMEOUT_MS);
@@ -62,6 +133,11 @@ const CODEX_INTERRUPT_TIMEOUT_MS =
   Number.isFinite(configuredInterruptTimeoutMs) && configuredInterruptTimeoutMs > 0
     ? configuredInterruptTimeoutMs
     : 1500;
+const configuredStallSteerTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_STALL_STEER_TIMEOUT_MS);
+const CODEX_STALL_STEER_TIMEOUT_MS =
+  Number.isFinite(configuredStallSteerTimeoutMs) && configuredStallSteerTimeoutMs > 0
+    ? configuredStallSteerTimeoutMs
+    : CODEX_INTERRUPT_TIMEOUT_MS;
 const configuredCloseTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_CLOSE_TIMEOUT_MS);
 const CODEX_CLOSE_TIMEOUT_MS =
   Number.isFinite(configuredCloseTimeoutMs) && configuredCloseTimeoutMs > 0
@@ -74,6 +150,15 @@ const CODEX_FORCE_KILL_GRACE_MS =
     : 500;
 const CODEX_CLIENT_CLOSE_BUDGET_MS =
   CODEX_CLOSE_TIMEOUT_MS * 2 + CODEX_FORCE_KILL_GRACE_MS + 100;
+const configuredHostSpawnRetryMs = Number(process.env.COMFYUI_MCP_CODEX_HOST_SPAWN_RETRY_MS);
+const CODEX_HOST_SPAWN_RETRY_MS =
+  Number.isFinite(configuredHostSpawnRetryMs) && configuredHostSpawnRetryMs >= 0
+    ? configuredHostSpawnRetryMs
+    : 150;
+// Two attempts: a stale WinGet path (os error 3) can be followed immediately
+// by a sharing-violation (os error 32) while the replacement image is copied
+// or scanned (#2045). A single retry died on that second failure.
+const CODEX_HOST_SPAWN_RETRIES = 2;
 
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
@@ -352,7 +437,16 @@ class AppServerClient {
       const p = this.pending.get(message.id);
       if (!p) return;
       this.pending.delete(message.id);
-      if (message.error) p.reject(new Error(message.error.message ?? `codex app-server ${p.method} failed.`));
+      if (message.error) {
+        // Keep the JSON-RPC error's structured data on the rejected value. A
+        // provider 400 can arrive as a rejected turn/start request rather than
+        // an `error` notification, and its request id/code may only be present
+        // in `error.data` (#2114). The user-facing formatter deliberately
+        // extracts only its safe diagnostic-shaped fields.
+        const error = new Error(message.error.message ?? `codex app-server ${p.method} failed.`);
+        Object.assign(error, message.error);
+        p.reject(error);
+      }
       else p.resolve(message.result ?? {});
       return;
     }
@@ -528,6 +622,94 @@ export function toolNameOf(item: Record<string, unknown> | undefined): string | 
   return type ?? null;
 }
 
+// A failed HTTP MCP send is observed outside panel-mcp-http.ts, so the backend
+// has to classify the in-flight app-server item before deciding whether the
+// transport may issue its one retry. Keep this allowlist intentionally narrower
+// than the panel tool catalog: scope navigation and every mutation must never
+// be replayed from an opaque outer transport error. Membership is the graph
+// inspect reads from QUEUE_BUSY_READ_TOOLS — including panel_find_nodes, which
+// is the #2395 recurrence after a completed panel_run.
+export const PANEL_OUTER_TRANSPORT_RETRY_SAFE_TOOLS = new Set([
+  "panel_graph_outline",
+  "panel_query_graph",
+  "panel_find_nodes",
+  "panel_get_errors",
+]);
+
+// Completing these can leave the Codex HTTP MCP client in a racy state (notably
+// the read immediately following a successful panel_open_workflow).
+// Arm a one-shot window for the immediate next allowlisted read. The tools
+// themselves stay off the retry allowlist so a failed arm operation is fenced.
+export const PANEL_OUTER_TRANSPORT_RETRY_ARM_TOOLS = new Set([
+  "panel_enter_subgraph",
+  "panel_open_workflow",
+  "panel_run",
+]);
+
+type PanelMcpToolItem = {
+  name: string;
+  itemId: string;
+  requestKeys: readonly string[];
+  retryOf?: string;
+};
+
+function stringFieldOf(value: Record<string, unknown> | undefined, ...keys: string[]): string | undefined {
+  if (!value) return undefined;
+  for (const key of keys) {
+    if (typeof value[key] === "string" && value[key]) return value[key] as string;
+  }
+  return undefined;
+}
+
+function isMcpToolCallItem(item: Record<string, unknown> | undefined): boolean {
+  return stringFieldOf(item, "type") === "mcpToolCall";
+}
+
+function panelMcpToolItemOf(item: Record<string, unknown> | undefined): PanelMcpToolItem | null {
+  const qualified = toolNameOf(item);
+  if (!qualified) return null;
+  const type = stringFieldOf(item, "type");
+  if (type && type !== "mcpToolCall") return null;
+  const separator = qualified.lastIndexOf(".");
+  const server = separator >= 0 ? qualified.slice(0, separator) : undefined;
+  const name = separator >= 0 ? qualified.slice(separator + 1) : qualified;
+  // If app-server identifies the MCP server, require the configured panel
+  // server. An item id is required for transport correlation; the display path
+  // above still supports older items that only have a tool name.
+  if (server && server !== "panel") return null;
+  const itemId = stringFieldOf(item, "id");
+  if (!itemId) return null;
+  const requestKeys = new Set<string>([itemId]);
+  for (const key of ["requestId", "request_id", "callId", "call_id"]) {
+    const value = stringFieldOf(item, key);
+    if (value) requestKeys.add(value);
+  }
+  const retryOf = stringFieldOf(item, "retryOf", "retry_of", "parentItemId", "parent_item_id");
+  if (retryOf) requestKeys.add(retryOf);
+  return {
+    name,
+    itemId,
+    requestKeys: [...requestKeys],
+    ...(retryOf ? { retryOf } : {}),
+  };
+}
+
+function panelMcpTransportErrorKeys(params: Record<string, unknown>): string[] {
+  const error = params.error as Record<string, unknown> | undefined;
+  const details = error?.additionalDetails as Record<string, unknown> | undefined;
+  const item = params.item as Record<string, unknown> | undefined;
+  const keys = new Set<string>();
+  for (const value of [
+    stringFieldOf(params, "itemId", "item_id", "requestId", "request_id", "callId", "call_id"),
+    stringFieldOf(item, "id", "requestId", "request_id", "callId", "call_id"),
+    stringFieldOf(error, "itemId", "item_id", "requestId", "request_id", "callId", "call_id"),
+    stringFieldOf(details, "itemId", "item_id", "requestId", "request_id", "callId", "call_id"),
+  ]) {
+    if (value) keys.add(value);
+  }
+  return [...keys];
+}
+
 /** A declared MCP server for the Codex app-server. Either a stdio command (the
  *  headless comfyui MCP) or a streamable-HTTP url (the panel_* loopback server). */
 export type CodexMcpServerSpec =
@@ -553,11 +735,94 @@ export interface CodexBackendDeps {
    */
   mcpServers?: Record<string, CodexMcpServerSpec>;
   /**
+   * Tool names that this orchestrator-owned MCP server must expose. This is
+   * deliberately supplied by the owner of the registration rather than
+   * inferred from a server name or from a cached catalog. It lets the bounded
+   * reconnect watch distinguish a connected-but-partial catalog from a healthy
+   * server without changing reload behavior for arbitrary MCP servers.
+   */
+  requiredMcpTools?: Readonly<Record<string, readonly string[]>>;
+  /**
    * Panel system prompt (persona). The app-server's thread/start has no
    * instructions field, so this is PREPENDED to the first turn's input as a
    * clearly-marked system/context preamble; later turns send plain text.
    */
   systemAppend?: string;
+}
+
+interface MissingMcpToolCatalog {
+  name: string;
+  missing: string[];
+}
+
+/**
+ * Read the current app-server status inventory without treating an absent
+ * inventory as evidence. The current protocol uses a name -> schema map; the
+ * array form is retained for older app-server test/runtime stubs.
+ */
+function mcpToolNames(tools: unknown): Set<string> | undefined {
+  if (Array.isArray(tools)) {
+    const names = new Set<string>();
+    for (const entry of tools) {
+      if (typeof entry === "string") {
+        names.add(entry);
+      } else if (entry && typeof entry === "object") {
+        const name = (entry as { name?: unknown }).name;
+        if (typeof name === "string") names.add(name);
+      }
+    }
+    return names;
+  }
+  if (tools && typeof tools === "object") return new Set(Object.keys(tools));
+  return undefined;
+}
+
+/**
+ * Find the one safe partial-catalog shape this backend knows how to repair:
+ * the app-server says the explicitly-owned server is connected, but its
+ * present, non-empty status inventory omits a tool the orchestrator explicitly
+ * guarantees. An absent or empty inventory is not enough to create this signal
+ * because the caller must provide the guarantee and the row must say
+ * `connected`.
+ */
+function missingRequiredMcpTools(
+  listed: readonly CodexMcpServerListing[],
+  required: Readonly<Record<string, readonly string[]>> | undefined,
+): MissingMcpToolCatalog[] {
+  if (!required) return [];
+  const gaps: MissingMcpToolCatalog[] = [];
+  for (const entry of listed) {
+    if (!entry || typeof entry.name !== "string" || !entry.name) continue;
+    const expected = Object.prototype.hasOwnProperty.call(required, entry.name) ? required[entry.name] : undefined;
+    if (!Array.isArray(expected) || expected.length === 0) continue;
+    const runtime = typeof entry.runtimeStatus === "string" ? entry.runtimeStatus.trim().toLowerCase() : "";
+    if (runtime !== "connected") continue;
+    const actual = mcpToolNames(entry.tools);
+    if (!actual || actual.size === 0) continue;
+    const missing = expected.filter((name) => typeof name === "string" && !actual.has(name));
+    if (missing.length) gaps.push({ name: entry.name, missing });
+  }
+  return gaps;
+}
+
+/** Return only servers whose present, non-empty connected inventory proves all
+ * explicitly-owned required wrappers are available. */
+function presentRequiredMcpTools(
+  listed: readonly CodexMcpServerListing[],
+  required: Readonly<Record<string, readonly string[]>> | undefined,
+): Set<string> {
+  const present = new Set<string>();
+  if (!required) return present;
+  for (const entry of listed) {
+    if (!entry || typeof entry.name !== "string" || !entry.name) continue;
+    const expected = Object.prototype.hasOwnProperty.call(required, entry.name) ? required[entry.name] : undefined;
+    if (!Array.isArray(expected) || expected.length === 0) continue;
+    const runtime = typeof entry.runtimeStatus === "string" ? entry.runtimeStatus.trim().toLowerCase() : "";
+    if (runtime !== "connected") continue;
+    const actual = mcpToolNames(entry.tools);
+    if (actual && actual.size > 0 && expected.every((name) => actual.has(name))) present.add(entry.name);
+  }
+  return present;
 }
 
 /**
@@ -618,6 +883,189 @@ export function resolveCodexSandbox(): string {
 }
 
 /**
+ * #1929 — Windows can refuse CreateProcess on the bundled
+ * `codex-code-mode-host.exe` with ERROR_SHARING_VIOLATION (os error 32) while
+ * Defender / a previous host still holds the image. Codex does not retry that
+ * spawn; the next identical call succeeds. Match the host-spawn failure, not
+ * every os-error-32, so a missing binary (os error 2) stays terminal.
+ */
+export function isWindowsCodeModeHostSharingViolation(message: string): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  const isHost = m.includes("code-mode host") || m.includes("codex-code-mode-host");
+  if (!isHost) return false;
+  return (
+    /\bos error 32\b/.test(m) ||
+    m.includes("error_sharing_violation") ||
+    m.includes("sharing violation") ||
+    m.includes("being used by another process") ||
+    m.includes("utilise par un autre processus") ||
+    m.includes("utilizado por otro proceso")
+  );
+}
+
+/**
+ * #2045 — Windows ERROR_PATH_NOT_FOUND (os error 3) when WinGet deletes a
+ * versioned Node package dir (`node-vX.Y.Z-win-x64\\...`) out from under a live
+ * app-server. Distinct from os error 2 (file not found in an existing dir),
+ * which stays terminal (#1929).
+ */
+export function isWindowsCodeModeHostPathNotFound(message: string): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  const isHost = m.includes("code-mode host") || m.includes("codex-code-mode-host");
+  if (!isHost) return false;
+  if (/\bos error 2\b/.test(m)) return false;
+  return (
+    /\bos error 3\b/.test(m) ||
+    m.includes("cannot find the path specified") ||
+    m.includes("chemin d'acces specifie est introuvable") ||
+    m.includes("chemin d'accès spécifié est introuvable") ||
+    m.includes("no puede encontrar la ruta")
+  );
+}
+
+export function isWindowsCodeModeHostSpawnRetryable(message: string): boolean {
+  return isWindowsCodeModeHostSharingViolation(message) || isWindowsCodeModeHostPathNotFound(message);
+}
+
+const CODEX_PLATFORM_PACKAGE: Record<string, { pkg: string; triple: string }> = {
+  "win32-x64": { pkg: "@openai/codex-win32-x64", triple: "x86_64-pc-windows-msvc" },
+  "win32-arm64": { pkg: "@openai/codex-win32-arm64", triple: "aarch64-pc-windows-msvc" },
+  "darwin-x64": { pkg: "@openai/codex-darwin-x64", triple: "x86_64-apple-darwin" },
+  "darwin-arm64": { pkg: "@openai/codex-darwin-arm64", triple: "aarch64-apple-darwin" },
+  "linux-x64": { pkg: "@openai/codex-linux-x64", triple: "x86_64-unknown-linux-musl" },
+  "linux-arm64": { pkg: "@openai/codex-linux-arm64", triple: "aarch64-unknown-linux-musl" },
+};
+
+function vendorHostName(platform: NodeJS.Platform | string = process.platform): string {
+  return platform === "win32" ? "codex-code-mode-host.exe" : "codex-code-mode-host";
+}
+
+function vendorExeName(platform: NodeJS.Platform | string = process.platform): string {
+  return platform === "win32" ? "codex.exe" : "codex";
+}
+
+function platformOfHostPath(hostPath: string): NodeJS.Platform | string {
+  return hostPath.toLowerCase().endsWith(".exe") ? "win32" : process.platform;
+}
+
+/** WinGet's versioned Node dir and nvm-windows layouts vanish on an update. */
+export function isVolatileCodexPackagePath(p: string): boolean {
+  const n = p.replace(/\\/g, "/").toLowerCase();
+  return (
+    n.includes("/winget/packages/") ||
+    /\/node-v\d+\.\d+\.\d+-win/.test(n) ||
+    /\/nvm\/v?\d/.test(n) ||
+    n.includes("/.nvm/")
+  );
+}
+
+export function codeModeHostPathFromError(message: string): string | null {
+  const m = message.match(/code-mode host\s+(.+?):\s/i);
+  const p = m?.[1]?.trim();
+  return p || null;
+}
+
+export function resolveCodexCodeModeHostPath(
+  opts: {
+    resolve?: (id: string) => string;
+    existsSync?: (p: string) => boolean;
+    platform?: NodeJS.Platform;
+    arch?: string;
+  } = {},
+): string | null {
+  const platform = opts.platform ?? process.platform;
+  const arch = opts.arch ?? process.arch;
+  const spec = CODEX_PLATFORM_PACKAGE[`${platform}-${arch}`];
+  if (!spec) return null;
+  const exists = opts.existsSync ?? existsSync;
+  const resolve = opts.resolve ?? ((id: string) => createRequire(import.meta.url).resolve(id));
+  try {
+    const pkgJson = resolve(`${spec.pkg}/package.json`);
+    const host = path.join(path.dirname(pkgJson), "vendor", spec.triple, "bin", vendorHostName(platform));
+    return exists(host) ? host : null;
+  } catch {
+    return null;
+  }
+}
+
+export function stableCodexVendorDir(home = os.homedir()): string {
+  const override = process.env.COMFYUI_MCP_CODEX_VENDOR_DIR?.trim();
+  return override || path.join(home, ".comfyui-mcp", "codex-vendor");
+}
+
+/**
+ * Copy the vendor `codex` + `codex-code-mode-host` pair out of a volatile
+ * WinGet/nvm package dir into a stable location. If the source is already gone
+ * or the dest is locked (os error 32), keep a usable dest copy.
+ */
+export function ensureStableCodexVendor(
+  srcHost: string,
+  opts: {
+    destDir?: string;
+    existsSync?: (p: string) => boolean;
+    mkdirSync?: (p: string, options?: { recursive: boolean }) => void;
+    copyFileSync?: (src: string, dest: string) => void;
+  } = {},
+): string | null {
+  const exists = opts.existsSync ?? existsSync;
+  const mkdir = opts.mkdirSync ?? mkdirSync;
+  const copy = opts.copyFileSync ?? copyFileSync;
+  const destDir = opts.destDir ?? stableCodexVendorDir();
+  const plat = platformOfHostPath(srcHost);
+  const destHost = path.join(destDir, vendorHostName(plat));
+  const destExe = path.join(destDir, vendorExeName(plat));
+  const srcExe = path.join(path.dirname(srcHost), vendorExeName(plat));
+  const destUsable = exists(destHost) && exists(destExe);
+  if (!exists(srcHost) || !exists(srcExe)) return destUsable ? destHost : null;
+  try {
+    mkdir(destDir, { recursive: true });
+    copy(srcExe, destExe);
+    copy(srcHost, destHost);
+    return exists(destHost) && exists(destExe) ? destHost : destUsable ? destHost : null;
+  } catch {
+    return destUsable ? destHost : null;
+  }
+}
+
+export function resolveCodexLaunchBin(
+  opts: {
+    resolveJs?: () => string | null;
+    resolveHost?: () => string | null;
+    existsSync?: (p: string) => boolean;
+    ensureStable?: (srcHost: string) => string | null;
+  } = {},
+): string {
+  const exists = opts.existsSync ?? existsSync;
+  const host = (opts.resolveHost ?? (() => resolveCodexCodeModeHostPath({ existsSync: exists })))();
+  if (host && isVolatileCodexPackagePath(host)) {
+    const ensure = opts.ensureStable ?? ((src: string) => ensureStableCodexVendor(src));
+    const stableHost = ensure(host);
+    if (stableHost) {
+      const exe = path.join(path.dirname(stableHost), vendorExeName(platformOfHostPath(stableHost)));
+      if (exists(exe)) return exe;
+    }
+  }
+  try {
+    const js =
+      opts.resolveJs?.() ??
+      (() => {
+        const require = createRequire(import.meta.url);
+        const pkgPath = require.resolve("@openai/codex/package.json");
+        const pkg = require("@openai/codex/package.json") as { bin?: Record<string, string> | string };
+        const binRel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.codex;
+        if (!binRel) return null;
+        return path.join(pkgPath.replace(/[\\/]package\.json$/, ""), binRel.replace(/^\.[\\/]/, ""));
+      })();
+    if (js && exists(js)) return js;
+  } catch {
+    // bundled package not installed — fall through to PATH.
+  }
+  return "codex";
+}
+
+/**
  * The Codex app-server adapter. One instance per PanelAgent; it holds the live
  * app-server client + current thread/turn ids and re-opens on each `run()`.
  */
@@ -649,6 +1097,21 @@ export class CodexBackend implements AgentBackend {
   /** The live thread + turn ids — used for `turn/interrupt`. */
   private threadId: string | null = null;
   private turnId: string | null = null;
+  /** MCP servers this run currently knows are DOWN, name → reconnect attempted.
+   *  Codex does not auto-reconnect HTTP MCP (openai/codex#11489); we poll
+   *  `mcpServerStatus/list` at each turn end and queue one
+   *  `config/mcpServer/reload` per down-episode (#1524). */
+  private mcpDown = new Map<string, boolean>();
+  /** Names whose `config/mcpServer/reload` was queued this down/partial episode and has
+   *  not been judged yet. The app-server applies the refresh on the NEXT
+   *  turn, so the following poll is the verdict — not an immediate re-read. */
+  private mcpReloadPending = new Set<string>();
+  /** Partial-catalog episodes cannot be closed by a connected row alone. */
+  private mcpCatalogRecovery = new Set<string>();
+  /** A WorkerTransport send failure is stronger evidence than a cached
+   * `runtimeStatus: connected` row, but it still opens only one recovery episode.
+   * The control-plane reload below never replays the failed tool call. */
+  private mcpTransportRecovery = new Set<string>();
   /** The model requested for new turns (mutable for a future live setModel). */
   private model: string | undefined;
   /** The Codex reasoning effort for new turns, already mapped to a valid Codex
@@ -666,6 +1129,14 @@ export class CodexBackend implements AgentBackend {
    *  Tracked so each turn cleans up its own files, and close() sweeps any
    *  stragglers. */
   private tempImageFiles = new Set<string>();
+  /** #1516 — fetched bytes of AUTOMATIC previews delivered into the CURRENT
+   *  thread (refs flagged `automatic`; user attachments never count). Codex
+   *  persists every localImage as an inline input_image data URL and its
+   *  compaction recopies them unboundedly, so this is the ledger the cumulative
+   *  byte budget enforces against. Reset when the thread changes. */
+  private previewBytes = 0;
+  /** The thread {@link previewBytes} belongs to (a fresh thread starts at 0). */
+  private previewBytesThread: string | null = null;
 
   constructor(deps: CodexBackendDeps = {}) {
     this.deps = deps;
@@ -697,41 +1168,37 @@ export class CodexBackend implements AgentBackend {
   }
 
   /**
-   * Resolve the codex binary: prefer the bundled `@openai/codex` launcher (via
-   * require.resolve of its package bin) so no separate install is needed; fall
-   * back to a `codex` on PATH. Throws a clear message if neither is available.
+   * Resolve the codex binary: prefer a stable copy of the vendor exe when the
+   * active package lives under a WinGet/nvm versioned dir (#2045), else the
+   * bundled `@openai/codex` launcher, else a `codex` on PATH. A cached path
+   * that no longer exists is dropped so the next spawn cannot keep a stale
+   * WinGet Node folder.
    */
   private resolveBin(): string {
-    if (this.bin) return this.bin;
-    try {
-      const require = createRequire(import.meta.url);
-      // The package exposes bin/codex.js; resolve its package.json then derive the
-      // bin path relative to the package dir (works regardless of OS separators).
-      const pkgPath = require.resolve("@openai/codex/package.json");
-      const pkg = require("@openai/codex/package.json") as { bin?: Record<string, string> | string };
-      const binRel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.codex;
-      if (binRel) {
-        const sep = pkgPath.includes("\\") ? "\\" : "/";
-        const pkgDir = pkgPath.replace(/[\\/]package\.json$/, "");
-        this.bin = `${pkgDir}${sep}${binRel.replace(/^\.[\\/]/, "")}`;
+    if (this.bin && this.bin !== "codex") {
+      if (!existsSync(this.bin)) this.bin = null;
+      else if (!/\.(c|m)?js$/i.test(this.bin)) {
+        const host = path.join(path.dirname(this.bin), vendorHostName(platformOfHostPath(this.bin)));
+        if (!existsSync(host)) this.bin = null;
       }
-    } catch {
-      // bundled package not installed — fall through to PATH.
     }
-    if (!this.bin) this.bin = "codex"; // PATH fallback (a `codex` on PATH)
+    if (this.bin) return this.bin;
+    this.bin = resolveCodexLaunchBin();
     return this.bin;
   }
 
   /**
    * Fetch a ComfyUI image (/view) and spill the bytes to a temp file, returning
-   * its absolute path — or null on any failure (the text reference still names the
-   * image as a fallback). The app-server `turn/start` `localImage` input item takes
-   * a FILE PATH (mirrors the codex CLI `-i, --image <FILE>`), so unlike Claude
-   * (inline base64) we must write the bytes to disk. Mirrors
-   * ClaudeBackend.fetchImageBlock's source/size guards. Each written path is
-   * tracked in tempImageFiles for per-turn + close() cleanup.
+   * its absolute path and byte size — or null on any failure (the text reference
+   * still names the image as a fallback). The app-server `turn/start`
+   * `localImage` input item takes a FILE PATH (mirrors the codex CLI
+   * `-i, --image <FILE>`), so unlike Claude (inline base64) we must write the
+   * bytes to disk. Mirrors ClaudeBackend.fetchImageBlock's source/size guards.
+   * Each written path is tracked in tempImageFiles for per-turn + close()
+   * cleanup. The byte count rides along so the caller can charge the #1516
+   * cumulative preview ledger with the size that was ACTUALLY delivered.
    */
-  private async fetchImageFile(ref: ImageRef): Promise<string | null> {
+  private async fetchImageFile(ref: ImageRef): Promise<{ path: string; bytes: number } | null> {
     if (!this.deps.comfyuiUrl || !ref?.filename) return null;
     try {
       const u = new URL("/view", this.deps.comfyuiUrl);
@@ -763,10 +1230,44 @@ export class CodexBackend implements AgentBackend {
       );
       await fsp.writeFile(file, buf);
       this.tempImageFiles.add(file);
-      return file;
+      return { path: file, bytes: buf.length };
     } catch {
       return null;
     }
+  }
+
+  /** #1516 — fetched bytes of AUTOMATIC previews delivered into the current
+   *  thread, as the AgentBackend port exposes them: PanelAgent adds this to the
+   *  durable pre-restart base when it checks the cumulative session budget. */
+  automaticPreviewBytes(): number {
+    return this.previewBytes;
+  }
+
+  /**
+   * How long a turn's localImage files survive after the turn ends (#1152).
+   *
+   * The app-server may read a localImage well after turn/start returns, so the
+   * delete has to wait for a read whose timing we do not control. There is no
+   * signal for "the image was consumed" in the protocol, so this is a grace
+   * window rather than a handshake — chosen long enough to cover a deferred read
+   * on a busy machine, and bounded so the files do not accumulate for a session's
+   * whole lifetime.
+   */
+  private static readonly TEMP_IMAGE_GRACE_MS = 5 * 60_000;
+
+  /** Pending grace timers, so close() can clear them rather than leave them armed. */
+  private tempImageTimers = new Set<NodeJS.Timeout>();
+
+  /** Delete this turn's temp images after the grace window (#1152). */
+  private scheduleTempImageCleanup(files: string[]): void {
+    const timer = setTimeout(() => {
+      this.tempImageTimers.delete(timer);
+      void this.cleanupTempImages(files);
+    }, CodexBackend.TEMP_IMAGE_GRACE_MS);
+    // Must never keep the process alive: an orchestrator that has finished its
+    // work should exit, and close() sweeps the files regardless.
+    timer.unref?.();
+    this.tempImageTimers.add(timer);
   }
 
   /** Delete the given temp image files (best-effort) and drop them from tracking. */
@@ -876,6 +1377,10 @@ export class CodexBackend implements AgentBackend {
    * next batch (the channel async-iteration IS the turn-gate).
    */
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+    this.mcpDown.clear();
+    this.mcpReloadPending.clear();
+    this.mcpCatalogRecovery.clear();
+    this.mcpTransportRecovery.clear();
     await this.prepare();
     const client = this.client;
     if (!client) throw new Error("codex app-server not initialized");
@@ -934,6 +1439,13 @@ export class CodexBackend implements AgentBackend {
       this.needsSystemPreamble = !!this.deps.systemAppend;
     }
     // The thread id is our session id (PanelAgent persists it for resume).
+    // #1516 — the cumulative preview byte ledger is a property OF THE THREAD:
+    // a different conversation (fresh start, or a resume of another id after a
+    // fork) provably holds none of this process's earlier previews.
+    if (this.threadId !== this.previewBytesThread) {
+      this.previewBytesThread = this.threadId;
+      this.previewBytes = 0;
+    }
     yield {
       type: "session",
       sessionId: this.threadId,
@@ -943,11 +1455,210 @@ export class CodexBackend implements AgentBackend {
     // Process the neutral channel one turn at a time. onActivity is the LIVENESS
     // signal — every raw app-server notification for the active turn re-arms
     // PanelAgent's idle watchdog so a long, quiet generation doesn't falsely trip.
+    let turnSeq = 0;
+    let liveClient = client;
     for await (const turn of opts.channel) {
-      yield* this.runTurn(client, turn, opts.onActivity);
-      // A timed-out interrupt detaches this client. End the old run before it can
-      // consume another queued turn; PanelAgent will start a fresh app-server.
-      if (this.client !== client) return;
+      // A timed-out interrupt nulls this.client — stop draining so PanelAgent
+      // can start a fresh app-server. A stale-host recycle (#2045) replaces
+      // the client in place; keep going on the replacement.
+      if (!this.client) return;
+      liveClient = this.client;
+      yield* stampTurn(this.runTurn(liveClient, turn, opts.onActivity), ++turnSeq);
+      if (!this.client) return;
+      liveClient = this.client;
+      try {
+        for (const ev of await this.checkMcpServers(liveClient)) yield ev;
+      } catch (err) {
+        logger.debug(`[codex-backend] checkMcpServers: ${msgOf(err)}`);
+      }
+    }
+  }
+
+  /**
+   * Watch the Codex toolset for a MID-SESSION drop and queue one reconnect
+   * (#1524). Codex's MCP client is one-shot (openai/codex#11489): stdio
+   * `comfyui` is respawned by the client, HTTP `panel` is not. After
+   * `panel_restart_comfyui` the session resumes with ALL_TOOLS missing every
+   * `mcp__panel__*` entry while the generic comfyui gateway remains.
+   *
+   * Detection is one `mcpServerStatus/list` poll per turn end (with this
+   * thread's id, so `runtimeStatus` is filled) against the servers this
+   * session was given. Cached `tools` do not prove connected; an explicitly
+   * configured required wrapper missing from a non-absent connected inventory
+   * is the only partial-catalog case this watch repairs. Recovery is
+   * `config/mcpServer/reload`, which the app-server applies on the NEXT
+   * turn — so this turn does not claim a verdict from an immediate re-read.
+   * The next poll is the verdict.
+   * One attempt per down-episode; `needs-auth` / `disabled` are reported
+   * and not retried. A poll or reload that throws leaves the session as
+   * informed as before and never takes the turn stream down.
+   */
+  private async checkMcpServers(client: AppServerClient): Promise<AgentEvent[]> {
+    const names = Object.keys(this.deps.mcpServers ?? {});
+    if (names.length === 0) return [];
+    // A WorkerTransport failure can leave Codex's status inventory cached as
+    // connected. Preserve the observation as a bounded, panel-only recovery
+    // episode so a status poll cannot erase the evidence before reload.
+    const transportRecovery = new Set(
+      [...this.mcpTransportRecovery].filter(
+        (name) => !this.mcpDown.has(name) && !this.mcpReloadPending.has(name),
+      ),
+    );
+    const polled = await this.pollMcpStatus(client);
+    if (!polled && transportRecovery.size === 0) return [];
+    const { reported, listed } = polled ?? { reported: [], listed: [] };
+    const events: AgentEvent[] = [];
+    const health = inspectMcpServers(names, reported);
+    const catalogGaps = missingRequiredMcpTools(listed, this.deps.requiredMcpTools);
+    const catalogRecovered = presentRequiredMcpTools(listed, this.deps.requiredMcpTools);
+    for (const gap of catalogGaps) this.mcpCatalogRecovery.add(gap.name);
+    // A server reported as failed already has the authoritative failure status;
+    // do not replace it with the partial-catalog diagnosis if both observations
+    // arrive in one poll.
+    const degradedByName = new Map(health.degraded.map((d) => [d.name, d]));
+    for (const gap of catalogGaps) {
+      if (!degradedByName.has(gap.name)) degradedByName.set(gap.name, { name: gap.name, status: "partial" });
+    }
+    for (const name of transportRecovery) {
+      if (!degradedByName.has(name)) degradedByName.set(name, { name, status: "transport-error" });
+    }
+    const degraded: DegradedMcpServer[] = [...degradedByName.values()];
+    const catalogGapNames = new Set(catalogGaps.map((gap) => gap.name));
+    const downNow = new Set(degraded.map((d) => d.name));
+
+    // Verdict on a reload queued at the previous turn end. The refresh is
+    // applied when the next turn starts, so THIS poll is the first honest read.
+    const pendingVerdict = [...this.mcpReloadPending];
+    this.mcpReloadPending.clear();
+
+    const backByUs: string[] = [];
+    const backOnItsOwn: string[] = [];
+    for (const name of [...this.mcpDown.keys()]) {
+      if (downNow.has(name)) continue;
+      if (this.mcpCatalogRecovery.has(name) && !catalogRecovered.has(name)) continue;
+      const weTried = this.mcpDown.get(name) === true || pendingVerdict.includes(name);
+      this.mcpDown.delete(name);
+      this.mcpCatalogRecovery.delete(name);
+      (weTried ? backByUs : backOnItsOwn).push(name);
+    }
+    if (backByUs.length) {
+      logger.info(`[codex-backend] MCP reload brought back: ${backByUs.join(", ")}`);
+      events.push({ type: "error", sessionNotice: true, message: recoveredMcpNotice(backByUs, true) });
+    }
+    if (backOnItsOwn.length) {
+      logger.info(`[codex-backend] MCP servers connected again on their own: ${backOnItsOwn.join(", ")}`);
+      events.push({ type: "error", sessionNotice: true, message: recoveredMcpNotice(backOnItsOwn, false) });
+    }
+
+    const stillDownAfterReload = degraded.filter((d) => pendingVerdict.includes(d.name));
+    if (stillDownAfterReload.length) {
+      this.reportDegradedMcp(stillDownAfterReload, "lost");
+      events.push({
+        type: "error",
+        sessionNotice: true,
+        message: unrecoveredMcpNotice(stillDownAfterReload, "reconnect-failed"),
+      });
+    }
+
+    const triable = degraded.filter(
+      (d) =>
+        !pendingVerdict.includes(d.name) &&
+        this.mcpDown.get(d.name) !== true &&
+        (reconnectableMcpStatus(d.status) || catalogGapNames.has(d.name) || transportRecovery.has(d.name)),
+    );
+    if (triable.length > 0) {
+      for (const d of triable) {
+        this.mcpDown.set(d.name, true);
+        this.mcpTransportRecovery.delete(d.name);
+      }
+      try {
+        await client.request("config/mcpServer/reload", {});
+        for (const d of triable) this.mcpReloadPending.add(d.name);
+      } catch (err) {
+        logger.debug(`[codex-backend] config/mcpServer/reload: ${msgOf(err)}`);
+        this.reportDegradedMcp(triable, "lost");
+        events.push({
+          type: "error",
+          sessionNotice: true,
+          message: unrecoveredMcpNotice(triable, "unverified"),
+        });
+      }
+    }
+
+    const unreported = degraded.filter(
+      (d) =>
+        !pendingVerdict.includes(d.name) &&
+        !triable.some((t) => t.name === d.name) &&
+        !this.mcpDown.has(d.name),
+    );
+    const notRetriable = unreported.filter((d) => !reconnectableMcpStatus(d.status));
+    const unsupported = unreported.filter((d) => reconnectableMcpStatus(d.status));
+    for (const d of unreported) this.mcpDown.set(d.name, true);
+    if (notRetriable.length) {
+      this.reportDegradedMcp(notRetriable, "lost");
+      events.push({
+        type: "error",
+        sessionNotice: true,
+        message: unrecoveredMcpNotice(notRetriable, "not-retriable"),
+      });
+    }
+    if (unsupported.length) {
+      this.reportDegradedMcp(unsupported, "lost");
+      events.push({
+        type: "error",
+        sessionNotice: true,
+        message: unrecoveredMcpNotice(unsupported, "unsupported"),
+      });
+    }
+    return events;
+  }
+
+  /** Record the specific HTTP MCP failure observed by the Codex app-server.
+   * Do not open a second episode while an existing status/reload episode is
+   * still unresolved; the next turn's status poll is its verdict. */
+  private noteMcpTransportFailure(message: string): boolean {
+    const panel = this.deps.mcpServers?.panel;
+    if (panel?.transport !== "http" || !isCodexPanelMcpTransportFailure(message, panel.url)) return false;
+    if (!this.mcpDown.has("panel") && !this.mcpReloadPending.has("panel")) {
+      this.mcpTransportRecovery.add("panel");
+    }
+    return true;
+  }
+
+  private reportDegradedMcp(degraded: readonly DegradedMcpServer[], when: string): void {
+    logger.error(
+      `[codex-backend] session ${this.threadId?.slice(0, 8) ?? "?"} ${when} WITHOUT ` +
+        `${degraded.map((d) => `${d.name}=${d.status ?? "absent"}`).join(" ")}`,
+    );
+  }
+
+  private async pollMcpStatus(client: AppServerClient): Promise<
+    | { reported: Array<{ name: string; status: string }>; listed: CodexMcpServerListing[] }
+    | undefined
+  > {
+    try {
+      const listed: CodexMcpServerListing[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < 8; page++) {
+        const res = await client.request<{
+          data?: CodexMcpServerListing[];
+          nextCursor?: string | null;
+        }>("mcpServerStatus/list", {
+          detail: "toolsAndAuthOnly",
+          limit: 50,
+          ...(this.threadId ? { threadId: this.threadId } : {}),
+          ...(cursor ? { cursor } : {}),
+        });
+        if (!Array.isArray(res?.data)) break;
+        listed.push(...res.data);
+        cursor = res.nextCursor ?? undefined;
+        if (!cursor) break;
+      }
+      const reported = reportedFromCodexMcpListing(listed);
+      return reported ? { reported, listed } : undefined;
+    } catch (err) {
+      logger.debug(`[codex-backend] mcpServerStatus/list: ${msgOf(err)}`);
+      return undefined;
     }
   }
 
@@ -962,6 +1673,7 @@ export class CodexBackend implements AgentBackend {
     onActivity?: () => void,
   ): AsyncGenerator<AgentEvent> {
     const threadId = this.threadId!;
+    let liveClient = client;
     // Event queue bridging the push-based notification handler to this pull-based
     // async generator. The handler enqueues normalized AgentEvents; we drain.
     const queue: AgentEvent[] = [];
@@ -985,11 +1697,11 @@ export class CodexBackend implements AgentBackend {
     // already emitted (so the error notification, the exit watcher, and the
     // turn/start rejection can all call it without double-finishing) (P0-B).
     let finishedResult = false;
-    const emitTerminalError = (message: string) => {
+    const emitTerminalError = (message: string, flags?: { outcomeUnknown?: boolean }) => {
       if (finishedResult) return;
       finishedResult = true;
       closeStream();
-      push({ type: "error", message });
+      push({ type: "error", message, ...flags });
       push({ type: "result", ok: false, subtype: "error" });
       finish();
     };
@@ -1001,6 +1713,12 @@ export class CodexBackend implements AgentBackend {
     let activeTurnId: string | null = null;
     let turnIdKnown = false;
     const buffered: RpcMessage[] = [];
+    // #1929 — one bounded retry of turn/start after a Windows sharing-violation
+    // on the bundled code-mode host. While the retry is armed, drop notifications
+    // for the dead turn so a racing turn/completed cannot finish us first.
+    let hostSpawnRetries = 0;
+    let retryPending = false;
+    let retryTimer: NodeJS.Timeout | undefined;
     const belongsToTurn = (msg: RpcMessage): boolean => {
       const params = (msg.params ?? {}) as Record<string, unknown>;
       const msgThreadId = params.threadId as string | undefined;
@@ -1012,6 +1730,39 @@ export class CodexBackend implements AgentBackend {
       // carries no turn id → accept; otherwise require an exact match.
       return activeTurnId === null || msgTurnId === null || msgTurnId === activeTurnId;
     };
+
+    // A WorkerTransport error can arrive with willRetry:true, which means the
+    // app-server still owns the turn and may emit a retry/completion after the
+    // notification. Local recovery must fence that turn before exposing a
+    // terminal outcome to PanelAgent; otherwise a new turn could start while
+    // the original panel mutation is still being retried.
+    let mcpTransportFencePending = false;
+    let turnFenced = false;
+    type PanelMcpRequest = PanelMcpToolItem & {
+      afterArmItemId: string | null;
+      completed: boolean;
+    };
+    type PanelReadRetry = {
+      originalMessage: string;
+      tool: string;
+      itemIds: Set<string>;
+      requestKeys: Set<string>;
+    };
+    const panelMcpRequests = new Map<string, PanelMcpRequest>();
+    const panelRequestKeyToItem = new Map<string, string>();
+    const panelReadRetries = new Map<string, PanelReadRetry>();
+    const inFlightMcpItemIds = new Set<string>();
+    let unkeyedMcpItems = 0;
+    let panelArmCandidate: { itemId: string; laterPanelRequestStarted: boolean } | null = null;
+    let immediatePanelReadAfterArm: string | null = null;
+
+    // Retry contract: only the next panel request after a successful
+    // panel_enter_subgraph, panel_open_workflow, or panel_run completion can be
+    // an eligible graph read. The one-shot sequence is consumed at request
+    // start; a mutation or unrelated panel request therefore invalidates it
+    // before a later read can qualify. Correlation must resolve the transport
+    // error to that request; ambiguity is fail-closed. Mutations and unrelated
+    // reads use normal fencing.
 
     // LIVENESS (watchdog re-arm): re-arm PanelAgent's idle watchdog ONLY for
     // notifications that represent work or an outcome for THIS active turn. A
@@ -1041,7 +1792,7 @@ export class CodexBackend implements AgentBackend {
     const TURN_LIVENESS = (m: string) =>
       m.startsWith("item/") || m.startsWith("turn/") || m === "error" || MODEL_TURN_EVENTS.has(m);
     const bumpTurnActivity = (msg: RpcMessage): void => {
-      if (!belongsToTurn(msg) || !TURN_LIVENESS(msg.method ?? "")) return;
+      if (turnFenced || !belongsToTurn(msg) || !TURN_LIVENESS(msg.method ?? "")) return;
       try {
         onActivity?.();
       } catch {
@@ -1056,6 +1807,10 @@ export class CodexBackend implements AgentBackend {
     let streamOpen = false;
     let streamKind: "text" | "thinking" | null = null;
     let interrupted = false;
+    // Accumulate the streamed reply text so a malformed final commit (structured
+    // `agentMessage.text` coercing to empty/"[object Object]") can fall back to the
+    // text the user already saw stream in, instead of clobbering it (#421, #422).
+    let assistantTextBuffer = "";
 
     const openStream = (id: string | null, kind: "text" | "thinking") => {
       if (streamOpen && streamKind === kind) return;
@@ -1072,6 +1827,85 @@ export class CodexBackend implements AgentBackend {
       }
     };
 
+    // `willRetry:true` is the app-server's positive signal that it still owns
+    // the active connection and can retry the failed MCP send. Keep the local
+    // state checks as well: cancellation, timeout teardown, client replacement,
+    // and disposal must not wake a retry after the turn has stopped being live.
+    const appServerConnectionIsActive = (): boolean =>
+      !interrupted &&
+      !finishedResult &&
+      !turnFenced &&
+      !this.disposed &&
+      this.client === liveClient &&
+      liveClient.exitError == null;
+
+    const trackPanelMcpItem = (
+      item: PanelMcpToolItem,
+      afterArmItemId: string | null,
+    ): PanelMcpRequest => {
+      const existing = panelMcpRequests.get(item.itemId);
+      if (existing) {
+        for (const key of item.requestKeys) {
+          existing.requestKeys = [...new Set([...existing.requestKeys, key])];
+          panelRequestKeyToItem.set(key, item.itemId);
+        }
+        return existing;
+      }
+      const request: PanelMcpRequest = {
+        ...item,
+        afterArmItemId,
+        completed: false,
+      };
+      panelMcpRequests.set(item.itemId, request);
+      for (const key of item.requestKeys) panelRequestKeyToItem.set(key, item.itemId);
+      return request;
+    };
+
+    const panelMcpRequestForTransportError = (
+      params: Record<string, unknown>,
+    ): PanelMcpRequest | null => {
+      const keys = panelMcpTransportErrorKeys(params);
+      if (keys.length > 0) {
+        const itemIds = new Set<string>();
+        let unknownKey = false;
+        for (const key of keys) {
+          const itemId = panelRequestKeyToItem.get(key) ?? (panelMcpRequests.has(key) ? key : undefined);
+          if (itemId) itemIds.add(itemId);
+          else unknownKey = true;
+        }
+        // An unknown explicit key must never fall back to a different request.
+        if (unknownKey || itemIds.size !== 1) return null;
+        const request = panelMcpRequests.get([...itemIds][0]);
+        return request && !request.completed ? request : null;
+      }
+
+      // Older app-server errors omit itemId. A sole in-flight MCP request is
+      // still unambiguous; any parallel or unkeyed MCP item makes it ineligible.
+      if (unkeyedMcpItems > 0 || inFlightMcpItemIds.size !== 1) return null;
+      const inFlight = [...panelMcpRequests.values()].filter((request) => !request.completed);
+      if (inFlight.length !== 1) return null;
+      const [itemId] = inFlightMcpItemIds;
+      return inFlight[0].itemId === itemId ? inFlight[0] : null;
+    };
+
+    const panelReadRetryForRequest = (
+      request: PanelMcpRequest | null,
+    ): { originItemId: string; retry: PanelReadRetry } | null => {
+      if (!request) return null;
+      for (const [originItemId, retry] of panelReadRetries) {
+        if (
+          retry.itemIds.has(request.itemId) ||
+          request.requestKeys.some((key) => retry.requestKeys.has(key))
+        ) {
+          return { originItemId, retry };
+        }
+      }
+      return null;
+    };
+
+    const firstPanelReadRetry = (): PanelReadRetry | undefined =>
+      panelReadRetries.values().next().value as PanelReadRetry | undefined;
+
     const abortActiveTurn = () => {
       interrupted = true;
       if (finishedResult) return;
@@ -1084,6 +1918,184 @@ export class CodexBackend implements AgentBackend {
     };
     this.abortActiveTurn = abortActiveTurn;
 
+    // Assigned after turn input is built — the retry timer only fires after a
+    // turn/start has already run, so this is never invoked while still a no-op.
+    let issueTurnStart: () => void = () => {};
+    let handler: (msg: RpcMessage) => void = () => {};
+    let hostRecycleInFlight = false;
+    const watchExit = (watched: AppServerClient) => {
+      void watched.exitPromise.then(() => {
+        if (done || turnFenced) return;
+        if (watched !== liveClient) return;
+        // Closing the old app-server is the point of a stale-host recycle;
+        // its exit must not finish the replacement turn (#2045).
+        const retry = firstPanelReadRetry();
+        if (retry) {
+          panelReadRetries.clear();
+          emitTerminalError(panelMcpTransportFailureNotice(retry.originalMessage, true), {
+            outcomeUnknown: true,
+          });
+          return;
+        }
+        if (hostRecycleInFlight) return;
+        emitTerminalError(
+          watched.exitError ? msgOf(watched.exitError) : "codex app-server connection closed.",
+        );
+      });
+    };
+
+    const closeFencedClient = async (fencedClient: AppServerClient): Promise<void> => {
+      if (this.client === fencedClient) {
+        this.client = null;
+        this.threadId = null;
+        this.turnId = null;
+      }
+      await this.beginClientClose(fencedClient, "panel MCP transport recovery fence teardown failed");
+    };
+
+    const finishMcpTransportFailure = (
+      message: string,
+      willRetry: boolean,
+      retriedRead = false,
+    ): void => {
+      if (mcpTransportFencePending || finishedResult) return;
+      mcpTransportFencePending = true;
+
+      // willRetry:false is already terminal at the app-server boundary. Keep
+      // the existing bounded recovery path and its single local error/result.
+      if (!willRetry) {
+        emitTerminalError(panelMcpTransportFailureNotice(message, retriedRead), { outcomeUnknown: true });
+        return;
+      }
+
+      // willRetry:true is different: Codex may still retry the failed MCP call.
+      // Fence notification handling immediately, then wait for the app-server
+      // to accept turn/interrupt before emitting the local terminal error. If
+      // the interrupt cannot be confirmed, close the client so the old turn
+      // cannot continue while reload/reconnect/new-turn processing starts.
+      turnFenced = true;
+      const fencedClient = liveClient;
+      const fencedTurnId = activeTurnId ?? this.turnId;
+      void (async () => {
+        let interruptError: unknown;
+        if (fencedTurnId) {
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            await Promise.race([
+              fencedClient.request("turn/interrupt", { threadId, turnId: fencedTurnId }),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error(`turn/interrupt timed out after ${CODEX_INTERRUPT_TIMEOUT_MS}ms`)),
+                  CODEX_INTERRUPT_TIMEOUT_MS,
+                );
+              }),
+            ]);
+          } catch (err) {
+            interruptError = err;
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+        } else {
+          interruptError = new Error("the active Codex turn had no interruptible turn id");
+        }
+
+        if (interruptError) {
+          logger.warn(`[codex-backend] panel MCP transport fence failed: ${msgOf(interruptError)}`);
+          await closeFencedClient(fencedClient);
+        }
+        if (finishedResult) return;
+        const fenceNote = interruptError
+          ? " The active app-server turn could not be interrupted; its connection was closed before recovery."
+          : " The active app-server turn was interrupted before recovery.";
+        emitTerminalError(panelMcpTransportFailureNotice(message, retriedRead) + fenceNote, {
+          outcomeUnknown: true,
+        });
+      })();
+    };
+
+    const tryRetryCodeModeHostSpawn = (message: string): boolean => {
+      if (interrupted || finishedResult || retryPending) return false;
+      if (hostSpawnRetries >= CODEX_HOST_SPAWN_RETRIES) return false;
+      if (!isWindowsCodeModeHostSpawnRetryable(message)) return false;
+      hostSpawnRetries += 1;
+      retryPending = true;
+      const reportedHost = codeModeHostPathFromError(message);
+      const recycle =
+        isWindowsCodeModeHostPathNotFound(message) &&
+        typeof this.bin === "string" &&
+        this.bin !== "codex" &&
+        (!reportedHost || !existsSync(reportedHost) || isVolatileCodexPackagePath(reportedHost));
+      logger.warn(
+        recycle
+          ? `[codex-backend] code-mode host spawn hit a stale path; recycling the app-server then retrying after ${CODEX_HOST_SPAWN_RETRY_MS}ms (#2045)`
+          : `[codex-backend] code-mode host spawn failed; retrying after ${CODEX_HOST_SPAWN_RETRY_MS}ms (#1929/#2045)`,
+      );
+      try {
+        onActivity?.();
+      } catch {
+        // a watchdog bump must never break the protocol reader
+      }
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        void (async () => {
+          if (interrupted || finishedResult || this.disposed) {
+            retryPending = false;
+            return;
+          }
+          if (recycle) {
+            hostRecycleInFlight = true;
+            this.bin = null;
+            if (this.client === liveClient) this.client = null;
+            await this.beginClientClose(liveClient, "stale code-mode host recycle teardown failed");
+            if (interrupted || finishedResult || this.disposed) {
+              hostRecycleInFlight = false;
+              retryPending = false;
+              return;
+            }
+            try {
+              await this.prepare();
+            } catch (err) {
+              hostRecycleInFlight = false;
+              retryPending = false;
+              emitTerminalError(msgOf(err));
+              return;
+            }
+            const next = this.client;
+            if (!next) {
+              hostRecycleInFlight = false;
+              retryPending = false;
+              emitTerminalError("codex app-server not initialized");
+              return;
+            }
+            liveClient = next;
+            hostRecycleInFlight = false;
+            liveClient.notificationHandler = handler;
+            watchExit(liveClient);
+            try {
+              await liveClient.request("thread/resume", {
+                threadId,
+                cwd: this.deps.cwd ?? process.cwd(),
+                model: this.resolveTurnModel(),
+                approvalPolicy: "never",
+                sandbox: this.sandbox,
+              });
+            } catch {
+              // Thread may not survive a process recycle; still retry the turn.
+            }
+            if (interrupted || finishedResult || this.disposed) {
+              retryPending = false;
+              return;
+            }
+          }
+          turnIdKnown = false;
+          buffered.length = 0;
+          issueTurnStart();
+        })();
+      }, CODEX_HOST_SPAWN_RETRY_MS);
+      retryTimer.unref?.();
+      return true;
+    };
+
     // Normalize ONE notification (already confirmed to belong to this turn) into
     // canonical AgentEvents. Pulled out so it can be applied to both live and
     // buffered (replayed) notifications.
@@ -1094,6 +2106,10 @@ export class CodexBackend implements AgentBackend {
       // (double-completing PanelAgent's gate) or enqueue deltas into a closing
       // iterator. This is the "exactly one result" invariant (P0-B).
       if (finishedResult) return;
+      if (turnFenced) return;
+      // The previous turn died on a retryable host-spawn; wait for the replacement
+      // turn/start rather than treating its turn/completed as ours (#1929).
+      if (retryPending) return;
       const params = (msg.params ?? {}) as Record<string, unknown>;
       switch (msg.method) {
         case "turn/started": {
@@ -1109,6 +2125,7 @@ export class CodexBackend implements AgentBackend {
           const itemId = params.itemId as string | undefined;
           if (typeof delta === "string" && delta) {
             openStream(itemId ?? null, "text");
+            assistantTextBuffer += delta;
             push({ type: "assistant_delta", text: delta });
           }
           break;
@@ -1134,6 +2151,40 @@ export class CodexBackend implements AgentBackend {
           // reasoning items aren't "tools" — they're handled by the delta/commit
           // paths above — so skip them here.
           const item = params.item as Record<string, unknown> | undefined;
+          if (isMcpToolCallItem(item)) {
+            const itemId = stringFieldOf(item, "id");
+            if (itemId) inFlightMcpItemIds.add(itemId);
+            else unkeyedMcpItems += 1;
+          }
+          const panelTool = panelMcpToolItemOf(item);
+          if (panelTool) {
+            const isNewPanelRequest = !panelMcpRequests.has(panelTool.itemId);
+            let afterArmItemId: string | null = null;
+            if (isNewPanelRequest) {
+              if (PANEL_OUTER_TRANSPORT_RETRY_ARM_TOOLS.has(panelTool.name)) {
+                immediatePanelReadAfterArm = null;
+                panelArmCandidate = { itemId: panelTool.itemId, laterPanelRequestStarted: false };
+              } else {
+                if (panelArmCandidate) panelArmCandidate.laterPanelRequestStarted = true;
+                if (immediatePanelReadAfterArm && PANEL_OUTER_TRANSPORT_RETRY_SAFE_TOOLS.has(panelTool.name)) {
+                  afterArmItemId = immediatePanelReadAfterArm;
+                }
+                immediatePanelReadAfterArm = null;
+              }
+            }
+            const request = trackPanelMcpItem(panelTool, afterArmItemId);
+            for (const [originItemId, retry] of panelReadRetries) {
+              if (
+                request.name === retry.tool &&
+                (request.requestKeys.some((key) => retry.requestKeys.has(key)) ||
+                  request.retryOf === originItemId)
+              ) {
+                retry.itemIds.add(request.itemId);
+                for (const key of request.requestKeys) retry.requestKeys.add(key);
+                break;
+              }
+            }
+          }
           const name = toolNameOf(item);
           if (name) push({ type: "tool_call", name, phase: "start", detail: item });
           break;
@@ -1143,10 +2194,56 @@ export class CodexBackend implements AgentBackend {
           // (reasoning OR reply) then emit the canonical event: `assistant` for an
           // agentMessage, or tool_call(end) for a finished tool/command/MCP item.
           const item = params.item as Record<string, unknown> | undefined;
+          if (isMcpToolCallItem(item)) {
+            const itemId = stringFieldOf(item, "id");
+            if (itemId) inFlightMcpItemIds.delete(itemId);
+            else if (unkeyedMcpItems > 0) unkeyedMcpItems -= 1;
+          }
           const itemType = item?.type as string | undefined;
+          const panelTool = panelMcpToolItemOf(item);
+          const request = panelTool ? panelMcpRequests.get(panelTool.itemId) : undefined;
+          if (request) {
+            request.completed = true;
+            const completedSuccessfully =
+              item?.status !== "failed" &&
+              item?.status !== "error" &&
+              item?.status !== "declined" &&
+              item?.error == null;
+            if (
+              PANEL_OUTER_TRANSPORT_RETRY_ARM_TOOLS.has(request.name) &&
+              panelArmCandidate?.itemId === request.itemId
+            ) {
+              immediatePanelReadAfterArm =
+                completedSuccessfully && !panelArmCandidate.laterPanelRequestStarted
+                  ? request.itemId
+                  : null;
+              panelArmCandidate = null;
+            }
+
+            const retryMatch = panelReadRetryForRequest(request);
+            if (retryMatch && request.name === retryMatch.retry.tool) {
+              const retryMessage = retryMatch.retry.originalMessage;
+              panelReadRetries.delete(retryMatch.originItemId);
+              if (!completedSuccessfully) {
+                finishMcpTransportFailure(retryMessage, false, true);
+                break;
+              }
+              // A successful completion proves that this request's one retry
+              // produced a tool result; do not queue the control-plane reload
+              // for the transient error recovered in-band.
+              if (panelReadRetries.size === 0) this.mcpTransportRecovery.delete("panel");
+            }
+          }
           closeStream();
           if (itemType === "agentMessage") {
-            const text = ((item?.text as string | undefined) ?? "").trim();
+            // `item.text` is normally a string, but newer app-server builds can
+            // send structured content (arrays/objects) that String()-coerces to
+            // "[object Object]". Route it through the shared serializer, and if it
+            // still yields nothing readable, fall back to the streamed text the
+            // user already saw rather than committing an empty/garbage bubble that
+            // overwrites the good reply (#421, #422).
+            const committed = messageText(item?.text).trim();
+            const text = committed || assistantTextBuffer.trim();
             const id = item?.id as string | undefined;
             push({
               type: "assistant",
@@ -1154,6 +2251,9 @@ export class CodexBackend implements AgentBackend {
               ...(id ? { id } : {}),
               // No per-turn rewind anchor for Codex (forkAtAnchor=false) — omit uuid.
             });
+            // Reset for a possible next agentMessage in the same turn so its
+            // fallback can't inherit this one's streamed text.
+            assistantTextBuffer = "";
           } else {
             const name = toolNameOf(item);
             if (name) push({ type: "tool_call", name, phase: "end", detail: item });
@@ -1168,17 +2268,89 @@ export class CodexBackend implements AgentBackend {
           // "Reconnecting... 2/5" as the final failure. `error` is in the turn
           // liveness set, so this already re-armed the watchdog — keep waiting
           // for either a later terminal error or turn/completed.
-          const e = (params.error ?? {}) as { message?: string };
+          const e = params.error ?? {};
+          const message = formatCodexTurnError(e);
+          // The app-server's normal willRetry path is useful for provider
+          // failures, but it is unsafe to allow a WorkerTransport MCP error to
+          // silently replay a panel mutation. Stop this turn, remember the
+          // panel transport failure for the turn-boundary reload, and make the
+          // outcome/reconnect boundary explicit to the caller.
+          if (this.noteMcpTransportFailure(message)) {
+            const request = panelMcpRequestForTransportError(params);
+            const matchedRetry = panelReadRetryForRequest(request);
+            // Only a correlated terminal error for the armed request is its
+            // retry outcome. A distinct mutation or unrelated request never
+            // borrows, clears, or consumes that read's retry.
+            const retryAttempted = matchedRetry?.retry;
+            if (
+              !retryAttempted &&
+              params.willRetry === true &&
+              request != null &&
+              request.afterArmItemId != null &&
+              PANEL_OUTER_TRANSPORT_RETRY_SAFE_TOOLS.has(request.name) &&
+              appServerConnectionIsActive()
+            ) {
+              // The Codex app-server owns the actual HTTP client. Let its live
+              // connection perform this one retry, but remember the first error
+              // so a second failure cannot amplify or replace the diagnosis.
+              panelReadRetries.set(request.itemId, {
+                originalMessage: message,
+                tool: request.name,
+                itemIds: new Set([request.itemId]),
+                requestKeys: new Set(request.requestKeys),
+              });
+              break;
+            }
+            // A transport error for a different request must not consume or
+            // rewrite a read retry that is already armed. The mutation still
+            // fences this turn, because its dispatch/outcome is unknown, but
+            // retain the saved read error in the terminal diagnosis and leave
+            // its per-item retry state untouched.
+            const pendingRead = firstPanelReadRetry();
+            const failureMessage = pendingRead
+              ? `${pendingRead.originalMessage}\nA distinct panel MCP request also failed: ${message}`
+              : message;
+            finishMcpTransportFailure(
+              retryAttempted?.originalMessage ?? failureMessage,
+              params.willRetry === true,
+              retryAttempted !== undefined,
+            );
+            break;
+          }
+          if (panelReadRetries.size > 0 && params.willRetry !== true) {
+            const retry = firstPanelReadRetry();
+            panelReadRetries.clear();
+            finishMcpTransportFailure(retry?.originalMessage ?? message, false, retry !== undefined);
+            break;
+          }
           if (params.willRetry === true) break;
+          // #1929 / #2045 — a Windows sharing-violation or stale WinGet path on
+          // the bundled code-mode host is the same transient /restart recovered.
+          if (tryRetryCodeModeHostSpawn(message)) break;
           // A non-retrying `error` ends the turn: emit it AND finish, so a turn that
           // errors out (no following turn/completed) doesn't hang (P0-2). Route it
           // through the idempotent helper to avoid racing another terminal path.
-          emitTerminalError(e.message ?? "Codex error");
+          emitTerminalError(message);
           break;
         }
         case "turn/completed": {
-          closeStream();
           const t = params.turn as { status?: string } | undefined;
+          if (panelReadRetries.size > 0 && (t?.status === "interrupted" || interrupted)) {
+            // User cancellation (including a watchdog timeout that successfully
+            // interrupts the turn) is not a failed retry. Preserve the normal
+            // interrupted result and let the existing turn-end recovery observe
+            // the transport episode on its usual path.
+            panelReadRetries.clear();
+          } else if (panelReadRetries.size > 0) {
+            const retry = firstPanelReadRetry();
+            panelReadRetries.clear();
+            // A turn completion without a successful retry item is the retry's
+            // terminal outcome. Preserve the original transport error rather
+            // than reporting a later wrapper or a false success.
+            finishMcpTransportFailure(retry?.originalMessage ?? "panel MCP read retry failed", false, true);
+            break;
+          }
+          closeStream();
           // Mark a result emitted so a racing terminal-error path stays a no-op.
           finishedResult = true;
           push({ type: "result", ok: t?.status === "completed", ...(t?.status ? { subtype: t.status } : {}) });
@@ -1190,8 +2362,8 @@ export class CodexBackend implements AgentBackend {
       }
     };
 
-    const prev = client.notificationHandler;
-    client.notificationHandler = (msg: RpcMessage) => {
+    const prev = liveClient.notificationHandler;
+    handler = (msg: RpcMessage) => {
       // Until the turnId is known, buffer everything — we can't yet tell which
       // turn a notification belongs to, so we can't yet decide whether it counts
       // as liveness either. Replayed (and bumped) after turn/start resolves, so
@@ -1207,6 +2379,7 @@ export class CodexBackend implements AgentBackend {
       }
       apply(msg);
     };
+    liveClient.notificationHandler = handler;
 
     // Watch for the app-server child dying mid-turn: reject/finish the turn so the
     // local drain below is woken instead of waiting forever (P0-2). Crucially this
@@ -1214,23 +2387,18 @@ export class CodexBackend implements AgentBackend {
     // turn/start is still pending leaves the turn with a terminal `result` — the
     // turn-start .catch() running first (rejecting the pending request) no longer
     // lets this watcher finish() without a result and hang the gate (P0-B).
-    void client.exitPromise.then(() => {
-      if (done) return;
-      // emitTerminalError is a no-op if a result already fired, so it's safe to
-      // call alongside the turn-start .catch() (which may run first when the child
-      // dies while turn/start is pending) — it guarantees the turn still ends with
-      // exactly one terminal result and never hangs the gate (P0-B).
-      emitTerminalError(client.exitError ? msgOf(client.exitError) : "codex app-server connection closed.");
-    });
+    // A stale-host recycle (#2045) replaces liveClient; the old child's exit
+    // must not finish the replacement turn.
+    watchExit(liveClient);
 
     // FIRST-TURN PERSONA: the app-server has no thread-level instructions field,
     // so the panel system prompt is prepended to the first turn's input as a
     // clearly-marked system/context preamble (later turns send plain text).
-    let turnText = turn.text;
+    let turnText = promptText(turn.text);
     if (this.needsSystemPreamble && this.deps.systemAppend) {
       turnText =
         `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${turn.text}`;
+        `The user's first message follows.\n\n${turnText}`;
       this.needsSystemPreamble = false;
     }
 
@@ -1245,18 +2413,51 @@ export class CodexBackend implements AgentBackend {
       { type: "text", text: turnText, text_elements: [] },
     ];
     const turnTempFiles: string[] = [];
+    // #1516 — the BYTE budget's point of fact. PanelAgent gates the cumulative
+    // session budget when it COMPOSES the turn, but it cannot see the bytes of
+    // the batch already in flight, so this loop is the backstop: an automatic
+    // preview that would arrive past the conversation's cumulative byte budget
+    // is NOT attached, and the turn text says so with fetchable coordinates —
+    // the same correct-the-claim discipline as PanelAgent's drain trim, one
+    // layer down where the real fetch sizes are known. A user's own attachment
+    // (no `automatic` flag) is never touched by this budget.
+    const byteWithheld: ImageRef[] = [];
     for (const ref of turn.images ?? []) {
-      const file = await this.fetchImageFile(ref);
-      if (file) {
-        turnTempFiles.push(file);
-        turnInput.push({ type: "localImage", path: file });
+      if (ref?.automatic && this.previewBytes >= MAX_SESSION_PREVIEW_BYTES) {
+        byteWithheld.push(ref);
+        continue;
+      }
+      const got = await this.fetchImageFile(ref);
+      if (got) {
+        turnTempFiles.push(got.path);
+        turnInput.push({ type: "localImage", path: got.path });
+        if (ref.automatic) this.previewBytes += got.bytes;
       }
     }
+    if (byteWithheld.length) {
+      const refs = byteWithheld
+        .map((i) => {
+          const type = i.type ?? "output";
+          const sub = i.subfolder ? `, subfolder:"${i.subfolder}"` : "";
+          return type === "output" && !i.subfolder
+            ? i.filename
+            : `${i.filename} (type:"${type}"${sub})`;
+        })
+        .join(", ");
+      turnInput[0]!.text +=
+        `\n\n[panel note: ${byteWithheld.length} automatic preview image(s) named above were NOT attached to this turn: ` +
+        `this conversation's cumulative automatic-preview byte budget (~${previewByteBudgetLabel()}) is spent — the bound that keeps a long session's rollout from growing without limit (every attached preview is retained inline and recopied at compaction). ` +
+        `The outputs are already shown to the user in the panel — fetch one with get_image action:"get" if you need to look: ${refs}.]`;
+      logger.info(
+        `[codex] withheld ${byteWithheld.length} automatic preview image(s) at the cumulative byte budget ` +
+          `(${this.previewBytes}/${MAX_SESSION_PREVIEW_BYTES} bytes delivered to this thread); the turn says so and names them (#1516)`,
+      );
+    }
 
-    try {
+    issueTurnStart = () => {
       // turn/start delivers the user text plus any resolved image input items.
       const turnModel = this.resolveTurnModel();
-      client
+      liveClient
         .request<{ turn?: { id?: string } }>("turn/start", {
           threadId,
           input: turnInput,
@@ -1274,6 +2475,7 @@ export class CodexBackend implements AgentBackend {
           outputSchema: null,
         })
         .then((res) => {
+          retryPending = false;
           // Set the active turn id, flush the buffer (replaying only this turn's
           // notifications), then switch the handler to live filtering.
           if (res.turn?.id) {
@@ -1301,13 +2503,28 @@ export class CodexBackend implements AgentBackend {
           // returns without one, hanging PanelAgent's gate forever. Route through
           // the idempotent helper so it always emits exactly one result.
           if (interrupted) {
+            retryPending = false;
             // Deliberate teardown (interrupt restored/closed the turn): still end
             // with a result so the gate advances, but no user-facing error.
             abortActiveTurn();
+          } else if (turnFenced) {
+            // The fenced MCP recovery owns terminalization. A late
+            // turn/start rejection must not race it with a generic error.
+            return;
           } else {
-            emitTerminalError(msgOf(err));
+            const message = formatCodexTurnError(err);
+            if (tryRetryCodeModeHostSpawn(message)) {
+              // retryPending is now true; the dead turn's result is deferred.
+            } else {
+              retryPending = false;
+              emitTerminalError(message);
+            }
           }
         });
+    };
+
+    try {
+      issueTurnStart();
 
       // Drain the bridged queue until the turn completes.
       while (true) {
@@ -1322,18 +2539,39 @@ export class CodexBackend implements AgentBackend {
       // Flush any trailing events queued between the last drain and done.
       while (queue.length) yield queue.shift()!;
     } finally {
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
+      retryPending = false;
       // Mark interrupted so a late turn/start rejection / exit doesn't surface as
       // a spurious error after we've already torn the turn down.
       interrupted = true;
       if (this.abortActiveTurn === abortActiveTurn) this.abortActiveTurn = null;
       // Restore the prior handler ONLY if it's still ours (close() may have nulled
       // it during shutdown — don't resurrect a stale handler onto a dead client).
-      if (client.notificationHandler && !client.exitError) client.notificationHandler = prev ?? null;
+      if (liveClient.notificationHandler && !liveClient.exitError) {
+        liveClient.notificationHandler = prev ?? null;
+      }
       this.turnId = null;
-      // Sweep this turn's temp image files now that the app-server has consumed
-      // them (the bytes were read at turn/start). Best-effort + non-blocking on the
-      // generator's teardown.
-      if (turnTempFiles.length) void this.cleanupTempImages(turnTempFiles);
+      // #1152 — the app-server does NOT necessarily read a localImage at
+      // turn/start, which is what this used to assume ("the bytes were read at
+      // turn/start"). A reporter saw the panel render a storyboard while the
+      // Codex turn reported the file gone:
+      //
+      //   Codex could not read the local image at …\comfyui-codex-<pid>-…png:
+      //   The system cannot find the file specified. (os error 2)
+      //
+      // Deleting at turn teardown therefore races a read that has not happened
+      // yet. Hold the files for a grace period instead: the cost of keeping a few
+      // PNGs in the OS temp dir for minutes is nothing next to an image the agent
+      // cannot see.
+      //
+      // The files stay in `tempImageFiles`, so close() still sweeps them — a
+      // pending timer is a delay, never the only thing standing between us and a
+      // leak. The timer is unref'd (it must not hold the process open) and
+      // tracked so close() can clear it.
+      if (turnTempFiles.length) this.scheduleTempImageCleanup(turnTempFiles);
     }
   }
 
@@ -1368,6 +2606,48 @@ export class CodexBackend implements AgentBackend {
         return;
       }
       logger.debug(`[codex-backend] interrupt: ${msgOf(err)}`);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Tell Codex that the harness, not the user, observed a stalled turn. The
+   * app-server's `turn/interrupt` schema deliberately has no reason field and
+   * reports a pending tool interruption with its generic user-rejection text.
+   * `turn/steer` is the protocol operation for injecting an explicit message
+   * into the active turn, so it preserves the distinction for the agent.
+   *
+   * Older app-servers can reject `turn/steer`; return false so PanelAgent falls
+   * back to its existing bounded interrupt/restart recovery rather than wedging.
+   */
+  async recoverStalledTurn(notice: string): Promise<boolean> {
+    const client = this.client;
+    const threadId = this.threadId;
+    const turnId = this.turnId;
+    if (!client || !threadId || !turnId || !notice.trim()) return false;
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    try {
+      await Promise.race([
+        client.request("turn/steer", {
+          threadId,
+          expectedTurnId: turnId,
+          input: [{ type: "text", text: notice }],
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`turn/steer timed out after ${CODEX_STALL_STEER_TIMEOUT_MS}ms`));
+          }, CODEX_STALL_STEER_TIMEOUT_MS);
+        }),
+      ]);
+      return true;
+    } catch (err) {
+      logger.debug(
+        `[codex-backend] stalled-turn steer ${timedOut ? "timed out" : "unavailable"}: ${msgOf(err)}`,
+      );
+      return false;
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -1490,8 +2770,13 @@ export class CodexBackend implements AgentBackend {
         this.beginClientClose(candidate, "backend close teardown failed"),
       ),
     );
+    // #1152 — cancel the grace timers first. Their files are swept right below,
+    // so leaving them armed would only re-unlink paths that are already gone.
+    for (const t of this.tempImageTimers) clearTimeout(t);
+    this.tempImageTimers.clear();
     // Sweep any temp image files a turn didn't get to clean up (e.g. close() raced
-    // an in-flight turn). Snapshot first — cleanupTempImages mutates the set.
+    // an in-flight turn, or a grace window was still open). Snapshot first —
+    // cleanupTempImages mutates the set.
     if (this.tempImageFiles.size) {
       await this.cleanupTempImages([...this.tempImageFiles]).catch(() => {});
     }

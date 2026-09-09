@@ -1,6 +1,6 @@
-import sharp from "sharp";
 import { AssetRegistry } from "./asset-registry.js";
 import { getOutputImage } from "./image-management.js";
+import { requireSharp } from "./sharp-loader.js";
 
 export interface ViewImageResult {
   content: Array<
@@ -21,6 +21,7 @@ const SUPPORTED_IMAGE_MIME_PREFIX = "image/";
  * `background` composites onto a deliberate backdrop server-side instead.
  */
 async function compositeOnBackground(bytes: Buffer, background: ViewImageBackground): Promise<Buffer> {
+  const sharp = await requireSharp("Compositing onto a background");
   if (background === "dark") {
     return sharp(bytes).flatten({ background: { r: 24, g: 24, b: 24 } }).png().toBuffer();
   }
@@ -79,7 +80,7 @@ export async function viewAssetImage(
 
   if (!mimeType.startsWith(SUPPORTED_IMAGE_MIME_PREFIX)) {
     throw new Error(
-      `Asset "${assetId}" is not an image (mime: ${mimeType}). view_image only supports PNG/JPEG/WebP.`,
+      `Asset "${assetId}" is not an image (mime: ${mimeType}). get_image (action:"view") only supports PNG/JPEG/WebP.`,
     );
   }
 

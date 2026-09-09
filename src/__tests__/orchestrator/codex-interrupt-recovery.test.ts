@@ -16,6 +16,7 @@ let CodexBackend: BackendModule["CodexBackend"];
 
 beforeAll(async () => {
   vi.stubEnv("COMFYUI_MCP_CODEX_INTERRUPT_TIMEOUT_MS", "25");
+  vi.stubEnv("COMFYUI_MCP_CODEX_STALL_STEER_TIMEOUT_MS", "25");
   vi.stubEnv("COMFYUI_MCP_CODEX_CLOSE_TIMEOUT_MS", "25");
   vi.stubEnv("COMFYUI_MCP_CODEX_FORCE_KILL_GRACE_MS", "10");
   vi.resetModules();
@@ -56,6 +57,69 @@ function installActiveClient(backend: Backend, client: object): void {
 }
 
 describe("CodexBackend interrupt recovery", () => {
+  it("steers a watchdog stall as an explicit non-user-cancel notice", async () => {
+    const client = {
+      request: vi.fn().mockResolvedValue({}),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const backend = new CodexBackend();
+    installActiveClient(backend, client);
+
+    const notice = "The harness stalled; the user did NOT cancel this tool call.";
+    await expect(backend.recoverStalledTurn(notice)).resolves.toBe(true);
+    expect(client.request).toHaveBeenCalledWith("turn/steer", {
+      threadId: "thread-1",
+      expectedTurnId: "turn-1",
+      input: [{ type: "text", text: notice }],
+    });
+    expect(client.request).not.toHaveBeenCalledWith(
+      "turn/interrupt",
+      expect.anything(),
+    );
+  });
+
+  it("falls back cleanly when an older app-server rejects stalled-turn steering", async () => {
+    const client = {
+      request: vi.fn().mockRejectedValue(new Error("unknown method turn/steer")),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const backend = new CodexBackend();
+    installActiveClient(backend, client);
+
+    await expect(backend.recoverStalledTurn("harness stall")).resolves.toBe(false);
+    expect(client.request).toHaveBeenCalledWith("turn/steer", {
+      threadId: "thread-1",
+      expectedTurnId: "turn-1",
+      input: [{ type: "text", text: "harness stall" }],
+    });
+  });
+
+  it("bounds a hung stalled-turn steer so PanelAgent can take legacy recovery", async () => {
+    let resolveSteer!: (value: unknown) => void;
+    const client = {
+      request: vi.fn(
+        () =>
+          new Promise<unknown>((resolve) => {
+            resolveSteer = resolve;
+          }),
+      ),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const backend = new CodexBackend();
+    installActiveClient(backend, client);
+
+    const recovery = backend.recoverStalledTurn("harness stall");
+    expect(await settlesWithin(recovery)).toBe(true);
+    await expect(recovery).resolves.toBe(false);
+    // A late app-server completion belongs to the already-abandoned steer only;
+    // it must not mutate the still-live client or turn identities.
+    resolveSteer({});
+    await new Promise((resolve) => setImmediate(resolve));
+    expect((backend as any).client).toBe(client);
+    expect((backend as any).threadId).toBe("thread-1");
+    expect((backend as any).turnId).toBe("turn-1");
+  });
+
   it("keeps the turn alive while app-server reports a retryable error", async () => {
     const onActivity = vi.fn();
     const client = {
@@ -147,6 +211,52 @@ describe("CodexBackend interrupt recovery", () => {
 
     await expect(errorEvent).resolves.toMatchObject({
       value: { type: "error", message: "provider unavailable" },
+    });
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: { type: "result", ok: false, subtype: "error" },
+    });
+    await expect(iterator.next()).resolves.toMatchObject({ done: true });
+  });
+
+  it("surfaces the bare app-server Bad Request as an actionable 400 diagnosis (#2112)", async () => {
+    const client = {
+      notificationHandler: null as ((message: unknown) => void) | null,
+      exitError: null,
+      exitPromise: new Promise(() => {}),
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/start") {
+          return { thread: { id: "thread-1" }, model: "gpt-5.6-sol" };
+        }
+        if (method === "turn/start") return { turn: { id: "turn-1" } };
+        throw new Error(`unexpected request: ${method}`);
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const backend = new CodexBackend({ model: "gpt-5.6-sol" });
+    Object.assign(backend, { client });
+
+    async function* channel() {
+      yield { text: "continue" };
+    }
+
+    const iterator = backend.run({ channel: channel() });
+    await iterator.next();
+    const errorEvent = iterator.next();
+    for (let attempt = 0; attempt < 10 && !(backend as any).turnId; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    client.notificationHandler?.({
+      method: "error",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        willRetry: false,
+        error: { message: '{"detail":"Bad Request"}' },
+      },
+    });
+
+    await expect(errorEvent).resolves.toMatchObject({
+      value: { type: "error", message: expect.stringContaining("HTTP 400 Bad Request") },
     });
     await expect(iterator.next()).resolves.toMatchObject({
       value: { type: "result", ok: false, subtype: "error" },

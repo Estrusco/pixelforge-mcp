@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   getLogs,
   getHistory,
@@ -8,6 +9,10 @@ import {
 import { selectNewestHistoryEntry, extractWorkflowGraph } from "../services/history-select.js";
 import { validateWorkflow } from "../services/workflow-validator.js";
 import { errorToToolResult } from "../utils/errors.js";
+import {
+  generationStatsAction,
+  suggestSettingsAction,
+} from "./generation-tracker.js";
 
 /** The `execution_error` payload ComfyUI records in a history entry's status.messages. */
 interface ExecutionErrorInfo {
@@ -100,7 +105,49 @@ function selectRunToDiagnose(
   return selectNewestHistoryEntry(history);
 }
 
-function formatHistoryEntry(
+/** #1229 — per-value cap for a non-media history output. Generous enough for a
+ *  diagnostic string, small enough that a runaway value cannot dominate the
+ *  reply; anything longer is clipped WITH a note saying so. */
+const PER_OUTPUT_VALUE_CHARS = 800;
+
+/**
+ * Render one non-media history output value (#1229).
+ *
+ * Separator is " | " between keys and ", " inside an array. Multi-line values
+ * are indented as continuations so one value cannot shatter the bullet list --
+ * the motivating use case is reading validation errors through a scratch
+ * PreviewAny, which are multi-line by nature.
+ */
+function renderOutputValue(value: unknown): string {
+  let flat: string;
+  try {
+    flat = Array.isArray(value)
+      ? value.map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join(", ")
+      : typeof value === "string"
+        ? value
+        : JSON.stringify(value);
+  } catch {
+    // Unreachable today (the entry always comes from JSON.parse, which cannot
+    // produce a cycle or a BigInt) -- but losing the WHOLE entry, including the
+    // status and timing already computed, to an opaque TypeError would be worse
+    // than the bug this fixes.
+    return "(unserializable)";
+  }
+  if (flat === undefined || flat === "") return "(empty)";
+  // Slice by CODE POINT: a UTF-16 slice can split a surrogate pair and emit a
+  // lone half, which is not well-formed text.
+  const chars = Array.from(flat);
+  const clipped =
+    chars.length > PER_OUTPUT_VALUE_CHARS
+      ? chars.slice(0, PER_OUTPUT_VALUE_CHARS).join("") +
+        `... [truncated, ${chars.length} chars total]`
+      : flat;
+  return clipped.includes("\n")
+    ? "\n" + clipped.split("\n").map((l) => `    ${l}`).join("\n")
+    : clipped;
+}
+
+export function formatHistoryEntry(
   promptId: string,
   entry: HistoryEntry,
 ): string {
@@ -180,21 +227,68 @@ function formatHistoryEntry(
       // (jcd315/comfyui-mcp-muse, commit e13342ec).
       const mediaKeys = ["images", "videos", "video", "gifs"] as const;
       const expanded: string[] = [];
+      const consumed = new Set<string>();
       for (const key of mediaKeys) {
         const items = output[key];
         if (!Array.isArray(items)) continue;
         const fileList = (
-          items as Array<{ filename: string; subfolder?: string }>
+          items as Array<{ filename: string; subfolder?: string; type?: string }>
         )
-          .map((m) => (m.subfolder ? `${m.subfolder}/${m.filename}` : m.filename))
+          .map((m) => {
+            const path = m.subfolder ? `${m.subfolder}/${m.filename}` : m.filename;
+            // Carry each ref's ComfyUI directory TYPE (output/temp/input) so the
+            // caller passes the RIGHT `type` to get_image (#554): preview/compare
+            // nodes (e.g. PixaromaCompare) write to temp/, not output/, and
+            // get_image defaults to output — the old summary dropped the type, so
+            // the documented get_image(type:"output") call 404'd on a temp file.
+            const type = typeof m.type === "string" && m.type ? m.type : "output";
+            return `${path} (type=${type})`;
+          })
           .join(", ");
-        if (fileList) expanded.push(`${key} → **${fileList}**`);
+        if (fileList) {
+          expanded.push(`${key} → **${fileList}**`);
+          consumed.add(key);
+        }
       }
-      if (expanded.length > 0) {
-        lines.push(`- Node ${nodeId}: ${expanded.join("; ")}`);
+      // #1229 - render every key the media expansion did NOT consume, in BOTH
+      // branches.
+      //
+      // Scoping this to the no-media `else` left the reported defect live one
+      // branch over, on STOCK nodes: SaveAnimatedWEBP emits {images, animated}
+      // and a captioner emits {images, text}, so `expanded.length > 0` won a
+      // short-circuit and the payload was dropped exactly as before. Fixing the
+      // fallback alone fixed only the case I happened to test.
+      const leftovers = Object.entries(output)
+        .filter(([key]) => !consumed.has(key))
+        .map(([key, value]) => {
+          const v = renderOutputValue(value);
+          // No space before a multi-line block: `key: ` meeting the value's
+          // leading newline leaves a trailing space on the key line.
+          return v.startsWith("\n") ? `${key}:${v}` : `${key}: ${v}`;
+        });
+      const rendered = [...expanded, ...leftovers];
+      // One key per LINE once there is more than one, or any value is
+      // multi-line. Round 2 caught the two round-1 fixes colliding: rendering
+      // leftovers alongside media (HIGH 1) plus indented continuations for
+      // multi-line values meant `join(" | ")` appended the next key to the last
+      // indented line, so `animated: true` read as the tail of a PreviewAny
+      // error. No data lost, but mis-attributed -- and it fires on exactly the
+      // {images, text, animated} shape HIGH 1 made renderable.
+      //
+      // This also retires the inline separator rather than relocating its
+      // collision: `" | "` merely moved the clash from semicolon-bearing text
+      // onto pipe-bearing text, and a markdown table row is a very plausible
+      // PreviewAny payload.
+      if (rendered.length === 0) {
+        // Three states used to share "(no output data)": a missing output, a
+        // non-object output, and an object with no keys. Distinct causes, and
+        // folding them is the defect class this issue belongs to.
+        lines.push(`- Node ${nodeId}: (empty output object)`);
+      } else if (rendered.length === 1 && !rendered[0].includes("\n")) {
+        lines.push(`- Node ${nodeId}: ${rendered[0]}`);
       } else {
-        const outputTypes = Object.keys(output);
-        lines.push(`- Node ${nodeId}: ${outputTypes.join(", ")}`);
+        lines.push(`- Node ${nodeId}:`);
+        for (const part of rendered) lines.push(`  - ${part}`);
       }
     }
   }
@@ -202,186 +296,209 @@ function formatHistoryEntry(
   return lines.join("\n");
 }
 
+const HISTORY_ACTIONS = ["list", "diagnose", "stats", "suggest"] as const;
+
+/**
+ * `get_system_stats (action:"logs")` — what the retired `get_system_stats (action:"logs")` tool did
+ * (0.50.0 slice 13). Same /internal/logs read, same keyword filter, same
+ * default-100 tail, same ANSI strip, same "No log lines found" text.
+ *
+ * `keyword` keeps its TRUTHINESS check rather than an absence check: an empty
+ * keyword matched every line before this consolidation ("".toLowerCase() is a
+ * substring of everything), and that is the behaviour callers have. This is the
+ * filter's own semantics, not a requiredness guard.
+ */
+export async function getLogsAction(args: {
+  max_lines?: number;
+  keyword?: string;
+}): Promise<CallToolResult> {
+  // #1223 — the keyword filter and the tail are handed to getLogs so they run on
+  // the RAW log, BEFORE redaction. Filtering here meant matching against text the
+  // scrub had already rewritten, so `keyword:"ltxvideo"` answered "No log lines
+  // found" for a log that contained it — an absence claim about a line that was
+  // right there. Selection and redaction have to happen in that order, and the
+  // only way to guarantee it is to not have the raw lines here at all.
+  const maxLines = args.max_lines ?? 100;
+  const lines = await getLogs({ keyword: args.keyword, maxLines });
+
+  // Strip ANSI escape codes for readability
+  const clean = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+
+  const text =
+    clean.length === 0
+      ? `No log lines found${args.keyword ? ` matching \"${args.keyword}\"` : ""}.`
+      : clean.join("\n");
+
+  return { content: [{ type: "text" as const, text }] };
+}
 export function registerDiagnosticsTools(server: McpServer): void {
   server.tool(
-    "get_logs",
-    "Get ComfyUI server runtime logs. Useful for debugging execution errors, model loading issues, missing nodes, and Python tracebacks.",
+    "get_history",
+    "Read what has already been generated on this machine — execution history, why a run failed, and the settings your past renders actually used. Driven by the `action` parameter:\n" +
+      '- action:"list" — Execution history for a ComfyUI prompt: status, timing, cached nodes, and output details (media filenames for get_image action:\"get\"). Also carries the raw error/traceback. To diagnose WHY a run FAILED or what is missing, prefer action:"diagnose" — it returns the same failure info PLUS missing models (with the file + widget) and missing node types, which this action does not. Use action:"list" when you need the run\'s OUTPUTS or timing for a specific prompt_id.\n' +
+      '- action:"diagnose" — WHY DID MY RENDER FAIL / WHAT IS MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel\'s panel_get_errors ("why is this red?"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that is not installed and the widget holding it — feed the filename to download_model action:\'search_civitai\', then action:\'download_civitai\' — or action:\'search\' then action:\'download\' — to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes, then install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what is missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.\n' +
+      '- action:"stats" — Statistics from this MCP server\'s LOCAL generation-history database (populated as you run workflows; NOT from ComfyUI, and not the same source as action:"list"): total generations, count of unique sampler/scheduler/steps/CFG combos, a per-model-family breakdown, and the most-reused settings. Read-only; works without a running ComfyUI. Returns empty stats until you have generated images. For concrete recommended settings rather than aggregate counts, use action:"suggest".\n' +
+      '- action:"suggest" — Recommend concrete, proven sampler/scheduler/steps/CFG (and denoise/shift/LoRA) settings derived from that same LOCAL generation-history database. Read-only and works without a running ComfyUI. Narrow results by `model_family`, `lora_hash`, or a name `search`; with no filter it returns the top settings across all history. Returns a ranked list with each combo\'s reuse count, or a "no history" message until you have generated images. Use this for ready-to-apply values; use action:"stats" for aggregate counts and breakdowns rather than specific suggestions.',
     {
-      max_lines: z
+      action: z
+        .enum(HISTORY_ACTIONS)
+        .describe(
+          'Which history view to return. "list" and "diagnose" read ComfyUI\'s execution history and take an optional `prompt_id`; "stats" and "suggest" read this server\'s own local generation-settings database and take `model_family` (plus `lora_hash`/`search`/`limit` for "suggest"). No action requires any other field.',
+        ),
+      prompt_id: z
+        .string()
+        .optional()
+        .describe(
+          'Actions "list" and "diagnose" — the prompt ID to look up (returned by enqueue_workflow). For action:"list", if omitted, returns the most recent COMMITTED execution (chosen by ComfyUI\'s queue number, not dict order); immediately after a run finishes it can briefly lag by one until ComfyUI commits the new entry, so pass the prompt_id from enqueue_workflow to get that exact run, and prefer the run-finished event for naming a just-produced output. For action:"diagnose", omit to diagnose the most recent FAILED run — preferred over a newer successful one — falling back to the most recent run if nothing failed.',
+        ),
+      model_family: z
+        .string()
+        .optional()
+        .describe(
+          'Actions "stats" and "suggest" — model-family key to scope to, e.g. \'sdxl\', \'flux\', \'qwen_image\', \'illustrious\'.',
+        ),
+      lora_hash: z
+        .string()
+        .optional()
+        .describe('action:"suggest" — AutoV2 hash (10 chars) of a specific LoRA to find settings for.'),
+      search: z
+        .string()
+        .optional()
+        .describe("action:\"suggest\" — full-text search on model/LoRA filenames (e.g. 'copax', 'lightning')."),
+      limit: z
         .number()
         .int()
         .min(1)
-        .max(2000)
+        .max(50)
         .optional()
-        .describe("Maximum number of log lines to return from the end (default: 100)"),
-      keyword: z
-        .string()
-        .optional()
-        .describe("Filter log lines containing this keyword (case-insensitive). Examples: 'error', 'warning', 'VRAM', a node name"),
+        .describe('action:"suggest" — max results (default 10).'),
     },
     async (args) => {
       try {
-        let lines = await getLogs();
+        switch (args.action) {
+          case "list": {
+            const history = await getHistory(args.prompt_id);
+            const selected = selectNewestHistoryEntry(history, args.prompt_id);
 
-        // Filter by keyword if provided
-        if (args.keyword) {
-          const kw = args.keyword.toLowerCase();
-          lines = lines.filter((line) => line.toLowerCase().includes(kw));
-        }
+            if (!selected) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: args.prompt_id
+                      ? `No history found for prompt ${args.prompt_id}.`
+                      : "No execution history available.",
+                  },
+                ],
+              };
+            }
 
-        // Tail to max_lines
-        const maxLines = args.max_lines ?? 100;
-        if (lines.length > maxLines) {
-          lines = lines.slice(-maxLines);
-        }
+            const [promptId, entry] = selected;
+            const text = formatHistoryEntry(promptId, entry);
+            return { content: [{ type: "text", text }] };
+          }
+          case "diagnose": {
+            const history = await getHistory(args.prompt_id);
+            const selected = selectRunToDiagnose(history, args.prompt_id);
+            if (!selected) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: args.prompt_id
+                      ? `No history found for prompt ${args.prompt_id}.`
+                      : "No execution history available — nothing has run yet on this ComfyUI.",
+                  },
+                ],
+              };
+            }
 
-        // Strip ANSI escape codes for readability
-        const clean = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+            const [promptId, entry] = selected;
+            const lines: string[] = [];
+            lines.push(`## Diagnosis: ${promptId}`);
+            // 1. Status + outcome: runtime failure, interruption, or clean.
+            lines.push(...formatRunOutcome(entry));
 
-        const text = clean.length === 0
-          ? `No log lines found${args.keyword ? ` matching "${args.keyword}"` : ""}.`
-          : clean.join("\n");
-
-        return { content: [{ type: "text", text }] };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "get_history",
-    "Get execution history for a ComfyUI prompt: status, timing, cached nodes, and output details (media filenames for get_image). Also carries the raw error/traceback. To diagnose WHY a run FAILED or what's missing, prefer `diagnose_run` — it returns the same failure info PLUS missing models (with the file + widget) and missing node types, which this tool does not. Use get_history when you need the run's OUTPUTS or timing for a specific prompt_id.",
-    {
-      prompt_id: z
-        .string()
-        .optional()
-        .describe(
-          "Specific prompt ID to look up (returned by enqueue_workflow). If omitted, returns the most recent COMMITTED execution (chosen by ComfyUI's queue number, not dict order). Note: immediately after a run finishes it can briefly lag by one until ComfyUI commits the new entry — pass the prompt_id from enqueue_workflow to get that exact run, and prefer the run-finished event for naming a just-produced output.",
-        ),
-    },
-    async (args) => {
-      try {
-        const history = await getHistory(args.prompt_id);
-        const selected = selectNewestHistoryEntry(history, args.prompt_id);
-
-        if (!selected) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: args.prompt_id
-                  ? `No history found for prompt ${args.prompt_id}.`
-                  : "No execution history available.",
-              },
-            ],
-          };
-        }
-
-        const [promptId, entry] = selected;
-        const text = formatHistoryEntry(promptId, entry);
-        return { content: [{ type: "text", text }] };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "diagnose_run",
-    "WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_view_errored_nodes (\"why is this red?\"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to search_civitai_models/download_model to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes/install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.",
-    {
-      prompt_id: z
-        .string()
-        .optional()
-        .describe(
-          "Specific run to diagnose (the prompt_id from enqueue_workflow). Omit to diagnose the most recent FAILED run — preferred over a newer successful one — falling back to the most recent run if nothing failed.",
-        ),
-    },
-    async (args) => {
-      try {
-        const history = await getHistory(args.prompt_id);
-        const selected = selectRunToDiagnose(history, args.prompt_id);
-        if (!selected) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: args.prompt_id
-                  ? `No history found for prompt ${args.prompt_id}.`
-                  : "No execution history available — nothing has run yet on this ComfyUI.",
-              },
-            ],
-          };
-        }
-
-        const [promptId, entry] = selected;
-        const lines: string[] = [];
-        lines.push(`## Diagnosis: ${promptId}`);
-        // 1. Status + outcome: runtime failure, interruption, or clean.
-        lines.push(...formatRunOutcome(entry));
-
-        // 2. Re-validate the exact graph that ran, so we can name what's missing.
-        //    Reuses the same validator behind validate_workflow — the graph is the
-        //    one ComfyUI recorded, so this reflects what actually executed.
-        const graph = extractWorkflowGraph(entry);
-        if (!graph) {
-          lines.push("");
-          lines.push(
-            "_This history entry has no recorded graph_, so missing models/nodes can't be checked for it.",
-          );
-        } else {
-          const result = await validateWorkflow(graph, { health: false });
-          const errors = result.issues.filter((i) => i.severity === "error");
-          const missingModels = errors.filter((i) => i.kind === "missing_model");
-          const missingNodeTypes = errors.filter((i) => i.kind === "missing_node_type");
-          const otherErrors = errors.filter(
-            (i) => i.kind !== "missing_model" && i.kind !== "missing_node_type",
-          );
-
-          if (missingModels.length > 0) {
-            lines.push("");
-            lines.push("### Missing models");
-            for (const i of missingModels) {
+            // 2. Re-validate the exact graph that ran, so we can name what's missing.
+            //    Reuses the same validator behind create_workflow (action:"validate") — the graph is the
+            //    one ComfyUI recorded, so this reflects what actually executed.
+            const graph = extractWorkflowGraph(entry);
+            if (!graph) {
+              lines.push("");
               lines.push(
-                `- **${i.value ?? "(unknown file)"}** — node ${i.node_id} (${i.node_type}), widget \`${i.input ?? "?"}\``,
+                "_This history entry has no recorded graph_, so missing models/nodes can't be checked for it.",
               );
-            }
-            lines.push(
-              "_Fix_: search_civitai_models / search_models by that filename, then download_model (or download_civitai_model) into the loader's directory.",
-            );
-          }
+            } else {
+              const result = await validateWorkflow(graph, { health: false });
+              const errors = result.issues.filter((i) => i.severity === "error");
+              const missingModels = errors.filter((i) => i.kind === "missing_model");
+              const missingNodeTypes = errors.filter((i) => i.kind === "missing_node_type");
+              const otherErrors = errors.filter(
+                (i) => i.kind !== "missing_model" && i.kind !== "missing_node_type",
+              );
 
-          if (missingNodeTypes.length > 0) {
-            lines.push("");
-            lines.push("### Missing node types (packs this install lacks)");
-            const uniq = [...new Set(missingNodeTypes.map((i) => i.node_type))];
-            for (const t of uniq) lines.push(`- **${t}**`);
-            lines.push(
-              "_Fix_: search_custom_nodes for the owning pack, install_custom_node, then restart ComfyUI to load it.",
-            );
-          }
+              if (missingModels.length > 0) {
+                lines.push("");
+                lines.push("### Missing models");
+                for (const i of missingModels) {
+                  lines.push(
+                    `- **${i.value ?? "(unknown file)"}** — node ${i.node_id} (${i.node_type}), widget \`${i.input ?? "?"}\``,
+                  );
+                }
+                lines.push(
+                  "_Fix_: download_model action:\"search_civitai\" (or action:\"search\") by that filename, then download_model action:\"download\" (or action:\"download_civitai\") into the loader's directory.",
+                );
+              }
 
-          if (otherErrors.length > 0) {
-            lines.push("");
-            lines.push("### Validation errors");
-            for (const i of otherErrors.slice(0, 20)) {
-              lines.push(`- node ${i.node_id} (${i.node_type}): ${i.message}`);
-            }
-            if (otherErrors.length > 20) {
-              lines.push(`- …and ${otherErrors.length - 20} more`);
-            }
-          }
+              if (missingNodeTypes.length > 0) {
+                lines.push("");
+                lines.push("### Missing node types (packs this install lacks)");
+                const uniq = [...new Set(missingNodeTypes.map((i) => i.node_type))];
+                for (const t of uniq) lines.push(`- **${t}**`);
+                lines.push(
+                  "_Fix_: search_custom_nodes for the owning pack, install_custom_node with action:'install', then restart ComfyUI to load it.",
+                );
+              }
 
-          if (errors.length === 0) {
-            lines.push("");
-            lines.push(
-              "_The recorded graph validates clean_ — nothing is missing, so the failure was a runtime one (see above), not a setup problem.",
+              if (otherErrors.length > 0) {
+                lines.push("");
+                lines.push("### Validation errors");
+                for (const i of otherErrors.slice(0, 20)) {
+                  lines.push(`- node ${i.node_id} (${i.node_type}): ${i.message}`);
+                }
+                if (otherErrors.length > 20) {
+                  lines.push(`- …and ${otherErrors.length - 20} more`);
+                }
+              }
+
+              if (errors.length === 0) {
+                lines.push("");
+                lines.push(
+                  "_The recorded graph validates clean_ — nothing is missing, so the failure was a runtime one (see above), not a setup problem.",
+                );
+              }
+            }
+
+            return { content: [{ type: "text", text: lines.join("\n") }] };
+          }
+          case "stats":
+            return await generationStatsAction({ model_family: args.model_family });
+          case "suggest":
+            return await suggestSettingsAction({
+              model_family: args.model_family,
+              lora_hash: args.lora_hash,
+              search: args.search,
+              limit: args.limit,
+            });
+          default: {
+            // Unreachable given the zod enum, but a clear runtime guard beats a
+            // silent undefined if the schema and switch ever drift apart.
+            const exhaustive: never = args.action;
+            throw new Error(
+              `Unknown get_history action "${String(exhaustive)}". Expected one of: ${HISTORY_ACTIONS.join(", ")}.`,
             );
           }
         }
-
-        return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
         return errorToToolResult(err);
       }

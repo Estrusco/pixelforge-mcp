@@ -15,7 +15,6 @@ if not exist "%PY%" set "PY=python"
 echo using python: %PY%
 
 echo -------- custom nodes --------
-call :clone "ComfyUI-Manager" "https://github.com/ltdrdata/ComfyUI-Manager.git"
 call :clone "ComfyUI-GGUF" "https://github.com/city96/ComfyUI-GGUF"
 call :clone "rgthree-comfy" "https://github.com/rgthree/rgthree-comfy"
 call :clone "ComfyUI-Easy-Use" "https://github.com/yolain/ComfyUI-Easy-Use"
@@ -29,7 +28,7 @@ call :clone "RES4LYF" "https://github.com/ClownsharkBatwing/RES4LYF"
 echo -------- models --------
 call :grab "models\text_encoders\Qwen3-4B-UD-Q6_K_XL.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Qwen3-4B-UD-Q6_K_XL.gguf"
 call :grab "models\vae\z-image-ae.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/ae.safetensors"
-call :grab "models\unet\z_image_turbo-Q5_K_S.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/z_image_turbo-Q5_K_S.gguf"
+call :grab "models\unet\z_image_turbo-Q8_0.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/z_image_turbo-Q8_0.gguf"
 
 echo DONE. Restart ComfyUI, then load workflow.json.
 pause

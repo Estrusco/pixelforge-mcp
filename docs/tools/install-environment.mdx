@@ -4,133 +4,153 @@ description: "Install/update ComfyUI and the sidebar panel, self-update the MCP 
 icon: "wrench"
 ---
 
-<Info>12 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>5 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
 ## install_comfyui
 
-Install ComfyUI locally: git-clone it into a target directory, create a dedicated workspace virtualenv (&lt;target&gt;/.venv), and install Python requirements INTO that venv (never the Python running this MCP server) via pip or uv. ComfyUI-Manager is installed from manager_requirements.txt when present, else git-cloned as a fallback. Mirrors `comfy-cli install`. LOCAL, subprocess-only and independent of any remote --comfyui-url target; the target dir must be empty or non-existent (an existing install is never overwritten). Runs SYNCHRONOUSLY and can take several minutes (large git clone + full torch/dependency install); the call blocks until done. On success returns a JSON report &#123; installed, targetPath, venvPath, comfyuiUrl, managerInstalled, managerVia, version, pythonInstaller, steps[] &#125;. Does NOT start ComfyUI.
+Install, update and configure the local ComfyUI installation, its sidebar panel, and this MCP server itself. Driven by the `action` parameter:
+- action:"install" — Install ComfyUI locally: git-clone it into `target_path`, create a dedicated workspace virtualenv (&lt;target&gt;/.venv), and install Python requirements INTO that venv (never the Python running this MCP server) via pip or uv. ComfyUI-Manager is installed from manager_requirements.txt when present, else git-cloned as a fallback. Mirrors `comfy-cli install`. LOCAL, subprocess-only and independent of any remote --comfyui-url target; the target dir must be empty or non-existent (an existing install is never overwritten). Runs SYNCHRONOUSLY and can take several minutes (large git clone + full torch/dependency install); the call blocks until done. On success returns a JSON report &#123; installed, targetPath, venvPath, comfyuiUrl, managerInstalled, managerVia, version, pythonInstaller, steps[] &#125;. Does NOT start ComfyUI. `target_path` is REQUIRED.
+- action:"update" — Update the ComfyUI CORE install: runs `git pull` in the connected local server's observed checkout (falling back to COMFYUI_CODE_PATH, then COMFYUI_PATH) and reinstalls its Python requirements (auto-detecting uv vs pip). Returns a clear error when targeting a remote instance via --comfyui-url. The requirements install targets the running server's own interpreter (recorded when this server launched ComfyUI, or an explicit COMFYUI_PYTHON); when that interpreter cannot be verified the update refuses rather than install into a guessed environment — start ComfyUI or connect first. Does NOT touch custom nodes.
+- action:"update_all" — Update ALL installed CUSTOM NODES via the ComfyUI-Manager HTTP API. Mirrors `comfy-cli update all`. This does NOT update ComfyUI core — use action:"update" for that. Works against the connected instance (local or remote); updates run asynchronously and a ComfyUI restart may be required afterward. REFUSED while the comfyui-mcp sidebar panel is version-pinned, because 'all' would move the pinned panel too and ComfyUI-Manager cannot update everything-except-one-pack — clear the pin with action:"panel" + panel_action:"unpin", or update the other packs individually by id.
+- action:"panel" — Install, update, reinstall, sync, pin, unpin, unlock, or report status of the ComfyUI sidebar panel ('comfyui-agent-panel' on the Comfy Registry; repo comfyui-mcp-panel) in the LOCAL ComfyUI's custom_nodes, selected by `panel_action` (default "status"). Uses the same ComfyUI-Manager path as install_custom_node and always targets the 'nightly' (git-HEAD) channel. Local-only (no-op/refuses in remote/cloud mode) and NEVER modifies a dev install (a symlinked panel dir). After install/update/reinstall/sync, ComfyUI must be RESTARTED to load the new/updated node — this tool does not auto-restart. The panel is also auto-installed-if-missing when the MCP server loads. A version PIN (panel_action:"pin") holds the panel where it is: while a pin is set, install/update/reinstall/sync and the auto-install all refuse, and 'sync' only warns that a newer panel exists. Panel operations are serialized across orchestrator processes by a lock file. A lock whose recorded owner process is gone is reclaimed automatically; a living owner's lock is never stolen. panel_action:"unlock" RE-CHECKS and reports rather than forcing: it applies that same proof, so it clears the lock only when the recorded owner can be shown dead and REFUSES when ownership cannot be proven (an unreadable record, or a pid indistinguishable from a reused one) — in that case the recovery is manual, after confirming no orchestrator still runs. This is the SIDEBAR PANEL only; it never touches ComfyUI core or this npm package.
+- action:"self_update" — Check or apply a self-update of the comfyui-mcp NPM PACKAGE (this MCP server), selected by `self_update_action` (default "status"). The server also auto-checks on start (opt out with COMFYUI_MCP_AUTOUPDATE=0). Detects the install mode: a dev install (npm link / source checkout) is NEVER updated; global/local installs are updated via npm; npx fetches latest on next run. The running process cannot hot-swap its own code — after an update you must RECONNECT (/mcp) or restart the orchestrator to load the new version. This tool does not auto-restart. On Windows the running orchestrator holds its own sharp DLL locked, so an in-place npm replace fails (EBUSY); the update is then handed to a deferred helper that finishes it once the orchestrator has fully stopped, and the new version loads at the next start. A failed update reports npm's own error output. This updates comfyui-mcp ITSELF — not ComfyUI (action:"update"), not the sidebar panel (action:"panel"), and not custom nodes (install_comfyui (action:"update_all")).
+- action:"environment" — Report ComfyUI environment info (mirrors `comfy-cli env`): the running instance details from /system_stats (OS, Python, ComfyUI version, GPU/VRAM — works for remote targets) plus local probes when a workspace path is available (Python version, git revision, ComfyUI-Manager version, and key pip packages like torch/CUDA). Split installs report `local.workspace_path` for data/base state and `local.code_path` for the serving checkout; git follows the code path and Manager follows the data/base root (`custom_nodes`). The local python probe targets the interpreter the RUNNING server uses (its venv / embedded / standalone python, resolved from the live server), never a bare `python` on PATH. Degrades gracefully and NEVER guesses: when the correct interpreter can't be confirmed, `local.python_probe_trusted` is false, `local.packages` is omitted, and `local.python_probe_reason` says why — an absent package list means UNDETERMINED, never 'not installed'. READ-ONLY.
+- action:"configure_manager" — Configure ComfyUI-Manager settings, mirroring `comfy-cli manager` subcommands; `manager_setting` picks which setting and `value` its new value. Most settings use the ComfyUI-Manager HTTP API (works against remote ComfyUI); set_network_mode and set_security_level have no HTTP setter and are written to Manager's config.ini (requires a known local ComfyUI path; restart ComfyUI to apply).
+
+<Tip>**In plain terms:** One tool for everything that INSTALLS or UPDATES: ComfyUI itself, every custom node pack, the Agent sidebar panel, this MCP server, and ComfyUI-Manager's own settings. `action` picks which — and nothing here is read-only except action:"environment" and the two "status" sub-actions.</Tip>
 
 ### Parameters
 
-<ParamField path="target_path" type="string" required>
-  Absolute path to the workspace directory to install ComfyUI into. Must be empty or non-existent.
+<ParamField path="action" type="enum" required>
+  Which install/environment operation to perform. action:"update", action:"update_all" and action:"environment" take no other parameters; action:"install" requires `target_path`; action:"panel" takes `panel_action` (+ `version`/`reason` for a pin); action:"self_update" takes `self_update_action`; action:"configure_manager" requires `manager_setting` (+ `value`).
+  Options: `action:"install"`, `action:"update"`, `action:"update_all"`, `action:"panel"`, `action:"self_update"`, `action:"environment"`, `action:"configure_manager"`.
+</ParamField>
+<ParamField path="target_path" type="string">
+  action:"install" — REQUIRED absolute path to the workspace directory to install ComfyUI into. Must be empty or non-existent.
 </ParamField>
 <ParamField path="skip_manager" type="boolean">
-  If true, do not clone/install ComfyUI-Manager. Default false (Manager is installed).
+  action:"install" — if true, do not clone/install ComfyUI-Manager. Default false (Manager is installed).
 </ParamField>
 <ParamField path="use_uv" type="boolean">
-  If true, prefer `uv pip install` over plain pip when uv is available on PATH. Falls back to pip if uv is missing. Default false.
+  action:"install" — if true, prefer `uv pip install` over plain pip when uv is available on PATH. Falls back to pip if uv is missing. Default false.
 </ParamField>
 <ParamField path="version" type="string">
-  ComfyUI version to install (comfy-cli semantics): "nightly" (default-branch HEAD), "latest" (newest release tag), or a semantic version like "0.3.40" (checked out as tag v0.3.40). Raw git refs/branches are rejected. Omit to track the default branch HEAD.
+  action:"install" — ComfyUI version to install (comfy-cli semantics): "nightly" (default-branch HEAD), "latest" (newest release tag), or a semantic version like "0.3.40" (checked out as tag v0.3.40). Raw git refs/branches are rejected. Omit to track the default branch HEAD. ALSO used by action:"panel" + panel_action:"pin", where it is the PANEL version to hold at, e.g. '0.11.20' (take it from the installedVersion that panel_action:"status" reports).
+</ParamField>
+<ParamField path="panel_action" type="enum" default="status">
+  action:"panel" — which sidebar-panel operation to run. status: report installed/version/dev-symlink/pin plus a sync assessment (never errors). sync: bring the panel up to what this orchestrator needs — no-ops when already current, WARNS ONLY when pinned, and reports the version re-read from disk afterwards. install: add the panel (nightly). update: pull the latest nightly. Works on either install shape — a git checkout is fast-forwarded, and a Comfy Registry ZIP install (which has no .git) is replaced with a verified fresh clone, keeping the previous copy outside custom_nodes. Success is always re-read from disk. reinstall: uninstall + reinstall (nightly). pin: hold the panel at a version (requires `version`). unpin: clear the pin so a sync can proceed. unlock: recover from a crashed/killed orchestrator's leftover panel operation lock — reclaims it ONLY when it is provably abandoned (older than the stale threshold AND its recorded owner process is dead), and refuses with the observed state otherwise. install/update/reinstall/sync refuse on a dev symlink or an active pin, and require a local workspace (COMFYUI_PATH or the saved default workspace).
+  Options: `status`, `install`, `update`, `reinstall`, `sync`, `pin`, `unpin`, `unlock`.
+</ParamField>
+<ParamField path="reason" type="string">
+  action:"panel" + panel_action:"pin" only: why the user is pinning (stored with the pin).
+</ParamField>
+<ParamField path="self_update_action" type="enum" default="status">
+  action:"self_update" — status: report install mode + current vs latest version + dev-link note (never errors). update: update to the latest published version (refuses on a dev link; no-op when already up to date or for npx).
+  Options: `status`, `update`.
+</ParamField>
+<ParamField path="manager_setting" type="enum">
+  action:"configure_manager" — REQUIRED. Which ComfyUI-Manager setting to change. HTTP API: set_preview_method, set_db_mode, set_component_policy, set_update_policy, set_channel, reset_queue. config.ini fallback: set_network_mode, set_security_level.
+  Options: `set_preview_method`, `set_db_mode`, `set_component_policy`, `set_update_policy`, `set_channel`, `reset_queue`, `set_network_mode`, `set_security_level`.
+</ParamField>
+<ParamField path="value" type="string">
+  action:"configure_manager" — value for the chosen `manager_setting` (omit only for reset_queue). Allowed values per setting — set_preview_method: auto | latent2rgb | taesd | none; set_db_mode: local | cache | remote; set_component_policy: workflow | higher | mine; set_update_policy: stable-comfyui | nightly-comfyui; set_channel: a channel name (e.g. default); set_network_mode: public | private | offline; set_security_level: strong | normal | normal- | weak. HTTP-API settings take effect live; the config.ini ones (set_network_mode, set_security_level) apply only after a ComfyUI restart.
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Tell me about my setup — useful when I'm reporting a bug.
 
 ```json
 {
   "tool": "install_comfyui",
   "arguments": {
-    "target_path": "<target_path>"
+    "action": "environment"
   }
 }
 ```
 
----
+**You get back:** Where ComfyUI is installed, the Python and torch versions, the GPU, and which settings are in force. The first thing to paste into an issue.
 
-## update_comfyui
-
-Update the ComfyUI core install: runs `git pull` in the configured ComfyUI directory and reinstalls its Python requirements (auto-detecting uv vs pip). Requires a local install (COMFYUI_PATH); returns a clear error when targeting a remote instance via --comfyui-url.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** What version of the panel have I got?
 
 ```json
 {
-  "tool": "update_comfyui",
-  "arguments": {}
-}
-```
-
----
-
-## update_all
-
-Update ALL installed custom nodes via the ComfyUI-Manager HTTP API (queues update_all, then starts the queue worker). Mirrors `comfy-cli update all`. This does NOT update ComfyUI core — use update_comfyui for that. Works against the connected instance (local or remote); updates run asynchronously and a ComfyUI restart may be required afterward.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "update_all",
-  "arguments": {}
-}
-```
-
----
-
-## install_panel
-
-Install, update, reinstall, or report status of the ComfyUI sidebar panel ('comfyui-agent-panel' on the Comfy Registry; repo comfyui-mcp-panel) in the LOCAL ComfyUI's custom_nodes. Uses the same ComfyUI-Manager path as install_custom_node and always targets the 'nightly' (git-HEAD) channel. Local-only (no-op/refuses in remote/cloud mode) and NEVER modifies a dev install (a symlinked panel dir). After install/update/reinstall, ComfyUI must be RESTARTED to load the new/updated node — this tool does not auto-restart. The panel is also auto-installed-if-missing when the MCP server loads.
-
-### Parameters
-
-<ParamField path="action" type="enum" required default="status">
-  status: report installed/version/dev-symlink (never errors). install: add the panel (nightly). update: pull the latest nightly. reinstall: uninstall + reinstall (nightly). install/update/reinstall refuse on a dev symlink and require a local COMFYUI_PATH. Options: `status`, `install`, `update`, `reinstall`.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "install_panel",
+  "tool": "install_comfyui",
   "arguments": {
-    "action": "status"
+    "action": "panel",
+    "panel_action": "status"
   }
 }
 ```
 
----
+**You get back:** The installed panel version, where it lives, and whether it is pinned. This changes nothing.
 
-## self_update
-
-Check or apply a self-update of the comfyui-mcp npm package against the npm registry. The server also auto-checks on start (opt out with COMFYUI_MCP_AUTOUPDATE=0). Detects the install mode: a dev install (npm link / source checkout) is NEVER updated; global/local installs are updated via npm; npx fetches latest on next run. The running process cannot hot-swap its own code — after an update you must RECONNECT (/mcp) or restart the orchestrator to load the new version. This tool does not auto-restart.
-
-### Parameters
-
-<ParamField path="action" type="enum" required default="status">
-  status: report install mode + current vs latest version + dev-link note (never errors). update: update to the latest published version (refuses on a dev link; no-op when already up to date or for npx). Options: `status`, `update`.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** It says my panel is too old — update it.
 
 ```json
 {
-  "tool": "self_update",
+  "tool": "install_comfyui",
   "arguments": {
-    "action": "status"
+    "action": "panel",
+    "panel_action": "update"
   }
 }
 ```
+
+**You get back:** The update result. Two more steps are yours: restart ComfyUI, then hard-refresh the ComfyUI browser tab (Ctrl+Shift+R). Without that refresh the tab keeps running the old cached panel code and the same refusal comes back.
+
+**You say:** Am I on the latest comfyui-mcp?
+
+```json
+{
+  "tool": "install_comfyui",
+  "arguments": {
+    "action": "self_update",
+    "self_update_action": "status"
+  }
+}
+```
+
+**You get back:** Your version, the latest published version, and whether they differ.
+
+**You say:** Update comfyui-mcp itself.
+
+```json
+{
+  "tool": "install_comfyui",
+  "arguments": {
+    "action": "self_update",
+    "self_update_action": "update"
+  }
+}
+```
+
+**You get back:** The upgrade result. Your MCP client has to be restarted afterwards to pick up the new server.
+
+<Warning>This updates THIS server, not ComfyUI and not the sidebar panel — those are action:"update" and action:"panel".</Warning>
+
+**You say:** Update every custom node I have installed.
+
+```json
+{
+  "tool": "install_comfyui",
+  "arguments": {
+    "action": "update_all"
+  }
+}
+```
+
+**You get back:** Confirmation that the bulk update was queued with ComfyUI-Manager. It runs asynchronously and ComfyUI usually needs a restart after.
+
+<Warning>This moves EVERY installed pack, not just the one that is broken. It is refused while the sidebar panel is version-pinned.</Warning>
 
 ---
 
 ## apply_manifest
 
-Apply a ComfyUI setup manifest from an inline object or .json/.yaml/.yml file. Composes custom-node installs and model downloads, installs pip packages, and reports apt entries as skipped (system packages need manual/root installation). LOCAL ComfyUI (COMFYUI_PATH set): nodes/models land on the local filesystem and pip installs into the ComfyUI Python env. REMOTE ComfyUI: custom_nodes and models are routed through the ComfyUI-Manager HTTP API (handled on the host), while pip and apt entries are reported as skipped (no remote equivalent). Each item reports applied/skipped/failed independently.
+Apply a ComfyUI setup manifest from an inline object or .json/.yaml/.yml file. Composes custom-node installs and model downloads, installs pip packages, and reports apt entries as skipped (system packages need manual/root installation). LOCAL ComfyUI: model downloads use the connected server's live/data model roots; pip uses the serving checkout (live main.py root, then COMFYUI_CODE_PATH, then COMFYUI_PATH); filesystem custom-node fallbacks use the live data/base root (live --base-directory, then COMFYUI_PATH). REMOTE ComfyUI: custom_nodes and models are routed through the ComfyUI-Manager HTTP API (handled on the host), while pip and apt entries are reported as skipped (no remote equivalent). Each item reports applied/skipped/failed/pending independently. success is true only when nothing failed AND nothing is still pending. A PARTIAL INSTALL (custom_nodes left unsubmitted when the time budget elapsed) is named in the partial field — a drained Manager queue / panel_node_queue_status does not include those entries; re-run apply_manifest to submit them. Do not restart ComfyUI until they report applied or skipped.
 
 ### Parameters
 
@@ -138,12 +158,15 @@ Apply a ComfyUI setup manifest from an inline object or .json/.yaml/.yml file. C
   Inline manifest object. Provide exactly one of `manifest` or `path`.
 </ParamField>
 <ParamField path="path" type="string">
-  Path to a .json, .yaml, or .yml manifest file. Provide exactly one of `manifest` or `path`.
+  Path to a .json, .yaml, or .yml manifest file. Provide exactly one of `manifest`, `path`, or `pack`.
+</ParamField>
+<ParamField path="pack" type="string">
+  A bundled installer pack by NAME, as reported by list_packs (action:"list"). PREFER THIS over `path` for a bundled pack: the name is resolved against the running build at apply time, while a manifest_path captured earlier points into an npx cache directory that a later respawn no longer has (#1568). Provide exactly one of `manifest`, `path`, or `pack`.
 </ParamField>
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -154,119 +177,59 @@ Apply a ComfyUI setup manifest from an inline object or .json/.yaml/.yml file. C
 
 ---
 
-## get_workspace
+## workspace
 
-Report the active ComfyUI workspace (mirrors `comfy-cli which`): the local installation path being used (from COMFYUI_PATH or auto-detection), the source of that path, any persisted default workspace, and the resolved API target the MCP server talks to.
+Inspect and manage ComfyUI workspaces (local installs). Driven by the `action` parameter:
+- action:"get" — Report the active ComfyUI workspace (mirrors `comfy-cli which`): the local installation path being used (from COMFYUI_PATH or auto-detection), the source of that path, any persisted default workspace, and the resolved API target the MCP server talks to.
+- action:"set_default" — Persist a default ComfyUI workspace path to the MCP config file (mirrors `comfy-cli set-default`). The value is stored under the OS config dir (e.g. ~/.config/comfyui-mcp/workspace.json) and reported by action:"get"/action:"list". Does NOT change the live API target. `path` is REQUIRED, e.g. &#123;action:"set_default", path:"/opt/ComfyUI"&#125;.
+- action:"list" — List known/auto-detected ComfyUI installations on this machine. Scans common install locations across macOS, Linux, and Windows and marks which one is active and which is the saved default.
 
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "get_workspace",
-  "arguments": {}
-}
-```
-
----
-
-## set_default_workspace
-
-Persist a default ComfyUI workspace path to the MCP config file (mirrors `comfy-cli set-default`). The value is stored under the OS config dir (e.g. ~/.config/comfyui-mcp/workspace.json) and reported by get_workspace/list_workspaces. Does NOT change the live API target.
-
-### Parameters
-
-<ParamField path="path" type="string" required>
-  Absolute path to a ComfyUI installation directory to remember as the default workspace.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "set_default_workspace",
-  "arguments": {
-    "path": "<path>"
-  }
-}
-```
-
----
-
-## list_workspaces
-
-List known/auto-detected ComfyUI installations on this machine. Scans common install locations across macOS, Linux, and Windows and marks which one is active and which is the saved default.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "list_workspaces",
-  "arguments": {}
-}
-```
-
----
-
-## get_environment
-
-Report ComfyUI environment info (mirrors `comfy-cli env`): the running instance details from /system_stats (OS, Python, ComfyUI version, GPU/VRAM — works for remote targets) plus local probes when a workspace path is available (Python version, git revision, ComfyUI-Manager version, and key pip packages like torch/CUDA). Degrades gracefully: local probes are omitted when no local path is configured or tools are unavailable.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "get_environment",
-  "arguments": {}
-}
-```
-
----
-
-## configure_manager
-
-Configure ComfyUI-Manager settings, mirroring `comfy-cli manager` subcommands. Most actions use the ComfyUI-Manager HTTP API (works against remote ComfyUI); set_network_mode and set_security_level have no HTTP setter and are written to Manager's config.ini (requires a known local ComfyUI path; restart ComfyUI to apply).
+<Tip>**In plain terms:** Which ComfyUI installation everything else is talking about. One tool, three jobs, chosen with `action` — this is the tool the [consolidation note](/using-tools#one-tool-several-jobs) uses as its worked example.</Tip>
 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which setting to change. HTTP API: set_preview_method, set_db_mode, set_component_policy, set_update_policy, set_channel, reset_queue. config.ini fallback: set_network_mode, set_security_level. Options: `set_preview_method`, `set_db_mode`, `set_component_policy`, `set_update_policy`, `set_channel`, `reset_queue`, `set_network_mode`, `set_security_level`.
+  Which workspace operation to perform. "get" and "list" take no other parameters; "set_default" requires `path`.
+  Options: `action:"get"`, `action:"set_default"`, `action:"list"`.
 </ParamField>
-<ParamField path="value" type="string">
-  Value for the chosen action (omit only for reset_queue). Allowed values per action — set_preview_method: auto | latent2rgb | taesd | none; set_db_mode: local | cache | remote; set_component_policy: workflow | higher | mine; set_update_policy: stable-comfyui | nightly-comfyui; set_channel: a channel name (e.g. default); set_network_mode: public | private | offline; set_security_level: strong | normal | normal- | weak. HTTP-API actions take effect live; the config.ini actions (set_network_mode, set_security_level) apply only after a ComfyUI restart.
+<ParamField path="path" type="string">
+  action:"set_default" — REQUIRED absolute path to a ComfyUI installation directory to remember as the default workspace.
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Which ComfyUI am I actually using?
 
 ```json
 {
-  "tool": "configure_manager",
+  "tool": "workspace",
   "arguments": {
-    "action": "set_preview_method"
+    "action": "get"
   }
 }
 ```
+
+**You get back:** The active install's path and how it was chosen — a flag, an environment variable, or the saved default.
+
+**You say:** Always use the one on my big drive from now on.
+
+```json
+{
+  "tool": "workspace",
+  "arguments": {
+    "action": "set_default",
+    "path": "D:/AI/ComfyUI"
+  }
+}
+```
+
+**You get back:** Confirmation, and it sticks across restarts. Later sessions target this install unless something overrides it.
 
 ---
 
 ## report_issue
 
-Build a ready-to-open GitHub issue link for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp itself). Returns a URL with the title and body prefilled — SHARE it with the user so they can review and submit it in one click. It does NOT auto-file. Use it when you encounter an error you can't resolve so the user can report it upstream. For panel-specific bugs pass repo='artokun/comfyui-mcp-panel'.
+File or triage a GitHub issue for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp/its panel). For OUR repos (artokun/comfyui-mcp, artokun/comfyui-mcp-panel) it sends the report to the AI triage worker, which searches existing OPEN and CLOSED issues, version-matches, and either files a new issue, adds context to an existing one, or — if the problem was already FIXED in a newer version than the user runs — answers with the fixing PR + fixed-in version and a recommendation to upgrade (no new issue). It returns that triage result plus an instant check of whether the user is on the latest versions. TIMING: this call BLOCKS while the triage runs — typically a few minutes — and that wait is normal, not a hang. It always returns eventually (every request is time-capped and the poll budget is bounded); on a failing network the caps make that wait longer, but never indefinite. Do not abort a slow call just to retry it: once the worker has accepted the report it keeps triaging on its own — filing, deduping into an existing issue, advising an upgrade, or (rarely) reporting that it could not file — so a blind retry can double-file. If triage outlasts the polling budget the call still returns, with pending:true (and a job_id when the worker gave one — an accepted submit whose acknowledgement was unreadable returns pending without it). If the worker is unreachable it falls back to a prefilled GitHub 'new issue' URL. For third-party repos it returns a prefilled URL to SHARE (it does not auto-file). ALWAYS pass mcp_version and panel_version from the known environment (the env line in your context, e.g. 'mcp=… panel=…') so the worker can tell the user if simply upgrading fixes it — the single most common resolution. Surface the worker's agent_message / upgrade advice to the user.
 
 ### Parameters
 
@@ -274,7 +237,7 @@ Build a ready-to-open GitHub issue link for a bug/problem you hit (ComfyUI, a wo
   Short, specific issue title.
 </ParamField>
 <ParamField path="body" type="string" required>
-  Issue body: what happened, steps to reproduce, the exact error text, and environment (GPU/VRAM, ComfyUI version, OS) if known.
+  Issue body: what happened, steps to reproduce, the exact error text, and environment (GPU/VRAM, ComfyUI version, ComfyUI FRONTEND version, OS) if known. The FRONTEND version is a SEPARATE package from ComfyUI and they move independently — get_system_stats (action:"health") prints both, and for any panel/UI bug it is often the deciding variable. Scrub secrets first.
 </ParamField>
 <ParamField path="repo" type="string">
   owner/repo (default 'artokun/comfyui-mcp'; use 'artokun/comfyui-mcp-panel' for the sidebar panel).
@@ -282,19 +245,112 @@ Build a ready-to-open GitHub issue link for a bug/problem you hit (ComfyUI, a wo
 <ParamField path="labels" type="string[]">
   Optional GitHub label names to prefill.
 </ParamField>
+<ParamField path="mcp_version" type="string">
+  The running comfyui-mcp version (from the env line in your context). Auto-detected if omitted.
+</ParamField>
+<ParamField path="panel_version" type="string">
+  The running comfyui-mcp-panel (sidebar) version, from the env line in your context, if known.
+</ParamField>
+<ParamField path="no_file" type="boolean">
+  Force the prefilled-URL path even for our repos (skip the Worker). Rarely needed.
+</ParamField>
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** This keeps crashing. File a bug about it.
 
 ```json
 {
   "tool": "report_issue",
   "arguments": {
-    "title": "<title>",
-    "body": "<body>"
+    "title": "Video render finishes but no file appears in outputs",
+    "body": "Running the WAN template completes and history shows success, but output/video/ is empty. Happens every time on 0.49.3."
   }
 }
 ```
+
+**You get back:** A GitHub issue on the project, with your environment details attached automatically, and a link to it.
+
+<Warning>This posts publicly. The environment block it attaches includes paths and versions from your machine — glance at what it drafted before agreeing to send it.</Warning>
+
+---
+
+## kitchen
+
+See what comfy-kitchen can do on this GPU, find where a graph is leaving it on the table, and apply the faster path. Driven by `action`:
+- action:"status" — kitchen version, backends (hip/cuda/triton/eager), INT8 attention, GPU fp8/NVFP4/MXFP8, launch flags (--use-ck-attention, --enable-triton-backend, --fast fp8_matrix_mult). Local gets log + /system_stats + an import probe when COMFYUI_PATH is set; remote gets log + /system_stats only and reports model.quant / the probe as unknown. A failed probe is unknown, never a no.
+- action:"assess" — walk the workflow JSON's UNETLoaders and emit a recommendation only when every fact it needs is known: (1) weight_dtype default on a bf16 UNETLoader + GPU fp8 + kitchen present → fp8_e4m3fn_fast (widget, no restart); (2) no --use-sage-attention, sageattention not installed, kitchen INT8 available → --use-ck-attention (restart, confirm); (3) Blackwell + local NVFP4 sibling → model swap; (4) ROCm + triton ≥ 3.7 + kitchen, triton backend off → --enable-triton-backend. Pass `workflow` (API or UI JSON). For the open canvas use panel_kitchen.
+- action:"apply" — apply one recommendation_id from assess. Widget edits are reversible and do not need confirm. Flags and downloads need `confirm: true`. Flag apply names the launch flag; restart_comfyui replays the previous argv and does not inject a new one. Proof (before/after s/it, peak VRAM, output not black) is the panel_kitchen apply path.
+
+<Tip>**In plain terms:** comfy-kitchen is ComfyUI's kernel library (fp8 / NVFP4 / MXFP8 / INT8 attention). This tool reports what the connected GPU can run, walks a graph for the faster path, and applies a recommendation. A failed probe is unknown, never a no — a recommendation fires only when every fact it needs is known. For the open canvas use panel_kitchen.</Tip>
+
+### Parameters
+
+<ParamField path="action" type="enum" required>
+  Which kitchen operation. "status" takes no other parameters; "assess" takes `workflow`; "apply" takes `recommendation_id` and `confirm` for restarts/downloads.
+  Options: `action:"status"`, `action:"assess"`, `action:"apply"`.
+</ParamField>
+<ParamField path="workflow" type="string | object">
+  action:"assess" / "apply" — workflow JSON (API-format &#123;id:&#123;class_type,inputs&#125;&#125; or UI-format &#123;nodes,links&#125;), as a string or object.
+</ParamField>
+<ParamField path="recommendation_id" type="string">
+  action:"apply" — id from assess (e.g. "fp8_unet_fast:12" or "ck_attention").
+</ParamField>
+<ParamField path="confirm" type="boolean">
+  action:"apply" — required true for anything that restarts or downloads. Widget edits do not need it.
+</ParamField>
+
+### Examples
+
+**You say:** Is kitchen even installed on this GPU, and can it do fp8?
+
+```json
+{
+  "tool": "kitchen",
+  "arguments": {
+    "action": "status"
+  }
+}
+```
+
+**You get back:** Kitchen version (or unknown), which backends loaded, whether INT8 attention is on, GPU fp8/NVFP4/MXFP8, and the launch flags in argv. Remote sessions skip the import probe and model.quant.
+
+**You say:** Where is this workflow leaving kitchen speed on the table?
+
+```json
+{
+  "tool": "kitchen",
+  "arguments": {
+    "action": "assess",
+    "workflow": {
+      "12": {
+        "class_type": "UNETLoader",
+        "inputs": {
+          "unet_name": "flux1-dev.safetensors",
+          "weight_dtype": "default"
+        }
+      }
+    }
+  }
+}
+```
+
+**You get back:** Per-loader facts plus recommendations that fired. A default UNETLoader on a bf16 file, with kitchen present and an fp8 GPU, yields fp8_e4m3fn_fast. Missing facts stay unknown; they do not invent a rec.
+
+**You say:** Apply that fp8 widget change.
+
+```json
+{
+  "tool": "kitchen",
+  "arguments": {
+    "action": "apply",
+    "recommendation_id": "fp8_unet_fast:12"
+  }
+}
+```
+
+**You get back:** The widget edit on the supplied workflow, or a needs_confirm refusal for a flag that would restart. Flag apply names the launch flag; restart_comfyui replays argv and does not inject it.
+
+<Warning>A flag or download recommendation needs confirm:true. Proof of a faster non-black after-run is panel_kitchen apply.</Warning>
 
 ---

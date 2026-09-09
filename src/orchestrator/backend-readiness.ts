@@ -9,13 +9,21 @@
 // which the panel then prefers (see comfyui-mcp-panel: applyReadiness on a
 // {type:"backends"} bridge frame).
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { kimiCodeAuthCandidates } from "../services/code-provider-auth.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readOAuthStatus } from "../services/code-provider-auth.js";
 import { resolveAgyBin } from "./antigravity-backend.js";
+import { resolvePiLaunch } from "./pi-backend.js";
+// pi's credential detection is large enough (pi's whole env map + auth.json /
+// models.json / Vertex-ADC parsing) to live in its own module; re-exported below
+// so existing importers of `piCredentialPresent` are unaffected.
+import { piCredentialPresent } from "./pi-credentials.js";
 import type { OAuthStatusRecord } from "../services/panel-secrets.js";
 import { simpleKeyProvider } from "../services/openai-provider-registry.js";
+
+export { piCredentialPresent } from "./pi-credentials.js";
 
 export type BackendReadiness = {
   backend: string;
@@ -30,6 +38,20 @@ export type BackendReadiness = {
    *  false) for every other backend so this frame stays a pure ADDITION for
    *  existing consumers/tests. */
   experimental?: boolean;
+  /** Discovery-only signal used for automatic selection. `ready` retains its
+   *  historical install/config semantics; `available` means usable right now.
+   *  Optional so older panel/orchestrator pairs remain wire-compatible. */
+  available?: boolean;
+};
+
+export type BackendDiscoveryOptions = {
+  home?: string;
+  ollamaBaseUrl?: string;
+  ollamaApi?: "ollama" | "openai";
+  lmstudioBaseUrl?: string;
+  llamacppBaseUrl?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
 };
 
 // CLI binary names per provider (Windows resolves .cmd/.exe via PATHEXT, but we
@@ -38,6 +60,8 @@ const CLI_NAMES: Record<string, string[]> = {
   codex: ["codex", "codex.cmd", "codex.exe"],
   gemini: ["gemini", "gemini.cmd", "gemini.exe"],
   grok: ["grok", "grok.cmd", "grok.exe"],
+  qwen: ["qwen", "qwen.cmd", "qwen.exe"],
+  pi: ["pi", "pi.exe"], // presence only; the pi READINESS path uses resolvePiLaunch (#2835)
   ollama: ["ollama", "ollama.exe"],
   lmstudio: ["lms", "lms.exe"],
   llamacpp: ["llama-server", "llama-server.exe"],
@@ -95,12 +119,139 @@ function onPath(names: string[]): boolean {
   return false;
 }
 
+/** True if <geminiHome>/.gemini/settings.json selects API-key auth
+ *  (security.auth.selectedType === "gemini-api-key"). This is an
+ *  env-independent "configured for API key" signal (issue #456): the gemini CLI
+ *  writes it on `/auth` → "Gemini API key" and it persists across processes,
+ *  unlike GEMINI_API_KEY which the orchestrator only inherits if set before
+ *  launch. Never throws — a missing/corrupt file just means "no signal". */
+function geminiSettingsUsesApiKey(geminiHome: string): boolean {
+  try {
+    const raw = readFileSync(join(geminiHome, ".gemini", "settings.json"), "utf8");
+    const parsed = JSON.parse(raw) as {
+      security?: { auth?: { selectedType?: unknown } };
+    };
+    return parsed?.security?.auth?.selectedType === "gemini-api-key";
+  } catch {
+    return false;
+  }
+}
+
+/** True if <home>/.qwen/settings.json selects an auth type
+ *  (security.auth.selectedType is a non-empty string) — the env-independent
+ *  "configured" signal for Qwen Code, mirroring geminiSettingsUsesApiKey. `/auth`
+ *  writes it and it persists across processes, unlike DASHSCOPE_API_KEY which
+ *  the orchestrator only inherits if set before launch. A stale or keyless
+ *  selection still surfaces via the connect ack's model probe (degraded), same
+ *  as every other provider. Never throws — a missing/corrupt file just means
+ *  "no signal". */
+function qwenSettingsConfigured(home: string): boolean {
+  try {
+    const raw = readFileSync(join(home, ".qwen", "settings.json"), "utf8");
+    const parsed = JSON.parse(raw) as {
+      security?: { auth?: { selectedType?: unknown } };
+    };
+    const t = parsed?.security?.auth?.selectedType;
+    return typeof t === "string" && t.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function fileExists(...parts: string[]): boolean {
   try {
     return existsSync(join(...parts));
   } catch {
     return false;
   }
+}
+
+function claudeCredentialPresent(home: string): boolean {
+  try {
+    const raw = JSON.parse(
+      readFileSync(join(home, ".claude", ".credentials.json"), "utf8"),
+    ) as { claudeAiOauth?: { accessToken?: unknown; refreshToken?: unknown } };
+    const oauth = raw?.claudeAiOauth;
+    return [oauth?.accessToken, oauth?.refreshToken].some(
+      (value) => typeof value === "string" && value.trim().length > 0,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function staticAvailability(readiness: BackendReadiness, home: string): boolean {
+  if (["ollama", "lmstudio", "llamacpp"].includes(readiness.backend)) return false;
+  if (readiness.backend === "claude") return claudeCredentialPresent(home);
+  return readiness.ready;
+}
+
+function modelsEndpoint(baseUrl: string): string {
+  const base = baseUrl.replace(/\/+$/, "");
+  return /\/v1$/i.test(base) ? `${base}/models` : `${base}/v1/models`;
+}
+
+async function probeJsonShape(
+  url: string,
+  valid: (value: unknown) => boolean,
+  options: Required<Pick<BackendDiscoveryOptions, "timeoutMs" | "fetchImpl">>,
+): Promise<boolean> {
+  try {
+    const response = await options.fetchImpl(url, {
+      signal: AbortSignal.timeout(options.timeoutMs),
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) return false;
+    return valid(await response.json());
+  } catch {
+    return false;
+  }
+}
+
+/** Overlay live local-service availability onto the static snapshot. Raw open
+ *  ports do not count: every endpoint must return its provider's JSON shape. */
+export async function discoverBackendAvailability(
+  snapshot: BackendReadiness[],
+  options: BackendDiscoveryOptions = {},
+): Promise<BackendReadiness[]> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 1500;
+  const ollamaBase = (options.ollamaBaseUrl ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
+  const lmstudioBase = options.lmstudioBaseUrl ?? "http://127.0.0.1:1234/v1";
+  const llamacppBase = options.llamacppBaseUrl ?? "http://127.0.0.1:8080/v1";
+  const json = { fetchImpl, timeoutMs };
+  const checks = new Map<string, Promise<boolean>>([
+    [
+      "ollama",
+      options.ollamaApi === "openai"
+        ? probeJsonShape(modelsEndpoint(ollamaBase), (v) => Array.isArray((v as { data?: unknown })?.data), json)
+        : probeJsonShape(`${ollamaBase.replace(/\/v1$/i, "")}/api/tags`, (v) => Array.isArray((v as { models?: unknown })?.models), json),
+    ],
+    [
+      "lmstudio",
+      probeJsonShape(modelsEndpoint(lmstudioBase), (v) => Array.isArray((v as { data?: unknown })?.data), json),
+    ],
+    [
+      "llamacpp",
+      probeJsonShape(modelsEndpoint(llamacppBase), (v) => Array.isArray((v as { data?: unknown })?.data), json),
+    ],
+  ]);
+  const live = new Map<string, boolean>();
+  await Promise.all(
+    [...checks].map(async ([backend, check]) => live.set(backend, await check)),
+  );
+  return snapshot.map((entry) => {
+    if (!live.has(entry.backend)) return entry;
+    const available = live.get(entry.backend) === true;
+    return {
+      ...entry,
+      available,
+      // A reachable local service is usable even if its binary/app lives outside
+      // our install probes. Preserve cli=false when stopped so the UI can still
+      // distinguish "not installed" from "installed but not running".
+      ...(available ? { cli: true, auth: true, ready: true } : {}),
+    };
+  });
 }
 
 /** The panel's in-panel-OAuth status records — injectable for tests (so a test
@@ -185,17 +336,35 @@ export function backendReadiness(
   }
   if (b === "kimi") {
     const apiKey = process.env.KIMI_API_KEY?.trim();
-    const kimiShare = process.env.KIMI_SHARE_DIR || join(home, ".kimi");
-    const oauth = fileExists(kimiShare, "credentials", "kimi-code.json");
+    // Asks the SAME resolver the auth path uses. This used to re-derive the location
+    // and looked only in the legacy ~/.kimi, so a user signed in with the current
+    // kimi-code CLI (~/.kimi-code) was reported {auth:false, ready:false} while their
+    // credentials resolved fine everywhere else — and the panel told them they were not
+    // signed in.
+    const oauth = kimiCodeAuthCandidates(home).some((p) => existsSync(p));
     const auth = !!apiKey || oauth;
     return { backend: "kimi", cli: true, auth, ready: auth };
   }
   if (b === "gemini") {
     const cli = onPath(CLI_NAMES.gemini);
-    // The gemini CLI caches its Google OAuth at <home>/.gemini/oauth_creds.json
-    // (or GEMINI_CLI_HOME when set).
+    // API-key auth is a first-class gemini CLI mode and writes NO
+    // oauth_creds.json (issue #456). Mirror the kimi branch and accept ANY of:
+    //   1. GEMINI_API_KEY / GOOGLE_API_KEY in the orchestrator's env, or
+    //   2. Google OAuth cached at <home>/.gemini/oauth_creds.json (or
+    //      GEMINI_CLI_HOME when set), or
+    //   3. an env-independent "configured for API key" signal —
+    //      <home>/.gemini/settings.json with
+    //      security.auth.selectedType === "gemini-api-key". This lets a user
+    //      who authed with a key before ComfyUI launched (so the key isn't in
+    //      this process's env yet) still read as ready rather than "not signed
+    //      in"; a genuinely-bad/absent key surfaces via the connect ack's model
+    //      probe (degraded), same as every other key provider.
     const geminiHome = process.env.GEMINI_CLI_HOME || home;
-    const auth = fileExists(geminiHome, ".gemini", "oauth_creds.json");
+    const apiKey =
+      !!(process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim());
+    const oauth = fileExists(geminiHome, ".gemini", "oauth_creds.json");
+    const apiKeyConfigured = geminiSettingsUsesApiKey(geminiHome);
+    const auth = apiKey || oauth || apiKeyConfigured;
     return { backend: "gemini", cli, auth, ready: cli && auth };
   }
   if (b === "antigravity") {
@@ -209,6 +378,34 @@ export function backendReadiness(
     const cli = !!resolveAgyBin(home);
     return { backend: "antigravity", cli, auth: cli ? null : false, ready: cli };
   }
+  if (b === "pi") {
+    // pi.dev CLI (`pi`, issue #491) — a multi-provider coding agent. Auth lives
+    // in ~/.pi/agent/auth.json (API keys + `/login` subscriptions) or provider
+    // env vars. UNLIKE agy, `pi --list-models` is NOT an auth probe (it prints
+    // the built-in catalog with no key), so readiness must NOT key off the CLI
+    // alone — that would greet a keyless pi green-ready and then fail its first
+    // turn (issue #491 codex P1a). We report ready ONLY when a WELL-FORMED,
+    // PRESENT credential is verifiable — see pi-credentials.ts, which mirrors
+    // pi's own resolution (its full provider env map minus the keys our spawn
+    // env strips, a parsed auth.json record that actually carries a key/token, a
+    // JSONC models.json provider with its own apiKey/oauth, or Google Vertex ADC
+    // with an existing credentials file plus project+location). When the CLI is
+    // present but no credential is verifiable, auth is UNKNOWN (null) and ready
+    // is FALSE — the panel then shows "configure a provider", not green.
+    // Residual (accepted, and the UI wording must not over-promise): a present
+    // but revoked/quota-exhausted key is indistinguishable from a good one here
+    // and still fails on the first turn.
+    // #2835 — the SAME resolver prepare() launches with. Readiness used to call
+    // resolvePiBin, whose candidate list is ["pi", "pi.exe"] with .cmd excluded on
+    // the premise that Node cannot spawn one. That premise no longer holds: an npm
+    // .cmd resolves to the script it runs. Keeping the two apart reported a
+    // .cmd-only install as ABSENT though it runs, and an unresolvable extensionless
+    // shim as PRESENT though it spawns ENOENT -- which is #2835's own symptom.
+    const cli = !!resolvePiLaunch(home);
+    const authKnown = piCredentialPresent(home);
+    const auth = authKnown ? true : cli ? null : false;
+    return { backend: "pi", cli, auth, ready: cli && authKnown };
+  }
   if (b === "grok") {
     const cli = onPath(CLI_NAMES.grok);
     // Same reasoning as codex above: the panel's in-panel OAuth writes the
@@ -217,6 +414,32 @@ export function backendReadiness(
       fileExists(home, ".grok", "auth.json") ||
       hasValidPanelOAuth("grok", panelOAuthRecords(opts), nowMs);
     return { backend: "grok", cli, auth, ready: cli && auth };
+  }
+  if (b === "qwen") {
+    // Qwen Code CLI (`qwen --acp`, issue #1417). `.cmd` IS probed — unlike pi,
+    // we spawn through the shell on Windows (see qwen-backend resolveSpawn), so
+    // a `qwen.cmd` shim is genuinely runnable. Auth (the CLI owns it) reads as
+    // present when ANY of: a Qwen-side key is in the orchestrator's env
+    // (DASHSCOPE_API_KEY / BAILIAN_CODING_PLAN_API_KEY / OPENAI_API_KEY), cached
+    // OAuth creds exist at <home>/.qwen/oauth_creds.json (the free tier ended
+    // 2026-04-15, but a Coding Plan key configured via /auth lands in
+    // settings.json — covered by the next signal), or ~/.qwen/settings.json
+    // selects an auth type (the env-independent "configured" signal, mirroring
+    // the gemini branch's settings check — this also covers the generic
+    // OPENAI_API_KEY + selectedType:"openai" setup, which a bare env probe
+    // can't distinguish from an unrelated OPENAI_API_KEY the user set for
+    // something else). A stale/bad credential still surfaces via the connect
+    // ack's model probe → degraded, same as every other provider.
+    const cli = onPath(CLI_NAMES.qwen);
+    const envKey = !!(
+      process.env.DASHSCOPE_API_KEY?.trim() ||
+      process.env.BAILIAN_CODING_PLAN_API_KEY?.trim()
+    );
+    const auth =
+      envKey ||
+      fileExists(home, ".qwen", "oauth_creds.json") ||
+      qwenSettingsConfigured(home);
+    return { backend: "qwen", cli, auth, ready: cli && auth };
   }
   if (b === "copilot") {
     // No external CLI/native-file concept for Copilot — the in-panel device-
@@ -285,6 +508,10 @@ export function allBackendReadiness(
   backends: BackendReadiness[];
   any_ready: boolean;
 } {
-  const list = [...backends].map((b) => backendReadiness(b, opts));
+  const home = opts?.home ?? homedir();
+  const list = [...backends].map((b) => {
+    const readiness = backendReadiness(b, opts);
+    return { ...readiness, available: staticAvailability(readiness, home) };
+  });
   return { backends: list, any_ready: list.some((r) => r.ready) };
 }

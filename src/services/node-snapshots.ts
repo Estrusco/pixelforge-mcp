@@ -1,7 +1,16 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { config, getComfyUIBaseUrl } from "../config.js";
+import { getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import {
+  resolveEffectiveComfyUICodeBase,
+  resolveLocalMutationTarget,
+} from "./workspace-env.js";
+import {
+  recordPanelPendingOp,
+  SNAPSHOT_RESTORE_PENDING_MS,
+  withPanelPinGuard,
+} from "./panel-pin-guard.js";
 import { NodeSnapshotError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -16,7 +25,10 @@ import { logger } from "../utils/logger.js";
 //
 // The HTTP API works against remote instances (--comfyui-url). Naming a
 // snapshot is only possible via the file fallback (writes get_current output
-// to the Manager snapshots dir), which requires a local config.comfyuiPath.
+// to the Manager snapshots dir), which requires a resolvable local install
+// data/base root (COMFYUI_PATH, else the saved default workspace — never in
+// remote mode). A split COMFYUI_CODE_PATH is consulted last for Manager's
+// legacy custom_nodes layout (after the data/base root, #1770).
 // ---------------------------------------------------------------------------
 
 export interface SaveSnapshotResult {
@@ -45,7 +57,11 @@ const SNAPSHOTS_UNSUPPORTED_MESSAGE =
   "Node snapshots aren't supported on this ComfyUI-Manager build — its HTTP API " +
   "doesn't expose the /snapshot/* endpoints (common on the bundled ComfyUI Desktop " +
   "Manager). Update ComfyUI-Manager to a build that supports snapshots, or manage " +
-  "snapshots from the ComfyUI-Manager UI / comfy-cli instead.";
+  "snapshots from the ComfyUI-Manager UI / comfy-cli instead. When neither is " +
+  "available there is still a rollback path: before changing anything, copy the " +
+  "pack directories under custom_nodes somewhere safe (or move them into a " +
+  "custom_nodes/.disabled folder) and record what moved — restore is moving them " +
+  "back.";
 
 /**
  * True when an error indicates the Manager build simply lacks the snapshot
@@ -65,12 +81,18 @@ function managerBaseUrl(): string {
 /**
  * Fetch a ComfyUI-Manager endpoint. Throws NodeSnapshotError on non-2xx or
  * network failure so callers can route through errorToToolResult.
+ *
+ * `base` pins the target for this call (the ManagerFetchOptions.base
+ * convention): callers that record a pending-op marker must pass the SAME
+ * base they recorded, so marker and request can never name different servers
+ * (#689 round 3).
  */
 async function managerFetch(
   path: string,
   init?: RequestInit,
+  base = managerBaseUrl(),
 ): Promise<Response> {
-  const url = `${managerBaseUrl()}${path}`;
+  const url = `${base}${path}`;
   logger.debug("Manager API request", { url, method: init?.method ?? "GET" });
 
   let res: Response;
@@ -86,6 +108,9 @@ async function managerFetch(
   }
 
   if (!res.ok) {
+    // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+    // HTTP status is reported either way, so an unreadable body costs detail in the
+    // text, never a wrong conclusion. Verified there is no branch on this value.
     const body = await res.text().catch(() => "");
     throw new NodeSnapshotError(
       `ComfyUI-Manager API ${res.status} ${res.statusText} for ${path}`,
@@ -96,15 +121,39 @@ async function managerFetch(
 }
 
 /**
+ * Candidate ComfyUI-Manager FILES directories under a local install, newest
+ * layout first. Mirrors manager_migration.get_manager_path() (user/__manager
+ * when ComfyUI has the system-user API, user/default/ComfyUI-Manager
+ * otherwise) plus the legacy git-clone layout, which keeps everything inside
+ * the extension dir.
+ */
+function managerFilesDirCandidates(comfyuiPath: string): string[] {
+  const candidates = [
+    join(comfyuiPath, "user", "__manager"),
+    join(comfyuiPath, "user", "default", "ComfyUI-Manager"),
+  ];
+  // Modern Manager files are data/user state and stay anchored to the local
+  // mutation target above. The legacy git-clone layout lives under
+  // custom_nodes/, which --base-directory runtimes scan from the data/base
+  // root (#1770). Search the data root first, then the checkout as a last
+  // resort for a non-base-directory split that still keeps Manager next to
+  // main.py.
+  const legacyRoots = new Set([
+    comfyuiPath,
+    resolveEffectiveComfyUICodeBase(),
+  ]);
+  for (const root of legacyRoots) {
+    if (root) candidates.push(join(root, "custom_nodes", "ComfyUI-Manager"));
+  }
+  return candidates;
+}
+
+/**
  * Candidate ComfyUI-Manager snapshot directories under a local install,
- * newest layout first. Mirrors manager_migration.get_manager_path().
+ * newest layout first.
  */
 function snapshotDirCandidates(comfyuiPath: string): string[] {
-  return [
-    join(comfyuiPath, "user", "__manager", "snapshots"),
-    join(comfyuiPath, "user", "default", "ComfyUI-Manager", "snapshots"),
-    join(comfyuiPath, "custom_nodes", "ComfyUI-Manager", "snapshots"),
-  ];
+  return managerFilesDirCandidates(comfyuiPath).map((dir) => join(dir, "snapshots"));
 }
 
 /**
@@ -199,8 +248,8 @@ export async function listNodeSnapshots(): Promise<ListSnapshotsResult> {
  * - No name: POST /snapshot/save (Manager names it {date}_snapshot). Works
  *   remotely. We diff getlist before/after to report the created name.
  * - Named: fetch GET /snapshot/get_current and write <name>.json into the
- *   local Manager snapshots dir. Requires config.comfyuiPath (errors clearly
- *   in remote --comfyui-url mode).
+ *   local Manager snapshots dir. Requires a resolvable local install root
+ *   (COMFYUI_PATH or a saved default workspace); errors clearly when there is none.
  */
 export async function saveNodeSnapshot(
   name?: string,
@@ -234,13 +283,31 @@ export async function saveNodeSnapshot(
     }
   }
 
-  // Named snapshot — requires a local install to write the file.
+  // Named snapshot — requires a local install to write the file. Resolve the
+  // data/base root through the same local-mutation resolver used by other
+  // filesystem writes (#775): COMFYUI_PATH, then the saved default workspace.
+  // A split COMFYUI_CODE_PATH is consulted later only for the legacy Manager
+  // layout under custom_nodes.
   validateSnapshotName(trimmed);
-  if (!config.comfyuiPath) {
+  // A named save WRITES a file into the install tree, so it must know WHICH
+  // install — and in remote mode a stale local COMFYUI_PATH would send that write
+  // to an unrelated tree while the snapshot content came from the remote server
+  // (codex gate P0). Refuse instead of guessing.
+  const target = resolveLocalMutationTarget();
+  if (target.refusal) {
     throw new NodeSnapshotError(
-      "Saving a named snapshot requires a local ComfyUI install path, which " +
-        "is unavailable in remote (--comfyui-url) mode. Omit the name to let " +
-        "ComfyUI-Manager assign a timestamped snapshot instead.",
+      `Saving a named snapshot requires a local ComfyUI install, and ${target.refusal} ` +
+        "Omit the name to let ComfyUI-Manager assign a timestamped one on the server itself.",
+    );
+  }
+  const comfyuiBase: string | undefined = target.base;
+  if (!comfyuiBase) {
+    throw new NodeSnapshotError(
+      "Saving a named snapshot requires a local ComfyUI install path, and none is " +
+        "available: COMFYUI_PATH is unset, no default workspace is saved (set one with " +
+        "the workspace tool, action 'set_default'), or the session targets a genuinely " +
+        "remote ComfyUI. Omit the name to let ComfyUI-Manager assign a timestamped " +
+        "snapshot instead — that works remotely.",
     );
   }
 
@@ -271,7 +338,7 @@ export async function saveNodeSnapshot(
   const isJson = lower.endsWith(".json");
   const fileName = isYaml || isJson ? trimmed : `${trimmed}.json`;
 
-  const dir = resolveSnapshotWriteDir(config.comfyuiPath);
+  const dir = resolveSnapshotWriteDir(comfyuiBase);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
@@ -298,29 +365,190 @@ export async function restoreNodeSnapshot(
     throw new NodeSnapshotError("Snapshot name is required to restore.");
   }
 
-  // The Manager stores names without the .json suffix; tolerate either.
-  const target = trimmed.endsWith(".json") ? trimmed.slice(0, -5) : trimmed;
+  // PIN GUARD. A snapshot records every pack's commit and restoring reverts them
+  // ALL, so this moves the sidebar panel exactly like an "update all" would —
+  // another door that never passes through install_comfyui(action:'panel'). It is inherently bulk
+  // (there is no restore-everything-except-one-pack), so a pin refuses it
+  // outright and the message explains the two real options. The check and the
+  // restore request are atomic under the panel mutation lock (withPanelPinGuard);
+  // the Manager then applies the restore on its own schedule (the message below
+  // says "requested", never "restored").
+  return withPanelPinGuard("restore a node snapshot over", "all", async () => {
+    // The Manager stores names without the .json suffix; tolerate either.
+    const target = trimmed.endsWith(".json") ? trimmed.slice(0, -5) : trimmed;
 
-  try {
-    await managerFetch("/snapshot/restore", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target }),
-    });
-  } catch (err) {
-    if (isSnapshotEndpointUnsupported(err)) {
-      logger.info("Snapshot restore unsupported on this ComfyUI-Manager build");
-      return { name: target, message: SNAPSHOTS_UNSUPPORTED_MESSAGE, unsupported: true };
+    // Pin the target ONCE and use it for BOTH the marker and the request: a
+    // retarget between the record and the POST must never leave the marker
+    // naming server A while the restore is scheduled on server B — a later
+    // pin-write cancellation trusts the marker's base (#689 round 3).
+    const base = managerBaseUrl();
+
+    // Persist and VERIFY the warning marker BEFORE requesting the deferred
+    // restore. A pin written after Manager receives the request cannot stop the
+    // next-restart apply; refusing when the marker cannot be made durable is the
+    // only way to avoid reporting such a pin as protective. Keep the marker on a
+    // request failure because a transport error cannot prove Manager did not
+    // receive it. The base is recorded so the pin-write cancellation path aims
+    // at the host the restore is actually scheduled on (#689).
+    recordPanelPendingOp(
+      "snapshot-restore",
+      `a snapshot restore ("${target}") may have been requested and reverts EVERY pack to ` +
+        `its snapshot commit — the sidebar panel included — at the next ComfyUI ` +
+        `restart`,
+      SNAPSHOT_RESTORE_PENDING_MS,
+      { base },
+    );
+
+    try {
+      await managerFetch(
+        "/snapshot/restore",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target }),
+        },
+        base,
+      );
+    } catch (err) {
+      if (isSnapshotEndpointUnsupported(err)) {
+        logger.info("Snapshot restore unsupported on this ComfyUI-Manager build");
+        return { name: target, message: SNAPSHOTS_UNSUPPORTED_MESSAGE, unsupported: true };
+      }
+      throw err;
     }
-    throw err;
-  }
 
-  logger.info(`Requested restore of node snapshot "${target}"`);
+    logger.info(`Requested restore of node snapshot "${target}"`);
+
+    return {
+      name: target,
+      message:
+        `Restore of snapshot "${target}" requested. ComfyUI-Manager applies ` +
+        `custom-node changes on the next ComfyUI restart.`,
+    };
+  });
+}
+
+/**
+ * The deferred-restore file Manager's POST /snapshot/restore leaves behind:
+ * nothing happens at request time beyond copying the chosen snapshot to
+ * `<manager files>/startup-scripts/restore-snapshot.json`, and
+ * prestartup_script.py applies it at the next ComfyUI start only
+ * `if os.path.exists(...)`, then deletes it. Deleting the file before that
+ * restart is therefore a PROVABLE cancel, and its absence proves nothing is
+ * scheduled. (Verified against Comfy-Org/ComfyUI-Manager main AND the
+ * manager-v4 pip package — both use the same path.)
+ */
+const RESTORE_SNAPSHOT_FILE = join("startup-scripts", "restore-snapshot.json");
+
+export interface CancelSnapshotRestoreResult {
+  outcome:
+    | "cancelled" // the deferred-restore file was found and is now gone
+    | "not-scheduled" // no deferred-restore file exists anywhere — nothing to cancel
+    | "remote" // no local install path: the file lives on the ComfyUI host
+    | "failed"; // a delete was attempted and failed
+  /** The restore file(s) deleted (outcome "cancelled"). */
+  deletedPaths: string[];
+  /** Every location checked (local mode only). */
+  checkedPaths: string[];
+  /** Human-facing explanation for the pin-write report. */
+  detail: string;
+}
+
+/**
+ * Cancel a DEFERRED snapshot restore by deleting Manager's deferred-restore
+ * file before the next ComfyUI restart consumes it (#689).
+ *
+ * Local installs only: in remote mode the file lives on the ComfyUI host,
+ * which this process cannot reach — reported truthfully as "cannot cancel",
+ * never as a cancel. Every candidate Manager files dir is checked (a stale
+ * copy in a legacy layout is deleted too: Manager's prestartup reads exactly
+ * one of these, and leaving any of them in place risks the restore running).
+ */
+export function cancelPendingSnapshotRestore(): CancelSnapshotRestoreResult {
+  // Same resolver as a named save (#775): the saved default workspace counts as
+  // a local install path — a bare comfyuiPath check misclassified exactly that
+  // session as "remote".
+  // Cancelling DELETES the pending-restore file. Same hazard as the save: in
+  // remote mode a stale local path would delete an unrelated install's pending
+  // restore (codex gate P0).
+  const cancelTarget = resolveLocalMutationTarget();
+  if (cancelTarget.refusal) {
+    return {
+      outcome: "remote",
+      deletedPaths: [],
+      checkedPaths: [],
+      detail: `cannot cancel — ${cancelTarget.refusal} Nothing was deleted.`,
+    };
+  }
+  const comfyuiBase: string | undefined = cancelTarget.base;
+  if (!comfyuiBase) {
+    return {
+      outcome: "remote",
+      deletedPaths: [],
+      checkedPaths: [],
+      detail:
+        "cannot cancel — no local install path (COMFYUI_PATH unset, no saved " +
+        "default workspace, or a genuinely remote target): the deferred restore file " +
+        "(<ComfyUI>/user/**/startup-scripts/restore-snapshot.json) lives on the " +
+        "ComfyUI host and this orchestrator has no local install path to delete " +
+        "it through. Delete it on the host BEFORE the next ComfyUI restart, or " +
+        "the restore will run.",
+    };
+  }
+  const checkedPaths = managerFilesDirCandidates(comfyuiBase).map((dir) =>
+    join(dir, RESTORE_SNAPSHOT_FILE),
+  );
+  const found = checkedPaths.filter((p) => existsSync(p));
+  if (found.length === 0) {
+    return {
+      outcome: "not-scheduled",
+      deletedPaths: [],
+      checkedPaths,
+      detail:
+        "no deferred restore file exists in any ComfyUI-Manager files dir, so " +
+        "there was NOTHING left to cancel — the restore already ran at a ComfyUI " +
+        "restart (or was never scheduled). The panel may ALREADY have been " +
+        "reverted to its snapshot commit — check install_comfyui(action:'panel', panel_action:'status').",
+    };
+  }
+  const deletedPaths: string[] = [];
+  for (const p of found) {
+    try {
+      rmSync(p, { force: true });
+    } catch (err) {
+      return {
+        outcome: "failed",
+        deletedPaths,
+        checkedPaths,
+        detail:
+          `could not delete the deferred restore file at ${p}: ${
+            err instanceof Error ? err.message : String(err)
+          }. The restore may still run at the next ComfyUI restart — delete that ` +
+          `file on the ComfyUI host manually.`,
+      };
+    }
+    // Verify gone rather than trusting the syscall — the whole point is proof.
+    if (!existsSync(p)) deletedPaths.push(p);
+  }
+  if (deletedPaths.length !== found.length) {
+    const surviving = found.filter((p) => !deletedPaths.includes(p));
+    return {
+      outcome: "failed",
+      deletedPaths,
+      checkedPaths,
+      detail:
+        `the deferred restore file still exists after deletion was attempted ` +
+        `(${surviving.join(", ")}). The restore may still run at the next ` +
+        `ComfyUI restart — delete it on the ComfyUI host manually.`,
+    };
+  }
   return {
-    name: target,
-    message:
-      `Restore of snapshot "${target}" requested. ComfyUI-Manager applies ` +
-      `custom-node changes on the next ComfyUI restart.`,
+    outcome: "cancelled",
+    deletedPaths,
+    checkedPaths,
+    detail:
+      `deleted the deferred restore file (${deletedPaths.join(", ")}) — the ` +
+      `snapshot restore will NOT run at the next ComfyUI restart.`,
   };
 }
 

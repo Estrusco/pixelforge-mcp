@@ -1,7 +1,7 @@
-import sharp from "sharp";
 import { AssetRegistry } from "./asset-registry.js";
 import { getOutputImage } from "./image-management.js";
 import { ValidationError } from "../utils/errors.js";
+import { requireSharp, type SharpModule } from "./sharp-loader.js";
 
 // ---------------------------------------------------------------------------
 // contact_sheet — tile N registered assets into ONE preview PNG for batch QA.
@@ -39,6 +39,7 @@ export interface ContactSheetResult {
 export const CONTACT_SHEET_MAX_ASSETS = 64;
 
 async function renderBackgroundCanvas(
+  sharp: SharpModule,
   width: number,
   height: number,
   background: ContactSheetBackground,
@@ -75,7 +76,7 @@ interface LoadedAsset {
   readonly label: string;
 }
 
-async function loadAsset(assetId: string): Promise<LoadedAsset> {
+async function loadAsset(sharp: SharpModule, assetId: string): Promise<LoadedAsset> {
   const record = AssetRegistry.get(assetId);
   if (!record) {
     throw new ValidationError(
@@ -112,7 +113,8 @@ export async function buildContactSheet(opts: ContactSheetOptions): Promise<Cont
     throw new ValidationError(`columns must be a positive integer (got ${opts.columns}).`);
   }
 
-  const images = await Promise.all(opts.assetIds.map(loadAsset));
+  const sharp = await requireSharp("contact_sheet");
+  const images = await Promise.all(opts.assetIds.map((id) => loadAsset(sharp, id)));
 
   const cellWidth = Math.max(...images.map((i) => i.width));
   const cellHeight = Math.max(...images.map((i) => i.height));
@@ -122,7 +124,7 @@ export async function buildContactSheet(opts: ContactSheetOptions): Promise<Cont
   const sheetHeight = cellHeight * rows;
   const background = opts.background ?? "dark";
 
-  const canvas = await renderBackgroundCanvas(sheetWidth, sheetHeight, background);
+  const canvas = await renderBackgroundCanvas(sharp, sheetWidth, sheetHeight, background);
 
   const composites = images.map((img, i) => {
     const col = i % columns;

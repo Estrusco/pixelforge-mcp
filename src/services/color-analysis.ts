@@ -1,13 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
-import sharp from "sharp";
+import { requireSharp } from "./sharp-loader.js";
 import { AssetRegistry } from "./asset-registry.js";
 import { getOutputImage } from "./image-management.js";
 import { resolveOutputDir } from "./output-dir.js";
 import { ValidationError } from "../utils/errors.js";
 
 // ---------------------------------------------------------------------------
-// analyze_color — objective color scopes/stats for a rendered image.
+// get_image (action:"analyze_color") — objective color scopes/stats for a rendered image.
 //
 // Motivation: judging "washed out" by eye off a contact sheet is unreliable.
 // This computes the numbers a colorist reads off scopes — black/white points,
@@ -124,7 +124,7 @@ async function resolveBytes(opts: AnalyzeColorOptions): Promise<Buffer> {
   }
 
   throw new ValidationError(
-    "analyze_color requires one of: asset_id, filename (+optional subfolder/type), or path.",
+    'get_image (action:"analyze_color") requires one of: asset_id, filename (+optional subfolder/type), or path.',
   );
 }
 
@@ -150,6 +150,9 @@ async function resolveSafePath(path: string): Promise<string> {
  * computeAlphaStats read it below without a second decode.
  */
 async function toRaw(bytes: Buffer): Promise<RawPixels> {
+  // #2411 — loaded HERE, not at module scope. A blocked libvips used to throw
+  // while this file evaluated, which took every tool registration down with it.
+  const sharp = await requireSharp("Colour analysis");
   const { data, info } = await sharp(bytes, { limitInputPixels: 100_000_000 })
     .toColourspace("srgb")
     .raw()
@@ -374,6 +377,7 @@ async function renderHistogram(raw: RawPixels): Promise<{ data: string; mimeType
   draw(rHist, 220, 60, 60);
   draw(gHist, 60, 200, 80);
   draw(bHist, 80, 130, 240);
+  const sharp = await requireSharp("Colour analysis");
   const png = await sharp(buf, { raw: { width: W, height: H, channels: 3 } })
     .png()
     .toBuffer();
@@ -403,7 +407,13 @@ export async function analyzeColor(opts: AnalyzeColorOptions): Promise<AnalyzeCo
   const alpha = computeAlphaStats(raw);
 
   const content: AnalyzeColorResult["content"] = [];
-  let summary = `analyze_color — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
+  // This header used to be the TOOL's name, which 0.50.0 slice 15 retired. It is
+  // a label on a SUCCESS response, not remedy guidance, so it does not want to be
+  // a call form (`get_image (action:"analyze_color") — 1024x1024` reads as an
+  // instruction where none is wanted). It says what the block is instead — the
+  // same information the tool name carried, minus a name that would 404. Every
+  // other field of the response is unchanged.
+  let summary = `Color analysis — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
     JSON.stringify({ ...stats, alpha }, null, 2);
 
   if (opts.reference_path) {

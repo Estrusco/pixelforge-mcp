@@ -14,16 +14,18 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
   mkdtempSync,
   renameSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 // zod 4 ships JSON Schema conversion natively (z.toJSONSchema) — no zod-to-json-schema.
 import { registerAllTools } from "../src/tools/index.js";
+import { TOOL_DOC_EXAMPLES, type ToolDocEntry } from "./tool-doc-examples.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..");
@@ -75,26 +77,24 @@ const CATEGORIES: Array<{
     group: "Image & Audio Generation",
     slug: "image-generation",
     icon: "image",
-    description: "High-level text-to-image and text-to-audio generation, plus conditioned image variants.",
+    description: "High-level text-to-image, audio, video and 3D generation, conditioned image variants, and the two post-processing passes — all nine actions of one tool since 0.50.0 slice 16.",
     tools: [
       "generate_image",
-      "generate_with_controlnet",
-      "generate_with_ip_adapter",
-      "regenerate",
-      "generate_audio",
-      "generate_video",
     ],
   },
   {
     group: "Workflow Execution",
     slug: "workflow-execution",
     icon: "play",
-    description: "Enqueue workflows and inspect the queue, jobs, history, and system stats.",
+    description: "Enqueue workflows — one at a time, from a named template, or as a batch — and inspect the queue, jobs, history, and system stats.",
     tools: [
-      "enqueue_workflow", "rerun_generation", "get_system_stats", "get_queue", "get_job_status",
-      "get_queued_workflow", "move_queued_job", "edit_queued_job",
-      "cancel_job", "cancel_queued_job", "clear_queue", "get_history", "get_logs",
-      "health_check", "calculate", "diagnose_run",
+      // 0.50.0 slice 16 folded the re-run, run-from-URL and template
+      // entrypoints into `enqueue_workflow`, and the diagnosis + local
+      // settings-history views into `get_history`.
+      "enqueue_workflow", "get_system_stats", "queue", "get_history",
+      "calculate",
+      // Batch execution: submit many prompts under one batch_id, then poll/await it.
+      "batch",
     ],
   },
   {
@@ -102,19 +102,18 @@ const CATEGORIES: Array<{
     slug: "workflow-authoring",
     icon: "pen-ruler",
     description: "Build, modify, validate, and visualize ComfyUI workflows.",
-    tools: [
-      "create_workflow", "modify_workflow", "validate_workflow", "get_node_info",
-      "workflow_to_dsl", "dsl_to_workflow", "visualize_workflow",
-      "visualize_workflow_hierarchical", "mermaid_to_workflow",
-      "prompt_director_inspect", "query_workflow",
-    ],
+    // 0.50.0 slice 14: create_workflow absorbed modify/validate/node_info and
+    // visualize_workflow absorbed the hierarchical, mermaid and DSL conversions,
+    // so this group is two entries rather than nine. query/prompt_director moved
+    // to Workflow Library with the rest of get_workflow's read actions.
+    tools: ["create_workflow", "visualize_workflow"],
   },
   {
     group: "Workflow Library",
     slug: "workflow-library",
     icon: "folder-open",
     description: "Save, load, strip/slice, analyze, and extract workflows.",
-    tools: ["list_workflows", "get_workflow", "run_workflow_url", "strip_workflow", "slice_workflow", "save_workflow", "analyze_workflow", "workflow_from_image", "lock_workflow", "verify_workflow_lock"],
+    tools: ["get_workflow", "save_workflow"],
   },
   {
     group: "Assets & Images",
@@ -122,11 +121,11 @@ const CATEGORIES: Array<{
     icon: "images",
     description: "View, convert, and upload generated images; analyze colors; stage outputs as inputs; upload media inputs; browse outputs.",
     tools: [
-      "view_image", "get_image", "convert_image", "analyze_color",
-      "remove_background", "upscale_image",
-      "stage_output_as_input", "upload_output",
-      "upload_image", "upload_video", "upload_audio",
-      "list_output_images", "list_assets", "get_asset_metadata",
+      // 0.50.0 slice 15 folded twelve names into these two: `get_image` is the
+      // read/inspect half (get, view, list_outputs, convert, plus the colour
+      // measure and the asset-registry reads) and `upload_image` the write half
+      // (image, video, audio, stage, output).
+      "get_image", "upload_image",
     ],
   },
   {
@@ -135,11 +134,12 @@ const CATEGORIES: Array<{
     icon: "box",
     description: "Search (HuggingFace + CivitAI), download, list, and remove models; resolve a workflow's missing models with VRAM-aware candidates; manage embeddings and VRAM.",
     tools: [
-      "search_models", "search_civitai_models", "search_civitai_creators",
-      "download_model", "download_civitai_model", "resolve_missing_models", "list_local_models",
-      "remove_model", "list_extra_paths", "add_extra_path", "remove_extra_path",
-      "get_embeddings", "clear_vram",
-      "model_metadata_read", "model_metadata_propose", "model_metadata_fetch_civitai",
+      // 0.50.0 slice 11 folded fourteen model tools into two: download_model
+      // (8 actions) and list_local_models (6). Both survivors keep their names,
+      // so this list simply shrinks.
+      "download_model", "list_local_models",
+      "clear_vram",
+      "model_metadata",
     ],
   },
   {
@@ -148,14 +148,11 @@ const CATEGORIES: Array<{
     icon: "puzzle",
     description: "Discover, install, update, snapshot, bisect, scaffold, and publish custom node packs.",
     tools: [
-      "search_custom_nodes", "get_node_pack_details", "install_custom_node",
-      "update_custom_node", "reinstall_custom_node", "fix_custom_node",
-      "list_installed_nodes", "sync_node_dependencies", "extract_workflow_dependencies",
-      "install_workflow_dependencies", "save_node_snapshot", "restore_node_snapshot",
-      "list_node_snapshots", "bisect_start", "bisect_good", "bisect_bad",
-      "bisect_reset", "bisect_status", "scaffold_custom_node", "verify_custom_node", "publish_custom_node",
-      "list_node_pack_files", "read_node_file", "search_node_packs", "write_node_file",
-      "apply_node_patch", "node_pack_git",
+      // 0.50.0 slice 12 folded twenty names into these three: registry
+      // discovery into `search_custom_nodes`, Manager lifecycle into
+      // `install_custom_node`, the author loop into `node_pack`.
+      "search_custom_nodes", "install_custom_node", "node_pack",
+      "node_snapshot", "bisect",
     ],
   },
   {
@@ -163,7 +160,7 @@ const CATEGORIES: Array<{
     slug: "api-nodes",
     icon: "cloud",
     description: "Discover and run hosted partner / API nodes (comfy.org).",
-    tools: ["list_api_nodes", "get_api_node_schema", "generate_with_api_node"],
+    tools: ["list_api_nodes"],
   },
   {
     group: "Install & Environment",
@@ -171,9 +168,10 @@ const CATEGORIES: Array<{
     icon: "wrench",
     description: "Install/update ComfyUI and the sidebar panel, self-update the MCP server, apply a setup manifest, manage workspaces, inspect the environment, configure ComfyUI-Manager, report issues.",
     tools: [
-      "install_comfyui", "update_comfyui", "update_all", "install_panel", "self_update",
-      "apply_manifest", "get_workspace", "set_default_workspace", "list_workspaces",
-      "get_environment", "configure_manager", "report_issue",
+      "install_comfyui",
+      "apply_manifest", "workspace",
+      "report_issue",
+      "kitchen",
     ],
   },
   {
@@ -181,16 +179,19 @@ const CATEGORIES: Array<{
     slug: "process-control",
     icon: "power",
     description: "Start, stop, and restart the ComfyUI process.",
-    tools: ["start_comfyui", "stop_comfyui", "restart_comfyui"],
+    tools: ["restart_comfyui"],
   },
   {
-    group: "Defaults, Stats & Skills",
+    group: "Defaults",
+    // Slug deliberately unchanged: it is the published URL. The GROUP outgrew its name when
+    // stats and skills moved elsewhere (stats onto get_history in 0.50.0 slice 16, skills to
+    // the Skills & Knowledge page), leaving a page titled for three subjects that documents
+    // one tool. Renaming the slug too would 404 the existing page for a cosmetic win.
     slug: "defaults-stats-skills",
     icon: "sliders",
-    description: "Generation defaults, ComfyUI frontend UI settings, history-based suggestions, and skill generation.",
+    description: "Generation defaults and ComfyUI frontend UI settings. Stats now live on get_system_stats and get_history; skills on the Skills & Knowledge page.",
     tools: [
-      "get_defaults", "set_defaults", "get_comfyui_settings", "set_comfyui_setting",
-      "suggest_settings", "generation_stats", "generate_node_skill",
+      "get_defaults",
     ],
   },
   {
@@ -198,38 +199,32 @@ const CATEGORIES: Array<{
     slug: "runpod",
     icon: "server",
     description: "Deploy, connect, monitor, and stop RunPod cloud GPU pods, and switch rendering between your local rig and a pod — the tools behind the panel/mobile RunPod control panel.",
-    tools: [
-      "runpod_pod_create", "runpod_pod_connect", "runpod_use_local",
-      "runpod_pod_start", "runpod_pod_stop", "runpod_pod_status", "runpod_list_pods",
-      "runpod_pod_troubleshoot", "runpod_watch", "runpod_unwatch", "runpod_deploy_link",
-    ],
+    // 0.50.0 slice 8 folded the eleven runpod_* tools into these two.
+    tools: ["runpod", "runpod_watch"],
   },
   {
     group: "LoRA Training",
     slug: "training",
     icon: "graduation-cap",
     description: "Train character LoRAs (FLUX.1-dev) via ostris ai-toolkit — locally in a GPU Docker image or on a rented RunPod pod — with a crash-safe job registry and streamed progress.",
-    tools: [
-      "train_list_flows", "train_doctor", "train_build_image", "train_bootstrap",
-      "train_prepare_dataset", "train_start", "train_status", "train_cancel",
-    ],
+    // 0.50.0 slice 10 folded eighteen train_* tools into three, split by
+    // work-domain: the datasets a run consumes, the jobs that consume them, and
+    // the trainer machinery itself.
+    tools: ["train_prepare_dataset", "train_start", "train_doctor"],
   },
   {
     group: "Apps (micro-apps)",
     slug: "apps",
     icon: "layout-grid",
     description: "List, inspect, and run the panel's micro-apps — named, one-click workflow apps with exposed inputs — for canvas-less clients (mobile).",
-    tools: ["apps_list", "apps_get", "apps_run", "apps_run_status", "apps_import"],
+    tools: ["apps"],
   },
   {
     group: "comfy-cli",
     slug: "comfy-cli",
     icon: "terminal",
     description: "Drive the official comfy-cli — managed server lifecycle, jobs, loaded-node search, workflow validation/execution, uploads/downloads, model discovery, and official agent skills.",
-    tools: [
-      "comfy_cli_status", "comfy_cli_server", "comfy_cli_jobs", "comfy_cli_search_nodes",
-      "comfy_cli_workflow", "comfy_cli_transfer", "comfy_cli_models", "comfy_cli_skills",
-    ],
+    tools: ["comfy_cli"],
   },
 ];
 
@@ -242,14 +237,9 @@ const CATEGORIES: Array<{
 const HAND_WRITTEN_PAGES: Array<{ slug: string; tools: string[] }> = [
   {
     slug: "skills-knowledge",
-    tools: [
-      "list_skills",
-      "read_skill",
-      "list_packs",
-      "read_pack_workflow",
-      "list_workflow_templates",
-      "check_workflow_runtime",
-    ],
+    // One tool since 0.50.0 slice 9: the nine knowledge tools folded into
+    // `list_packs`, whose ten actions this page documents by hand.
+    tools: ["list_packs"],
   },
 ];
 
@@ -281,10 +271,16 @@ function typeLabel(s: JsonSchema): string {
 }
 
 function esc(text: string): string {
-  // Keep MDX happy: collapse whitespace and escape characters MDX would parse as
+  // Keep MDX happy: collapse INLINE whitespace per line but preserve line breaks —
+  // a newline-separated list in a tool description must stay a list in the docs,
+  // not render as one long paragraph — and escape characters MDX would parse as
   // JSX — angle brackets (e.g. "<COMFYUI_PATH>") and curly braces (expressions).
   const map: Record<string, string> = { "<": "&lt;", ">": "&gt;", "{": "&#123;", "}": "&#125;" };
-  return text.replace(/\s+/g, " ").replace(/[<>{}]/g, (m) => map[m]).trim();
+  return text
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n")
+    .replace(/[<>{}]/g, (m) => map[m]);
 }
 
 function renderParam(name: string, schema: JsonSchema, required: boolean): string {
@@ -295,11 +291,65 @@ function renderParam(name: string, schema: JsonSchema, required: boolean): strin
   }
   const body: string[] = [];
   if (schema.description) body.push(esc(schema.description));
-  if (schema.enum) body.push(`Options: ${schema.enum.map((e) => `\`${String(e)}\``).join(", ")}.`);
-  return `<ParamField ${attrs.join(" ")}>\n  ${body.join(" ") || "—"}\n</ParamField>`;
+  if (schema.enum) {
+    // The `action` field gets its options rendered as the CALL FORM rather than
+    // bare values. Two reasons, and the first is the reader's: on the 0.50.0
+    // surface `action` is the only required field on most tools, so `action:"get"`
+    // is the thing to copy, where a bare `get` still has to be assembled. The
+    // second is mechanical — several folds reused a retired TOOL name as an
+    // action name, and a bare option value in generated prose is then
+    // indistinguishable from an instruction to call a tool that 404s. The call
+    // form says which it is, in the one syntax the dead-name gate recognises
+    // repo-wide. Any other enum field keeps the plain value list.
+    const opt = (e: unknown) => (name === "action" ? `\`action:"${String(e)}"\`` : `\`${String(e)}\``);
+    body.push(`Options: ${schema.enum.map(opt).join(", ")}.`);
+  }
+  // A description and its `Options:` list go on SEPARATE lines. Joining them with a
+  // space is not merely cosmetic here: the dead-name gate reasons PER LINE, and its
+  // exemptions cover one occurrence of a name per line on purpose (a line carrying two
+  // mentions is ambiguous, so it fails closed and "must be split"). Welding the two
+  // pieces together manufactures exactly that ambiguity — a description that mentions a
+  // retired name as history, glued to an `action:"…"` option that legitimately contains
+  // it, becomes one unsplittable line the gate cannot accept and no author can fix
+  // without editing generated output. Emitting them separately keeps each piece
+  // individually judgeable, which is what the per-line rule assumes.
+  return `<ParamField ${attrs.join(" ")}>\n  ${body.join("\n  ") || "—"}\n</ParamField>`;
 }
 
-function exampleArgs(jsonSchema: JsonSchema): Record<string, unknown> {
+// Most examples can be derived from JSON Schema required fields. Flat action
+// schemas deliberately keep action-specific required fields optional in that
+// schema (the MCP SDK does not render discriminated unions correctly), so they
+// need a complete, valid representative call here instead of an unusable
+// action-only skeleton.
+const EXAMPLE_ARG_OVERRIDES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
+  model_metadata: {
+    action: "read",
+    category: "loras",
+    name: "my_model.safetensors",
+  },
+  workspace: {
+    action: "set_default",
+    path: "/opt/ComfyUI",
+  },
+  // 0.50.0 slice 10. Without these the generated skeletons are `{"action": …}`
+  // alone, which every one of these tools rejects with a missing-field error —
+  // an example a reader copies and watches fail. train_doctor needs no override:
+  // its default action:"doctor" takes no other parameters and is a valid call.
+  train_prepare_dataset: {
+    action: "prepare",
+    name: "aria_character",
+    items: [{ path: "/photos/aria_01.png", caption: "ohwx person, side profile, window light" }],
+    defaultCaption: "ohwx person",
+  },
+  train_start: {
+    action: "start",
+    name: "aria_character",
+    datasetPath: "/home/me/.comfyui-mcp/training/datasets/aria_character",
+    trigger: "ohwx person",
+  },
+};
+
+function exampleArgs(toolName: string, jsonSchema: JsonSchema): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const props = jsonSchema.properties ?? {};
   const required = new Set(jsonSchema.required ?? []);
@@ -312,7 +362,7 @@ function exampleArgs(jsonSchema: JsonSchema): Record<string, unknown> {
     else if (s.type === "array") out[name] = [];
     else out[name] = `<${name}>`;
   }
-  return out;
+  return { ...out, ...EXAMPLE_ARG_OVERRIDES[toolName] };
 }
 
 function firstSentence(desc: string): string {
@@ -320,17 +370,150 @@ function firstSentence(desc: string): string {
   return (m ? m[0] : desc).trim();
 }
 
+/**
+ * Validate every curated example in scripts/tool-doc-examples.ts against the
+ * tool's REAL zod schema, and fail generation if any of them is wrong.
+ *
+ * This exists because a documented call that does not typecheck is worse than no
+ * example at all: a reader copies it, it 400s, and they conclude the tool is
+ * broken. Prose cannot be unit-tested, so this is where examples get tested.
+ *
+ * Three distinct failures, each caught deliberately:
+ *
+ * 1. A key for a tool that no longer exists. During the consolidation tools are
+ *    being renamed and folded together; an example still keyed by a retired name
+ *    must become a loud failure, not a silently-ignored map entry.
+ *
+ * 2. A field that is not in the schema. zod objects STRIP unknown keys by
+ *    default, so `safeParse` alone happily accepts `{"filenmae": "x"}` and
+ *    reports success — the misspelling would ship. Hence the explicit key check
+ *    against the JSON Schema's properties, before parsing.
+ *
+ * 3. A field with the wrong type or a missing required one. That is what
+ *    `safeParse` is for, run against the same shape the MCP SDK advertises.
+ */
+function validateExamples(byName: Map<string, CapturedTool>): void {
+  const problems: string[] = [];
+
+  for (const [toolName, entry] of Object.entries(TOOL_DOC_EXAMPLES)) {
+    const tool = byName.get(toolName);
+    if (!tool) {
+      problems.push(
+        `${toolName}: no such tool is registered — it was probably renamed or ` +
+          `consolidated. Update or remove its entry in scripts/tool-doc-examples.ts.`,
+      );
+      continue;
+    }
+    const schema = z.object(tool.shape);
+    const json = z.toJSONSchema(schema, { reused: "inline", io: "input" }) as JsonSchema;
+    const known = new Set(Object.keys(json.properties ?? {}));
+
+    entry.examples.forEach((ex, i) => {
+      const where = `${toolName} example #${i + 1} ("${ex.ask}")`;
+      const unknownKeys = Object.keys(ex.args).filter((k) => !known.has(k));
+      if (unknownKeys.length > 0) {
+        problems.push(
+          `${where}: field(s) ${unknownKeys.map((k) => `\`${k}\``).join(", ")} ` +
+            `do not exist on this tool. Known fields: ${[...known].join(", ") || "(none)"}.`,
+        );
+        // Still parse below: a typo'd key is stripped, so the parse would pass
+        // and hide any OTHER problem in the same example.
+      }
+      const parsed = schema.safeParse(ex.args);
+      if (!parsed.success) {
+        const detail = parsed.error.issues
+          .map((iss) => `${iss.path.join(".") || "(root)"}: ${iss.message}`)
+          .join("; ");
+        problems.push(`${where}: does not satisfy the tool's schema — ${detail}`);
+      }
+    });
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${problems.length} documented example(s) do not match the live tool ` +
+        `schemas:\n  ${problems.join("\n  ")}\n` +
+        `Fix the example in scripts/tool-doc-examples.ts — do NOT relax this check. ` +
+        `An example that does not typecheck will be copied by a reader and will fail.`,
+    );
+  }
+}
+
+/** Render the curated examples for one tool, or the generated skeleton if it has none. */
+function renderExamples(t: CapturedTool, json: JsonSchema, entry?: ToolDocEntry): string[] {
+  const lines: string[] = [];
+
+  if (!entry || entry.examples.length === 0) {
+    lines.push("### Example", "");
+    lines.push(
+      "<Note>No worked example yet — the call below is a skeleton generated from the " +
+        "required parameters. Real examples live in `scripts/tool-doc-examples.ts`; " +
+        "contributions welcome.</Note>",
+      "",
+    );
+    lines.push(
+      "```json",
+      JSON.stringify({ tool: t.name, arguments: exampleArgs(t.name, json) }, null, 2),
+      "```",
+      "",
+    );
+    return lines;
+  }
+
+  lines.push(entry.examples.length === 1 ? "### Example" : "### Examples", "");
+  for (const ex of entry.examples) {
+    // The ASK comes first on purpose. The audience for this page mostly does not
+    // type JSON at anything — they say a sentence to an agent and it makes the
+    // call. Leading with the sentence shows which request reaches this tool;
+    // leading with the JSON implies a calling convention they will never use.
+    lines.push(`**You say:** ${esc(ex.ask)}`, "");
+    lines.push(
+      "```json",
+      JSON.stringify({ tool: t.name, arguments: ex.args }, null, 2),
+      "```",
+      "",
+    );
+    if (ex.argsNote) lines.push(`<Note>${esc(ex.argsNote)}</Note>`, "");
+    lines.push(`**You get back:** ${esc(ex.returns)}`, "");
+    if (ex.caution) lines.push(`<Warning>${esc(ex.caution)}</Warning>`, "");
+  }
+  return lines;
+}
+
 function renderTool(t: CapturedTool): string {
+  // `io: "input"` matches what the MCP SDK advertises to clients
+  // (sdk/server/zod-json-schema-compat.js defaults pipeStrategy to 'input').
+  //
+  // Omitting it meant OUTPUT semantics, under which a field with `.default()` is
+  // always present and therefore listed as required. So every defaulted parameter was
+  // documented as REQUIRED while the real tools/list schema said optional — 25
+  // parameters across 18 tools, e.g. comfy_cli.detail, declared
+  // `.optional().default("env")` and rendered `required default="env"`. A reader
+  // supplying every "required" field is doing needless work; a model reading it may
+  // refuse to call the tool without them. The docs-freshness gate stayed green
+  // throughout because it faithfully regenerated the same wrong answer.
   const json = z.toJSONSchema(z.object(t.shape), {
     reused: "inline",
-  }) as unknown as JsonSchema;
+    io: "input",
+  }) as JsonSchema;
   const props = json.properties ?? {};
   const required = new Set(json.required ?? []);
   const paramNames = Object.keys(props);
 
+  const entry = TOOL_DOC_EXAMPLES[t.name];
+
   const lines: string[] = [];
   lines.push(`## ${t.name}`, "");
   lines.push(esc(t.description), "");
+
+  // The gloss is ADDITIVE. The description above is written for model dispatch —
+  // it disambiguates this tool from its neighbours in the terms a model needs,
+  // which is why it talks about context cost and about which tool NOT to pick.
+  // Rewriting it for readability measurably degrades tool choice (#557/#654), so
+  // a human-facing sentence goes here, next to it, instead of over it.
+  if (entry?.gloss) {
+    lines.push(`<Tip>**In plain terms:** ${esc(entry.gloss)}</Tip>`, "");
+  }
 
   if (paramNames.length > 0) {
     lines.push("### Parameters", "");
@@ -342,10 +525,7 @@ function renderTool(t: CapturedTool): string {
     lines.push("<Note>This tool takes no parameters.</Note>", "");
   }
 
-  lines.push("### Example", "");
-  lines.push("<Note>Example coming soon — the call below is a generated skeleton.</Note>", "");
-  const args = exampleArgs(json);
-  lines.push("```json", JSON.stringify({ tool: t.name, arguments: args }, null, 2), "```", "");
+  lines.push(...renderExamples(t, json, entry));
   lines.push("---", "");
   return lines.join("\n");
 }
@@ -365,10 +545,21 @@ async function main() {
   await registerAllTools(mockServer as never);
 
   const byName = new Map(captured.map((t) => [t.name, t]));
+
+  // Before ANY page is rendered — a bad example must abort the run, not be
+  // written into 16 files and then reported.
+  validateExamples(byName);
+
   const mapped = new Set<string>();
   mkdirSync(toolsDir, { recursive: true });
 
   const navPages: string[] = [];
+  // Pages are BUFFERED, not written as they are rendered, so the fatal checks
+  // below run before anything touches docs/. Writing inside the loop meant an
+  // unmapped-tool throw left the tree half-regenerated: some pages updated, some
+  // not, and a `git diff` that mixes the real change with debris from a failed
+  // run. Generation is now all-or-nothing with respect to those checks.
+  const pending: Array<{ path: string; content: string }> = [];
 
   for (const cat of CATEGORIES) {
     const present = cat.tools.filter((n) => byName.has(n));
@@ -384,40 +575,151 @@ async function main() {
     page.push("");
     page.push(`<Info>${present.length} tool${present.length === 1 ? "" : "s"}. Generated from the live MCP tool schemas — do not edit by hand; run \`npm run docs:gen\`.</Info>`);
     page.push("");
+    // Every page carries this. The JSON below is what the AGENT sends; readers
+    // arriving from a search result were being shown a calling convention they
+    // will never type, with nothing on the page to say so.
+    page.push(
+      "<Tip>**You don't type these calls.** Ask your agent for what you want in " +
+        "ordinary English — it chooses the tool and fills in the arguments. The JSON " +
+        "on this page is what it sends. New here? Start with " +
+        "[Using the tools](/using-tools).</Tip>",
+    );
+    page.push("");
     for (const name of present) page.push(renderTool(byName.get(name)!));
 
-    writeFileSync(join(toolsDir, `${cat.slug}.mdx`), page.join("\n"));
+    pending.push({ path: join(toolsDir, `${cat.slug}.mdx`), content: page.join("\n") });
     navPages.push(`tools/${cat.slug}`);
   }
 
-  // Append hand-written reference pages to the nav and mark their tools as covered
-  // (so they don't trip the warning). Their .mdx is hand-maintained, never written.
+  // Append hand-written reference pages to the nav. Their .mdx is hand-maintained,
+  // never written here.
+  //
+  // Existence is checked BEFORE their tools count as covered. The old order marked
+  // them mapped unconditionally and only warned about a missing page, so every tool
+  // on a hand-written page that did not exist was exempted from the fatal check
+  // below while having no documentation at all — a hole shaped exactly like the one
+  // that check was added to close.
+  const missingHandWritten: string[] = [];
   for (const hw of HAND_WRITTEN_PAGES) {
-    hw.tools.forEach((n) => mapped.add(n));
     if (existsSync(join(toolsDir, `${hw.slug}.mdx`))) {
+      hw.tools.forEach((n) => mapped.add(n));
       navPages.push(`tools/${hw.slug}`);
     } else {
-      console.warn(`[gen-tool-docs] hand-written page missing: docs/tools/${hw.slug}.mdx`);
+      missingHandWritten.push(`docs/tools/${hw.slug}.mdx (${hw.tools.length} tool(s))`);
     }
   }
-
-  // Warn about any tool not assigned to a category.
-  const unmapped = captured.map((t) => t.name).filter((n) => !mapped.has(n));
-  if (unmapped.length > 0) {
-    console.warn(`[gen-tool-docs] WARNING: ${unmapped.length} tool(s) not in any category:`, unmapped.join(", "));
+  if (missingHandWritten.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${missingHandWritten.length} hand-written page(s) are referenced by ` +
+        `HAND_WRITTEN_PAGES but do not exist, so their tools would be undocumented AND the nav ` +
+        `would link nowhere:\n  ${missingHandWritten.join("\n  ")}\n` +
+        `Create the page, or move those tools into a generated CATEGORIES entry.`,
+    );
   }
 
-  // Splice the generated "Tools" tab into docs.json (preserve everything else).
+  // FATAL, not a warning: an unmapped tool is silently absent from the published
+  // Tool Reference, and a warning in a passing build is a warning nobody reads —
+  // that is how 18 tools (all the batch/template tools and most of train_*) went
+  // undocumented. Failing here means adding a tool forces a docs decision, and
+  // during the 181 -> 29 consolidation it means a consolidated tool cannot land
+  // without its reference page.
+  //
+  // Do NOT "fix" a failure here by bulk-adding names to a category you haven't
+  // read — that recreates the warning with extra steps. Put the tool where a
+  // reader would look for it, or add it to HAND_WRITTEN_PAGES.
+  const unmapped = captured.map((t) => t.name).filter((n) => !mapped.has(n));
+  if (unmapped.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${unmapped.length} tool(s) are not in any CATEGORIES entry or HAND_WRITTEN_PAGES, ` +
+        `so they would be missing from the Tool Reference:\n  ${unmapped.join("\n  ")}\n` +
+        `Assign each one in scripts/gen-tool-docs.ts.`,
+    );
+  }
+
+  // An .mdx in docs/tools/ that no longer belongs to any category or hand-written
+  // page is still PUBLISHED — it just falls out of the nav, so it documents a
+  // surface nobody can navigate to and nothing regenerates. Phase 5 restructures
+  // every category, which is exactly when orphans appear. Reported, never deleted:
+  // removing a file the author may have hand-written is not this script's call.
+  // Derived from the pages actually GENERATED this run, not from every declared
+  // CATEGORY. A category whose tools have all been removed hits the `continue`
+  // above, so no page is written for it — but listing it as "expected" anyway kept
+  // its now-stale page permanently exempt: still published, still unreachable from
+  // the nav, and never regenerated. Phase 5 empties categories wholesale, so this
+  // is the common case, not an edge one.
+  const expectedPages = new Set([
+    ...pending.map((w) => basename(w.path)),
+    ...HAND_WRITTEN_PAGES.map((h) => `${h.slug}.mdx`),
+  ]);
+  const orphans = readdirSync(toolsDir)
+    .filter((f) => f.endsWith(".mdx") && !expectedPages.has(f))
+    .sort();
+  if (orphans.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${orphans.length} page(s) in docs/tools/ belong to no CATEGORIES entry ` +
+        `or HAND_WRITTEN_PAGES, so they are published but unreachable from the nav:\n  ` +
+        `${orphans.join("\n  ")}\n` +
+        `Delete them, or add the owning entry back to scripts/gen-tool-docs.ts.`,
+    );
+  }
+
+  // docs.json's SHAPE is validated before any page is written. Buffering the pages
+  // was only half the fix: the generator still wrote all 16 of them and then threw
+  // on a malformed navigation.tabs, leaving exactly the partial-regeneration debris
+  // the buffering was introduced to prevent.
+  type LangEntry = { language?: string; default?: boolean; tabs?: unknown };
+  let docsJson:
+    | { navigation?: { tabs?: unknown; languages?: LangEntry[] } }
+    | undefined;
+  /**
+   * Where the English tabs live. Once docs.json is localized, `navigation.tabs` moves under
+   * `navigation.languages[<default>].tabs` — the Tool Reference is English-only and belongs to
+   * that entry, not to a translated one. Returning the holder rather than the array keeps the
+   * splice below writing through to the real object in both shapes.
+   */
+  const tabsHolder = (): { tabs?: unknown } | undefined => {
+    const nav = docsJson?.navigation;
+    if (!nav) return undefined;
+    if (Array.isArray(nav.languages)) {
+      return nav.languages.find((l) => l.default) ?? nav.languages[0];
+    }
+    return nav;
+  };
   if (existsSync(docsJsonPath)) {
-    const docsJson = JSON.parse(readFileSync(docsJsonPath, "utf-8"));
-    // Fail loudly rather than silently reshape navigation into something
-    // Mintlify can't read if the config schema ever changes.
-    if (docsJson.navigation && !Array.isArray(docsJson.navigation.tabs)) {
+    docsJson = JSON.parse(readFileSync(docsJsonPath, "utf-8"));
+    const tabsValue = tabsHolder()?.tabs;
+    if (docsJson!.navigation && !Array.isArray(tabsValue)) {
       throw new Error(
         "docs.json navigation.tabs is not an array — aborting so we don't corrupt the config.",
       );
     }
-    const tabs: Array<{ tab: string; groups?: unknown[] }> = docsJson.navigation?.tabs ?? [];
+    // Each ENTRY is validated too, not just the container. `{"tabs":[null]}` satisfied
+    // Array.isArray, so all 16 pages were written and the code then threw dereferencing
+    // `t.tab` — leaving exactly the partial-regeneration debris this pre-write check was
+    // introduced to prevent. A shape check that stops at the outer type is not a shape
+    // check.
+    if (Array.isArray(tabsValue)) {
+      const bad = tabsValue.findIndex(
+        (t) => !t || typeof t !== "object" || typeof (t as { tab?: unknown }).tab !== "string",
+      );
+      if (bad >= 0) {
+        throw new Error(
+          `docs.json navigation.tabs[${bad}] is not an object with a string "tab" — ` +
+            `aborting before any page is written.`,
+        );
+      }
+    }
+  }
+
+  // Every check passed — now the tree may change.
+  for (const { path, content } of pending) writeFileSync(path, content);
+
+  // Splice the generated "Tools" tab into docs.json (preserve everything else).
+  if (docsJson) {
+    // Shape already validated above, before any page was written.
+    const holder = tabsHolder();
+    const tabs: Array<{ tab: string; groups?: unknown[] }> =
+      (holder?.tabs as Array<{ tab: string; groups?: unknown[] }>) ?? [];
     const toolsTab = {
       tab: "Tool Reference",
       groups: [{ group: "Tools", pages: navPages }],
@@ -425,7 +727,10 @@ async function main() {
     const idx = tabs.findIndex((t) => t.tab === "Tool Reference");
     if (idx >= 0) tabs[idx] = toolsTab;
     else tabs.push(toolsTab);
-    docsJson.navigation = { ...docsJson.navigation, tabs };
+    // Write back through the holder so the localized shape updates the default language's
+    // tabs in place, rather than resurrecting a top-level navigation.tabs beside them.
+    if (holder) holder.tabs = tabs;
+    else docsJson.navigation = { ...docsJson.navigation, tabs };
     // Write atomically (temp + rename) so a crash mid-write can't leave a
     // half-written docs.json.
     const tmp = `${docsJsonPath}.tmp`;

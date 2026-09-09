@@ -97,6 +97,7 @@ import {
   resolveAgyBin,
 } from "../../orchestrator/antigravity-backend.js";
 import { backendReadiness } from "../../orchestrator/backend-readiness.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 const FAKE_BIN = join(tmpdir(), "fake-agy", "agy.exe");
 
@@ -176,13 +177,13 @@ describe("parseAgyModels", () => {
 describe("mergeAgyMcpConfig", () => {
   const servers = {
     comfyui: { transport: "stdio" as const, command: "node", args: ["mcp.js"], env: { A: "1" } },
-    panel: { transport: "http" as const, url: "http://127.0.0.1:9181/tab" },
+    panel: { transport: "http" as const, url: "http://127.0.0.1:9198/tab" },
   };
 
   it("creates a fresh mcpServers wrapper", () => {
     const merged = JSON.parse(mergeAgyMcpConfig(null, servers));
     expect(merged.mcpServers.comfyui).toEqual({ command: "node", args: ["mcp.js"], env: { A: "1" } });
-    expect(merged.mcpServers.panel).toEqual({ serverUrl: "http://127.0.0.1:9181/tab" });
+    expect(merged.mcpServers.panel).toEqual({ serverUrl: "http://127.0.0.1:9198/tab" });
   });
 
   it("preserves the user's existing entries and unknown top-level keys", () => {
@@ -422,8 +423,8 @@ describe("AntigravityBackend turns", () => {
       "Second answer",
     ]);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: true, subtype: "end_turn" },
-      { type: "result", ok: true, subtype: "end_turn" },
+      { type: "result", ok: true, subtype: "end_turn", turn: 1 },
+      { type: "result", ok: true, subtype: "end_turn", turn: 2 },
     ]);
 
     // Turn 1: fresh (-p, no -c), persona prepended, model + skip-permissions set.
@@ -491,7 +492,7 @@ describe("AntigravityBackend turns", () => {
     expect(err.message).toContain("code 7");
     expect(err.message).toContain("quota exceeded");
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "error" },
+      { type: "result", ok: false, subtype: "error", turn: 1 },
     ]);
   });
 
@@ -512,12 +513,12 @@ describe("AntigravityBackend turns", () => {
     const drain = (async () => {
       for await (const ev of gen) events.push(ev);
     })();
-    await vi.waitFor(() => expect(hoisted.spawns.length).toBe(1));
+    await waitFor(() => expect(hoisted.spawns.length).toBe(1));
     await backend.interrupt();
     await drain;
     expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "cancelled" },
+      { type: "result", ok: false, subtype: "cancelled", turn: 1 },
     ]);
   });
 
@@ -543,7 +544,7 @@ describe("AntigravityBackend turns", () => {
     await drain;
 
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "cancelled" },
+      { type: "result", ok: false, subtype: "cancelled", turn: 1 },
     ]);
     // and the child must not be left running
     if (hoisted.procs[0]) expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);
@@ -556,7 +557,7 @@ describe("AntigravityBackend turns", () => {
     await new Promise((r) => setTimeout(r, 650)); // let it expire (no turn started)
     const events = await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: true, subtype: "end_turn" },
+      { type: "result", ok: true, subtype: "end_turn", turn: 1 },
     ]);
     expect(hoisted.killed).toEqual([]);
   });
@@ -571,7 +572,7 @@ describe("AntigravityBackend turns", () => {
     const err = events.find((e) => e.type === "error") as { message: string };
     expect(err.message).toMatch(/too large/i);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "error" },
+      { type: "result", ok: false, subtype: "error", turn: 1 },
     ]);
   });
 
@@ -601,13 +602,13 @@ describe("AntigravityBackend MCP config", () => {
       mcpConfigPath: cfg,
       mcpServers: {
         comfyui: { transport: "stdio", command: "node", args: ["dist/index.js"], env: {} },
-        panel: { transport: "http", url: "http://127.0.0.1:9181/t1" },
+        panel: { transport: "http", url: "http://127.0.0.1:9198/t1" },
       },
     });
     await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
     const written = JSON.parse(readFileSync(cfg, "utf8"));
     expect(written.mcpServers.comfyui.command).toBe("node");
-    expect(written.mcpServers.panel.serverUrl).toBe("http://127.0.0.1:9181/t1");
+    expect(written.mcpServers.panel.serverUrl).toBe("http://127.0.0.1:9198/t1");
   });
 
   it("defaults to ~/.gemini/config/mcp_config.json (the only path agy honors)", () => {

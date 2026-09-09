@@ -13,6 +13,25 @@ export interface AssetOutput {
   images: AssetImage[];
 }
 
+/**
+ * Provenance of a record: "watched" means this process saw the prompt complete
+ * (JobWatcher); "history-reconcile" means the record was recovered from
+ * ComfyUI's /history after the fact (render dispatched by the panel, an earlier
+ * session, or before a server restart — see issue #751).
+ */
+export type AssetSource = "watched" | "history-reconcile";
+
+/** The only directory types that ComfyUI's /view consumer can address. */
+export type AssetType = "output" | "input" | "temp";
+
+/**
+ * Provenance of a record's createdAt: "history" means the run's recorded
+ * execution_success timestamp; "observed" means the moment this process
+ * observed the finish (the live watch's detection, or the registry clock
+ * fallback) — a real observation, but not ComfyUI's recorded time.
+ */
+export type CreatedAtSource = "history" | "observed";
+
 export interface AssetRecord {
   assetId: string;
   promptId: string;
@@ -23,12 +42,54 @@ export interface AssetRecord {
   url: string;
   workflow: WorkflowJSON;
   createdAt: number;
+  createdAtSource: CreatedAtSource;
+  source: AssetSource;
 }
 
 export interface RegisterArgs {
   promptId: string;
   workflow: WorkflowJSON;
   outputs: AssetOutput[];
+  /** Defaults to "watched". */
+  source?: AssetSource;
+  /** ms epoch. Callers pass a REAL time — the run's recorded completion
+   *  timestamp or their own observed finish time. Defaults to the registry
+   *  clock (itself an observation). */
+  createdAt?: number;
+  /** Provenance of createdAt. Defaults to "observed" — pass "history" only
+   *  when createdAt is the entry's recorded execution_success timestamp. */
+  createdAtSource?: CreatedAtSource;
+}
+
+/**
+ * Canonicalize an externally supplied ComfyUI directory type before it can
+ * participate in asset identity. Unknown values are unsafe to preserve: the
+ * /view consumer only accepts these three types, so they deliberately fall
+ * back to output just as the history consumer does.
+ */
+export function normalizeAssetType(type: unknown): AssetType {
+  return type === "input" || type === "temp" || type === "output" ? type : "output";
+}
+
+/**
+ * Return an asset ref with one canonical type and a matching public URL.
+ * Invalid test/downtime URLs are retained; the production URL builder always
+ * supplies an absolute URL and gets its type query corrected here.
+ */
+export function normalizeAssetImage(
+  img: AssetImage,
+): AssetImage & { type: AssetType } {
+  const type = normalizeAssetType(img.type);
+  let url = img.url;
+  try {
+    const parsed = new URL(img.url);
+    parsed.searchParams.set("type", type);
+    url = parsed.toString();
+  } catch {
+    // The registry does not fetch this URL. Keep opaque test/custom URLs
+    // usable while still canonicalizing their identity metadata.
+  }
+  return { ...img, type, url };
 }
 
 export interface RegisterLocalArgs {
@@ -63,9 +124,13 @@ const state = {
   config: { ttlMs: DEFAULT_TTL_MS, now: Date.now } as RegistryConfig,
 };
 
-function makeAssetId(promptId: string, img: AssetImage): string {
+function makeAssetId(
+  promptId: string,
+  img: Pick<AssetImage, "filename" | "subfolder" | "type">,
+): string {
+  const type = normalizeAssetType(img.type);
   const hash = createHash("sha256")
-    .update(`${promptId}\0${img.filename}\0${img.subfolder}\0${img.type}`)
+    .update(`${promptId}\0${img.filename}\0${img.subfolder}\0${type}`)
     .digest("hex");
   return `a_${hash.slice(0, 8)}`;
 }
@@ -78,33 +143,74 @@ function isExpired(record: AssetRecord): boolean {
   return state.config.now() - record.createdAt >= state.config.ttlMs;
 }
 
+function sourcePriority(source: AssetSource): number {
+  // A live observation by this process is stronger provenance than a later
+  // best-effort recovery from /history. This is the arbitration rule for the
+  // async reconcile/watch race; equal sources are first-writer-wins.
+  return source === "watched" ? 2 : 1;
+}
+
 export const AssetRegistry = {
   /**
    * Register all images produced by a completed prompt.
-   * Returns the AssetRecords created (one per image).
+   * Returns records newly inserted or upgraded by this call. Existing records
+   * win ties, and watched provenance wins a history-reconcile attempt for the
+   * same canonical identity.
    */
-  register({ promptId, workflow, outputs }: RegisterArgs): AssetRecord[] {
+  register({ promptId, workflow, outputs, source, createdAt, createdAtSource }: RegisterArgs): AssetRecord[] {
     const snapshot = deepCloneWorkflow(workflow);
-    const created: AssetRecord[] = [];
+    const registered: AssetRecord[] = [];
+    const recordSource = source ?? "watched";
     for (const output of outputs) {
       for (const img of output.images) {
-        const assetId = makeAssetId(promptId, img);
+        const normalizedImg = normalizeAssetImage(img);
+        const assetId = makeAssetId(promptId, normalizedImg);
+        const existing = state.records.get(assetId);
+        if (existing && !isExpired(existing) && sourcePriority(existing.source) >= sourcePriority(recordSource)) {
+          continue;
+        }
         const record: AssetRecord = {
           assetId,
           promptId,
           nodeId: output.node_id,
-          filename: img.filename,
-          subfolder: img.subfolder,
-          type: img.type,
-          url: img.url,
+          filename: normalizedImg.filename,
+          subfolder: normalizedImg.subfolder,
+          type: normalizedImg.type,
+          url: normalizedImg.url,
           workflow: snapshot,
-          createdAt: state.config.now(),
+          createdAt: createdAt ?? state.config.now(),
+          createdAtSource: createdAtSource ?? "observed",
+          source: recordSource,
         };
         state.records.set(assetId, record);
-        created.push(record);
+        registered.push(record);
       }
     }
-    return created;
+    return registered;
+  },
+
+  /** True when a live (unexpired) record exists for this prompt + image. */
+  has(
+    promptId: string,
+    img: Pick<AssetImage, "filename" | "subfolder" | "type">,
+  ): boolean {
+    const record = state.records.get(makeAssetId(promptId, img));
+    return record !== undefined && !isExpired(record);
+  },
+
+  /** Look up a live record by the canonical prompt + image reference. */
+  find(
+    promptId: string,
+    img: Pick<AssetImage, "filename" | "subfolder" | "type">,
+  ): AssetRecord | undefined {
+    const assetId = makeAssetId(promptId, img);
+    const record = state.records.get(assetId);
+    if (!record) return undefined;
+    if (isExpired(record)) {
+      state.records.delete(assetId);
+      return undefined;
+    }
+    return record;
   },
 
   /**
@@ -119,7 +225,7 @@ export const AssetRegistry = {
       .update(`${filename}\0${subfolder}\0${type}\0${now}\0${Math.random()}`)
       .digest("hex")
       .slice(0, 16)}`;
-    const assetId = makeAssetId(promptId, { filename, subfolder, type, url: "" });
+    const assetId = makeAssetId(promptId, { filename, subfolder, type });
     const record: AssetRecord = {
       assetId,
       promptId,
@@ -130,6 +236,8 @@ export const AssetRegistry = {
       url: "",
       workflow: {},
       createdAt: now,
+      createdAtSource: "observed",
+      source: "watched",
     };
     state.records.set(assetId, record);
     return record;

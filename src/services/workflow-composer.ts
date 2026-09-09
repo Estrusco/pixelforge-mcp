@@ -709,6 +709,14 @@ interface AceStep15Txt2AudioParams {
   language?: string;
   musical_key?: string;
   guidance_scale?: number;
+  bpm?: number;
+  timesignature?: string;
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  min_p?: number;
+  generate_audio_codes?: boolean;
+  audio_quality?: string;
   filename_prefix?: string;
 }
 
@@ -724,6 +732,11 @@ interface StableAudio3Txt2AudioParams {
   sampler_name?: string;
   scheduler?: string;
   filename_prefix?: string;
+  /** #1458 — mirrors the ace_step sibling. `audio_quality` is a PUBLIC parameter of
+   *  the audio generation tool, and this family both ignored it and emitted no
+   *  `quality` at all, so a caller who set it had it silently dropped on top of every
+   *  run failing validation. */
+  audio_quality?: string;
 }
 
 function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
@@ -742,13 +755,23 @@ function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
   const shift = p.shift ?? 3;
   const language = p.language ?? "en";
   const key = p.musical_key ?? "C major";
-  const posCfg = p.guidance_scale ?? 0.85;
+  // `cfg_scale` on TextEncodeAceStepAudio1.5 defaults to 2 in the node schema;
+  // it is distinct from the sampler's `cfg` and from `temperature` (0.85).
+  const cfgScale = p.guidance_scale ?? 2;
+  const bpm = p.bpm ?? 120;
+  const timesignature = p.timesignature ?? "4";
+  const temperature = p.temperature ?? 0.85;
+  const topP = p.top_p ?? 0.9;
+  const topK = p.top_k ?? 0;
+  const minP = p.min_p ?? 0;
+  const generateAudioCodes = p.generate_audio_codes ?? true;
+  const audioQuality = p.audio_quality ?? "320k";
   const prefix = p.filename_prefix ?? "audio/ace_step";
 
   return {
     "1": {
       class_type: "UNETLoader",
-      inputs: { ckpt_name: unet, weight_dtype: "default" },
+      inputs: { unet_name: unet, weight_dtype: "default" },
     },
     "2": {
       class_type: "DualCLIPLoader",
@@ -774,13 +797,20 @@ function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
       class_type: "TextEncodeAceStepAudio1.5",
       inputs: {
         clip: conn("2", 0),
-        seed,
-        duration,
-        text: prompt,
+        tags: prompt,
         lyrics,
+        seed,
+        bpm,
+        duration,
+        timesignature,
         language,
-        key,
-        cfg: posCfg,
+        keyscale: key,
+        generate_audio_codes: generateAudioCodes,
+        cfg_scale: cfgScale,
+        temperature,
+        top_p: topP,
+        top_k: topK,
+        min_p: minP,
       },
     },
     "7": {
@@ -808,7 +838,7 @@ function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
     },
     "10": {
       class_type: "SaveAudioMP3",
-      inputs: { audio: conn("9", 0), filename_prefix: prefix },
+      inputs: { audio: conn("9", 0), filename_prefix: prefix, quality: audioQuality },
     },
   };
 }
@@ -822,9 +852,20 @@ function buildStableAudio3Txt2Audio(p: StableAudio3Txt2AudioParams): WorkflowJSO
   const seed = p.seed ?? Math.floor(Math.random() * 2 ** 48);
   const steps = p.steps ?? 50;
   const cfg = p.cfg ?? 7;
-  const sampler = p.sampler_name ?? "lcm";
+  // #1458 — NOT "lcm". lcm at cfg 7 renders DIGITAL SILENCE (mean -91 dB) while
+  // ComfyUI reports success: a correctly-sized, correctly-durated file of nothing,
+  // with nothing in the logs to say so. The reporter measured six combinations and
+  // that pair was the only silent one — lcm at cfg 1 is fine — so it was specifically
+  // the pairing this template shipped.
+  //
+  // dpmpp_2m rather than euler, also measured: at 42s euler produced ~53.7 audible
+  // click artifacts/sec against ~0.8/sec for dpmpp_2m. Both avoid the silence; only
+  // one stays clean as the render gets longer, and a default is judged on the long
+  // case because that is where nobody is watching.
+  const sampler = p.sampler_name ?? "dpmpp_2m";
   const scheduler = p.scheduler ?? "simple";
   const prefix = p.filename_prefix ?? "audio/stable_audio_3";
+  const audioQuality = p.audio_quality ?? "320k";
 
   return {
     "1": {
@@ -870,7 +911,11 @@ function buildStableAudio3Txt2Audio(p: StableAudio3Txt2AudioParams): WorkflowJSO
     },
     "8": {
       class_type: "SaveAudioMP3",
-      inputs: { audio: conn("7", 0), filename_prefix: prefix },
+      // #1458 — `quality` is REQUIRED on SaveAudioMP3. Omitting it made every
+      // audio generation for this family fail validation before execution:
+      // "SaveAudioMP3 (node 8): Required input is missing (quality)". The ace_step
+      // builder above always set it; only this sibling did not.
+      inputs: { audio: conn("7", 0), filename_prefix: prefix, quality: audioQuality },
     },
   };
 }

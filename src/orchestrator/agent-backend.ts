@@ -1,6 +1,6 @@
 // Agent backend port — the provider-neutral seam that lets the panel orchestrator
 // run on different agent providers (Claude Agent SDK today, OpenAI Codex next) via
-// dependency injection. See docs/design/agent-backend-injection.md.
+// dependency injection. See design/agent-backend-injection.md.
 //
 // PanelAgent keeps the orchestration (queue, turn-gate, bridge push, rewind-anchor
 // tracking, self-restart) and delegates the provider-specific bits — opening a
@@ -8,6 +8,7 @@
 // interrupt, model enumeration, session resume/fork — to an injected AgentBackend.
 
 import type { ImageRef } from "./panel-agent.js";
+import type { AudioRef } from "./audio-attachment.js";
 
 export type BackendId =
   | "claude"
@@ -15,10 +16,14 @@ export type BackendId =
   | "chatgpt"
   | "gemini"
   | "antigravity"
+  | "pi"
   | "grok"
+  | "qwen"
   | "glm"
   | "kimi"
   | "moonshot"
+  | "minimax"
+  | "atlascloud"
   | "ollama"
   | "openrouter"
   | "copilot";
@@ -34,6 +39,11 @@ export interface NeutralTurn {
   text: string;
   /** ComfyUI image refs to deliver inline (vision), resolved by the backend. */
   images?: ImageRef[];
+  /** ComfyUI audio refs to deliver inline (hearing, #790), resolved by the
+   *  backend. Only reaches a backend whose `AgentCapabilities.audio` is true —
+   *  PanelAgent refuses centrally (and visibly) for the rest, so an audio-less
+   *  adapter can never receive an attachment it would quietly discard. */
+  audio?: AudioRef[];
 }
 
 /**
@@ -60,6 +70,40 @@ export interface AgentCapabilities {
   /** Accepts inline image input in a user turn (vision). When false, image refs
    *  the panel sends are ignored by the backend (text-only). */
   vision: boolean;
+  /**
+   * This backend has an audio content part IMPLEMENTED for its wire protocol
+   * (#790). It is a statement about OUR code, not about any model: whether the
+   * selected model can actually hear is established per-turn by the backend
+   * (Ollama `/api/show` capabilities; the ACP `audio` prompt capability), and a
+   * model that cannot gets an explicit refusal naming what would work.
+   *
+   * false is the honest default for an adapter with no audio part at all —
+   * PanelAgent then refuses the attachment centrally and tells the user AND the
+   * model, rather than letting the bytes vanish into a text-only turn.
+   *
+   * Optional so an out-of-tree backend that omits it is treated as audio-less,
+   * which is the only safe reading: the failure mode of a wrong `true` is a
+   * silently unheard attachment.
+   */
+  audio?: boolean;
+  /**
+   * Stamps the #728 TURN MARKER (`AgentEvent.turn`) on the events it emits for a
+   * submitted turn. DECLARED, never inferred: #468's run-completion ack requires
+   * knowing up front whether an UNMARKED `result` could be a straggler from an
+   * abandoned turn. Inferring it from "have I seen a marker yet" is unsound while
+   * still unlearned — a zero-output turn's traceless terminal arrives before the
+   * replacement turn stamps anything, and would falsely ack (and destroy the
+   * replay of) a completion the replacement turn is carrying.
+   *
+   * true  → an unmarked result never acks a completion; the carrying turn's own
+   *         marked result does (an unmarked one hands the tokens back instead).
+   * false → a legacy/third-party backend that never stamps; unmarked results ack,
+   *         the pre-#468 behavior.
+   *
+   * Optional so an out-of-tree backend that omits it is treated as non-stamping,
+   * which is the conservative reading for something that also never dead-letters.
+   */
+  turnMarkers?: boolean;
 }
 
 /**
@@ -73,7 +117,21 @@ export interface AgentCapabilities {
  * meter, the result subtype/contextWindow/cost, live thinking-token counts). A
  * non-Claude backend simply omits the optional fields it can't supply.
  */
-export type AgentEvent =
+/**
+ * The per-response token counts the live context meter reads (panel-agent's
+ * reportStatus). A backend hands over its provider's own usage object — the
+ * Claude SDK's BetaUsage reports the cache counters as `number | null`, the
+ * OpenAI-dialect backends build a plain number map — so every counter here is
+ * optional and nullable, and any extra provider fields simply ride along unread.
+ */
+export interface AssistantUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+}
+
+export type AgentEvent = (
   /** Session opened/continued; `model` is the SDK-reported active model, if any. */
   | { type: "session"; sessionId: string; model?: string }
   /** Incremental assistant/thinking text (token-by-token streaming). */
@@ -86,7 +144,7 @@ export type AgentEvent =
   | { type: "thinking"; tokens: number }
   /** A turn-ending assistant message; `uuid` (when present) is the rewind anchor.
    *  `id` matches the streamed preview; `usage` is that response's prompt usage. */
-  | { type: "assistant"; text: string; uuid?: string; id?: string; usage?: Record<string, number> }
+  | { type: "assistant"; text: string; uuid?: string; id?: string; usage?: AssistantUsage }
   | { type: "tool_call"; name: string; phase: "start" | "end"; detail?: unknown }
   /** A turn completed. `contextWindow`/`costUsd`/`subtype` are provider extras. */
   | {
@@ -97,8 +155,66 @@ export type AgentEvent =
       contextWindow?: number;
       costUsd?: number;
     }
-  | { type: "rate_limit"; resetsAt?: number; kind?: string }
-  | { type: "error"; message: string };
+  /** The provider asked us to slow down and the request is being waited out
+   *  (see orchestrator/rate-limit.ts). NOT a failure: the turn is still running,
+   *  and a `result` will follow normally once the retry lands. `message`, when
+   *  present, is a finished user-facing line — renderers show it as-is rather
+   *  than composing their own, because only the emitter knows whether the wait
+   *  came from a header, a reset counter, or the provider's prose. */
+  | { type: "rate_limit"; resetsAt?: number; kind?: string; retryInMs?: number; message?: string }
+  | {
+      type: "error";
+      message: string;
+      /** The error is a "completed but UNVERIFIED" disclosure (#886): a result
+       *  arrived for a turn whose record was lost at a session restart. The
+       *  turn may have completed real work — it is NOT a failure and NOT a
+       *  verified success, so renderers must not frame it as either (no "turn
+       *  failed", no "nothing was lost — try again"). */
+      unverifiedCompletion?: boolean;
+      /** The error is about the SESSION, not about a turn (#1524): it is emitted
+       *  at session start — before any turn exists — so the turn framing every
+       *  other error gets ("the <model> turn failed … try again") would name a
+       *  turn that never ran and offer a retry that changes nothing. It must be
+       *  rendered as its own self-contained line, and must NOT consume the
+       *  once-per-turn error slot, or a session notice would silence the first
+       *  REAL turn error that follows it. */
+      sessionNotice?: boolean;
+      /** The provider/transport did not establish a mutation outcome. Renderers
+       *  must show the backend's self-contained recovery guidance rather than
+       *  adding the generic "Nothing was lost — try again" prompt. */
+      outcomeUnknown?: boolean;
+      /** The turn ended on a provider RATE LIMIT that could not be waited out.
+       *  `message` is already the finished sentence — it names the model, the
+       *  reason, and the remedy — so renderers must not wrap it in the generic
+       *  "the <model> turn failed: <backend>: …" framing, which would bury the
+       *  one actionable fact under a stack of prefixes. It IS a turn failure,
+       *  so it still consumes the once-per-turn error slot. */
+      rateLimit?: boolean;
+    }
+) & {
+  /** Backend-minted TURN MARKER (#728): a monotonically increasing id (1 = the
+   *  first turn read from the channel in this run) the backend stamps on every
+   *  event it emits FOR a submitted turn, so PanelAgent can attribute stragglers:
+   *  an event stamped with a turn OLDER than the in-flight turn is dead-lettered
+   *  (logged, never painted, never gate-affecting) instead of corrupting the turn
+   *  that replaced an abandoned one. OMITTED = legacy/third-party backend (or an
+   *  event outside any turn, like session init) — NO dead-lettering, previous
+   *  behavior (better a rare duplicate than a wedge). */
+  turn?: number;
+};
+
+/** Stamp every event of a per-turn stream with the backend-minted `turn` marker
+ *  (see AgentEvent.turn). Backends mint one incrementing marker per turn read
+ *  from the channel and wrap their per-turn generator: events inside a turn are
+ *  stamped; a `session` event (outside any turn) passes through unstamped. */
+export async function* stampTurn(
+  stream: AsyncIterable<AgentEvent>,
+  turn: number,
+): AsyncGenerator<AgentEvent> {
+  for await (const ev of stream) {
+    yield ev.type === "session" ? ev : { ...ev, turn };
+  }
+}
 
 export interface ModelChoice {
   id: string;
@@ -122,6 +238,14 @@ export interface ModelChoice {
 export interface BackendStartOptions {
   /** Resume an existing session/thread by id. */
   resume?: string;
+  /**
+   * Resume into a NEW session id that keeps conversation history but takes the
+   * CURRENT MCP server set (#1700). A plain `resume` restores the MCP set
+   * recorded with that session, so panel_add_mcp / panel_remove_mcp would not
+   * take effect. Honored by Claude (`forkSession: true`); other backends ignore
+   * it. Distinct from `rewindAnchor`, which also forks but drops later turns.
+   */
+  forkSession?: boolean;
   /** Fork the conversation at this anchor — honored only if `forkAtAnchor`. */
   rewindAnchor?: string | null;
   /** Model id (provider-specific). */
@@ -157,6 +281,8 @@ export interface BackendStartOptions {
 
 export interface SendMeta {
   images?: ImageRef[];
+  /** Audio attachments for this turn (#790). */
+  audio?: AudioRef[];
   title?: string;
   mid?: string;
 }
@@ -178,10 +304,28 @@ export interface AgentBackend {
   run(opts: BackendStartOptions): AsyncIterable<AgentEvent>;
   /** Stop the current turn without ending the session (if supported). */
   interrupt(): Promise<void>;
+  /**
+   * Try to recover a watchdog-stalled turn without representing the interruption
+   * as a user cancellation. Returns true only when the provider accepted the
+   * supplied agent-facing notice; callers must retain their normal interrupt
+   * fallback for older providers/protocols.
+   */
+  recoverStalledTurn?(notice: string): Promise<boolean>;
   /** Switch the model on the LIVE session (next turn uses it), if supported. */
   setModel?(model: string): Promise<void>;
   /** Models the current account can use (empty if `modelEnumeration` is false). */
   listModels(): Promise<ModelChoice[]>;
+  /**
+   * #1516 — fetched BYTES of AUTOMATIC run-completion previews this backend has
+   * actually delivered into the CURRENT provider conversation (ImageRefs flagged
+   * `automatic`; a user's explicit attachments are never counted). PanelAgent
+   * reads this when composing an injection so the cumulative per-conversation
+   * byte budget (preview-budget.ts) is enforced against real fetch sizes, not a
+   * count-times-constant guess. Optional: a backend that does not report bytes
+   * is bounded by the image COUNT alone. Reset by the backend whenever the
+   * underlying provider conversation changes (a fresh thread starts at zero).
+   */
+  automaticPreviewBytes?(): number;
   /** Permanently dispose of the backend's resources: kill any child process tree,
    *  remove listeners, drop the live connection. Called by PanelAgent.stop() and on
    *  every path that retires/replaces an agent (reset, effort restart, stopAll).
@@ -202,6 +346,8 @@ export const CLAUDE_CAPABILITIES: AgentCapabilities = {
   slashCommands: true,
   hooks: true,
   vision: true, // resolves image refs to inline base64 blocks (shapeTurn)
+  audio: false, // the Anthropic Messages API has no audio input block (#790)
+  turnMarkers: true, // claude-backend stamps every event from the #745 per-turn trace FIFO
 };
 
 /** Capability descriptor for the Codex app-server backend (Phase 2). */
@@ -215,6 +361,8 @@ export const CODEX_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // gpt-5.5 sees images; delivered as `localImage` turn input items
+  audio: false, // codex app-server turn input accepts text + localImage only (#790)
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Gemini CLI ACP backend (Agent Client Protocol).
@@ -232,6 +380,15 @@ export const GEMINI_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // gemini-2.5 sees images; delivered as inline base64 image ContentBlocks
+  // ACP defines an `audio` ContentBlock and requires the agent to advertise the
+  // `audio` prompt capability before a client may send one. Neither CLI has been
+  // observed advertising it, so the send path could never be exercised — and its
+  // failure mode (session/prompt rejecting after the bytes were attached) would
+  // surface as a generic error, i.e. an attachment the user is never told did not
+  // arrive. Shipping that is the overclaim #790 exists to remove, so this is false
+  // and the attachment is refused centrally, naming a path that works.
+  audio: false,
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Antigravity CLI backend (`agy`, issue #262) —
@@ -252,6 +409,31 @@ export const ANTIGRAVITY_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: false, // no documented image input in -p mode
+  audio: false, // `agy -p` has no documented media input at all (#790)
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
+};
+
+/** Capability descriptor for the pi.dev CLI backend (`pi`, issue #491) — the
+ *  open-source multi-provider coding agent from earendil-works. Unlike agy, pi
+ *  exposes a DOCUMENTED machine-readable JSON-lines event stream (`--mode json`)
+ *  with real text deltas, per-tool events, and a resumable session id — so this
+ *  is a spawn-per-turn adapter that parses that stream. inProcessMcp is false and
+ *  there is NO config-MCP path either: pi has no MCP client at all (its tools are
+ *  built-ins + TS extensions), so a pi turn does NOT get the ComfyUI panel_* /
+ *  comfyui tools — a real limitation surfaced in the ready banner. vision=false
+ *  (no documented headless image input). Models come from `pi --list-models`. */
+export const PI_CAPABILITIES: AgentCapabilities = {
+  persistentChannel: true, // spawn-per-turn, continuity via `pi --session <id>`
+  streamingDeltas: true, // `--mode json` text_delta events
+  interruptMidTurn: true, // kill the in-flight child tree; next turn continues
+  forkAtAnchor: false, // whole-session resume only (no per-turn anchor wired)
+  inProcessMcp: false, // pi has no MCP client at all (built-in tools + extensions)
+  modelEnumeration: true, // `pi --list-models`
+  slashCommands: false,
+  hooks: false,
+  vision: false, // no documented headless image input
+  audio: false, // pi's JSON mode has no documented media input (#790)
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Grok CLI ACP backend (xAI / Grok Build).
@@ -267,6 +449,33 @@ export const GROK_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true,
+  // ACP defines an `audio` ContentBlock and requires the agent to advertise the
+  // `audio` prompt capability before a client may send one. Neither CLI has been
+  // observed advertising it, so the send path could never be exercised — and its
+  // failure mode (session/prompt rejecting after the bytes were attached) would
+  // surface as a generic error, i.e. an attachment the user is never told did not
+  // arrive. Shipping that is the overclaim #790 exists to remove, so this is false
+  // and the attachment is refused centrally, naming a path that works.
+  audio: false,
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
+};
+
+/** Capability descriptor for the Qwen Code CLI ACP backend (`qwen --acp`,
+ *  issue #1417). Same ACP posture as Gemini: persistent session, streaming
+ *  deltas, interrupt via session/cancel, config-declared MCP servers, static
+ *  model catalog pinned at spawn. */
+export const QWEN_CAPABILITIES: AgentCapabilities = {
+  persistentChannel: true, // session/new + repeated session/prompt
+  streamingDeltas: true, // session/update agent_message_chunk / agent_thought_chunk
+  interruptMidTurn: true, // session/cancel
+  forkAtAnchor: false, // session/load is whole-session only (no anchor fork)
+  inProcessMcp: false, // ACP session/new declares config MCP servers only
+  modelEnumeration: true, // static catalog — ACP exposes no catalog
+  slashCommands: false,
+  hooks: false,
+  vision: true, // delivered as inline base64 image ContentBlocks (when the agent advertises image input)
+  audio: false, // same overclaim rationale as GEMINI_CAPABILITIES.audio (#790)
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Ollama local-LLM backend (issue #97's panel
@@ -289,6 +498,8 @@ export const OLLAMA_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // attempted for every model; graceful strip-and-retry on rejection
+  audio: true, // native /api/chat images[] and openai input_audio, both live-verified; per-model gate via /api/show (#790) plus verified-tag allowlist on the native image slot (#1972)
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** ChatGPT subscription via direct Codex OAuth (~/.codex/auth.json) — Codex Responses
@@ -303,6 +514,8 @@ export const CHATGPT_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // Responses input_image data URLs; strip-and-retry on rejection (#218)
+  audio: false, // the Codex Responses models take input_text/input_image only (#790)
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Kimi Code subscription OAuth or KIMI_API_KEY — OpenAI-compatible coding API. */

@@ -26,6 +26,19 @@ export interface ComfyUINodeDef {
    * with "api node/" (e.g. "api node/image/BFL").
    */
   api_node?: boolean;
+  /**
+   * #2543 — opt-in for third-party nodes that bill a paid external service
+   * from environment-only credentials (no api_key widget, no Comfy `api_node`).
+   * Packs may set the class attribute `EXTERNAL_API_NODE` (boolean, or a string
+   * naming the provider). Honored when present on /object_info so the next
+   * env-only pack does not need a code change here.
+   */
+  external_api_node?: boolean | string;
+  /** Python class-attr spelling of `external_api_node`, if a serializer dumps it. */
+  EXTERNAL_API_NODE?: boolean | string;
+  /** Optional provider when `external_api_node` is a boolean. */
+  external_api_provider?: string;
+  EXTERNAL_API_PROVIDER?: string;
   deprecated?: boolean;
   experimental?: boolean;
 }
@@ -56,6 +69,16 @@ export interface SystemStats {
     embedded_python: boolean;
     argv?: string[];
     comfyui_version?: string;
+    /** Reported by recent ComfyUI, e.g. "2.11.0.dev20260123+cu130". */
+    pytorch_version?: string;
+    /** Working directory of the running server, when a build reports it. */
+    cwd?: string;
+    ram_total?: number;
+    ram_free?: number;
+    /** The frontend version this ComfyUI asked for (panel#779). */
+    required_frontend_version?: string;
+    /** Installed Python packages ComfyUI reports on, e.g. comfyui-frontend-package. */
+    comfy_package_versions?: Array<{ name?: string; installed?: string }>;
   };
   devices: Array<{
     name: string;
@@ -164,6 +187,31 @@ export interface UiNode {
   widgets_values?: unknown[];
   title?: string;
   _meta?: { title?: string };
+  /**
+   * INTERNAL, never serialized: widget values resolved BY NAME during subgraph
+   * expansion — a promoted ("proxy") widget value pushed down from the subgraph
+   * node, or a virtual PrimitiveNode's literal baked onto its consumer. Applied
+   * by convertUiToApi against object_info, which is authoritative about widget
+   * names; carrying them by name avoids the positional guessing that used to
+   * drop them or land them on the wrong widget (issue #361).
+   */
+  resolvedWidgetValues?: Record<string, unknown>;
+  /**
+   * INTERNAL, never serialized: the panel's AUTHORITATIVE name→value map for this
+   * node's widgets, captured from the live canvas alongside the serialized graph
+   * (see applyCapturedWidgetValues). When present it REPLACES `widgets_values` as
+   * the converter's widget source, which is the whole point: `widgets_values` is a
+   * bare positional array whose order is the FRONTEND's, while the converter can
+   * only reconstruct an order from object_info's — and for custom nodes that add or
+   * reorder widgets in JS the two disagree, silently landing each value on the wrong
+   * widget (#961/#955/#361). A name-keyed map has no order to disagree about.
+   *
+   * It is deliberately a SEPARATE field rather than an object written into
+   * `widgets_values`: several call sites legitimately read that array BY INDEX
+   * (a subgraph node's proxyWidgets, a PrimitiveNode's literal at [0], a Set/Get
+   * node's bus name), and handing them an object would silently drop those values.
+   */
+  capturedWidgetValues?: Record<string, unknown>;
 }
 
 // link: [link_id, source_node_id, source_slot, target_node_id, target_slot, type_name]

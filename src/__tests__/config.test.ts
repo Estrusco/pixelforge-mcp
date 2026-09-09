@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_PANEL_BRIDGE_PORT } from "../services/bridge-ports.js";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 
 // config.ts has top-level await (port auto-detect). Use vi.resetModules() so
 // each test re-evaluates it with a fresh process.env.
@@ -19,6 +22,7 @@ describe("config mode detection", () => {
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_URL = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188";
     process.env.COMFYUI_MCP_FORCE_REMOTE = "";
@@ -96,6 +100,14 @@ describe("config mode detection", () => {
     expect(mod.config.comfyuiPath).toBe("/explicit/local/comfy");
   });
 
+  it("normalizes an explicit COMFYUI_CODE_PATH independently of the data root", async () => {
+    process.env.COMFYUI_PATH = "/explicit/data";
+    process.env.COMFYUI_CODE_PATH = "  /explicit/code  ";
+    const mod = await import("../config.js");
+    expect(mod.config.comfyuiPath).toBe("/explicit/data");
+    expect(mod.config.comfyuiCodePath).toBe("/explicit/code");
+  });
+
   it("getApiKey() throws when not configured (local mode)", async () => {
     process.env.COMFYUI_PORT = "8188";
     const mod = await import("../config.js");
@@ -109,9 +121,9 @@ describe("config mode detection", () => {
   });
 
   it("getInstanceSlug() keeps dots/hyphens for a RunPod-style https host", async () => {
-    process.env.COMFYUI_URL = "https://abcd-8188.proxy.runpod.net";
+    process.env.COMFYUI_URL = "https://abcd-3000.proxy.runpod.net";
     const mod = await import("../config.js");
-    expect(mod.getInstanceSlug()).toBe("abcd-8188.proxy.runpod.net_443");
+    expect(mod.getInstanceSlug()).toBe("abcd-3000.proxy.runpod.net_443");
   });
 
   it("getInstanceSlug() is 'comfy-cloud' in cloud mode", async () => {
@@ -119,6 +131,67 @@ describe("config mode detection", () => {
     process.env.COMFYUI_PORT = "8188";
     const mod = await import("../config.js");
     expect(mod.getInstanceSlug()).toBe("comfy-cloud");
+  });
+});
+
+describe("IPv6 loopback ComfyUI targets (#2719)", () => {
+  const OLD_ENV = process.env;
+  const OLD_ARGV = process.argv;
+
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...OLD_ENV };
+    process.argv = [...OLD_ARGV];
+    process.env.COMFYUI_API_KEY = "";
+    process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
+    process.env.COMFYUI_HOST = "";
+    process.env.COMFYUI_MCP_FORCE_REMOTE = "";
+  });
+
+  afterEach(() => {
+    process.env = OLD_ENV;
+    process.argv = OLD_ARGV;
+    vi.restoreAllMocks();
+  });
+
+  async function listenIPv6Only(): Promise<{ server: ReturnType<typeof createServer>; port: number }> {
+    const server = createServer((_req, res) => res.end("ipv6-only-ok"));
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "::1", () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("IPv6 server did not expose an address");
+    return { server, port: address.port };
+  }
+
+  it("uses a dual-family localhost connection for a legacy IPv4 loopback URL", async () => {
+    const { server, port } = await listenIPv6Only();
+    try {
+      process.env.COMFYUI_URL = `http://127.0.0.1:${port}`;
+      const mod = await import("../config.js");
+
+      expect(mod.getComfyUIApiHost()).toBe(`127.0.0.1:${port}`);
+      expect(mod.getComfyUIBaseUrl()).toBe(`http://127.0.0.1:${port}`);
+      await expect(comfyuiFetch(`${mod.getComfyUIBaseUrl()}/system_stats`)).resolves.toMatchObject({ status: 200 });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("keeps an explicit IPv6 loopback target valid for URL consumers", async () => {
+    const { server, port } = await listenIPv6Only();
+    try {
+      process.env.COMFYUI_URL = `http://[::1]:${port}`;
+      const mod = await import("../config.js");
+
+      expect(mod.getComfyUIApiHost()).toBe(`[::1]:${port}`);
+      expect(mod.getComfyUIBaseUrl()).toBe(`http://[::1]:${port}`);
+      await expect(fetch(`${mod.getComfyUIBaseUrl()}/system_stats`)).resolves.toMatchObject({ status: 200 });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
 
@@ -130,6 +203,7 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_URL = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188";
     process.env.COMFYUI_AUTH_HEADER = "";
@@ -220,6 +294,60 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
     expect(mod.isCloudMode()).toBe(false);
     expect(mod.isRemoteMode()).toBe(true);
   });
+
+  it("re-reads panel-saved gateway credentials without reloading config (#2085)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-config-auth-"));
+    process.env.COMFYUI_MCP_ENV_FILE = join(dir, ".env");
+
+    try {
+      const mod = await import("../config.js");
+      const {
+        CREDENTIAL_SLOTS,
+        clearPanelSecret,
+        listPanelSecretsMasked,
+        setComfyuiSecret,
+      } = await import("../services/panel-secrets.js");
+
+      // config.ts has already loaded with empty auth values. Exercise the same
+      // persisted panel path used by panel_request_secret, then call the real
+      // production header builder again in this still-running module.
+      expect(mod.getComfyUIAuthHeaders()).toEqual({});
+      setComfyuiSecret("COMFYUI_AUTH_TOKEN", "panel-token");
+      setComfyuiSecret("COMFYUI_AUTH_HEADER", "X-Panel-Token");
+      setComfyuiSecret("COMFYUI_AUTH_SCHEME", "Token");
+      setComfyuiSecret("CF_ACCESS_CLIENT_ID", "access-id");
+      setComfyuiSecret("CF_ACCESS_CLIENT_SECRET", "access-secret");
+      expect(mod.getComfyUIAuthHeaders()).toEqual({
+        "X-Panel-Token": "Token panel-token",
+        "CF-Access-Client-Id": "access-id",
+        "CF-Access-Client-Secret": "access-secret",
+      });
+
+      const gatewayKeys = [
+        "COMFYUI_AUTH_TOKEN",
+        "COMFYUI_AUTH_HEADER",
+        "COMFYUI_AUTH_SCHEME",
+        "CF_ACCESS_CLIENT_ID",
+        "CF_ACCESS_CLIENT_SECRET",
+      ];
+      const gatewaySlots = CREDENTIAL_SLOTS.filter((slot) => gatewayKeys.includes(slot.envKeys[0]));
+      expect(gatewaySlots.map((slot) => slot.envKeys[0])).toEqual(gatewayKeys);
+      const gatewayRows = listPanelSecretsMasked().filter((slot) => gatewaySlots.some((gateway) => gateway.id === slot.id));
+      expect(gatewayRows).toHaveLength(gatewaySlots.length);
+      expect(gatewayRows.every((slot) => slot.set)).toBe(true);
+
+      setComfyuiSecret("COMFYUI_AUTH_TOKEN", "rotated-token");
+      expect(mod.getComfyUIAuthHeaders()["X-Panel-Token"]).toBe("Token rotated-token");
+
+      for (const slot of gatewaySlots) clearPanelSecret(slot.id);
+      expect(mod.getComfyUIAuthHeaders()).toEqual({});
+      const clearedRows = listPanelSecretsMasked().filter((slot) => gatewaySlots.some((gateway) => gateway.id === slot.id));
+      expect(clearedRows.every((slot) => !slot.set && slot.masked === null)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.COMFYUI_MCP_ENV_FILE;
+    }
+  });
 });
 
 describe("COMFYUI_PATH nested/wrapper self-heal (doubled-path bug)", () => {
@@ -245,6 +373,7 @@ describe("COMFYUI_PATH nested/wrapper self-heal (doubled-path bug)", () => {
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_URL = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188"; // skip port auto-detect
   });
@@ -321,6 +450,7 @@ describe("getLocalComfyuiUrl (#269 LAN fallback)", () => {
     process.env.COMFYUI_MCP_LOCAL_TARGET_FILE = join(fakeHome, "local-target.json");
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188";
     process.env.COMFYUI_MCP_FORCE_REMOTE = "";
@@ -393,5 +523,111 @@ describe("getLocalComfyuiUrl (#269 LAN fallback)", () => {
     process.env.COMFYUI_URL = "https://comfy.example-vps.com:8188";
     const second = await import("../config.js");
     expect(second.getLocalComfyuiUrl()).toBe("http://127.0.0.1:8188");
+  });
+
+  it("bumps the target generation on EVERY retarget — an A→B→A round trip is detectable (#742 r11)", async () => {
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    const mod = await import("../config.js");
+    const g0 = mod.getComfyuiTargetGeneration();
+    // A → B → A: the final base equals the initial one, but the generation
+    // must have advanced twice — final-state equality can never prove stability.
+    expect(mod.setComfyuiTarget("http://192.168.1.50:8188")).toBe(true);
+    expect(mod.setComfyuiTarget("http://127.0.0.1:8188")).toBe(true);
+    expect(mod.getComfyuiTargetGeneration()).toBe(g0 + 2);
+    expect(mod.getComfyUIBaseUrl()).toBe("http://127.0.0.1:8188"); // base keeps configured identity
+    // A rejected (malformed) retarget does NOT bump.
+    expect(mod.setComfyuiTarget("not a url")).toBe(false);
+    expect(mod.getComfyuiTargetGeneration()).toBe(g0 + 2);
+  });
+
+  it("a synchronous target-change listener always observes target and generation in step (#742 r12)", async () => {
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    const mod = await import("../config.js");
+    const seen: Array<{ url: string; generation: number }> = [];
+    mod.onComfyuiTargetChanged((url) => {
+      seen.push({ url, generation: mod.getComfyuiTargetGeneration() });
+    });
+    const g0 = mod.getComfyuiTargetGeneration();
+    expect(mod.setComfyuiTarget("http://192.168.1.50:8188")).toBe(true);
+    // The listener fired with the NEW target — it must have observed the NEW
+    // generation with it, never the pre-bump one (the contract: any observer
+    // of the new target value sees the new generation).
+    expect(seen).toHaveLength(1);
+    expect(seen[0].url).toBe("http://192.168.1.50:8188");
+    expect(seen[0].generation).toBe(g0 + 1);
+    expect(seen[0].generation).toBe(mod.getComfyuiTargetGeneration());
+  });
+});
+
+describe("rescopeLocalTargetFile (#1909 non-default loopback port)", () => {
+  let fakeHome: string;
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...OLD_ENV };
+    process.argv = [...OLD_ARGV];
+    fakeHome = mkdtempSync(join(tmpdir(), "config-home-"));
+    process.env.COMFYUI_MCP_LOCAL_TARGET_FILE = join(fakeHome, "local-target.json");
+    process.env.COMFYUI_API_KEY = "";
+    process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
+    process.env.COMFYUI_HOST = "";
+    process.env.COMFYUI_PORT = "8188";
+    process.env.COMFYUI_MCP_FORCE_REMOTE = "";
+    process.env.COMFYUI_URL = "";
+  });
+  afterEach(() => {
+    process.env = OLD_ENV;
+    process.argv = OLD_ARGV;
+  });
+
+  function writtenUrl(path: string): unknown {
+    return (JSON.parse(readFileSync(path, "utf-8")) as { url?: unknown }).url;
+  }
+
+  it("records a loopback COMFYUI_URL assigned after config init, not the :8188 default", async () => {
+    // Production order: config.ts is imported first (boot.ts static import),
+    // then boot.ts assigns COMFYUI_URL from `connect` / --comfyui-url, then
+    // the orchestrator calls rescopeLocalTargetFile. The default-seeded
+    // lastNonPodTarget must not win over the live configured origin.
+    const mod = await import("../config.js");
+    const configured = "http://127.0.0.1:18188";
+    process.env.COMFYUI_URL = configured;
+    const scoped = join(fakeHome, `local-target-${DEFAULT_PANEL_BRIDGE_PORT}.json`);
+    mod.rescopeLocalTargetFile(scoped);
+    expect(writtenUrl(scoped)).toBe(configured);
+    expect(mod.getLocalComfyuiUrl()).toBe(configured);
+    // Restart identity reads these — they must name the configured instance
+    // or panel_restart_comfyui still refuses a panel that is on that port.
+    expect(mod.getBootLocalComfyUIBaseUrl()).toBe("http://127.0.0.1:18188");
+    expect(mod.getComfyUIBaseUrl()).toBe(configured);
+  });
+
+  it("overwrites a stale scoped file that still says :8188", async () => {
+    const configured = "http://127.0.0.1:18188";
+    const scoped = join(fakeHome, `local-target-${DEFAULT_PANEL_BRIDGE_PORT}.json`);
+    writeFileSync(scoped, JSON.stringify({ url: "http://127.0.0.1:8188" }));
+    const mod = await import("../config.js");
+    process.env.COMFYUI_URL = configured;
+    mod.rescopeLocalTargetFile(scoped);
+    expect(writtenUrl(scoped)).toBe(configured);
+  });
+
+  it("records the configured URL when it is already set at import", async () => {
+    const configured = "http://127.0.0.1:18188";
+    process.env.COMFYUI_URL = configured;
+    const mod = await import("../config.js");
+    const scoped = join(fakeHome, `local-target-${DEFAULT_PANEL_BRIDGE_PORT}.json`);
+    mod.rescopeLocalTargetFile(scoped);
+    expect(writtenUrl(scoped)).toBe(configured);
+    expect(mod.getBootLocalComfyUIBaseUrl()).toBe("http://127.0.0.1:18188");
+  });
+
+  it("keeps :8188 when that is the configured loopback URL", async () => {
+    const configured = "http://127.0.0.1:8188";
+    process.env.COMFYUI_URL = configured;
+    const mod = await import("../config.js");
+    const scoped = join(fakeHome, `local-target-${DEFAULT_PANEL_BRIDGE_PORT}.json`);
+    mod.rescopeLocalTargetFile(scoped);
+    expect(writtenUrl(scoped)).toBe(configured);
   });
 });

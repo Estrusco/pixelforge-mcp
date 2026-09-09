@@ -18,7 +18,7 @@ All configuration is via environment variables (set in the server's `env` block 
 | **Remote** | `--comfyui-url` / `COMFYUI_URL` points at a non-loopback host | no | no | yes |
 | **Cloud** | `COMFYUI_API_KEY` is set (targets Comfy Cloud) | no | no | no (HTTP polling) |
 
-Tools that require a local install (`start_comfyui` / `apply_manifest` / `remove_model` / `list_output_images` / etc.)
+Tools that require a local install (`restart_comfyui` with `action: "start"` / `apply_manifest` / `list_local_models` (`action:"remove"`) / `get_image (action:"list_outputs")` / etc.)
 return a clear error when running in remote or cloud mode. In remote and cloud modes the server skips
 local `COMFYUI_PATH` auto-detection so a stale local install can't silently absorb uploads or model
 downloads the agent intends for the actual target — set `COMFYUI_PATH` explicitly if you want to
@@ -43,9 +43,26 @@ mix-and-match.
   Use `https`/`wss` instead of `http`/`ws`.
 </ParamField>
 <ParamField path="COMFYUI_PATH" type="string">
-  Absolute path to the local ComfyUI install. Auto-detected from common locations when unset
-  (suppressed in remote/cloud modes). Required by local-only tools (install/manage nodes, remove
-  models, read logs, list output files).
+  Absolute path to the local ComfyUI data/base directory. In a conventional install this is also
+  the code checkout. Auto-detected from common locations when unset (suppressed in remote/cloud
+  modes). Component-aware tools prefer the running server's explicit input/output/models paths.
+</ParamField>
+<ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
+  Optional code-checkout root for split installs where `main.py` and `.venv` are separate
+  from the data/model/user root. Pip, venv, and core updates use this checkout (core updates
+  prefer the checkout observed from the running local server). Pack reads/writes —
+  `custom_nodes`, comfy-cli `--workspace`, `apply_manifest` clone/checkout, workflow-lock
+  pack commits — stay on the live `--base-directory` / `COMFYUI_PATH` data root (#1770).
+  Ignored for local filesystem mutation in remote mode.
+</ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  Shell command that restarts an **externally managed** ComfyUI — e.g. `docker restart comfyui`
+  or `systemctl --user restart comfyui`. When set, `restart_comfyui` runs this command instead
+  of kill+relaunch (which needs the install's launch path resolvable — impossible for a
+  container or launcher whose `main.py` anchors only inside its own namespace), and
+  `panel_restart_comfyui` routes through it too. Local targets only; remote/cloud targets keep
+  the Manager-reboot path. The restart verifies the instance came back healthy and reports the
+  cycle as confirmed only when the down→up was actually observed.
 </ParamField>
 
 ## Remote behind a reverse proxy / API gateway
@@ -58,6 +75,14 @@ route, an API gateway, an SSO edge) — this is **not** Comfy Cloud:
 - The `COMFYUI_AUTH_*` variables attach a generic auth header to **every** ComfyUI request
   (the direct HTTP calls and the underlying client/WebSocket library). This is independent of
   cloud mode, so a gateway-auth'd instance is never misread as Comfy Cloud.
+
+The secure `panel_request_secret` path accepts these gateway keys for the built-in `comfyui`
+server. They are re-read for each subsequent ComfyUI/Manager request, so a saved credential
+takes effect without restarting the orchestrator or calling `panel_reload`. The corresponding
+gateway keys also appear as masked slots in the panel credential surface; clearing a slot
+revokes that key for subsequent requests without a restart. `panel_request_secret` remains
+save-only and rejects blank input. The built-in tool child may still be rebuilt by the existing
+secret-change path.
 
 <ParamField path="COMFYUI_AUTH_TOKEN" type="string">
   Auth token for a self-hosted ComfyUI behind a gateway. When set, sent on every ComfyUI
@@ -100,7 +125,7 @@ error. Architecture and `cloud-client` dispatcher originally contributed by
 [@picoSols](https://github.com/picoSols).
 
 <Note>
-  **Comfy-Org ships an [official Comfy Cloud MCP](https://docs.comfy.org/development/cloud/mcp-server)** (currently invite-only beta) which is cloud-exclusive and maintained by the Comfy team. If you only target Comfy Cloud, that's likely the right choice when it goes GA. `comfyui-mcp`'s cloud-mode below is best when you want a single MCP across local / remote / cloud, or you need it today (it's MIT and shipping now).
+  **Comfy-Org ships [official agent tooling](https://docs.comfy.org/agent-tools)** — Comfy Cloud MCP (public beta) and the Comfy In-App Agent (private alpha), both maintained by the Comfy team and both running on Comfy Cloud. If you only target Comfy Cloud, that's likely the right choice; see [Local vs. Comfy Cloud](./local-vs-comfy-cloud). `comfyui-mcp`'s cloud-mode below is best when you want a single MCP across local / remote / cloud, or you need it today (it's MIT and shipping now).
 </Note>
 
 <ParamField path="COMFYUI_API_KEY" type="string">
@@ -144,7 +169,7 @@ for the full slot list and current masked status) instead of the `env` block bel
   out of environment/process listings.
 </ParamField>
 <ParamField path="REGISTRY_ACCESS_TOKEN" type="string">
-  Comfy Registry API key used by `publish_custom_node` to publish a node pack. Passed to comfy-cli via env, never placed in args or logs.
+  Comfy Registry API key used by `node_pack` (`action: "publish"`) to publish a node pack. Passed to comfy-cli via env, never placed in args or logs.
 </ParamField>
 
 ## Behavior
@@ -161,22 +186,35 @@ for the full slot list and current masked status) instead of the `env` block bel
 <ParamField path="COMFYUI_DOWNLOAD_CACHE_DIR" type="string" default="~/.comfyui-mcp/cache">
   Content-addressed cache for model downloads. Repeat or concurrent downloads of the same URL reuse the cached file; the target model path is materialized via hardlink (falling back to copy).
 </ParamField>
+For model-download proxy routing, set `COMFYUI_DOWNLOAD_PROXY` to an HTTP/HTTPS proxy. This applies only to model-download requests, including redirect probes, payload sniffing, and segmented ranges. When unset, standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` settings are honored; on Windows, a static WinINet proxy from Internet Settings is used when environment proxy variables are absent. Loopback hosts stay direct, and ComfyUI API requests are never routed through this setting.
 <ParamField path="COMFYUI_LRU_CACHE_SIZE_GB" type="number" default="0">
   Max size of the download cache in GB. `0` disables eviction; above the limit, least-recently-used cached files are deleted after a download completes.
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  Parallel connections per model download. A single connection is capped by round-trip time and, on many model CDNs, by a per-connection rate limit; fetching byte ranges in parallel lifts both. `1` disables it and downloads over one connection. Used only when the file host advertises byte-range support and proves it on a probe request — otherwise the download runs over a single connection exactly as before.
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  Minimum file size, in MB, worth splitting across multiple connections. Below it the extra round-trips cost more than the parallelism returns.
 </ParamField>
 
 ## Process supervision (local installs)
 
-Applies to `start_comfyui` / `restart_comfyui` when comfyui-mcp manages a local ComfyUI process.
+Applies to `restart_comfyui` (actions `start` and `restart`) when comfyui-mcp manages a local ComfyUI process.
 
 <ParamField path="COMFYUI_STARTUP_CHECK_INTERVAL_S" type="number" default="1">
   Seconds between readiness probes after launching ComfyUI.
 </ParamField>
-<ParamField path="COMFYUI_STARTUP_CHECK_MAX_TRIES" type="number" default="20">
-  Maximum readiness probes before reporting a startup timeout.
+<ParamField path="COMFYUI_STARTUP_CHECK_MAX_TRIES" type="number" default="60">
+  Maximum readiness probes before reporting that startup is not confirmed. With the
+  default 1s interval this is a ~60s budget. It was raised from 20 because ComfyUI
+  with a normal set of custom nodes routinely takes longer than 20s to answer
+  `/system_stats` on a cold start, and the shorter budget reported a startup as
+  unconfirmed moments before a healthy instance became ready.
+
+  Exhausting the budget means startup is **not confirmed yet** — not that it failed.
 </ParamField>
 <ParamField path="COMFYUI_ALWAYS_RESTART" type="boolean" default="false">
-  When enabled, a ComfyUI process that exits unexpectedly is automatically restarted. A deliberate `stop_comfyui` is never restarted.
+  When enabled, a ComfyUI process that exits unexpectedly is automatically restarted. A deliberate `restart_comfyui` with `action: "stop"` is never restarted.
 </ParamField>
 <ParamField path="COMFYUI_RESTART_MAX_ATTEMPTS" type="number" default="3">
   Maximum auto-restarts allowed within the restart window before giving up.
@@ -192,7 +230,7 @@ driven by the **panel orchestrator** — a background process that owns a loopba
 WebSocket bridge and runs an autonomous Claude Agent SDK session per panel tab on
 your **Claude subscription** (no API keys). The panel pack auto-starts it on
 ComfyUI load, so you normally don't run anything by hand — see
-[Sidebar Panel](/panel). To run it yourself:
+[Sidebar Panel](./panel). To run it yourself:
 
 ```bash
 npx -y comfyui-mcp@latest connect
@@ -204,9 +242,10 @@ npx -y comfyui-mcp@latest connect
 <ParamField path="COMFYUI_MCP_PANEL_MODEL" type="string" default="claude-opus-5">
   Model for the background panel agents.
 </ParamField>
-<ParamField path="COMFYUI_MCP_BRIDGE_PORT" type="number" default="9180">
+<ParamField path="COMFYUI_MCP_BRIDGE_PORT" type="number" default="9199">
   Loopback port for the panel WebSocket bridge that the **panel orchestrator**
-  owns (default **9180**).
+  owns (default **9199**; was 9180 — that port collides with Logitech G HUB on
+  many desktops. A live 9180 session is not moved; set this to pin).
 </ParamField>
 <ParamField path="COMFYUI_MCP_STALL_S" type="number" default="180">
   Render-stall threshold (seconds) for the orchestrator's queue/render watchdog: a
@@ -224,8 +263,8 @@ When `connect <url>` targets a **remote https** ComfyUI (e.g. a RunPod pod), the
 pod's HTTPS panel page can't open a plain `ws://127.0.0.1` socket to the bridge on
 your machine — browsers block it (mixed content / Private Network Access). The
 orchestrator automatically upgrades to a secure `wss://` tunnel so it works with
-no prompt, in any browser. See [Cloud deployment](/cloud-deployment) for the full
-walkthrough and [Self-hosted relay](/self-hosted-relay) for running your own
+no prompt, in any browser. See [Cloud deployment](./cloud-deployment) for the full
+walkthrough and [Self-hosted relay](./self-hosted-relay) for running your own
 tunnel infrastructure instead of the default cloudflared quick tunnel.
 
 <ParamField path="COMFYUI_MCP_INSECURE_BRIDGE" type="boolean" default="false">
@@ -237,7 +276,7 @@ tunnel infrastructure instead of the default cloudflared quick tunnel.
 <ParamField path="COMFYUI_MCP_TUNNEL_BACKEND" type="string" default="cloudflared">
   Which secure-bridge backend to use for a remote target: `cloudflared` (default
   — an ephemeral quick tunnel, zero setup) or `relay` (dial a
-  [self-hosted relay](/self-hosted-relay) you operate, for a stable domain and no
+  [self-hosted relay](./self-hosted-relay) you operate, for a stable domain and no
   third-party quick-tunnel dependency). Only takes effect when secure mode is
   active (remote https target, not `COMFYUI_MCP_INSECURE_BRIDGE`).
 </ParamField>
@@ -264,11 +303,80 @@ available, HTTP polling otherwise).
   Seconds between HTTP history polls while a job is being watched.
 </ParamField>
 <ParamField path="COMFYUI_MCP_INTERRUPT_S" type="number" default="30">
-  Cancel honor window (seconds) for `cancel_job`: how long to wait for an interrupt to
+  Cancel honor window (seconds) for `queue` (action:"cancel"): how long to wait for an
+  interrupt to
   actually stop the running job before escalating (to `/free`, then reporting the render
   WEDGED). ComfyUI only checks the interrupt flag between nodes/steps, so a multi-minute
   single step won't honor it immediately — this wait is what detects a true wedge.
 </ParamField>
+
+## Restricting the tool surface
+
+For a **hosted** deployment — a shared Open WebUI, a team frontend — the operator is not
+the person prompting. The tool preset/allow/deny variables withhold tools from the model
+entirely: a withheld tool is never registered, so it is absent from `tools/list`, absent
+from `call_tool`, and the model never learns it exists. The action allow list is the
+narrower companion for a tool that must remain visible: the tool stays registered, but
+an unlisted action is rejected before its handler runs.
+
+<ParamField path="COMFYUI_MCP_TOOL_PRESET" type="string">
+  `safe` — everything except tools that change the machine or the model library.
+  Installing, deleting and restarting are withheld. **Rendering still works, and so do
+  the things that come with it**: queueing generations, `list_api_nodes` (hosted partner
+  nodes that spend PAID credits), and `report_issue` (files a public GitHub issue). Use
+  `readonly` if a shared frontend's users must not be able to spend or publish.
+  `readonly` — inspection only: no renders queued, nothing written, nothing spent.
+  Both also withhold the whole `panel_*` surface, which drives a live shared canvas.
+</ParamField>
+<ParamField path="COMFYUI_MCP_TOOL_DENY" type="string">
+  Comma-separated tool names to withhold, e.g. `restart_comfyui,download_model`. A
+  trailing `*` matches a family: `train_*`. Applied on top of any preset **and** on top
+  of an allow list.
+</ParamField>
+<ParamField path="COMFYUI_MCP_TOOL_ALLOW" type="string">
+  Comma-separated allow list. When set, the surface is **exactly** these tools — anything
+  not named is withheld even if no deny rule mentions it. Use it to opt individual tools
+  back in past a preset: `COMFYUI_MCP_TOOL_PRESET=safe` plus
+  `COMFYUI_MCP_TOOL_ALLOW=panel_graph_outline,panel_query_graph`.
+
+  Only an **exact name** opts a tool back in past a preset. A glob (`list_*`) narrows the
+  surface like any other entry but cannot re-open what a preset closed — otherwise
+  `ALLOW=list_*` would re-admit `list_packs`, whose `install_deps` action installs and
+  runs third-party code, and `ALLOW=*` would make every preset inert.
+</ParamField>
+<ParamField path="COMFYUI_MCP_TOOL_ACTION_ALLOW" type="string">
+  Comma-separated, exact `tool:action` pairs. When set, every tool call carrying an
+  `action` field must match one of these pairs; action-bearing tools omitted from the
+  list cannot dispatch any action. This restricts consolidated tools whose names alone
+  no longer reveal their blast radius—for example, allow queue inspection and targeted
+  cancellation without also allowing queue edits or a global clear:
+
+  `queue:list,queue:status,queue:cancel,enqueue_workflow:enqueue`
+
+  Pair this with `COMFYUI_MCP_TOOL_ALLOW` to bound both dimensions. Rules are exact;
+  wildcards are rejected so a newly-added action cannot become allowed after an upgrade.
+</ParamField>
+
+```bash A hosted deployment that cannot install or restart anything
+COMFYUI_MCP_TOOL_PRESET=safe npx comfyui-mcp@latest --http --host 0.0.0.0 --port 9100
+```
+
+```bash A generation operator that can inspect, enqueue, and cancel—but not install or clear queues
+COMFYUI_MCP_TOOL_ALLOW=get_system_stats,get_history,create_workflow,enqueue_workflow,queue \
+COMFYUI_MCP_TOOL_ACTION_ALLOW=get_system_stats:stats,get_system_stats:logs,get_system_stats:health,get_history:list,get_history:diagnose,create_workflow:create,create_workflow:modify,create_workflow:validate,create_workflow:node_info,enqueue_workflow:enqueue,queue:list,queue:status,queue:cancel \
+npx comfyui-mcp@latest
+```
+
+<Warning>
+  This is a boundary against the **model** and the people prompting it — not against
+  whoever sets the environment, who can simply unset it, and not a substitute for keeping
+  an untrusted party off the ComfyUI host.
+
+  A misconfiguration **refuses to start** rather than starting unrestricted: an unknown
+  preset name, or a variable that is set but empty (an unexpanded `${VAR}` in a compose
+  file), aborts with the reason. Coming up with a full tool surface while you believe it
+  is restricted is worse than having no filter at all.
+</Warning>
 
 ## Transport
 

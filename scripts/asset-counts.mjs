@@ -16,11 +16,79 @@
  * --check requires a build (it imports dist/), which CI already does.
  */
 
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Refuse to report counts from a stale build.
+ *
+ * This script asks the REGISTRY rather than grepping, which is right — but it asks
+ * `dist/`, so what it actually reports is the surface as of the last `npm run
+ * build`. A stale dist therefore produces a confidently wrong number, and then
+ * that number gets written into prose as if it were verified.
+ *
+ * This is not hypothetical: docs/local-vs-comfy-cloud.mdx claimed "182 MCP tools"
+ * against a real count of 181, and 182 is exactly what this machine's stale dist
+ * reported. The guard closes the loop on the bug the count checks were added for.
+ *
+ * CI always builds first, so this only ever fires locally — where it converts a
+ * silent wrong answer into an instruction.
+ */
+function newestMtime(dir, exts) {
+  const p = join(root, dir);
+  if (!existsSync(p)) return undefined;
+  let newest = 0;
+  const walk = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const full = join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (exts.some((x) => e.name.endsWith(x))) {
+        const m = statSync(full).mtimeMs;
+        if (m > newest) newest = m;
+      }
+    }
+  };
+  walk(p);
+  return newest || undefined;
+}
+
+/** The built modules this script actually imports. */
+const IMPORTED = ["dist/tools/index.js", "dist/orchestrator/panel-tools.js"];
+
+function assertFreshBuild() {
+  const srcNewest = newestMtime("src", [".ts"]);
+
+  // Compared against the modules this script IMPORTS, not against the newest file
+  // anywhere in dist/. The latter let a stale dist/tools/index.js pass whenever any
+  // unrelated output — dist/utils/image.js, say — happened to be written later, and
+  // the script then imported the stale registry and reported the wrong count with
+  // full confidence. That is the exact failure this guard exists to prevent.
+  //
+  // Still a heuristic, not a dependency graph: a stale transitive import behind a
+  // fresh entry point is not detected. CI's full build is the real guarantee; this
+  // only has to stop a developer reading numbers off a half-built tree.
+  const missing = IMPORTED.filter((f) => !existsSync(join(root, f)));
+  if (missing.length > 0) {
+    console.error(
+      `dist/ is missing ${missing.join(", ")} — run \`npm run build\` first ` +
+        `(this script reads the built registry).`,
+    );
+    process.exit(2);
+  }
+  if (srcNewest === undefined) return;
+
+  const stale = IMPORTED.filter((f) => statSync(join(root, f)).mtimeMs < srcNewest);
+  if (stale.length > 0) {
+    console.error(
+      `dist/ is STALE — src/ is newer than ${stale.join(", ")}, so every count below ` +
+        `would describe an older tool surface.\nRun \`npm run build\` and try again.`,
+    );
+    process.exit(2);
+  }
+}
 const dirsContaining = (dir, file) => {
   const p = join(root, dir);
   if (!existsSync(p)) return 0;
@@ -35,6 +103,7 @@ const filesMatching = (dir, ext) => {
 };
 
 async function counts() {
+  assertFreshBuild();
   // Tools come from the REGISTRY, not a grep — that is the whole point. A tool
   // registered conditionally, or in a file the pattern missed, still counts.
   // pathToFileURL: on Windows a bare absolute path ("C:\…") is rejected by the
@@ -96,6 +165,43 @@ const CLAIMS = [
   { file: "README.md", key: "agents", re: /\*\*(\d+) autonomous agents\*\*/ },
   { file: "README.md", key: "hooks", re: /\*\*(\d+) hooks\*\*/ },
   { file: "docs/plugin.mdx", key: "mcp_tools", re: /the (\d+) MCP tools/ },
+  // Every claim below was UNGUARDED and two had already drifted: this file said
+  // "182 MCP tools" (matching a stale local dist build, not the 181 in the
+  // registry) and plugin.mdx said "4 hooks" while the README correctly said 3.
+  // Phase 5 changes the tool count itself, so an unguarded count is a doc that
+  // silently becomes wrong at exactly the moment accuracy matters most.
+  { file: "docs/plugin.mdx", key: "skills", re: /(\d+) AI skills, \d+ slash commands/ },
+  { file: "docs/plugin.mdx", key: "slash_commands", re: /\d+ AI skills, (\d+) slash commands/ },
+  { file: "docs/plugin.mdx", key: "agents", re: /(\d+) autonomous agents, and \d+ hooks/ },
+  { file: "docs/plugin.mdx", key: "hooks", re: /\d+ autonomous agents, and (\d+) hooks/ },
+  { file: "docs/plugin.mdx", key: "skills", re: /^## (\d+) AI skills/m },
+  { file: "docs/plugin.mdx", key: "slash_commands", re: /^## (\d+) slash commands/m },
+  { file: "docs/plugin.mdx", key: "agents", re: /^## (\d+) autonomous agents/m },
+  { file: "docs/local-vs-comfy-cloud.mdx", key: "mcp_tools", re: /(\d+) MCP tools/ },
+  { file: "docs/local-vs-comfy-cloud.mdx", key: "skills", re: /(\d+) model-specific skills/ },
+  { file: "docs/local-llms.mdx", key: "mcp_tools", re: /The full surface is (\d+) tools/ },
+  // PROSE counts, not just badges. The badge patterns above were all correct while
+  // "35 skills total" sat five lines under a correct "**38 AI skills**" badge in the same
+  // file, and docs/index.mdx advertised "80+ tools" against a real 37 — both invisible to
+  // this gate because it only matched the bolded forms. A count is a count wherever it is
+  // written.
+  { file: "README.md", key: "skills", re: /(\d+) skills total/ },
+  { file: "docs/index.mdx", key: "mcp_tools", re: /(\d+)\+? tools, auto-documented/ },
+  // The blog drifts the same way the README did. local-llms-comfyui said "roughly 200 tools"
+  // — five times the real surface — because the consolidation landed and the post didn't move.
+  // `\s+`, not literal spaces. A non-match is a FAILURE here ("could not find a claim
+  // matching…"), so a routine re-wrap of this hard-wrapped prose — "MCP server exposes\n**37
+  // tools**" — would reject factually correct text. The panel row below was already
+  // wrap-tolerant; this one was not, which is the kind of inconsistency that only shows up
+  // the day someone reflows a paragraph.
+  { file: "docs/blog/local-llms-comfyui.mdx", key: "mcp_tools", re: /MCP\s+server\s+exposes\s+\*\*(\d+)\s+tools\*\*/ },
+  // The SAME sentence also counts the panel surface, and guarding only its first half left
+  // the second half free to drift — it had already been rewritten to "a comparable set",
+  // which reads as ~37 against a real 92. Both numbers in a sentence need the same gate.
+  // `\s+` on both sides, not a literal space: the sentence is hard-wrapped, and which words
+  // land on which line shifts whenever the paragraph is re-flowed. A no-match is a loud
+  // failure here, not a silent pass, but a gate that cries at a re-wrap still gets muted.
+  { file: "docs/blog/local-llms-comfyui.mdx", key: "panel_tools", re: /the\s+panel\s+adds\s+\*\*(\d+)\*\*\s+`panel_\*`\s+live-canvas\s+tools/ },
 ];
 
 const c = await counts();

@@ -1,0 +1,140 @@
+// Coverage for the WS-3 panel_restart_comfyui cache invalidation (codex finding
+// #2): the shared ComfyUI client + object_info cache must be dropped ONLY on a
+// CONFIRMED reboot (`rebooting:true`). A busy-guard / forbidden / no-endpoint
+// refusal comes back as a normal ToolResult with `rebooting:false` — resetting
+// then would close the shared client mid-generation.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const resetClient = vi.fn();
+const resetObjectInfoCache = vi.fn();
+vi.mock("../../comfyui/client.js", () => ({
+  getObjectInfo: vi.fn(),
+  backfillObjectInfo: vi.fn(),
+  resetClient: () => resetClient(),
+  resetObjectInfoCache: () => resetObjectInfoCache(),
+}));
+
+const { buildPanelToolDefs, rebootConfirmed, __panelToolsTestHooks } = await import(
+  "../../orchestrator/panel-tools.js"
+);
+import type { PanelToolCtx } from "../../orchestrator/panel-tools.js";
+import type { ToolResult } from "../../orchestrator/panel-tools.js";
+import { getBootLocalComfyUIBaseUrl } from "../../config.js";
+
+/** The orchestrator own boot endpoint — what a local tab must front to be bound. */
+const BOOT_BASE = (getBootLocalComfyUIBaseUrl() ?? "http://127.0.0.1:8188").replace(
+  /[/]+$/,
+  "",
+);
+
+function ctxReplying(
+  reply: unknown,
+  confirm: PanelToolCtx["confirm"] = async () => "yes" as const,
+  sends: Array<Record<string, unknown>> = [],
+): PanelToolCtx {
+  // comfy_reboot is dispatched via ctx.bridge.send (pinned, no rebind); readiness
+  // never certifies here (no down→up, no reconnect) — that's fine, this suite only
+  // asserts cache-reset gating on the reboot CLASSIFICATION, not readiness.
+  return {
+    call: async () => ({ content: [{ type: "text", text: JSON.stringify(reply) }] }),
+    confirm,
+    ensureReachable: () => {},
+    bridge: {
+      send: async (cmd: Record<string, unknown>) => {
+        sends.push(cmd);
+        return reply;
+      },
+      tabOrigin: () => undefined,
+      // BOUND to our own boot instance (#814): a LOCAL target the panel cannot be
+      // tied to is now refused before any dispatch, so a suite about what happens
+      // AFTER the dispatch has to model the ordinary local panel.
+      tabIsLocal: () => true,
+      tabServerOrigin: () => BOOT_BASE,
+      tabSockId: () => "s0",
+      canReach: () => false,
+    } as unknown as PanelToolCtx["bridge"],
+    tabId: "test-tab",
+  } as unknown as PanelToolCtx;
+}
+
+function rebootHandler() {
+  const def = buildPanelToolDefs().find((d) => d.name === "panel_restart_comfyui");
+  if (!def) throw new Error("panel_restart_comfyui not found");
+  return def.handler;
+}
+
+const rr = (obj: unknown): ToolResult =>
+  ({ content: [{ type: "text", text: JSON.stringify(obj) }] }) as ToolResult;
+
+describe("rebootConfirmed", () => {
+  it("is true only for a parsed rebooting:true", () => {
+    expect(rebootConfirmed(rr({ rebooting: true, endpoint: "/v2/manager/reboot" }))).toBe(true);
+  });
+  it("is false for an explicit refusal (busy guard)", () => {
+    expect(rebootConfirmed(rr({ rebooting: false, blocked_busy: true }))).toBe(false);
+  });
+  it("is false when the field is absent, on isError, and on unparseable text", () => {
+    expect(rebootConfirmed(rr({ ok: 1 }))).toBe(false);
+    expect(
+      rebootConfirmed({ content: [{ type: "text", text: "not json" }] } as ToolResult),
+    ).toBe(false);
+    expect(
+      rebootConfirmed({ content: [{ type: "text", text: '{"rebooting":true}' }], isError: true } as ToolResult),
+    ).toBe(false);
+  });
+});
+
+describe("panel_restart_comfyui cache invalidation", () => {
+  beforeEach(() => {
+    resetClient.mockClear();
+    resetObjectInfoCache.mockClear();
+    // Fast, deterministic readiness poll (no real 3s settle / network probe) so
+    // these cache-invalidation assertions don't hit vitest's 5s test timeout.
+    __panelToolsTestHooks.setPanelRebootTiming({
+      settleMs: 0,
+      budgetMs: 100,
+      intervalMs: 5,
+      probeTimeoutMs: 20,
+    });
+    __panelToolsTestHooks.setHealthProbe(async () => false); // panel round-trip governs
+    // #814 widened the refuse-safe preflight to EVERY local target, not only a
+    // tab-bound one, so it now runs on this path too. These tests are about the
+    // dispatch classification, not about relaunch safety, and the real preflight
+    // would do live process/port discovery against the host — stub a PASS so the
+    // subject under test is the only thing being measured.
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
+  });
+
+  afterEach(() => {
+    __panelToolsTestHooks.setPanelRebootTiming(null);
+    __panelToolsTestHooks.setHealthProbe(null);
+  __panelToolsTestHooks.setLocalRestartPreflight(null);
+  });
+
+  it("invalidates the client + object_info caches on a CONFIRMED reboot", async () => {
+    await rebootHandler()({ force: false }, ctxReplying({ rebooting: true }));
+    expect(resetClient).toHaveBeenCalledTimes(1);
+    expect(resetObjectInfoCache).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT touch the caches when the panel REFUSES (busy/forbidden/no-endpoint)", async () => {
+    await rebootHandler()(
+      { force: false },
+      ctxReplying({ rebooting: false, blocked_busy: true, queue_running: 1 }),
+    );
+    expect(resetClient).not.toHaveBeenCalled();
+    expect(resetObjectInfoCache).not.toHaveBeenCalled();
+  });
+
+  it("already_authorized skips only the card and never implies force", async () => {
+    const confirm = vi.fn(async () => "yes" as const);
+    const sends: Array<Record<string, unknown>> = [];
+    await rebootHandler()(
+      { already_authorized: true },
+      ctxReplying({ rebooting: false, blocked_busy: true, queue_running: 1 }, confirm, sends),
+    );
+    expect(confirm).not.toHaveBeenCalled();
+    expect(sends).toEqual([{ cmd: "comfy_reboot", force: false }]);
+  });
+});

@@ -18,12 +18,23 @@
 //     blocking or crashing the server.
 //   - we NEVER kill/restart the running MCP process; we only surface a
 //     "reconnect to load vX" note.
+//
+// WINDOWS (#912): an in-place npm replace of the running install fails every
+// time — this process holds its own sharp libvips DLL mapped, and Windows
+// refuses to move a mapped file (EBUSY). A failed npm on win32 is therefore
+// handed to a DETACHED helper (buildDeferredUpdateScript) that waits for the
+// lock to clear and finishes the install after this process has fully
+// stopped; the result is honestly reported as "scheduled", never "updated",
+// and npm's own error output travels in the note either way (#912/#916-a).
 
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
-import { execFile } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { npxUpdateNote } from "./npx-restart-scope.js";
 
 /** npm package name — authoritative for the registry lookup and update command. */
 export const PACKAGE_NAME = "comfyui-mcp";
@@ -52,6 +63,7 @@ export type SelfUpdateAction =
   | "skipped-dev"
   | "skipped-disabled"
   | "notify"
+  | "scheduled"
   | "unavailable";
 
 export interface SelfUpdateResult {
@@ -59,6 +71,16 @@ export interface SelfUpdateResult {
   mode: InstallMode;
   from?: string;
   to?: string;
+  /**
+   * Machine-readable cause for a non-update, when one is known:
+   *   - "locked-by-running-process" — npm failed because THIS process holds its
+   *     own files open (Windows keeps sharp's libvips DLL mapped, #912).
+   *   - "npm-failed" — npm failed for some other reason (see `note` for the tail).
+   *   - "npm-not-found" — npm could not be LOCATED at all (#2671), so the
+   *     failure says nothing about the update itself. Distinct from
+   *     "npm-failed": that one is npm's verdict, this one is npm never running.
+   */
+  reason?: "locked-by-running-process" | "npm-failed" | "npm-not-found";
   /** Human-facing note (reconnect instruction, reason, etc.). */
   note?: string;
 }
@@ -84,12 +106,39 @@ export interface SelfUpdateDeps {
   /** Read a UTF-8 file. May throw; callers guard. */
   readFile: (p: string) => string;
   /** Fetch the latest published version from the npm registry, or undefined. */
-  getLatestVersion: () => Promise<string | undefined>;
+  getLatestVersion: () => Promise<VersionProbe>;
   /**
    * Run an `npm` command (args are fixed constants — no user input).
-   * Resolves { ok } and NEVER throws.
+   * Resolves and NEVER throws. stdout/stderr are captured so a failure can be
+   * DIAGNOSED (#912: an EBUSY from our own locked files is indistinguishable
+   * from a registry 404 when only `ok` survives).
    */
-  runNpm: (args: string[], cwd?: string) => Promise<{ ok: boolean }>;
+  runNpm: (
+    args: string[],
+    cwd?: string,
+  ) => Promise<{
+    ok: boolean;
+    stdout?: string;
+    stderr?: string;
+    /**
+     * #2671 — true only when npm could not be LOCATED (neither on PATH nor
+     * beside the running node binary) AND the last-resort bare-name spawn also
+     * failed. A STRUCTURED signal on purpose: the alternative is matching
+     * cmd.exe's "is not recognized as an internal or external command", which
+     * is localized and would misclassify on every non-English Windows.
+     */
+    npmMissing?: boolean;
+  }>;
+  /** Process platform — injectable so the Windows-only deferred path is testable. */
+  platform?: () => string;
+  /**
+   * #912: schedule the DETACHED helper that applies an npm update after this
+   * process has released its own files (Windows holds sharp's libvips DLL open
+   * while the orchestrator runs, so an in-place `npm i` of this package fails
+   * with EBUSY every time). Resolves true only when the helper was actually
+   * launched — callers must NOT claim "scheduled" on false. Never throws.
+   */
+  scheduleDeferredUpdate?: (opts: DeferredUpdateOpts) => Promise<boolean>;
 }
 
 function defaultPackageDir(): string {
@@ -98,39 +147,555 @@ function defaultPackageDir(): string {
   return resolve(here, "..", "..");
 }
 
-async function defaultGetLatestVersion(): Promise<string | undefined> {
+/**
+ * The outcome of one registry probe (#1136).
+ *
+ * Three states, because the previous `string | undefined` had four conditions
+ * collapsing into the same `undefined` and the CONSUMER then asserted the most
+ * specific of them: a 500, a 429, a missing `version` field and a JSON parse
+ * failure were all reported as "npm registry unreachable". That is a verdict we
+ * did not earn -- it sends a user with a rate-limited registry off to debug
+ * their network.
+ *
+ * The line is drawn HERE, not by the message helper: the `try` below wraps only
+ * `await fetch(...)`, so a rejection means no response was received at all,
+ * while `!res.ok` / an unparseable body mean the host demonstrably answered.
+ * `unreachableHostMessage` draws no such boundary -- it always returns a
+ * message, splitting only timeout wording from refusal wording -- so do not
+ * read this type as "the transport proved unreachability". A slow-but-alive
+ * registry that trips our own AbortSignal also lands in `unreachable`; the text
+ * says "did not respond in time", which is honest, and nothing branches on the
+ * state.
+ */
+export type VersionProbe =
+  | { version: string }
+  | { unreachable: string }
+  | { undetermined: string };
+
+async function defaultGetLatestVersion(): Promise<VersionProbe> {
+  const url = `https://registry.npmjs.org/${PACKAGE_NAME}/latest`;
+  let res: Response;
   try {
-    const res = await fetch(`https://registry.npmjs.org/${PACKAGE_NAME}/latest`, {
+    res = await fetch(url, {
       signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
       headers: { accept: "application/json" },
     });
-    if (!res.ok) return undefined;
+  } catch (err) {
+    // `fetch` rejected: no response at all. That is the `unreachable` state --
+    // the three-way split is about whether we got an answer, not about which
+    // transport code we happened to see.
+    return { unreachable: unreachableHostMessage(err, url, "the version check").message };
+  }
+  if (!res.ok) {
+    // The registry ANSWERED. Whatever went wrong, the host was reachable, so
+    // saying otherwise would point the user at their network.
+    return {
+      undetermined: `registry.npmjs.org answered HTTP ${res.status} for the version check (the host IS reachable)`,
+    };
+  }
+  try {
     const json = (await res.json()) as { version?: unknown };
-    return typeof json.version === "string" ? json.version : undefined;
+    if (typeof json.version !== "string" || json.version.trim() === "") {
+      // The trim matters. `if (!latest)` on the old string|undefined shape caught
+      // an empty string; `"version" in probe` does not, so without this a body of
+      // {"version":""} reaches the consumer and renders as up-to-date with to:"".
+      // That is a non-answer read as a reassuring answer -- the exact failure the
+      // undetermined branch exists to prevent, reintroduced by its own type.
+      return { undetermined: "the registry response carried no usable version field" };
+    }
+    return { version: json.version };
   } catch {
-    return undefined;
+    return { undetermined: "the registry response was not valid JSON" };
   }
 }
 
-function defaultRunNpm(args: string[], cwd?: string): Promise<{ ok: boolean }> {
-  return new Promise((resolveP) => {
-    // `npm` is a .cmd shim on Windows; execFile needs shell:true to run it.
-    // SAFE: every arg is a hard-coded constant (no interpolation of user input),
-    // so there is no shell-injection surface.
-    const isWin = process.platform === "win32";
-    const cmd = isWin ? "npm.cmd" : "npm";
+// ---------------------------------------------------------------------------
+// #912 — the deferred (post-exit) updater for Windows
+// ---------------------------------------------------------------------------
+
+/** What the detached helper needs to finish an update this process cannot. */
+export interface DeferredUpdateOpts {
+  mode: "global" | "local";
+  /** Local installs: the project root `npm i` must run in. */
+  projectRoot?: string;
+  /** Resolved package root — the helper probes THIS tree's sharp DLL lock. */
+  packageDir: string;
+  /** Version the helper should land (for the log line; it installs @latest). */
+  to: string;
+  /**
+   * #2671 — how the helper must launch npm. The helper inherits the SAME PATH
+   * this process has, so when npm was only reachable beside the node binary,
+   * a helper hard-coded to bare `npm.cmd` fails exactly as the in-process run
+   * would have — silently, into a log the user never opens. Undefined keeps
+   * the historical bare-shim call.
+   */
+  npm?: NpmLauncher;
+}
+
+/** Where the helper writes its log (named in user-facing notes). */
+const HELPER_LOG_NAME = "comfyui-mcp-self-update.log";
+/**
+ * Helper scripts are named UNIQUELY per launch (`…-<pid>-<ms>.ps1`): a shared
+ * fixed name let two orchestrators stat-miss the same path and each spawn a
+ * helper running the OTHER caller's freshly-overwritten script — for a local
+ * install that is `npm i` in the wrong project (codex gate r1).
+ */
+const HELPER_SCRIPT_RE = /^comfyui-mcp-self-update-.+\.ps1$/;
+
+/** Once per process: the auto-update tick must not pile up helpers. */
+let helperScheduledThisProcess = false;
+
+/**
+ * Per-wait budget inside the helper, and the staleness window for the dedupe
+ * below (a script younger than this is a helper still waiting/working — or one
+ * that died mid-wait, whose log says so — so a second helper is not stacked).
+ */
+const HELPER_WAIT_CAP_MINUTES = 120;
+const HELPER_ATTEMPTS = 3;
+const HELPER_STALE_MS = (HELPER_WAIT_CAP_MINUTES * HELPER_ATTEMPTS + 60) * 60_000;
+
+/** PowerShell single-quoted literal. */
+function psLiteral(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+/**
+ * The helper script text (exported for tests — its PowerShell syntax is
+ * validated against a real powershell.exe in the test suite on Windows).
+ *
+ * The helper must outlive THIS process and only run npm once the files npm
+ * replaces are no longer locked — on Windows that is sharp's libvips-42.dll,
+ * mapped by every running orchestrator. So each attempt first waits (bounded)
+ * for the DLL to open with NO sharing; a quick respawn that re-locks it
+ * mid-install just sends the next attempt back to the wait. Every outcome is
+ * logged, and the script deletes itself on the way out (a helper killed by a
+ * shutdown leaves the script behind; the staleness window above is what lets a
+ * later run schedule a fresh one).
+ *
+ * All interpolated values are psLiteral-quoted constants of ours (paths, the
+ * package name) — nothing user-controlled reaches the script.
+ */
+export function buildDeferredUpdateScript(opts: DeferredUpdateOpts, logPath: string): string {
+  const dll = join(
+    opts.packageDir,
+    "node_modules",
+    "@img",
+    "sharp-win32-x64",
+    "lib",
+    "libvips-42.dll",
+  );
+  const npmArgs =
+    opts.mode === "global"
+      ? `i -g ${PACKAGE_NAME}@latest --no-audit --no-fund`
+      : `i ${PACKAGE_NAME}@latest --no-audit --no-fund`;
+  // Local installs run npm IN the project root — re-validated immediately before
+  // EVERY attempt: the helper can wait hours, and a project moved meanwhile must
+  // abort the helper, never let npm run in whatever directory it inherited
+  // (codex gate r1). Empty for global installs (npm -g has no cwd dependence).
+  const cwd = opts.mode === "local" && opts.projectRoot ? opts.projectRoot : "";
+  // #2671 — call the SAME npm the in-process attempt resolved. A node-adjacent
+  // launcher becomes `& '<node.exe>' '<npm-cli.js>' …`; both are psLiteral'd, so
+  // the default `C:\Program Files\nodejs` path survives its space. With no
+  // resolved launcher we keep the historical bare shim, which is still right
+  // whenever PATH carries npm by the time the helper actually runs.
+  const npmCall = opts.npm
+    ? [opts.npm.file, ...opts.npm.prefixArgs].map(psLiteral).join(" ")
+    : "npm.cmd";
+  return [
+    `# comfyui-mcp deferred self-update helper (#912). Log: ${logPath}`,
+    `$ErrorActionPreference = 'Continue'`,
+    `$log = ${psLiteral(logPath)}`,
+    `$dll = ${psLiteral(dll)}`,
+    `$cwd = ${psLiteral(cwd)}`,
+    `function Wait-LockFree {`,
+    `  $deadline = (Get-Date).AddMinutes(${HELPER_WAIT_CAP_MINUTES})`,
+    `  while ((Get-Date) -lt $deadline) {`,
+    `    if (-not (Test-Path -LiteralPath $dll)) { return $true } # unexpected layout — let npm's own error say so`,
+    `    try {`,
+    `      $fs = [System.IO.File]::Open($dll, 'Open', 'ReadWrite', 'None')`,
+    `      $fs.Close()`,
+    `      return $true`,
+    `    } catch { Start-Sleep -Seconds 5 }`,
+    `  }`,
+    `  return $false`,
+    `}`,
+    `"$(Get-Date -Format o) helper started (mode=${opts.mode}, target=${opts.to})" | Out-File -Append -LiteralPath $log`,
+    `$ok = $false`,
+    `$aborted = ''`,
+    `for ($i = 0; $i -lt ${HELPER_ATTEMPTS} -and -not $ok -and -not $aborted; $i++) {`,
+    `  if (-not (Wait-LockFree)) {`,
+    `    $aborted = 'the sharp DLL stayed locked'`,
+    `  } elseif ($cwd -and -not (Test-Path -LiteralPath $cwd -PathType Container)) {`,
+    `    $aborted = "the project root $cwd no longer exists"`,
+    `  } elseif ($cwd) {`,
+    `    try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch {`,
+    `      $aborted = "could not enter the project root $cwd ($($_.Exception.Message))"`,
+    `    }`,
+    `  }`,
+    `  if ($aborted) { break }`,
+    `  & ${npmCall} ${npmArgs} *>> $log`,
+    `  if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 10 }`,
+    `}`,
+    `if ($aborted) {`,
+    `  "$(Get-Date -Format o) ABORTED without running npm: $aborted" | Out-File -Append -LiteralPath $log`,
+    `} else {`,
+    `  "$(Get-Date -Format o) npm update $(if ($ok) { 'SUCCEEDED' } else { 'FAILED' })" | Out-File -Append -LiteralPath $log`,
+    `}`,
+    `Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue`,
+    ``,
+  ]
+    .filter((l) => l !== "")
+    .join("\r\n");
+}
+
+/**
+ * The helper script the scheduler actually writes: #2671's npm resolution
+ * DEFAULTED in for this process when the caller supplied none.
+ *
+ * Exported as its own seam because the defaulting is the entire fix on this
+ * exit, and it is invisible to a test of buildDeferredUpdateScript alone — that
+ * one is handed a launcher and can only prove it renders one. Resolving at this
+ * single choke point also means both scheduler callers inherit it rather than
+ * each having to remember.
+ */
+export function deferredUpdateScriptFor(opts: DeferredUpdateOpts, logPath: string): string {
+  return buildDeferredUpdateScript({ ...opts, npm: opts.npm ?? currentNpmLauncher() }, logPath);
+}
+
+/**
+ * Launch the detached helper. Resolves true only when the script was written
+ * AND powershell actually spawned — a false here must surface as "not
+ * scheduled", never as a claimed scheduled update. Never throws.
+ *
+ * Dedupe: once per process (the auto-update tick), and cross-process by
+ * helper-script freshness — a script younger than the staleness window is a
+ * helper still waiting/working (or one that died mid-wait; its log says
+ * which), so a second is not stacked. Stale leftovers from killed helpers are
+ * our own artifacts and are cleaned up as they are found.
+ */
+async function defaultScheduleDeferredUpdate(opts: DeferredUpdateOpts): Promise<boolean> {
+  if (process.platform !== "win32") return false;
+  try {
+    const dir = tmpdir();
+    const logPath = join(dir, HELPER_LOG_NAME);
+    if (helperScheduledThisProcess) return true;
+    for (const name of readdirSync(dir)) {
+      if (!HELPER_SCRIPT_RE.test(name)) continue;
+      try {
+        const st = statSync(join(dir, name));
+        if (Date.now() - st.mtimeMs < HELPER_STALE_MS) return true; // already scheduled
+        unlinkSync(join(dir, name)); // stale leftover from a killed helper
+      } catch {
+        /* vanished between listing and stat — fine */
+      }
+    }
+    const scriptPath = join(dir, `comfyui-mcp-self-update-${process.pid}-${Date.now()}.ps1`);
+    writeFileSync(scriptPath, deferredUpdateScriptFor(opts, logPath), "utf-8");
+    const spawned = await new Promise<boolean>((resolveP) => {
+      const child = spawn(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
+        { detached: true, stdio: "ignore", windowsHide: true },
+      );
+      child.once("error", () => resolveP(false));
+      child.once("spawn", () => {
+        child.unref();
+        resolveP(true);
+      });
+    });
+    // A spawn failure leaves the script behind; remove it so the dedupe scan
+    // does not read it as a pending helper.
+    if (!spawned) {
+      try {
+        unlinkSync(scriptPath);
+      } catch {
+        /* best effort */
+      }
+      return false;
+    }
+    helperScheduledThisProcess = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The log path the helper writes to — named in user-facing notes. */
+export function deferredUpdateLogPath(): string {
+  return join(tmpdir(), HELPER_LOG_NAME);
+}
+
+// ---------------------------------------------------------------------------
+// #2671 — locating npm
+// ---------------------------------------------------------------------------
+
+/**
+ * How to LAUNCH npm (#2671).
+ *
+ * npm used to be resolved as the bare name `npm.cmd`/`npm` through the
+ * inherited PATH, so an orchestrator started by a launcher that does not put
+ * the Node directory on PATH — ComfyUI Desktop, a Python venv, a service
+ * wrapper — could never self-update: Windows answered `'npm.cmd' is not
+ * recognized as an internal or external command` and the note relayed that
+ * verbatim, leaving the user to remediate by hand.
+ *
+ * npm is not actually absent in that case. It ships NEXT TO the `node` binary
+ * that is running this very process, and `process.execPath` is an absolute
+ * path we always have, PATH or no PATH.
+ */
+export interface NpmLauncher {
+  /** Executable to spawn. */
+  file: string;
+  /** Args inserted BEFORE npm's own argv (the npm-cli.js path, or nothing). */
+  prefixArgs: string[];
+  /** Whether the spawn needs a shell — a Windows `.cmd` shim does, node does not. */
+  shell: boolean;
+  /** Where it was found. Reported in diagnostics; never parsed. */
+  source: "path" | "node-adjacent";
+}
+
+/** The launcher shim name cmd.exe/sh would resolve for a bare `npm`. */
+function npmShimName(platform: string): string {
+  return platform === "win32" ? "npm.cmd" : "npm";
+}
+
+/**
+ * Resolve how to run npm (#2671). Pure over its injected IO so the Windows
+ * layouts are testable from POSIX and vice versa.
+ *
+ * Order matters:
+ *   1. PATH. When the shim is there we return the BARE name and keep the shell
+ *      exactly as before, so the invocation is byte-identical to the
+ *      pre-#2671 one on every host where it already worked. This change can
+ *      only add reach, never move the working case onto a new code path.
+ *   2. npm's own JS beside the running node binary, run by `process.execPath`
+ *      directly. Deliberately NOT the `npm.cmd` shim: a shim needs shell:true,
+ *      and `execFile` with shell:true concatenates file+args unquoted, so the
+ *      default install path `C:\Program Files\nodejs\npm.cmd` would be split
+ *      at the space and cmd.exe would try to run `C:\Program`. Spawning node
+ *      with the script as an argv entry needs no shell and no quoting.
+ *
+ * Returns undefined when npm is genuinely not locatable; callers still get one
+ * last-resort bare-name attempt before reporting that.
+ */
+export function resolveNpmLauncher(io: {
+  platform: string;
+  pathEnv: string | undefined;
+  execPath: string;
+  exists: (p: string) => boolean;
+}): NpmLauncher | undefined {
+  const isWin = io.platform === "win32";
+  const shim = npmShimName(io.platform);
+  // Path arithmetic must follow the INJECTED platform, never the host's (codex
+  // gate r3). Host-native `dirname` on a Windows execPath evaluated from Linux
+  // returns "." — there is no "/" in it — so the node-adjacent candidate
+  // silently collapses to a bare relative path and the launcher is missed. In
+  // production io.platform IS process.platform, so this is the native flavour
+  // and nothing changes; it only makes the seam mean what it says. Choosing the
+  // FLAVOUR retires the class, where the r1 fix (dropping one `resolve()`)
+  // removed a single instance of it.
+  const P = isWin ? pathWin32 : pathPosix;
+
+  const pathSep = isWin ? ";" : ":";
+  for (const raw of (io.pathEnv ?? "").split(pathSep)) {
+    // A Windows PATH entry may be quoted; an empty one means "cwd", which is
+    // not somewhere we are willing to pick an npm up from.
+    const entry = raw.trim().replace(/^"(.*)"$/, "$1");
+    if (!entry) continue;
+    // Never stat a UNC path (codex gate r2). `exists` is synchronous, and a
+    // dead network share blocks on the SMB timeout — tens of seconds — inside
+    // a module whose whole contract is that it can be fired and forgotten from
+    // startup without blocking. Reach is not lost: npm genuinely living only on
+    // a share is still found by the last-resort bare-name spawn, whose own PATH
+    // walk is the shell's problem and already bounded by NPM_TIMEOUT_MS.
+    if (isWin && /^[\\/]{2}/.test(entry)) continue;
     try {
+      if (io.exists(P.join(entry, shim))) {
+        return { file: shim, prefixArgs: [], shell: isWin, source: "path" };
+      }
+    } catch {
+      /* an unreadable PATH entry is simply not where npm is */
+    }
+  }
+
+  // `P.join` normalizes the ".." itself and `io.execPath` is always absolute, so
+  // there is nothing left for a `resolve()` to do — and calling one would be
+  // actively wrong, since it resolves against the HOST's cwd (codex gate r1).
+  const nodeDir = P.dirname(io.execPath);
+  const cliCandidates = isWin
+    ? // Windows: node.exe and node_modules/ sit in the same directory.
+      [P.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js")]
+    : // POSIX: <prefix>/bin/node alongside <prefix>/lib/node_modules/npm.
+      [
+        P.join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+        P.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
+      ];
+  for (const cli of cliCandidates) {
+    try {
+      if (io.exists(cli)) {
+        return {
+          file: io.execPath,
+          prefixArgs: [cli],
+          shell: false,
+          source: "node-adjacent",
+        };
+      }
+    } catch {
+      /* probe failure is not a location */
+    }
+  }
+  return undefined;
+}
+
+/** Resolve the npm launcher for THIS process. */
+export function currentNpmLauncher(): NpmLauncher | undefined {
+  return resolveNpmLauncher({
+    platform: process.platform,
+    pathEnv: process.env.PATH ?? process.env.Path,
+    execPath: process.execPath,
+    exists: existsSync,
+  });
+}
+
+/** One npm spawn. Resolves and never throws; `ok` is a clean exit. */
+function spawnNpm(
+  file: string,
+  spawnArgs: string[],
+  useShell: boolean,
+  cwd?: string,
+): Promise<{ ok: boolean; stdout?: string; stderr?: string }> {
+  return new Promise((resolveP) => {
+    try {
+      // SAFE: every npm arg is a hard-coded constant (no interpolation of user
+      // input), so the shell path has no injection surface. `prefixArgs` is
+      // only ever populated on the shell:false node path.
       const child = execFile(
-        cmd,
-        args,
-        { cwd, timeout: NPM_TIMEOUT_MS, windowsHide: true, shell: isWin },
-        (err) => resolveP({ ok: !err }),
+        file,
+        spawnArgs,
+        { cwd, timeout: NPM_TIMEOUT_MS, windowsHide: true, shell: useShell },
+        (err, stdout, stderr) =>
+          resolveP({ ok: !err, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") }),
       );
       child.on("error", () => resolveP({ ok: false }));
     } catch {
       resolveP({ ok: false });
     }
   });
+}
+
+/**
+ * Ask the SHELL — not our own PATH scan — whether it can resolve npm at all
+ * (#2671, codex gate r1).
+ *
+ * This exists to keep "npm could not be found" from being asserted about a run
+ * that plainly happened. `resolveNpmLauncher` failing means only that OUR probe
+ * found nothing; the bare-name last resort still goes through cmd.exe/sh, whose
+ * resolver is not ours. If that attempt then fails because npm returned E404 or
+ * the registry timed out, calling it "npm is not installed" hands the user
+ * remediation for a problem they do not have.
+ *
+ * `where`/`command -v` answer with an EXIT CODE, so this is a structured
+ * question, not a match on cmd.exe's localized "is not recognized". Only a real
+ * exit code is an ANSWER; a probe that could not run, or that we killed on
+ * timeout, returns `undefined` — cannot tell — and callers must not read that
+ * as "missing".
+ *
+ * Discriminating on `err.code` being a NUMBER is measured, not assumed (codex
+ * gate r2). execFile reports all four outcomes through the same callback:
+ *   found            -> err === null
+ *   exit 1 (no npm)  -> { code: 1,        killed: false }
+ *   spawn failure    -> { code: "ENOENT"                }   (a STRING)
+ *   timeout kill     -> { code: null,     killed: true  }
+ * An earlier draft answered `undefined` from a `child.on("error")` listener,
+ * which never fires in time: execFile's own internal error handler invokes the
+ * callback FIRST, so the promise was already settled as `false`. Both failure
+ * modes silently became "npm is not installed".
+ */
+export async function shellCanResolveNpm(
+  // Injectable so a test can drive the REAL discriminator against real spawn
+  // failures and real timeouts. A test that re-implements the classification
+  // locally proves only that the test agrees with itself: the first draft of
+  // these tests did exactly that, and reverting the discriminator left every
+  // one of them green.
+  probe?: { file: string; args: string[]; timeoutMs?: number },
+): Promise<boolean | undefined> {
+  const isWin = process.platform === "win32";
+  const { file, args, timeoutMs } = probe ?? {
+    file: isWin ? "where" : "sh",
+    args: isWin ? [npmShimName("win32")] : ["-c", "command -v npm"],
+  };
+  return new Promise((resolveP) => {
+    try {
+      execFile(file, args, { timeout: timeoutMs ?? 15_000, windowsHide: true }, (err) => {
+        if (!err) return resolveP(true);
+        const e = err as NodeJS.ErrnoException & { killed?: boolean };
+        resolveP(typeof e.code === "number" && !e.killed ? false : undefined);
+      });
+    } catch {
+      resolveP(undefined);
+    }
+  });
+}
+
+/**
+ * The npm-running decision, over injected IO (#2671).
+ *
+ * Split out from `defaultRunNpm` so the unresolved-launcher branch is
+ * reachable from a test: on any machine that can run this suite npm IS
+ * resolvable, so the interesting path — the one the reporter hit — would
+ * otherwise never execute under test and its guard could not be pinned.
+ */
+export async function runNpmResolved(
+  io: {
+    platform: string;
+    launcher: NpmLauncher | undefined;
+    spawn: (
+      file: string,
+      spawnArgs: string[],
+      useShell: boolean,
+      cwd?: string,
+    ) => Promise<{ ok: boolean; stdout?: string; stderr?: string }>;
+    shellResolvesNpm: () => Promise<boolean | undefined>;
+  },
+  args: string[],
+  cwd?: string,
+): Promise<{ ok: boolean; stdout?: string; stderr?: string; npmMissing?: boolean }> {
+  const { launcher } = io;
+  if (launcher) {
+    // Resolved: run it and report npm's own verdict. Never `npmMissing` — we
+    // are holding the launcher.
+    return io.spawn(launcher.file, [...launcher.prefixArgs, ...args], launcher.shell, cwd);
+  }
+
+  // LAST RESORT (#2671): npm is nowhere WE can see it, but our PATH scan is not
+  // the shell's resolver, so make the pre-#2671 bare-name attempt rather than
+  // turning a failed probe into a hard refusal. This is why the change can only
+  // add reach.
+  const res = await io.spawn(npmShimName(io.platform), args, io.platform === "win32", cwd);
+  if (res.ok) return res;
+
+  // It failed, and we could not locate npm. Only NOW is it worth asking whether
+  // npm exists at all — and the answer has to come from the SHELL, because this
+  // failure is equally consistent with "npm ran and said no" (codex gate r1).
+  // Anything other than a definite no leaves the claim unmade.
+  const resolvable = await io.shellResolvesNpm();
+  return resolvable === false ? { ...res, npmMissing: true } : res;
+}
+
+function defaultRunNpm(
+  args: string[],
+  cwd?: string,
+): Promise<{ ok: boolean; stdout?: string; stderr?: string; npmMissing?: boolean }> {
+  return runNpmResolved(
+    {
+      platform: process.platform,
+      launcher: currentNpmLauncher(),
+      spawn: spawnNpm,
+      shellResolvesNpm: shellCanResolveNpm,
+    },
+    args,
+    cwd,
+  );
 }
 
 export const defaultDeps: SelfUpdateDeps = {
@@ -154,6 +719,8 @@ export const defaultDeps: SelfUpdateDeps = {
   readFile: (p) => readFileSync(p, "utf-8"),
   getLatestVersion: defaultGetLatestVersion,
   runNpm: defaultRunNpm,
+  platform: () => process.platform,
+  scheduleDeferredUpdate: defaultScheduleDeferredUpdate,
 };
 
 // ---------------------------------------------------------------------------
@@ -311,7 +878,8 @@ export async function getLatestPublishedVersion(
   deps: SelfUpdateDeps = defaultDeps,
 ): Promise<string | undefined> {
   try {
-    return await deps.getLatestVersion();
+    const probe = await deps.getLatestVersion();
+    return "version" in probe ? probe.version : undefined;
   } catch {
     return undefined;
   }
@@ -359,6 +927,158 @@ function npmInstallArgs(mode: "global" | "local"): string[] {
   return [...base, "--no-audit", "--no-fund"];
 }
 
+/**
+ * The last few lines of npm's output, trimmed and capped so a tool result stays
+ * readable. stderr is preferred (npm writes its `npm error code …` block there);
+ * stdout is the fallback for a failure that logged nothing to stderr.
+ * DISPLAY ONLY — classification reads the FULL output (a lock error older than
+ * the last 8 lines must still classify, codex gate).
+ */
+function npmOutputTail(res: { stdout?: string; stderr?: string }): string {
+  const raw = String(res.stderr ?? "").trim() || String(res.stdout ?? "").trim();
+  if (!raw) return "";
+  const tail = raw.split(/\r?\n/).slice(-8).join("\n");
+  return tail.length > 1200 ? `…${tail.slice(-1200)}` : tail;
+}
+
+/** The manual-update command a remedy can name for this install mode. */
+function manualUpdateCommand(info: InstallInfo): string {
+  return info.mode === "local" ? `npm i ${PACKAGE_NAME}@latest` : `npm i -g ${PACKAGE_NAME}@latest`;
+}
+
+/** Where the command runs — only meaningful for a local project install. */
+function manualUpdateLocation(info: InstallInfo): string {
+  return info.mode === "local" && info.projectRoot ? ` in ${info.projectRoot}` : "";
+}
+
+/** npm's signature for "a file it must replace is held open by a process". */
+const NPM_LOCK_RE = /EBUSY|EPERM|resource busy or locked/i;
+
+/**
+ * Apply the npm update for a global/local install and classify the result
+ * (#912 / #916-a). A failure MUST carry why: npm's output tail goes into the
+ * note, and on Windows the deterministic EBUSY — this process holds its own
+ * sharp libvips DLL mapped, so npm cannot replace the package it is running
+ * from — is named as such and routed to the deferred post-exit helper. The
+ * helper is only offered as "scheduled" when it actually launched.
+ */
+async function applyNpmUpdate(
+  deps: SelfUpdateDeps,
+  info: InstallInfo & { mode: "global" | "local" },
+  latest: string,
+): Promise<SelfUpdateResult> {
+  const args = npmInstallArgs(info.mode);
+  const res = await deps.runNpm(args, info.mode === "local" ? info.projectRoot : undefined);
+  if (res.ok) {
+    return {
+      action: "updated",
+      mode: info.mode,
+      from: info.currentVersion,
+      to: latest,
+      note: `Updated ${PACKAGE_NAME} ${info.currentVersion} → ${latest}. ${RECONNECT_NOTE}`,
+    };
+  }
+
+  const tail = npmOutputTail(res);
+  // Classify on the FULL capture, not the display tail: the lock error can sit
+  // anywhere in npm's output (the tail is only the last few lines of stderr).
+  const locked = NPM_LOCK_RE.test(`${res.stderr ?? ""}\n${res.stdout ?? ""}`);
+  const isWin = (deps.platform?.() ?? process.platform) === "win32";
+  if (locked && isWin) {
+    // The lock is held by THIS process, so no in-process retry can succeed.
+    // The helper applies the update once the orchestrator has fully stopped;
+    // claim "scheduled" only when it genuinely launched.
+    const scheduled = deps.scheduleDeferredUpdate
+      ? await deps.scheduleDeferredUpdate({
+          mode: info.mode,
+          projectRoot: info.projectRoot,
+          packageDir: info.packageDir,
+          to: latest,
+        })
+      : false;
+    if (scheduled) {
+      return {
+        action: "scheduled",
+        mode: info.mode,
+        from: info.currentVersion,
+        to: latest,
+        reason: "locked-by-running-process",
+        note:
+          `npm could not install ${latest} in place: Windows keeps this running ` +
+          `orchestrator's own sharp libvips DLL locked, so the package cannot be ` +
+          `replaced while it runs. A detached helper was scheduled — it waits for ` +
+          `the lock to clear, then runs \`${manualUpdateCommand(info)}\`` +
+          `${manualUpdateLocation(info)} (log: ` +
+          `${deferredUpdateLogPath()}). The update lands once this orchestrator has ` +
+          `fully STOPPED — quit the MCP client or end the process; a /mcp reconnect ` +
+          `or auto-restart keeps an orchestrator holding the lock and the helper keeps ` +
+          `waiting — and takes effect at the next start. Staying on ` +
+          `${info.currentVersion} until then; verify with ` +
+          `install_comfyui (action:"self_update") using self_update_action:'status' after the next start.`,
+      };
+    }
+    return {
+      action: "unavailable",
+      mode: info.mode,
+      from: info.currentVersion,
+      to: latest,
+      reason: "locked-by-running-process",
+      note:
+        `npm update to ${latest} failed: files of the RUNNING orchestrator are locked ` +
+        `(Windows holds this process's own sharp libvips DLL open), and the deferred ` +
+        `update helper could not be started. Staying on ${info.currentVersion}. Quit ` +
+        `the orchestrator fully (a /mcp reconnect or auto-restart keeps a process ` +
+        `holding the lock), then run: ${manualUpdateCommand(info)}${manualUpdateLocation(info)}` +
+        (tail ? `\nnpm said:\n${tail}` : ""),
+    };
+  }
+
+  // #2671 — npm was never LOCATED, so nothing here is npm's verdict on the
+  // update. Checked AFTER the lock branch on purpose: an EBUSY in the output is
+  // positive proof npm actually ran, and that proof outranks our own
+  // could-not-find-it probe (which cannot see every way a shell resolves a
+  // command). npm's raw output still travels in the note either way, so a
+  // misclassification can never hide evidence from the user.
+  if (res.npmMissing) {
+    const isDefaultWin = (deps.platform?.() ?? process.platform) === "win32";
+    return {
+      action: "unavailable",
+      mode: info.mode,
+      from: info.currentVersion,
+      to: latest,
+      reason: "npm-not-found",
+      note:
+        `Cannot self-update to ${latest}: npm could not be found. It is not on ` +
+        `this server process's PATH, and there is no npm beside the Node binary ` +
+        `running it (${process.execPath}). Staying on ${info.currentVersion} — ` +
+        `nothing was changed.\nTo update, run this yourself in a terminal that ` +
+        `HAS npm: ${manualUpdateCommand(info)}${manualUpdateLocation(info)}` +
+        (isDefaultWin
+          ? `\nIf that terminal also reports npm is not recognized, Node.js is ` +
+            `not installed for this user — install it from https://nodejs.org ` +
+            `and reopen the terminal.`
+          : `\nIf that terminal also cannot find npm, install Node.js ` +
+            `(https://nodejs.org) and retry.`) +
+        `\nWhen npm IS installed, this usually means the orchestrator was ` +
+        `launched by something that does not pass the Node directory on PATH; ` +
+        `relaunching it from a shell where \`npm -v\` works lets this action ` +
+        `run on its own.` +
+        (tail ? `\nThe launch failed with:\n${tail}` : ""),
+    };
+  }
+
+  return {
+    action: "unavailable",
+    mode: info.mode,
+    from: info.currentVersion,
+    to: latest,
+    reason: locked ? "locked-by-running-process" : "npm-failed",
+    note:
+      `npm update to ${latest} failed; staying on ${info.currentVersion}.` +
+      (tail ? `\nnpm said:\n${tail}` : ""),
+  };
+}
+
 export interface SelfUpdateOptions {
   deps?: SelfUpdateDeps;
 }
@@ -388,15 +1108,22 @@ async function checkInner(deps: SelfUpdateDeps): Promise<SelfUpdateResult> {
   }
 
   // 3) Registry probe.
-  const latest = await deps.getLatestVersion();
-  if (!latest) {
+  const probe = await deps.getLatestVersion();
+  if (!("version" in probe)) {
+    // #1136 — say which of the two it was. "unreachable" is a claim about the
+    // user's network and must not be made on the strength of a 500 or a
+    // malformed body; those get "could not determine", which is what we know.
     return {
       action: "unavailable",
       mode: info.mode,
       from: info.currentVersion,
-      note: "npm registry unreachable (offline or timed out).",
+      note:
+        "unreachable" in probe
+          ? probe.unreachable
+          : `Could not determine the latest published version — ${probe.undetermined}. This is NOT evidence that you are up to date.`,
     };
   }
+  const latest = probe.version;
 
   // 4) Up to date (also covers an unreadable current version → don't churn).
   if (!info.currentVersion || !isNewer(latest, info.currentVersion)) {
@@ -410,24 +1137,7 @@ async function checkInner(deps: SelfUpdateDeps): Promise<SelfUpdateResult> {
 
   // 5) Newer available. Only global/local can be safely self-replaced on disk.
   if (info.mode === "global" || info.mode === "local") {
-    const args = npmInstallArgs(info.mode);
-    const { ok } = await deps.runNpm(args, info.mode === "local" ? info.projectRoot : undefined);
-    if (!ok) {
-      return {
-        action: "unavailable",
-        mode: info.mode,
-        from: info.currentVersion,
-        to: latest,
-        note: `npm update to ${latest} failed; staying on ${info.currentVersion}.`,
-      };
-    }
-    return {
-      action: "updated",
-      mode: info.mode,
-      from: info.currentVersion,
-      to: latest,
-      note: `Updated ${PACKAGE_NAME} ${info.currentVersion} → ${latest}. ${RECONNECT_NOTE}`,
-    };
+    return applyNpmUpdate(deps, { ...info, mode: info.mode }, latest);
   }
 
   // 6) npx / unknown — can't safely self-replace; notify only.
@@ -498,7 +1208,18 @@ export async function selfUpdateStatus(
   } catch {
     info = { mode: "unknown", packageDir: "", currentVersion: undefined, isDevLink: false };
   }
-  const latest = await getLatestPublishedVersion(deps);
+  // #1136 — ask the PROBE. getLatestPublishedVersion flattens the three states
+  // back to string|undefined, which is the fold this change removes; reading it
+  // here made `action:"status"` report a 429 as "npm registry unreachable" AND
+  // discard the composed message on a genuine outage, losing the host name --
+  // the one thing #1136 asks for. `status` is the read-only action an agent
+  // reaches for while diagnosing exactly that situation.
+  const probe = await deps.getLatestVersion().catch(
+    (err: unknown): VersionProbe => ({
+      undetermined: `the version check threw: ${err instanceof Error ? err.message : String(err)}`,
+    }),
+  );
+  const latest = "version" in probe ? probe.version : undefined;
   const autoUpdateDisabled = isAutoUpdateDisabled(deps.env());
   const updateAvailable =
     !!latest && !!info.currentVersion && isNewer(latest, info.currentVersion);
@@ -507,17 +1228,30 @@ export async function selfUpdateStatus(
   if (info.isDevLink || info.mode === "linked") {
     note = "Dev install (npm link / checkout) — self-update is disabled; update via git.";
   } else if (!latest) {
-    note = "npm registry unreachable; cannot determine the latest version.";
+    note =
+      "unreachable" in probe
+        ? probe.unreachable
+        : `Could not determine the latest published version — ${"undetermined" in probe ? probe.undetermined : "the registry did not answer usably"}. This is NOT evidence that you are up to date.`;
   } else if (!updateAvailable) {
     note = `Up to date (${info.currentVersion}).`;
   } else if (info.mode === "npx") {
-    note = `${latest} available — npx fetches the latest on next run; restart to pick it up.`;
+    note = npxUpdateNote(latest);
   } else if (info.mode === "unknown") {
     note = `${latest} available — could not classify install; update manually.`;
   } else {
     note =
       `${latest} available (current ${info.currentVersion}). ` +
-      `Run self_update(action='update')${autoUpdateDisabled ? "" : " (or it auto-updates on start)"}. ${RECONNECT_NOTE}`;
+      `Run install_comfyui (action:"self_update") with self_update_action:'update'${autoUpdateDisabled ? "" : " (or it auto-updates on start)"}. ${RECONNECT_NOTE}`;
+    // #912: on Windows the running orchestrator holds its own sharp DLL open, so
+    // an in-place npm replace fails (EBUSY) — the update is applied by the
+    // deferred helper AFTER this process stops, not on a mere reconnect. Say so
+    // up front so nobody promises an in-place update this platform can't do.
+    if ((deps.platform?.() ?? process.platform) === "win32") {
+      note +=
+        " On Windows the running orchestrator keeps its own files locked, so the " +
+        "update is applied by a deferred helper once this orchestrator has fully " +
+        "stopped, and loads at the next start.";
+    }
   }
 
   return {
@@ -555,36 +1289,32 @@ export async function runSelfUpdate(
     );
   }
 
-  const latest = await getLatestPublishedVersion(deps);
-  if (!latest) {
+  // #1136 — ask the PROBE, not the flattening wrapper. getLatestPublishedVersion
+  // collapses the three states back into string|undefined, which is precisely
+  // the fold this change removes: it would report a 500 or an unparseable body
+  // as a network problem the user is expected to act on.
+  const probe = await deps.getLatestVersion().catch(
+    (err: unknown): VersionProbe => ({
+      undetermined: `the version check threw: ${err instanceof Error ? err.message : String(err)}`,
+    }),
+  );
+  if (!("version" in probe)) {
     return {
       action: "unavailable",
       mode: info.mode,
       from: info.currentVersion,
-      note: "npm registry unreachable (offline or timed out).",
+      note:
+        "unreachable" in probe
+          ? probe.unreachable
+          : `Could not determine the latest published version — ${probe.undetermined}. This is NOT evidence that you are up to date.`,
     };
   }
+  const latest = probe.version;
   if (!info.currentVersion || !isNewer(latest, info.currentVersion)) {
     return { action: "up-to-date", mode: info.mode, from: info.currentVersion, to: latest };
   }
   if (info.mode === "global" || info.mode === "local") {
-    const args = npmInstallArgs(info.mode);
-    const { ok } = await deps.runNpm(args, info.mode === "local" ? info.projectRoot : undefined);
-    return ok
-      ? {
-          action: "updated",
-          mode: info.mode,
-          from: info.currentVersion,
-          to: latest,
-          note: `Updated ${PACKAGE_NAME} ${info.currentVersion} → ${latest}. ${RECONNECT_NOTE}`,
-        }
-      : {
-          action: "unavailable",
-          mode: info.mode,
-          from: info.currentVersion,
-          to: latest,
-          note: `npm update to ${latest} failed; staying on ${info.currentVersion}.`,
-        };
+    return applyNpmUpdate(deps, { ...info, mode: info.mode }, latest);
   }
   // npx / unknown
   return {
@@ -594,7 +1324,7 @@ export async function runSelfUpdate(
     to: latest,
     note:
       info.mode === "npx"
-        ? `${latest} available — npx fetches the latest on next run; restart to pick it up.`
+        ? npxUpdateNote(latest)
         : `${latest} available — could not classify install; update manually.`,
   };
 }

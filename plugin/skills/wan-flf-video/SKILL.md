@@ -1,6 +1,6 @@
 ---
 name: wan-flf-video
-description: Build WAN 2.2 First-Last-Frame video workflows — native dual hi-lo (required), and WanVideoWrapper VACE approaches
+description: Build WAN 2.2 First-Last-Frame video workflows. Native dual hi-lo (required), and WanVideoWrapper VACE approaches
 globs:
   - "**/*.json"
 ---
@@ -9,40 +9,40 @@ globs:
 
 ## Overview
 
-First-Last-Frame (FLF) video generation takes a start image and an end image and generates a smooth video transition between them. WAN 2.2 I2V (Image-to-Video) 14B model excels at this.
+First-Last-Frame (FLF) video generation takes a start image and an end image and generates a smooth video transition between them. The WAN 2.2 I2V (Image-to-Video) 14B model is good at this.
 
 ## CRITICAL: Dual Hi-Lo Architecture (REQUIRED)
 
 **WAN 2.2 I2V uses a split-noise architecture.** Unlike WAN 2.1, the 2.2 model was trained with separate HighNoise and LowNoise components that handle different denoising ranges. **You MUST use both models in a two-pass KSamplerAdvanced setup.** Using a single model produces low-quality, broken output.
 
-- **HighNoise model** (pass 1, steps 0→N/2): Establishes structure, motion, and composition
-- **LowNoise model** (pass 2, steps N/2→N): Refines details and ensures fidelity to input frames
+- HighNoise model (pass 1, steps 0→N/2) establishes structure, motion, and composition
+- LowNoise model (pass 2, steps N/2→N) refines details and keeps fidelity to input frames
 - Both passes share the same conditioning from `WanFirstLastFrameToVideo`
 - Pass 1 returns noisy latent → Pass 2 continues from there
 
 **NEVER use a single KSampler with only one model for WAN 2.2 I2V.**
 
 Two native approaches are available:
-1. **Native Dual Hi-Lo (Default)** — `WanFirstLastFrameToVideo` + dual `KSamplerAdvanced` two-pass
-2. **WanVideoWrapper** — `WanVideoVACEStartToEndFrame` + `WanVideoVACEEncode` + `WanVideoSampler` (VACE, caching, context windows)
+1. Native Dual Hi-Lo (Default): `WanFirstLastFrameToVideo` + dual `KSamplerAdvanced` two-pass
+2. WanVideoWrapper: `WanVideoVACEStartToEndFrame` + `WanVideoVACEEncode` + `WanVideoSampler` (VACE, caching, context windows)
 
 ## Models
 
 ### UNET Pairs (Always load BOTH Hi and Lo)
 
-**Remix NSFW (Recommended — built-in lightning, fp16):**
+Remix NSFW (Recommended, built-in lightning, fp16):
 | Model | Loader | Notes |
 |-------|--------|-------|
 | `Wan2.2_Remix_NSFW_i2v_14b_high_lighting_fp16_v2.1.safetensors` | `UNETLoader` | HighNoise, built-in lightning acceleration |
 | `Wan2.2_Remix_NSFW_i2v_14b_low_lighting_fp16_v2.1.safetensors` | `UNETLoader` | LowNoise, built-in lightning acceleration |
 
-**GGUF Q8 (Alternative — needs external lightning LoRAs):**
+GGUF Q8 (Alternative, needs external lightning LoRAs):
 | Model | Loader | Notes |
 |-------|--------|-------|
 | `Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf` | `UnetLoaderGGUF` | HighNoise, quantized |
 | `Wan2.2-I2V-A14B-LowNoise-Q8_0.gguf` | `UnetLoaderGGUF` | LowNoise, quantized |
 
-**Official fp8:**
+Official fp8:
 | Model | Loader | Notes |
 |-------|--------|-------|
 | `wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors` | `UNETLoader` | HighNoise, needs lightning LoRA |
@@ -64,17 +64,17 @@ Two native approaches are available:
 
 ## ModelSamplingSD3 (REQUIRED)
 
-WAN 2.2 uses flow matching and requires `ModelSamplingSD3` applied to **each** UNET:
+WAN 2.2 uses flow matching and requires `ModelSamplingSD3` applied to each UNET:
 
 ```json
 {"class_type": "ModelSamplingSD3", "inputs": {"model": ["<unet>", 0], "shift": 5}}
 ```
 
-**shift=5** for lightning/Remix models. shift=8 for standard (non-lightning) models.
+shift=5 for lightning/Remix models. shift=8 for standard (non-lightning) models.
 
 ## Lightning LoRAs
 
-**Remix NSFW models have lightning baked in — no external LoRA needed.**
+Remix NSFW models have lightning baked in. No external LoRA needed.
 
 For GGUF/fp8 models, use paired hi/lo lightning LoRAs:
 - `wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors` → HighNoise UNET
@@ -89,11 +89,11 @@ Hi path: UNETLoader(HN) → ModelSamplingSD3(shift=5) → Hi Common Stack → Hi
 Lo path: UNETLoader(LN) → ModelSamplingSD3(shift=5) → Lo Common Stack → Lo Lora Stack → MODEL_LO
 ```
 
-Common stacks hold shared LoRAs (quality/style). Specific stacks hold model-variant LoRAs. Set slots to `"None"` when unused. Even with no LoRAs, include the stacks — they pass CLIP through for text encoding.
+Common stacks hold shared LoRAs (quality/style). Specific stacks hold model-variant LoRAs. Set slots to `"None"` when unused. Even with no LoRAs, include the stacks. They pass CLIP through for text encoding.
 
 ## Image Resizing (ImageResizeKJv2)
 
-Input frames MUST be resized to the target video resolution before FLF and CLIPVisionEncode. The end frame inherits width/height from the start frame's resize to ensure matching dimensions.
+Input frames MUST be resized to the target video resolution before FLF and CLIPVisionEncode. The end frame inherits width/height from the start frame's resize so the dimensions match.
 
 ```json
 {"class_type": "ImageResizeKJv2", "inputs": {
@@ -120,7 +120,7 @@ Input frames MUST be resized to the target video resolution before FLF and CLIPV
 
 Both passes share the same positive/negative conditioning from `WanFirstLastFrameToVideo` outputs [0] and [1].
 
-**For standard (non-lightning) models**: steps=20, split at step 10, cfg=4, sampler=euler, scheduler=simple, shift=8.
+For standard (non-lightning) models: steps=20, split at step 10, cfg=4, sampler=euler, scheduler=simple, shift=8.
 
 ## Negative Prompt (REQUIRED)
 
@@ -180,80 +180,9 @@ VAEDecode → IMAGE → VHS_VideoCombine (raw output)
                    → VRAM_Debug → SeedVR2VideoUpscaler (1080p) → VHS_VideoCombine (upscaled)
 ```
 
-## Complete Workflow: Native FLF (Remix NSFW + Lightning)
+## Complete workflow (API JSON)
 
-```json
-{
-  "1": { "class_type": "UNETLoader", "inputs": { "unet_name": "Wan2.2_Remix_NSFW_i2v_14b_high_lighting_fp16_v2.1.safetensors", "weight_dtype": "default" }, "_meta": { "title": "UNET HighNoise" }},
-  "2": { "class_type": "UNETLoader", "inputs": { "unet_name": "Wan2.2_Remix_NSFW_i2v_14b_low_lighting_fp16_v2.1.safetensors", "weight_dtype": "default" }, "_meta": { "title": "UNET LowNoise" }},
-  "3": { "class_type": "CLIPLoaderGGUF", "inputs": { "clip_name": "nsfw_wan_umt5-xxl_bf16_fixed.safetensors", "type": "wan" }},
-  "4": { "class_type": "CLIPVisionLoader", "inputs": { "clip_name": "clip_vision_h.safetensors" }},
-  "5": { "class_type": "VAELoader", "inputs": { "vae_name": "wan_2.1_vae.safetensors" }},
-  "6": { "class_type": "LoadImage", "inputs": { "image": "<start_image.png>" }, "_meta": { "title": "Start Frame" }},
-  "7": { "class_type": "LoadImage", "inputs": { "image": "<end_image.png>" }, "_meta": { "title": "End Frame" }},
-  "8": { "class_type": "ModelSamplingSD3", "inputs": { "model": ["1", 0], "shift": 5 }, "_meta": { "title": "Hi Shift" }},
-  "9": { "class_type": "ModelSamplingSD3", "inputs": { "model": ["2", 0], "shift": 5 }, "_meta": { "title": "Lo Shift" }},
-  "10": { "class_type": "Lora Loader Stack (rgthree)", "inputs": {
-    "model": ["8", 0], "clip": ["3", 0],
-    "lora_01": "None", "strength_01": 1, "lora_02": "None", "strength_02": 1,
-    "lora_03": "None", "strength_03": 1, "lora_04": "None", "strength_04": 1
-  }, "_meta": { "title": "Hi Common" }},
-  "11": { "class_type": "Lora Loader Stack (rgthree)", "inputs": {
-    "model": ["10", 0], "clip": ["10", 1],
-    "lora_01": "None", "strength_01": 1, "lora_02": "None", "strength_02": 1,
-    "lora_03": "None", "strength_03": 1, "lora_04": "None", "strength_04": 1
-  }, "_meta": { "title": "Hi Lora" }},
-  "12": { "class_type": "Lora Loader Stack (rgthree)", "inputs": {
-    "model": ["9", 0], "clip": ["3", 0],
-    "lora_01": "None", "strength_01": 1, "lora_02": "None", "strength_02": 1,
-    "lora_03": "None", "strength_03": 1, "lora_04": "None", "strength_04": 1
-  }, "_meta": { "title": "Low Common" }},
-  "13": { "class_type": "Lora Loader Stack (rgthree)", "inputs": {
-    "model": ["12", 0], "clip": ["12", 1],
-    "lora_01": "None", "strength_01": 1, "lora_02": "None", "strength_02": 1,
-    "lora_03": "None", "strength_03": 1, "lora_04": "None", "strength_04": 1
-  }, "_meta": { "title": "Low Lora" }},
-  "14": { "class_type": "ImageResizeKJv2", "inputs": {
-    "image": ["6", 0], "width": 480, "height": 720,
-    "upscale_method": "nearest-exact", "keep_proportion": "crop",
-    "pad_color": "0, 0, 0", "crop_position": "center", "divisible_by": 2
-  }, "_meta": { "title": "Resize Start" }},
-  "15": { "class_type": "ImageResizeKJv2", "inputs": {
-    "image": ["7", 0], "width": ["14", 1], "height": ["14", 2],
-    "upscale_method": "nearest-exact", "keep_proportion": "crop",
-    "pad_color": "0, 0, 0", "crop_position": "center", "divisible_by": 2
-  }, "_meta": { "title": "Resize End" }},
-  "16": { "class_type": "CLIPVisionEncode", "inputs": { "clip_vision": ["4", 0], "image": ["14", 0], "crop": "center" }},
-  "17": { "class_type": "CLIPVisionEncode", "inputs": { "clip_vision": ["4", 0], "image": ["15", 0], "crop": "center" }},
-  "18": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["11", 1], "text": "<positive prompt>" }, "_meta": { "title": "Positive" }},
-  "19": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["11", 1], "text": "The tones are vibrant, overexposed, static, details are unclear, subtitles, style, work, painting, image, still, overall grayish, worst quality, low quality, JPEG compression artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, distorted limbs, merged fingers, motionless image, cluttered background, three legs, many people in the background, walking backwards" }, "_meta": { "title": "Negative" }},
-  "20": { "class_type": "WanFirstLastFrameToVideo", "inputs": {
-    "positive": ["18", 0], "negative": ["19", 0], "vae": ["5", 0],
-    "clip_vision_start_image": ["16", 0], "clip_vision_end_image": ["17", 0],
-    "start_image": ["14", 0], "end_image": ["15", 0],
-    "width": ["15", 1], "height": ["15", 2], "length": 81, "batch_size": 1
-  }},
-  "21": { "class_type": "KSamplerAdvanced", "inputs": {
-    "model": ["11", 0], "positive": ["20", 0], "negative": ["20", 1], "latent_image": ["20", 2],
-    "add_noise": "enable", "noise_seed": 0, "steps": 4, "cfg": 1,
-    "sampler_name": "uni_pc", "scheduler": "beta",
-    "start_at_step": 0, "end_at_step": 2, "return_with_leftover_noise": "enable"
-  }, "_meta": { "title": "Hi Pass" }},
-  "22": { "class_type": "KSamplerAdvanced", "inputs": {
-    "model": ["13", 0], "positive": ["20", 0], "negative": ["20", 1], "latent_image": ["21", 0],
-    "add_noise": "disable", "noise_seed": 0, "steps": 4, "cfg": 1,
-    "sampler_name": "uni_pc", "scheduler": "beta",
-    "start_at_step": 2, "end_at_step": 4, "return_with_leftover_noise": "disable"
-  }, "_meta": { "title": "Lo Pass" }},
-  "23": { "class_type": "VAEDecode", "inputs": { "samples": ["22", 0], "vae": ["5", 0] }},
-  "24": { "class_type": "VHS_VideoCombine", "inputs": {
-    "images": ["23", 0], "frame_rate": 16, "loop_count": 0,
-    "filename_prefix": "wan_flf", "format": "video/h264-mp4",
-    "pingpong": false, "save_output": true,
-    "pix_fmt": "yuv420p", "crf": 19, "save_metadata": true, "trim_to_audio": false
-  }}
-}
-```
+The full Native FLF (Remix NSFW + Lightning) graph is in [`references/workflows.md`](references/workflows.md).
 
 ## Optional: Video Upscaling with SeedVR2
 
@@ -355,32 +284,32 @@ WanVideoDecode (vae, samples) → IMAGE → VHS_VideoCombine → MP4
 | VACE conditioning | Not available | Full VACE support |
 | Long video (>81 frames) | Limited | InfiniteTalk / context windows |
 
-**Recommendation**: Use **Native dual hi-lo** for standard FLF transitions. Use **WanVideoWrapper** when you need caching, context windows, VRAM management, or advanced conditioning.
+Recommendation: use Native dual hi-lo for standard FLF transitions. Use WanVideoWrapper when you need caching, context windows, VRAM management, or advanced conditioning.
 
 ### ⚠️ CRITICAL: `merge_loras=false` with fp8-scaled models
 
 When loading a LoRA through `WanVideoLoraSelect` → `WanVideoModelLoader`'s `lora`
-input on an **fp8-quantized** model (`quantization=fp8_e4m3fn_scaled`, e.g. the
+input on an fp8-quantized model (`quantization=fp8_e4m3fn_scaled`, e.g. the
 official `wan2.2_i2v_high/low_noise_14B_fp8_scaled` weights), you **MUST set the
 `WanVideoLoraSelect` widget `merge_loras=false`.**
 
-- `merge_loras=true` (the node **default**) tries to bake the LoRA deltas into the
-  already-quantized fp8 weights. That merge path **hard-crashes ComfyUI during
-  LoRA loading** — the process dies with **no Python traceback** (so
+- `merge_loras=true` (the node default) tries to bake the LoRA deltas into the
+  already-quantized fp8 weights. That merge path hard-crashes ComfyUI during
+  LoRA loading. The process dies with no Python traceback (so
   `panel_get_errors` / the frontend show nothing; only a process restart/OOM-style
   symptom). This is the #1 cause of a "crashed on lora loading" report with the
   wrapper.
-- `merge_loras=false` applies the LoRA as a **runtime patch** during the forward
-  pass instead of merging — fully fp8-safe, negligible speed cost. This is the
+- `merge_loras=false` applies the LoRA as a runtime patch during the forward
+  pass instead of merging. It is fp8-safe with negligible speed cost. This is the
   correct setting for the `lightx2v` 4-step lightning LoRAs (hi + lo) on the fp8
   hi/lo I2V models.
-- It also pairs cleanly with block swap: `WanVideoBlockSwap` (e.g. 20–30 of 40
+- It also pairs cleanly with block swap: `WanVideoBlockSwap` (e.g. 20 to 30 of 40
   blocks → RAM) + `merge_loras=false` is the verified combo for fp8 14B I2V at
   720p/81f on a 24GB card. (If you instead use a non-quantized bf16/fp16 model,
   `merge_loras=true` is fine.)
 
-Separately, at 720p/81f enable **`enable_vae_tiling=true`** on `WanVideoDecode` —
-the full-frame decode is the other common uncaught-OOM crash point.
+Separately, at 720p/81f enable `enable_vae_tiling=true` on `WanVideoDecode`.
+The full-frame decode is the other common uncaught-OOM crash point.
 
 ## Resolution & Frame Count
 
@@ -393,18 +322,18 @@ the full-frame decode is the other common uncaught-OOM crash point.
 | Portrait 9:16 | 480x832 | 0.4MP |
 | Square | 640x640 | 0.4MP |
 
-**Width and height must be divisible by 16.** Use `ImageResizeKJv2` with `divisible_by: 2` and `keep_proportion: crop`.
+Width and height must be divisible by 16. Use `ImageResizeKJv2` with `divisible_by: 2` and `keep_proportion: crop`.
 
 ### Frame Count
 
-- **81 frames** at 16fps = ~5 seconds (default, recommended)
-- **49 frames** at 16fps = ~3 seconds (faster, less motion)
-- **121 frames** at 16fps = ~7.5 seconds (longer, more VRAM)
+- 81 frames at 16fps = ~5 seconds (default, recommended)
+- 49 frames at 16fps = ~3 seconds (faster, less motion)
+- 121 frames at 16fps = ~7.5 seconds (longer, more VRAM)
 - Frame count should be `4n + 1` (1, 5, 9, ..., 49, 81, 121)
 
 ### Frame Rate
 
-Standard: **16 fps** for WAN 2.2 output.
+Standard: 16 fps for WAN 2.2 output.
 
 ## Video Output
 
@@ -443,14 +372,14 @@ ComfyUI manages VRAM by offloading models between passes. The Hi UNET is offload
 
 ### Tips
 
-1. **Always `clear_vram`** before switching to WAN from another model family
+1. Always `clear_vram` before switching to WAN from another model family
 2. Use `VRAM_Debug` node between generation and SeedVR2 upscaling to free all VRAM
 3. For 24GB GPUs, 81 frames at 480x720 is the practical maximum
-4. Remix NSFW models have lightning baked in — no separate LoRA needed, 4 steps total
+4. Remix NSFW models have lightning baked in. No separate LoRA needed, 4 steps total
 
 ## Morph LoRAs (Smooth Metamorphosis)
 
-By default, FLF produces a **transition/dissolve** between frames. For true **morphing** (one shape seamlessly reshaping into another), use a morph LoRA on both Hi and Lo paths.
+By default, FLF produces a transition/dissolve between frames. For true morphing (one shape continuously reshaping into another), use a morph LoRA on both Hi and Lo paths.
 
 ### Magical Morph (Recommended)
 
@@ -460,8 +389,8 @@ By default, FLF produces a **transition/dissolve** between frames. For true **mo
 | LowNoise | `wan2.2_i2v_magical_morph_lownoise.safetensors` | 0.7-1.0 | Apply to Lo Common stack |
 
 - Source: [NikolaSigmoid/wan2.2-i2v-loras-magical-morph](https://huggingface.co/NikolaSigmoid/wan2.2-i2v-loras-magical-morph)
-- No trigger word needed — the LoRA modifies the denoising behavior
-- **Strength 1.0** can add visual sparkle/particle effects. Reduce to 0.7-0.8 for cleaner morphs
+- No trigger word needed. The LoRA modifies the denoising behavior
+- Strength 1.0 can add visual sparkle/particle effects. Reduce to 0.7-0.8 for cleaner morphs
 - Works with Remix NSFW models (no conflict with built-in lightning)
 
 ### SkinMorph Redmond (Alternative — Face/Body Focus)
@@ -473,17 +402,17 @@ For person-to-person morphs (identity, gender transforms):
 
 ## Prompt Tips
 
-Describe the **transition motion**, not just the start/end states:
+Describe the transition motion in addition to the start/end states:
 
 ```
 Good: "A small cat sitting on the ground smoothly transforms and grows into a woman standing tall, seamless transformation, cinematic"
 Bad: "A cat and a girl"
 ```
 
-**IMPORTANT — Prompt language affects visuals:**
-- **AVOID** words like "magical", "enchanted", "mystical" — they cause literal sparkle/particle effects
-- **USE** clean motion language: "smoothly transforms", "gradually reshapes", "seamlessly morphs", "transitions into"
-- The morph LoRA handles the morphing effect — the prompt should describe **motion and form change**, not style
+IMPORTANT: prompt language affects visuals.
+- AVOID words like "magical", "enchanted", "mystical". They cause literal sparkle/particle effects
+- USE clean motion language: "smoothly transforms", "gradually reshapes", "seamlessly morphs", "transitions into"
+- The morph LoRA handles the morphing effect. The prompt should describe motion and form change, not style
 - Include scale/position cues when subjects differ in size: "grows into", "expands upward", "shrinks down"
 
 ## Settings Quick Reference
@@ -504,36 +433,41 @@ Bad: "A cat and a girl"
 
 ### Anchor Frame Strategy (Proportions)
 
-When the start and end frames have different subject sizes (e.g., small cat → tall person), **generate the "anchor" frame first** — the one with the most complex composition — then use Qwen Edit to create the other frame from it. This ensures:
+When the start and end frames have different subject sizes (e.g., small cat → tall person), generate the "anchor" frame first (the one with the most complex composition), then use Qwen Edit to create the other frame from it. This gives you:
 - Consistent background/scene between frames
 - Correct relative proportions (the edit inherits the scene scale)
 - Better FLF results since both frames share the same visual context
 
-**Example — Cat-to-Girl Morph:**
-1. Generate **girl standing in front of barn** with Z-Image (she fills the frame)
+Example, cat-to-girl morph:
+1. Generate girl standing in front of barn with Z-Image (she fills the frame)
 2. Qwen Edit: "Replace the woman with a small cat sitting at the bottom of the image"
-3. FLF: cat (start) → girl (end) — proportions are correct because the barn establishes scale
+3. FLF: cat (start) → girl (end). Proportions are correct because the barn establishes scale
 
-**Anti-pattern:** Generating cat and girl independently produces mismatched scale.
+Anti-pattern: generating cat and girl independently produces mismatched scale.
 
 ### Full Pipeline
 
-1. **Generate anchor frame** with Z-Image/SDXL/Flux (portrait orientation for standing subjects)
-2. **Qwen Edit to create second frame** — the edit preserves scene context
-3. **Clear VRAM** between model families
-4. **Stage both frames as inputs.** When the frames are ComfyUI OUTPUTS from a prior stage (the generated/edited frames above), use **`stage_output_as_input`** with each output's `{ filename, subfolder?, type? }` and feed the returned input filename into each `LoadImage`. (For a frame already on local disk, use `upload_image`.) **NEVER copy the output file into, or guess, a filesystem `input/` path** — ComfyUI's input/output dirs may be CUSTOM (`--input-directory` / `--output-directory`), so a guessed path makes `LoadImage` reject the file (`Invalid image file`) and wastes the render. `stage_output_as_input` routes through the server API (`/view` → `/upload/image`), which resolves the real dirs correctly.
-5. **Run dual hi-lo FLF** with morph LoRA if morphing is desired
-6. **Optionally upscale** with SeedVR2 to 1080p
+1. Generate anchor frame with Z-Image/SDXL/Flux (portrait orientation for standing subjects)
+2. Qwen Edit to create second frame. The edit preserves scene context
+3. Clear VRAM between model families
+4. **Stage both frames as inputs.** When the frames are ComfyUI OUTPUTS from a prior stage (the generated/edited frames above), use `upload_image (action:"stage")` with each output's `{ filename, subfolder?, type? }` and feed the returned input filename into each `LoadImage`. (For a frame already on local disk, use `upload_image (action:"image")`.) NEVER copy the output file into, or guess, a filesystem `input/` path. ComfyUI's input/output dirs may be CUSTOM (`--input-directory` / `--output-directory`), so a guessed path makes `LoadImage` reject the file (`Invalid image file`) and wastes the render. `upload_image (action:"stage")` routes through the server API (`/view` → `/upload/image`), which resolves the real dirs correctly.
+5. Run dual hi-lo FLF with morph LoRA if morphing is desired
+6. Optionally upscale with SeedVR2 to 1080p
 
-Proven timing on RTX 4090: Z-Image (35s) → Qwen Edit (78s) → WAN FLF 81 frames (139s) = **~4 minutes total**.
+Proven timing on RTX 4090: Z-Image (35s) → Qwen Edit (78s) → WAN FLF 81 frames (139s) = ~4 minutes total.
 
 ## Working with Saved Workflows
 
-Use `analyze_workflow` to understand any saved WAN FLF workflow before modifying or executing it. It returns a structured summary with sections, node IDs, key settings, and virtual wire connections — no raw JSON needed.
+Use `get_workflow (action:"analyze")` to understand any saved WAN FLF workflow before modifying or executing it. It returns a structured summary with sections, node IDs, key settings, and virtual wire connections. No raw JSON needed.
 
 ```
-analyze_workflow("Wan FirstLastFrame Advanced.json")           # summary view (default)
-analyze_workflow("Wan FirstLastFrame Advanced.json", view="flat")  # mermaid diagram
+get_workflow(action="analyze", filename="Wan FirstLastFrame Advanced.json")                # summary view (default)
+get_workflow(action="analyze", filename="Wan FirstLastFrame Advanced.json", view="flat")   # mermaid diagram
 ```
 
-Only use `get_workflow` when you need the raw JSON for `enqueue_workflow` or `modify_workflow`.
+Only use `get_workflow` when you need the raw JSON for `enqueue_workflow` or `create_workflow (action:"modify")`.
+
+## Sources
+
+- **Official:** none found.
+- **Empirical:** sampler values, wiring, and prompt notes from working graphs in `packs/` and observed renders; not a vendor prompting guide.

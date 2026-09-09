@@ -23,7 +23,14 @@ import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+// The repo this operates on. Derived from the script's own location so it works
+// from any cwd — with an explicit override so the generator can be exercised
+// against a scratch repo. Without one it can only be tested by running it on the
+// real CHANGELOG, which is how a range bug survived three releases: the only way
+// to check its output was to generate a release and read it.
+const ROOT = process.env.COMFYUI_MCP_CHANGELOG_ROOT
+  ? process.env.COMFYUI_MCP_CHANGELOG_ROOT
+  : join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHANGELOG = join(ROOT, "CHANGELOG.md");
 
 // ── Repo config ─────────────────────────────────────────────────────────────
@@ -66,20 +73,87 @@ function prevTag() {
   return git("rev-list --max-parents=0 HEAD").split(/\s+/)[0]; // first commit
 }
 
-/** Parsed conventional commits since `range`, newest-first, minus noise. */
+/** A release commit, in either shape we actually produce: `release: 0.49.6`, or the
+ *  squash-merge form GitHub writes from a PR titled with the bare version — `0.49.6 (#849)`.
+ *  Only the first was recognised, so the second fell through to the non-conventional
+ *  path and was silently dropped along with everything else there. */
+// #1309 — three shapes are needed; see scripts/lib/release-subject.mjs.
+import { isReleaseSubject } from "./lib/release-subject.mjs";
+
+/** Parsed commits since `range`, newest-first, minus noise.
+ *
+ *  A NON-CONVENTIONAL subject that carries a PR number is INCLUDED, not skipped. The
+ *  old code dropped it on the assumption it was "usually already covered by a PR merge"
+ *  — but a squash merge's subject IS the PR title, and this project's PR titles are
+ *  descriptive prose ("download_model: large-file timeouts…"), not `fix(scope):`. So the
+ *  assumption inverted the outcome: the entries most likely to be dropped were the
+ *  substantial ones, because a big PR gets a written title and a small one gets a
+ *  conventional prefix.
+ *
+ *  That silently omitted the headline entry from three consecutive releases — panel
+ *  0.11.39 lost #621 (a CRITICAL wrong-graph fix), mcp 0.49.6 lost #831 (which closed
+ *  eleven issues), and panel 0.11.40 lost three of its four. Each was caught by hand
+ *  only because someone read the generated output against the commit list.
+ *
+ *  Two rules now, and the second matters as much as the first:
+ *   1. anything with a PR number is emitted (defaulting to "Changed" when the type is
+ *      unstated) — a human editing a slightly-noisy line is cheap; a missing headline
+ *      fix is not;
+ *   2. NOTHING is dropped silently. Whatever is still skipped is reported to stderr, so
+ *      a release always shows what it chose to leave out. A generator whose output looks
+ *      complete when it is not is worse than no generator. */
 function parseCommits(range) {
   const raw = git(`log ${range} --no-merges --pretty=format:%s`);
   if (!raw) return [];
   const out = [];
+  const skipped = [];
   for (const subject of raw.split("\n")) {
-    if (/^release:/i.test(subject)) continue; // release commits describe themselves
+    if (isReleaseSubject(subject)) continue; // release commits describe themselves
     const m = subject.match(/^(\w+)(?:\(([^)]+)\))?(!)?:\s*(.+)$/);
-    if (!m) continue; // non-conventional → skip (usually already covered by a PR merge)
+    // The LAST `(#N)`, not the first: GitHub appends the PR reference at the end of a
+    // squash subject, so anything earlier is an ISSUE the author cited. Both shapes occur —
+    // `fix(#809): … (#818)` puts the issue in the SCOPE, and
+    // `test: … (#852) (#853)` puts it INLINE — and taking the first match attributes the
+    // entry to the issue. (Reading only the description fixes the first shape and not the
+    // second, which is why this reads positionally rather than by field.)
+    //
+    // Beyond a wrong link, this breaks the dedupe against hand-written highlights, which is
+    // keyed on the PR number — so a hand-written entry would be DUPLICATED by the
+    // auto-generated one instead of suppressed. That is the same class of failure as the
+    // silent drop this file was just fixed for, in the opposite direction.
+    const prIn = (s) => {
+      const all = [...s.matchAll(/\(#(\d+)\)/g)];
+      return all.length ? all[all.length - 1][1] : null;
+    };
+    if (!m) {
+      // Non-conventional. Keep it if it names a PR; otherwise it is a local commit
+      // that a squash will have superseded, and dropping it is right.
+      const pr = prIn(subject);
+      if (pr) {
+        out.push({ type: "", scope: "", desc: subject.trim(), section: "Changed", pr });
+      } else {
+        skipped.push(subject);
+      }
+      continue;
+    }
     const [, type, scope, , desc] = m;
-    const section = TYPE_SECTION[type.toLowerCase()];
-    if (!section) continue;
-    const pr = (desc.match(/\(#(\d+)\)/) || [])[1] || null;
+    const pr = prIn(desc);
+    // An UNMAPPED type (chore/ci/test/build/style/docs) is housekeeping and stays out —
+    // but only when it has no PR number. A `test(...)` or `docs(...)` PR is a real
+    // shipped change; panel 0.11.40's de-flake landed that way.
+    const section = TYPE_SECTION[type.toLowerCase()] ?? (pr ? "Changed" : null);
+    if (!section) {
+      skipped.push(subject);
+      continue;
+    }
     out.push({ type, scope: scope || "", desc: desc.trim(), section, pr });
+  }
+  if (skipped.length) {
+    process.stderr.write(
+      `changelog: left out ${skipped.length} commit(s) with no PR number — check none belong:\n` +
+        skipped.map((s) => `  · ${s}`).join("\n") +
+        "\n",
+    );
   }
   return out;
 }
@@ -144,10 +218,48 @@ const rawMd = readFileSync(CHANGELOG, "utf-8");
 const EOL = rawMd.includes("\r\n") ? "\r\n" : "\n";
 const writeChangelog = (s) => writeFileSync(CHANGELOG, EOL === "\r\n" ? s.replace(/\n/g, "\r\n") : s);
 
+/**
+ * Every PR number the CHANGELOG already documents (#988).
+ *
+ * Read from the file rather than from git, because the file is the record of
+ * what has actually been ANNOUNCED — which is the question being asked. Tags
+ * cannot answer it here: the release flow leaves them off the branch entirely.
+ *
+ * Deliberately scans the WHOLE file, not just the newest section. An
+ * over-reaching range can reach back several releases (v0.50.5's reached to
+ * v0.50.1, four sections back), and each of those releases already said its
+ * piece.
+ */
+function alreadyDocumentedPRs() {
+  return [...rawMd.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]);
+}
+
 /** Build a dated entry string for `ver` from commits in `range`, folding in any
  *  hand-written highlights (deduped by PR). */
 function buildEntry(ver, range, highlights = "") {
-  const covered = new Set([...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]));
+  // #988 — dedupe against EVERY PR the changelog already documents, not just the
+  // hand-written highlights for this release.
+  //
+  // The range this is given routinely reaches too far back. `describe --tags`
+  // returns the newest tag REACHABLE from HEAD, and the release flow pushes the
+  // tag from a local commit and then squash-merges the version bump onto
+  // protected main — which writes a different sha, so a version tag is never an
+  // ancestor of main. `describe` walks straight past it to the release before.
+  // 0.50.3, 0.50.4 and 0.50.5 each generated a section listing every commit back
+  // to v0.50.1, and each had to be trimmed by hand before the tag was pushed.
+  //
+  // A narrower RANGE was tried and rejected: bounding by the newest release
+  // COMMIT on the branch under-includes instead, silently dropping anything
+  // merged between the tag being cut and the reconcile PR landing (#976 fell in
+  // exactly that window). Dropping an entry is worse than repeating one — a
+  // duplicate is visible, a gap is not.
+  //
+  // Filtering by what is already WRITTEN has neither failure mode: an entry the
+  // changelog already carries is a duplicate by definition, and one it does not
+  // carry survives however wide the range was. The mechanism already existed
+  // for the highlights; it was simply never pointed at the rest of the file.
+  const documented = [...alreadyDocumentedPRs(), ...[...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1])];
+  const covered = new Set(documented);
   const commits = parseCommits(range);
   const auto = autoBody(commits, covered);
   const parts = [`## [${ver}] - ${today()}`, ""];

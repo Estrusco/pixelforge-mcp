@@ -1,15 +1,26 @@
-import { describe, expect, it } from "vitest";
-import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { join, posix as posixPath, win32 as winPath } from "node:path";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import {
+  buildDeferredUpdateScript,
   checkAndSelfUpdate,
   compareSemver,
   detectInstallMode,
+  currentNpmLauncher,
+  deferredUpdateScriptFor,
   isNewer,
+  resolveNpmLauncher,
+  runNpmResolved,
+  shellCanResolveNpm,
+  type NpmLauncher,
   runSelfUpdate,
   selfUpdateStatus,
   SelfUpdateError,
   PACKAGE_NAME,
+  defaultDeps,
   type SelfUpdateDeps,
 } from "../../services/self-update.js";
 
@@ -20,6 +31,12 @@ import {
 interface Harness {
   deps: SelfUpdateDeps;
   npmCalls: Array<{ args: string[]; cwd?: string }>;
+  scheduleCalls: Array<{
+    mode: "global" | "local";
+    projectRoot?: string;
+    packageDir: string;
+    to: string;
+  }>;
 }
 
 function pkgJson(version: string): string {
@@ -29,13 +46,19 @@ function pkgJson(version: string): string {
 function makeDeps(opts: {
   packageDir: string;
   currentVersion?: string; // written into <packageDir>/package.json
-  latest?: string | undefined; // registry latest; undefined → offline
+  latest?: string | undefined; // registry latest; undefined → UNDETERMINED (#1136)
+  unreachable?: string; // #1136: the transport proved the host unreachable
   symlink?: boolean; // packageDir is a raw symlink
   realpath?: string; // override realpath(packageDir)
   realpathFails?: boolean; // realpath() returns undefined (resolution failed)
   env?: NodeJS.ProcessEnv;
   existing?: string[]; // extra paths that exist (e.g. project package.json)
   npmOk?: boolean; // result of runNpm
+  npmStderr?: string; // npm failure output (diagnostics must survive, #912)
+  npmStdout?: string;
+  npmMissing?: boolean; // #2671: npm could not be LOCATED at all
+  platform?: string; // injected platform (the deferred path is Windows-only)
+  scheduleOk?: boolean; // whether scheduleDeferredUpdate reports a launch
   registryThrows?: boolean;
 }): Harness {
   const realDir = opts.realpath ?? opts.packageDir;
@@ -46,6 +69,7 @@ function makeDeps(opts: {
   }
   const existing = new Set(opts.existing ?? []);
   const npmCalls: Harness["npmCalls"] = [];
+  const scheduleCalls: Harness["scheduleCalls"] = [];
 
   const deps: SelfUpdateDeps = {
     packageDir: () => opts.packageDir,
@@ -59,14 +83,35 @@ function makeDeps(opts: {
     },
     getLatestVersion: async () => {
       if (opts.registryThrows) throw new Error("network down");
-      return opts.latest;
+      // #1136 — the probe is now three-state. A harness that always returned
+      // `unreachable` for a missing version would re-create the very fold the
+      // change removes, so an absent `latest` means UNDETERMINED here; the
+      // unreachable path is exercised explicitly by opts.unreachable.
+      if (opts.unreachable) return { unreachable: opts.unreachable };
+      if (opts.latest === "") return { undetermined: "the registry response carried no usable version field" };
+      return opts.latest === undefined
+        ? { undetermined: "test harness supplied no version" }
+        : { version: opts.latest };
     },
     runNpm: async (args, cwd) => {
       npmCalls.push({ args, cwd });
-      return { ok: opts.npmOk ?? true };
+      const ok = opts.npmOk ?? true;
+      return ok
+        ? { ok }
+        : {
+            ok,
+            stderr: opts.npmStderr ?? "",
+            stdout: opts.npmStdout ?? "",
+            ...(opts.npmMissing ? { npmMissing: true } : {}),
+          };
+    },
+    platform: opts.platform ? () => opts.platform! : undefined,
+    scheduleDeferredUpdate: async (o) => {
+      scheduleCalls.push({ ...o });
+      return opts.scheduleOk ?? true;
     },
   };
-  return { deps, npmCalls };
+  return { deps, npmCalls, scheduleCalls };
 }
 
 // Common install-dir fixtures (POSIX-style; detection normalizes separators).
@@ -376,6 +421,344 @@ describe("checkAndSelfUpdate policy", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #912 / #916-a — npm failure diagnostics + the Windows deferred updater
+// ---------------------------------------------------------------------------
+
+const EBUSY_STDERR = [
+  "npm error code EBUSY",
+  "npm error syscall copyfile",
+  "npm error path C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\comfyui-mcp\\node_modules\\@img\\sharp-win32-x64\\lib\\libvips-42.dll",
+  "npm error EBUSY: resource busy or locked, copyfile",
+].join("\n");
+
+describe("#912 — a failed npm update must carry WHY (never the bare 'failed' note)", () => {
+  it("npm's stderr tail lands in the failure note (global)", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/comfyui-mcp",
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("npm-failed");
+    expect(res.note).toContain("staying on 0.19.1");
+    expect(res.note).toContain("npm error code E404");
+    expect(res.note).toContain("404 Not Found");
+  });
+
+  it("the tail comes from stdout when stderr is empty", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStdout: "npm ERR! network timeout at fetch",
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.note).toContain("network timeout at fetch");
+  });
+
+  it("only the LAST 8 lines survive", async () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `npm error line-${i + 1} ${"x".repeat(80)}`);
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: lines.join("\n"),
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.note).toContain("line-30");
+    expect(res.note).toContain("line-23");
+    expect(res.note).not.toContain("line-22"); // dropped: outside the last 8
+  });
+
+  it("a single very long npm line is length-capped", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: `npm error ${"y".repeat(5000)} END-OF-LOG`,
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.note!.length).toBeLessThan(1500);
+    expect(res.note).toContain("END-OF-LOG"); // the tail is what survives
+  });
+
+  it("the on-load check surfaces the same diagnostics", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: "npm error code EACCES\nnpm error permission denied",
+      platform: "linux",
+    });
+    const res = await checkAndSelfUpdate({ deps: h.deps });
+    expect(res.action).toBe("unavailable");
+    expect(res.note).toContain("EACCES");
+  });
+});
+
+describe("#912 — Windows global/local: EBUSY on the orchestrator's OWN sharp DLL", () => {
+  it("a locked-files npm failure on win32 schedules the deferred helper and reports 'scheduled'", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("scheduled");
+    expect(res.reason).toBe("locked-by-running-process");
+    // The in-process npm was attempted first, then the helper was scheduled…
+    expect(h.npmCalls).toHaveLength(1);
+    expect(h.scheduleCalls).toHaveLength(1);
+    expect(h.scheduleCalls[0].mode).toBe("global");
+    expect(h.scheduleCalls[0].packageDir).toBe(GLOBAL_DIR);
+    expect(h.scheduleCalls[0].to).toBe("0.20.0");
+    // …and the note says what actually happens — never "updated".
+    expect(res.note).toMatch(/detached helper was scheduled/);
+    expect(res.note).toMatch(/fully STOPPED/);
+    expect(res.note).toMatch(/[sS]taying on 0\.19\.1/);
+    expect(res.note).toContain("npm i -g comfyui-mcp@latest");
+    expect(res.note).not.toMatch(/Updated comfyui-mcp/);
+    expect(res.note).toMatch(/self-update\.log/);
+  });
+
+  it("a win32 LOCAL install passes the project root to the helper", async () => {
+    const h = makeDeps({
+      packageDir: LOCAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      existing: [join(LOCAL_PROJECT, "package.json")],
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("scheduled");
+    expect(h.scheduleCalls).toHaveLength(1);
+    expect(h.scheduleCalls[0].mode).toBe("local");
+    expect(h.scheduleCalls[0].projectRoot).toBe(LOCAL_PROJECT.replace(/\\/g, "/"));
+    expect(res.note).toContain("npm i comfyui-mcp@latest");
+    expect(res.note).toContain(LOCAL_PROJECT.replace(/\\/g, "/"));
+  });
+
+  it("the on-load check takes the same deferred path on win32", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await checkAndSelfUpdate({ deps: h.deps });
+    expect(res.action).toBe("scheduled");
+    expect(h.scheduleCalls).toHaveLength(1);
+  });
+
+  it("when the helper cannot be launched, the note falls back to the manual remedy + npm's own error", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: false, // spawn failed — never claim "scheduled"
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("locked-by-running-process");
+    expect(res.note).not.toMatch(/scheduled/);
+    expect(res.note).toMatch(/could not be started/);
+    expect(res.note).toContain("npm i -g comfyui-mcp@latest");
+    expect(res.note).toContain("EBUSY: resource busy or locked");
+    expect(res.note).toMatch(/[sS]taying on 0\.19\.1/);
+  });
+
+  it("a lock failure on POSIX is reported, never scheduled (the deferred path is Windows-only)", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "linux",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("locked-by-running-process");
+    expect(h.scheduleCalls).toEqual([]);
+    expect(res.note).toContain("EBUSY: resource busy or locked");
+  });
+
+  it("a lock error ANYWHERE in npm's output still classifies as locked (not just the last 8 lines)", async () => {
+    // The display tail is the last 8 lines — but the classification must read
+    // the FULL capture (codex gate): an EBUSY high in a long log, buried under
+    // trailing diagnostics, is still a locked-files failure.
+    const longLog = [
+      "npm error code EBUSY",
+      "npm error EBUSY: resource busy or locked, copyfile",
+      ...Array.from({ length: 30 }, (_, i) => `npm error diagnostic line ${i + 1}`),
+    ].join("\n");
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: longLog,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("scheduled");
+    expect(res.reason).toBe("locked-by-running-process");
+    expect(h.scheduleCalls).toHaveLength(1);
+  });
+
+  it("a NON-lock npm failure on win32 is NOT scheduled (a 404 won't heal by waiting)", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: "npm error code E404\nnpm error 404 Not Found",
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("npm-failed");
+    expect(h.scheduleCalls).toEqual([]);
+    expect(res.note).toContain("404 Not Found");
+  });
+
+  it("a successful win32 update never touches the helper", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      platform: "win32",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("updated");
+    expect(h.scheduleCalls).toEqual([]);
+  });
+});
+
+describe("#912 — status says up front that Windows applies via the deferred helper", () => {
+  it("win32 global: the update-available note names the deferred post-stop application", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      platform: "win32",
+    });
+    const s = await selfUpdateStatus(h.deps);
+    expect(s.updateAvailable).toBe(true);
+    expect(s.note).toMatch(/deferred helper/);
+    expect(s.note).toMatch(/fully stopped/i);
+  });
+
+  it("non-Windows: no such caveat", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      platform: "linux",
+    });
+    const s = await selfUpdateStatus(h.deps);
+    expect(s.note).not.toMatch(/deferred helper/);
+  });
+});
+
+describe("#912 — the deferred helper script itself", () => {
+  const LOG = "C:\\Temp\\comfyui-mcp-self-update.log";
+
+  it("global: probes the sharp DLL lock, runs npm -g, self-deletes", () => {
+    const s = buildDeferredUpdateScript(
+      { mode: "global", packageDir: GLOBAL_DIR, to: "0.20.0" },
+      LOG,
+    );
+    expect(s).toContain("libvips-42.dll");
+    expect(s).toContain("[System.IO.File]::Open($dll, 'Open', 'ReadWrite', 'None')");
+    expect(s).toContain(`& npm.cmd i -g ${PACKAGE_NAME}@latest --no-audit --no-fund *>> $log`);
+    expect(s).toContain("Remove-Item -LiteralPath $MyInvocation.MyCommand.Path");
+    expect(s).toContain(`$log = '${LOG}'`);
+    expect(s).toContain("$cwd = ''"); // global: npm -g has no cwd dependence
+  });
+
+  it("local: runs npm in the project root, no -g, and the root is re-validated before every attempt", () => {
+    const s = buildDeferredUpdateScript(
+      { mode: "local", projectRoot: "C:\\proj", packageDir: LOCAL_DIR, to: "0.20.0" },
+      LOG,
+    );
+    expect(s).toContain("$cwd = 'C:\\proj'");
+    expect(s).toContain("Set-Location -LiteralPath $cwd -ErrorAction Stop");
+    expect(s).toContain(`& npm.cmd i ${PACKAGE_NAME}@latest --no-audit --no-fund *>> $log`);
+    expect(s).not.toContain("i -g");
+    // A vanished/moved project root aborts the helper WITHOUT running npm in
+    // whatever directory it inherited — and the guard sits before the npm line.
+    expect(s).toContain("ABORTED without running npm");
+    expect(s).toContain("Test-Path -LiteralPath $cwd -PathType Container");
+    expect(s.indexOf("Test-Path -LiteralPath $cwd")).toBeLessThan(s.indexOf("& npm.cmd"));
+  });
+
+  it("single quotes in paths are escaped (PowerShell literal doubling)", () => {
+    const s = buildDeferredUpdateScript(
+      { mode: "local", projectRoot: "C:\\it's here", packageDir: LOCAL_DIR, to: "0.20.0" },
+      LOG,
+    );
+    expect(s).toContain("$cwd = 'C:\\it''s here'");
+  });
+
+  it("the generated script parses as valid PowerShell (validated on Windows hosts only)", () => {
+    if (process.platform !== "win32") return; // no powershell on POSIX CI
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-helper-script-"));
+    try {
+      const file = join(dir, "helper.ps1");
+      writeFileSync(
+        file,
+        buildDeferredUpdateScript(
+          { mode: "local", projectRoot: dir, packageDir: LOCAL_DIR, to: "0.20.0" },
+          join(dir, "log.txt"),
+        ),
+      );
+      // Parse-only: a syntax error makes [scriptblock]::Create throw (exit ≠ 0).
+      execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `$null = [scriptblock]::Create((Get-Content -LiteralPath '${file.replace(/'/g, "''")}' -Raw))`,
+        ],
+        { stdio: "pipe" },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // runSelfUpdate (explicit tool action)
 // ---------------------------------------------------------------------------
 
@@ -435,5 +818,638 @@ describe("selfUpdateStatus", () => {
     const s = await selfUpdateStatus(h.deps);
     expect(s.latestVersion).toBeUndefined();
     expect(s.updateAvailable).toBe(false);
+  });
+});
+
+// ── #1136: "unreachable" is a claim about the USER'S NETWORK. It must not be
+// made on the strength of a registry that answered.
+//
+// Before this, `getLatestVersion` returned `string | undefined` and four
+// conditions collapsed into that `undefined` -- DNS failure, non-2xx, missing
+// `version` field, unparseable body -- after which the consumer reported all
+// four as "npm registry unreachable (offline or timed out)". A user hitting a
+// 429 was told to check their network.
+describe("registry probe distinguishes unreachable from undetermined (#1136)", () => {
+  it("names the host and says unreachable ONLY when the transport proves it", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "1.0.0",
+      unreachable:
+        "Could not reach registry.npmjs.org — the request could not be resolved (DNS).",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.note).toContain("registry.npmjs.org");
+    expect(res.note).toMatch(/could not be resolved/i);
+  });
+
+  it("does NOT say unreachable when the registry ANSWERED but we could not determine a version", async () => {
+    // The discriminating case. `latest: undefined` now means undetermined, not
+    // unreachable -- a 500/429/garbage body must not be reported as a network
+    // problem the user can act on.
+    const h = makeDeps({ packageDir: GLOBAL_DIR, currentVersion: "1.0.0" });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.note).not.toMatch(/unreachable/i);
+    expect(res.note).toMatch(/could not determine/i);
+  });
+
+  it("says an undetermined check is NOT evidence of being up to date", async () => {
+    // The failure this issue is about: a non-answer read as a reassuring answer.
+    const h = makeDeps({ packageDir: GLOBAL_DIR, currentVersion: "1.0.0" });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.note).toMatch(/NOT evidence that you are up to date/i);
+    expect(res.action).not.toBe("up-to-date");
+  });
+});
+
+// The two defects the #1136 review measured in my own fix. Both are cases where
+// a NON-answer was rendered as a confident one -- the failure this issue is
+// about, reintroduced by the change meant to remove it.
+describe("selfUpdateStatus and the empty-version guard (#1136 review)", () => {
+  it("action:status must not report a REACHABLE registry as unreachable", () => {
+    // status and the update path are the same tool (tools/self-update.ts:20).
+    // status kept calling getLatestPublishedVersion, which flattens the probe
+    // back to string|undefined, so a 429 read as a network failure -- and
+    // status is the read-only action an agent uses while diagnosing exactly
+    // the "I can't find anything" scenario #1136 reports.
+    const h = makeDeps({ packageDir: GLOBAL_DIR, currentVersion: "1.0.0" });
+    return selfUpdateStatus(h.deps).then((res) => {
+      expect(res.note).not.toMatch(/registry unreachable/i);
+      expect(res.note).toMatch(/could not determine/i);
+      expect(res.note).toMatch(/NOT evidence that you are up to date/i);
+    });
+  });
+
+  it("action:status keeps the composed unreachable message, host name included", async () => {
+    // The old branch replaced it with a fixed string, discarding the host --
+    // the one thing #1136 asks for.
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "1.0.0",
+      unreachable: "Could not reach registry.npmjs.org — the request could not be resolved (DNS).",
+    });
+    const res = await selfUpdateStatus(h.deps);
+    expect(res.note).toContain("registry.npmjs.org");
+  });
+
+  it('an empty version string is UNDETERMINED, never "up to date"', async () => {
+    // Drives the REAL probe, not the harness. The first version of this test
+    // configured makeDeps to return `undetermined` for "" -- which tests the
+    // consumer and hand-feeds the answer: deleting the trim guard from
+    // defaultGetLatestVersion killed ZERO tests. Stub fetch instead, so the
+    // guard itself is what stands between {"version":""} and a false
+    // "up to date".
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ version: "" }), { status: 200 })),
+    );
+    try {
+      const probe = await defaultDeps.getLatestVersion();
+      expect("version" in probe, "an empty version must not count as a version").toBe(false);
+      expect(probe).toHaveProperty("undetermined");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a real successful body still yields a version (the guard must not over-fire)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ version: "9.9.9" }), { status: 200 })),
+    );
+    try {
+      expect(await defaultDeps.getLatestVersion()).toEqual({ version: "9.9.9" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a fetch REJECTION is unreachable — the swap's own thesis, previously unpinned", async () => {
+    // S3 from the re-review. All three probe tests stubbed fetch to RESOLVE, so
+    // nothing asserted the state this whole change exists to produce: replacing
+    // the catch's {unreachable} with {undetermined} killed zero tests.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        const err = new TypeError("fetch failed");
+        (err as unknown as { cause: unknown }).cause = Object.assign(new Error("ENOTFOUND"), {
+          code: "ENOTFOUND",
+        });
+        throw err;
+      }),
+    );
+    try {
+      const probe = await defaultDeps.getLatestVersion();
+      expect(probe).toHaveProperty("unreachable");
+      expect((probe as { unreachable: string }).unreachable).toContain("registry.npmjs.org");
+      expect((probe as { unreachable: string }).unreachable).toMatch(/NOT an empty result/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a non-2xx says the host IS reachable — never 'unreachable'", async () => {
+    // The registry ANSWERED. This is the 429/500 case the review measured
+    // still reporting a network failure.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("rate limited", { status: 429 })));
+    try {
+      const probe = await defaultDeps.getLatestVersion();
+      expect(probe).not.toHaveProperty("unreachable");
+      expect((probe as { undetermined: string }).undetermined).toMatch(/host IS reachable/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2671 — self-update must not die because npm is not on THIS process's PATH
+// ---------------------------------------------------------------------------
+
+describe("#2671 — locating npm", () => {
+  // The reporter's host: comfyui-mcp launched by something that never puts the
+  // Node directory on PATH, so `npm.cmd` resolves to nothing and Windows says
+  // "'npm.cmd' is not recognized as an internal or external command".
+  // Windows fixtures are built with the WIN32 path flavour, not the host's, so
+  // these cases assert real Windows behaviour on the ubuntu-latest CI legs too
+  // (codex gate r3 — with host-native joins they passed only on Windows).
+  const WIN_NODE_DIR = "C:\\Program Files\\nodejs";
+  const WIN_NODE = winPath.join(WIN_NODE_DIR, "node.exe");
+  const WIN_NPM_CLI = winPath.join(WIN_NODE_DIR, "node_modules", "npm", "bin", "npm-cli.js");
+  const WIN_SHIM = winPath.join(WIN_NODE_DIR, "npm.cmd");
+
+  it("PATH hit keeps the pre-#2671 invocation byte-for-byte (bare shim, shell on)", () => {
+    const got = resolveNpmLauncher({
+      platform: "win32",
+      pathEnv: `C:\\Windows\\system32;${WIN_NODE_DIR}`,
+      execPath: WIN_NODE,
+      exists: (p) => p === WIN_SHIM,
+    });
+    // The bare name, NOT an absolute path: on every host where this already
+    // worked, nothing about the spawn changes.
+    expect(got).toEqual({ file: "npm.cmd", prefixArgs: [], shell: true, source: "path" });
+  });
+
+  it("PATH miss falls back to the npm beside the RUNNING node binary", () => {
+    const got = resolveNpmLauncher({
+      platform: "win32",
+      pathEnv: "C:\\Windows\\system32;C:\\Python311\\Scripts", // no node dir
+      execPath: WIN_NODE,
+      exists: (p) => p === WIN_NPM_CLI,
+    });
+    expect(got?.source).toBe("node-adjacent");
+    // Spawns node with npm's own JS — no shell, so the space in
+    // "C:\Program Files" needs no quoting and cannot split the command.
+    expect(got?.file).toBe(WIN_NODE);
+    expect(got?.shell).toBe(false);
+    expect(got?.prefixArgs).toEqual([WIN_NPM_CLI]);
+  });
+
+  it("POSIX resolves npm through the <prefix>/lib layout, not the Windows one", () => {
+    const cli = posixPath.join("/usr/local/bin", "..", "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    const got = resolveNpmLauncher({
+      platform: "linux",
+      pathEnv: "/usr/bin:/bin",
+      execPath: "/usr/local/bin/node",
+      exists: (p) => p === cli,
+    });
+    expect(got?.source).toBe("node-adjacent");
+    expect(got?.shell).toBe(false); // never a shell off Windows
+    // `join` already normalized the ".."; no host-cwd `resolve` is involved,
+    // which is what lets the win32 case above evaluate correctly on a POSIX runner.
+    expect(got?.prefixArgs).toEqual([cli]);
+    // `join` collapsed the "..", so nothing downstream has to.
+    expect(got?.prefixArgs[0]).not.toContain("..");
+  });
+
+  it("npm nowhere → undefined (callers still get one last-resort bare attempt)", () => {
+    expect(
+      resolveNpmLauncher({
+        platform: "win32",
+        pathEnv: "C:\\Windows\\system32",
+        execPath: WIN_NODE,
+        exists: () => false,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("an empty PATH entry never becomes a resolution; a quoted one still does", () => {
+    // An empty entry means "the current directory" to cmd.exe. Picking npm up
+    // from wherever ComfyUI happens to be running is not something we do.
+    expect(
+      resolveNpmLauncher({
+        platform: "win32",
+        pathEnv: ";;  ;",
+        execPath: WIN_NODE,
+        exists: (p) => p === winPath.join(".", "npm.cmd") || p === "npm.cmd",
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveNpmLauncher({
+        platform: "win32",
+        pathEnv: `"${WIN_NODE_DIR}"`,
+        execPath: WIN_NODE,
+        exists: (p) => p === WIN_SHIM,
+      })?.source,
+    ).toBe("path");
+  });
+
+  it("a PATH probe that THROWS does not abort the resolution", () => {
+    const got = resolveNpmLauncher({
+      platform: "win32",
+      pathEnv: "\\\\dead-share\\x;C:\\Windows\\system32",
+      execPath: WIN_NODE,
+      exists: (p) => {
+        if (p.startsWith("\\\\dead-share")) throw new Error("EPERM");
+        return p === WIN_NPM_CLI;
+      },
+    });
+    expect(got?.source).toBe("node-adjacent");
+  });
+});
+
+describe("#2671 — an unfindable npm is reported as such, not as a failed update", () => {
+  it("reports npm-not-found with the command to run by hand (global)", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.52.139",
+      latest: "0.52.165",
+      npmOk: false,
+      npmMissing: true,
+      npmStderr:
+        "'npm.cmd' is not recognized as an internal or external command,\noperable program or batch file.",
+      platform: "win32",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    // A distinct reason from "npm-failed": npm never ran, so it rendered no
+    // verdict on the update at all.
+    expect(res.reason).toBe("npm-not-found");
+    expect(res.note).toMatch(/npm could not be found/);
+    // The user must be told what to actually DO, and that nothing changed.
+    expect(res.note).toContain(`npm i -g ${PACKAGE_NAME}@latest`);
+    expect(res.note).toMatch(/nothing was changed/);
+    expect(res.note).toMatch(/nodejs\.org/);
+    // The raw launcher failure still travels, so a misclassification can never
+    // hide evidence from the user.
+    expect(res.note).toContain("is not recognized");
+    // The old note claimed npm had rejected the update. It had not.
+    expect(res.note).not.toMatch(/npm update to 0\.52\.165 failed/);
+  });
+
+  it("a LOCAL install is told WHERE to run the command", async () => {
+    const h = makeDeps({
+      packageDir: LOCAL_DIR,
+      currentVersion: "0.52.139",
+      latest: "0.52.165",
+      existing: [join(LOCAL_PROJECT, "package.json")],
+      npmOk: false,
+      npmMissing: true,
+      platform: "win32",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.reason).toBe("npm-not-found");
+    expect(res.note).toContain(`npm i ${PACKAGE_NAME}@latest`);
+    expect(res.note).toContain(LOCAL_PROJECT);
+  });
+
+  it("EBUSY OUTRANKS the not-found probe — npm plainly ran, so the deferred helper still fires", async () => {
+    // The ordering guard. `npmMissing` only says our own PATH/node-adjacent
+    // probe found nothing; an EBUSY in the output is positive proof npm
+    // executed anyway. Trusting the probe over that proof would strand every
+    // Windows user whose shell resolves npm in a way we cannot see, by
+    // skipping the helper that is the ONLY way an in-place Windows update
+    // ever lands.
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.52.139",
+      latest: "0.52.165",
+      npmOk: false,
+      npmMissing: true,
+      npmStderr: "npm error code EBUSY\nnpm error EBUSY: resource busy or locked",
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("scheduled");
+    expect(res.reason).toBe("locked-by-running-process");
+    expect(h.scheduleCalls).toHaveLength(1);
+  });
+
+  it("a normal npm failure is untouched by the new branch", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false, // npmMissing NOT set — npm ran and said no
+      npmStderr: "npm error code E404",
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.reason).toBe("npm-failed");
+    expect(res.note).toContain("npm update to 0.20.0 failed");
+    expect(res.note).not.toMatch(/npm could not be found/);
+  });
+});
+
+describe("#2671 — the DEFERRED helper must launch the same npm the caller resolved", () => {
+  const OPTS = {
+    mode: "global" as const,
+    packageDir: "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\comfyui-mcp",
+    to: "0.52.165",
+  };
+
+  it("a node-adjacent launcher is quoted, so 'Program Files' survives the space", () => {
+    const script = buildDeferredUpdateScript(
+      {
+        ...OPTS,
+        npm: {
+          file: "C:\\Program Files\\nodejs\\node.exe",
+          prefixArgs: ["C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js"],
+          shell: false,
+          source: "node-adjacent",
+        },
+      },
+      "C:\\tmp\\log.txt",
+    );
+    expect(script).toContain(
+      "& 'C:\\Program Files\\nodejs\\node.exe' " +
+        "'C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js' i -g",
+    );
+    // The bare shim would have failed for exactly the reason the in-process
+    // attempt did — silently, into a log nobody opens.
+    expect(script).not.toContain("& npm.cmd ");
+  });
+
+  it("with no resolved launcher the historical bare shim is kept", () => {
+    const script = buildDeferredUpdateScript(OPTS, "C:\\tmp\\log.txt");
+    expect(script).toContain("& npm.cmd i -g");
+  });
+});
+
+describe("#2671 — the scheduler's script carries THIS process's npm resolution", () => {
+  const OPTS = {
+    mode: "global" as const,
+    packageDir: "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\comfyui-mcp",
+    to: "0.52.165",
+  };
+  const LOG = "C:\\tmp\\log.txt";
+  const psq = (s: string) => `'${s.replace(/'/g, "''")}'`;
+
+  it("defaults npm in when the caller supplies none", () => {
+    const resolved = currentNpmLauncher();
+    // The composition itself, which holds on any host: the seam must default
+    // the launcher rather than pass opts through untouched.
+    expect(deferredUpdateScriptFor(OPTS, LOG)).toBe(
+      buildDeferredUpdateScript({ ...OPTS, npm: resolved }, LOG),
+    );
+    // And where npm IS resolvable — every host this repo builds on, since it
+    // installs with npm — pin the rendered call too, so the assertion above
+    // cannot pass merely because both sides resolved to nothing. Skipping
+    // rather than asserting `toBeDefined` keeps a pnpm/yarn-only or
+    // npm-less-Node host from going red for an environmental reason (codex
+    // gate r1).
+    if (resolved) {
+      const expected = [resolved.file, ...resolved.prefixArgs].map(psq).join(" ");
+      expect(deferredUpdateScriptFor(OPTS, LOG)).toContain(
+        `& ${expected} i -g ${PACKAGE_NAME}@latest`,
+      );
+    }
+  });
+
+  it("an explicitly supplied launcher is not overwritten by the default", () => {
+    const script = deferredUpdateScriptFor(
+      {
+        ...OPTS,
+        npm: {
+          file: "X:\\node\\node.exe",
+          prefixArgs: ["X:\\node\\npm-cli.js"],
+          shell: false,
+          source: "node-adjacent",
+        },
+      },
+      LOG,
+    );
+    expect(script).toContain("& 'X:\\node\\node.exe' 'X:\\node\\npm-cli.js' i -g");
+  });
+});
+
+describe("#2671 r1 — npmMissing must never be claimed about a run that happened", () => {
+  // codex gate r1. `npmMissing` used to be set from "our probe found nothing
+  // AND execFile reported an error", but on the last-resort bare-name attempt
+  // an error is equally consistent with npm running and returning E404. The
+  // user then got "npm could not be found — install Node.js" for a registry
+  // problem. defaultRunNpm now asks the SHELL before making that claim; these
+  // pin the CLASSIFIER's half of the contract, that a run npm demonstrably
+  // performed is never relabelled.
+
+  it("an npm-level failure reported WITHOUT the missing flag stays npm-failed", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.52.139",
+      latest: "0.52.165",
+      npmOk: false,
+      // The exact shape the old code mislabelled: our probe found no npm, but
+      // the bare-name attempt reached npm and npm answered.
+      npmStderr: "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/comfyui-mcp",
+      platform: "win32",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.reason).toBe("npm-failed");
+    expect(res.note).not.toMatch(/npm could not be found/);
+    expect(res.note).not.toMatch(/nodejs\.org/); // no install-Node remediation
+    expect(res.note).toContain("404 Not Found");
+  });
+
+  it("defaultRunNpm reports no missing flag on a host where npm IS resolvable", async () => {
+    // Drives the REAL defaultRunNpm (not the harness fake) against the real
+    // shell, with a deliberately failing npm subcommand. npm exists here, so
+    // whatever else happens the not-found flag must stay off.
+    const res = await defaultDeps.runNpm(["run", "comfyui-mcp-no-such-script-2671"]);
+    expect(res.ok).toBe(false); // the command really did fail
+    expect(res.npmMissing).toBeUndefined(); // ...but not because npm is absent
+  }, 60_000);
+});
+
+describe("#2671 r1 — the last-resort attempt only claims 'missing' on the shell's word", () => {
+  const FAIL = { ok: false, stdout: "", stderr: "npm error code E404" };
+  const okRes = { ok: true, stdout: "", stderr: "" };
+
+  function io(over: {
+    launcher?: NpmLauncher | undefined;
+    spawnResult?: { ok: boolean; stdout?: string; stderr?: string };
+    shellResolves?: boolean | undefined;
+    calls?: Array<{ file: string; args: string[]; shell: boolean }>;
+    probes?: number[];
+  }) {
+    return {
+      platform: "win32",
+      launcher: over.launcher,
+      spawn: async (file: string, args: string[], shell: boolean) => {
+        over.calls?.push({ file, args, shell });
+        return over.spawnResult ?? FAIL;
+      },
+      shellResolvesNpm: async () => {
+        over.probes?.push(1);
+        return over.shellResolves;
+      },
+    };
+  }
+
+  it("a resolved launcher is run as-is and NEVER probed or flagged", async () => {
+    const calls: Array<{ file: string; args: string[]; shell: boolean }> = [];
+    const probes: number[] = [];
+    const res = await runNpmResolved(
+      io({
+        launcher: {
+          file: "C:\\Program Files\\nodejs\\node.exe",
+          prefixArgs: ["C:\\Program Files\\nodejs\\npm-cli.js"],
+          shell: false,
+          source: "node-adjacent",
+        },
+        calls,
+        probes,
+      }),
+      ["i", "-g", "x"],
+    );
+    expect(res.npmMissing).toBeUndefined();
+    expect(calls).toEqual([
+      {
+        file: "C:\\Program Files\\nodejs\\node.exe",
+        args: ["C:\\Program Files\\nodejs\\npm-cli.js", "i", "-g", "x"],
+        shell: false,
+      },
+    ]);
+    expect(probes).toHaveLength(0); // holding a launcher, nothing to ask
+  });
+
+  it("THE REGRESSION: unresolved launcher + npm ran and said E404 → npm-failed, not missing", async () => {
+    // The exact shape codex caught. Our probe found no npm, the bare-name
+    // attempt reached npm anyway, npm returned 404. Reporting "npm could not
+    // be found" here sends the user to install Node.js over a registry error.
+    const res = await runNpmResolved(
+      io({ launcher: undefined, shellResolves: true }),
+      ["i", "-g", "x"],
+    );
+    expect(res.ok).toBe(false);
+    expect(res.npmMissing).toBeUndefined();
+    expect(res.stderr).toContain("E404");
+  });
+
+  it("unresolved launcher + the shell cannot resolve npm either → missing", async () => {
+    const res = await runNpmResolved(
+      io({ launcher: undefined, shellResolves: false }),
+      ["i", "-g", "x"],
+    );
+    expect(res.npmMissing).toBe(true);
+  });
+
+  it("an UNANSWERABLE probe does not become a claim", async () => {
+    // `where`/`sh` itself failed to launch. That says nothing about npm, so the
+    // not-found claim stays unmade rather than being guessed at.
+    const res = await runNpmResolved(
+      io({ launcher: undefined, shellResolves: undefined }),
+      ["i", "-g", "x"],
+    );
+    expect(res.npmMissing).toBeUndefined();
+  });
+
+  it("a SUCCESSFUL last-resort attempt is never probed at all", async () => {
+    const probes: number[] = [];
+    const res = await runNpmResolved(
+      io({ launcher: undefined, spawnResult: okRes, shellResolves: false, probes }),
+      ["i", "-g", "x"],
+    );
+    expect(res.ok).toBe(true);
+    expect(res.npmMissing).toBeUndefined();
+    expect(probes).toHaveLength(0); // it worked; there is nothing to diagnose
+  });
+
+  it("the last-resort attempt is the pre-#2671 invocation, unchanged", async () => {
+    const calls: Array<{ file: string; args: string[]; shell: boolean }> = [];
+    await runNpmResolved(io({ launcher: undefined, shellResolves: true, calls }), ["i", "-g", "x"]);
+    expect(calls).toEqual([{ file: "npm.cmd", args: ["i", "-g", "x"], shell: true }]);
+  });
+});
+
+describe("#2671 r2 — the shell probe must answer only what it actually knows", () => {
+  // codex gate r2. These pin the DISCRIMINATOR against execFile's real error
+  // shapes, measured on Windows rather than assumed:
+  //   found           -> err === null
+  //   exit 1 (no npm) -> { code: 1,       killed: false }   the only real "no"
+  //   spawn failure   -> { code: "ENOENT"               }   a STRING code
+  //   timeout kill    -> { code: null,    killed: true  }
+  // The first draft answered "cannot tell" from a child.on("error") listener,
+  // which never wins: execFile's own error handler invokes the callback first,
+  // so the promise was already settled `false` and BOTH non-answers became
+  // "npm is not installed".
+  // These drive the REAL shellCanResolveNpm against REAL child processes. An
+  // earlier draft re-implemented the classification inside the test; reverting
+  // the discriminator to `!err` left all of it green, which is the whole reason
+  // the probe command is injectable now.
+  const isWin = process.platform === "win32";
+
+  it("a command that IS resolvable answers yes", async () => {
+    const res = await shellCanResolveNpm(
+      isWin
+        ? { file: "where", args: ["where.exe"] }
+        : { file: "sh", args: ["-c", "command -v sh"] },
+    );
+    expect(res).toBe(true);
+  }, 60_000);
+
+  it("a command that is genuinely absent answers NO — a real exit code", async () => {
+    const res = await shellCanResolveNpm(
+      isWin
+        ? { file: "where", args: ["definitely-no-such-command-2671"] }
+        : { file: "sh", args: ["-c", "command -v definitely-no-such-command-2671"] },
+    );
+    expect(res).toBe(false);
+  }, 60_000);
+
+  it("a probe that cannot SPAWN answers cannot-tell, not 'npm is missing'", async () => {
+    // ENOENT arrives with a STRING code. Reading it as a failed lookup is what
+    // would send a user with a broken `where` off to reinstall Node.
+    const res = await shellCanResolveNpm({ file: "no-such-binary-2671-probe", args: [] });
+    expect(res).toBeUndefined();
+  }, 60_000);
+
+  it("a probe we KILL on timeout answers cannot-tell", async () => {
+    const res = await shellCanResolveNpm(
+      isWin
+        ? { file: "ping", args: ["-n", "30", "127.0.0.1"], timeoutMs: 700 }
+        : { file: "sleep", args: ["30"], timeoutMs: 700 },
+    );
+    expect(res).toBeUndefined();
+  }, 60_000);
+});
+
+describe("#2671 r2 — the PATH scan must not block on a dead network share", () => {
+  it("a UNC PATH entry is never stat'ed", () => {
+    // codex gate r2: `exists` is synchronous and a dead share blocks for the
+    // SMB timeout, inside a module contracted to never block startup.
+    const probed: string[] = [];
+    const got = resolveNpmLauncher({
+      platform: "win32",
+      pathEnv: "\\\\fileserver\\tools\\node;//other/share;C:\\Program Files\\nodejs",
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      exists: (p) => {
+        probed.push(p);
+        return p === winPath.join("C:\\Program Files\\nodejs", "npm.cmd");
+      },
+    });
+    expect(got?.source).toBe("path"); // the local entry after them still works
+    expect(probed.some((p) => p.startsWith("\\\\") || p.startsWith("//"))).toBe(false);
+  });
+
+  it("a UNC entry is still walked on POSIX, where a leading // is just a path", () => {
+    const got = resolveNpmLauncher({
+      platform: "linux",
+      pathEnv: "//net/tools:/usr/bin",
+      execPath: "/usr/local/bin/node",
+      exists: (p) => p === posixPath.join("//net/tools", "npm"),
+    });
+    expect(got?.source).toBe("path");
   });
 });

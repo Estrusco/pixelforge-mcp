@@ -27,12 +27,12 @@ The user wants to browse images that ComfyUI has generated, inspect their metada
 
 4. **Present image details.** For each image, show:
    - Filename
-   - File size (human-readable: KB/MB)
+   - File size (human-readable, KB/MB)
    - Creation/modification date and time
    - Use the Read tool to display the image thumbnail if the file is a supported image format
 
 5. **Extract workflow metadata.** When the user selects an image or asks for details:
-   - Use `workflow_from_image` to extract the embedded workflow JSON from the PNG metadata
+   - Use `get_workflow (action:"from_image")` to extract the embedded workflow JSON from the PNG metadata
    - Show key parameters: checkpoint used, prompt, negative prompt, seed, steps, CFG, sampler, dimensions
    - Offer to visualize the workflow with `visualize_workflow`
 
@@ -54,8 +54,8 @@ Steps:
 
 ## Notes
 
-- ComfyUI embeds workflow metadata in PNG files by default — this is what `workflow_from_image` reads
+- ComfyUI embeds workflow metadata in PNG files by default; that is what `get_workflow (action:"from_image")` reads
 - JPEG and WebP files may not have embedded metadata depending on ComfyUI settings
 - The output directory may contain subdirectories for different workflows or dates
 - If the output directory is empty, tell the user no images have been generated yet
-- Large galleries (100+ images) should be filtered to avoid overwhelming output
+- Filter large galleries (100+ images) so the output stays manageable

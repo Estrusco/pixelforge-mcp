@@ -6,9 +6,18 @@ import { join } from "node:path";
 // Mock resolveOutputDir so the scan targets our temp dir; everything else
 // (readdir/stat/extname classification) runs for real.
 let outputDir = "";
+let tempDir = "";
+// #877 needs the FAILING resolution too: "the output dir could not be
+// determined" is a distinct state from "it resolved and was empty", and the bug
+// was those two producing the same answer.
+let outputDirError: Error | null = null;
+let tempDirError: Error | null = null;
 vi.mock("../../services/output-dir.js", () => ({
-  resolveOutputDir: () => Promise.resolve(outputDir),
+  resolveOutputDir: () =>
+    outputDirError ? Promise.reject(outputDirError) : Promise.resolve(outputDir),
   resolveInputDir: () => Promise.resolve(outputDir),
+  resolveTempDir: () =>
+    tempDirError ? Promise.reject(tempDirError) : Promise.resolve(tempDir),
 }));
 
 // Mock the client so the remote (history-derived) branch is controllable. Only
@@ -18,6 +27,7 @@ vi.mock("../../comfyui/client.js", () => ({
   getHistory: (...a: unknown[]) => getHistoryMock(...a),
   fetchImage: vi.fn(),
   uploadImageHttp: vi.fn(),
+  MAX_VIEW_RESPONSE_BYTES: 32 * 1024 * 1024,
 }));
 
 // Keep the real config (and its mutable `comfyuiPath`) but make isRemoteMode()
@@ -52,20 +62,31 @@ async function touchSub(
   await utimes(p, when, when);
 }
 
+async function touchTemp(name: string, when: Date, bytes = 1024): Promise<void> {
+  await mkdir(tempDir, { recursive: true });
+  const p = join(tempDir, name);
+  await writeFile(p, Buffer.alloc(bytes));
+  await utimes(p, when, when);
+}
+
 let prevComfyuiPath: string | undefined;
 
 beforeEach(async () => {
   outputDir = await mkdtemp(join(tmpdir(), "comfy-out-"));
+  tempDir = await mkdtemp(join(tmpdir(), "comfy-temp-"));
   // The local filesystem scan only runs when COMFYUI_PATH is set; force local
   // mode for the scan-based tests (resolveOutputDir is mocked to our temp dir).
   prevComfyuiPath = config.comfyuiPath;
   config.comfyuiPath = outputDir;
   remoteFlag = false;
+  outputDirError = null;
+  tempDirError = null;
   getHistoryMock.mockReset();
 });
 
 afterEach(async () => {
   await rm(outputDir, { recursive: true, force: true });
+  await rm(tempDir, { recursive: true, force: true });
   config.comfyuiPath = prevComfyuiPath;
   vi.clearAllMocks();
 });
@@ -80,6 +101,82 @@ describe("listOutputImages", () => {
     expect(mp4?.kind).toBe("video");
     expect(mp4?.size).toBe(1024);
     expect(mp4?.modified).toBe(new Date("2026-06-26T12:00:00Z").toISOString());
+  });
+
+  // #2370 — the report's stated root cause: "the local output scan is omitting a
+  // known completed video or filtering it incorrectly ... including when the
+  // filename contains `-audio`". It is not, and this pins that it stays that way.
+  //
+  // VHS_VideoCombine muxes audio into a SECOND file, `<prefix>_<counter>-audio.mp4`
+  // (videohelpersuite/nodes.py), and that is the name it hands back as the run's
+  // output — so it is the name a caller filters on. Both the bare and the muxed
+  // file must come back for a prefix pattern, at top level and from a subfolder.
+  it("#2370: returns a VHS `-audio.mp4` for a prefix pattern, top level and nested", async () => {
+    const now = new Date("2026-08-26T12:00:00Z");
+    await touch("LTX_NATIVE_CONTEXT_TEST_00001.mp4", now);
+    await touch("LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4", now);
+    await touchSub("video", "LTX_NATIVE_CONTEXT_TEST_00002-audio.mp4", now);
+    // A near-miss that must NOT be swept in, so the pattern is doing real work.
+    await touch("SOMETHING_ELSE_00001-audio.mp4", now);
+
+    const hits = await listOutputImages({
+      pattern: "LTX_NATIVE_CONTEXT_TEST_00001",
+      limit: 100,
+    });
+    expect(hits.map((r) => r.filename).sort()).toEqual([
+      "LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4",
+      "LTX_NATIVE_CONTEXT_TEST_00001.mp4",
+    ]);
+    expect(hits.every((r) => r.kind === "video")).toBe(true);
+
+    // The nested one is reachable by its own prefix and reports its subfolder,
+    // which is what upload_image (action:"stage") needs to chain it forward.
+    const nested = await listOutputImages({
+      pattern: "LTX_NATIVE_CONTEXT_TEST_00002",
+      limit: 100,
+    });
+    expect(nested).toHaveLength(1);
+    expect(nested[0]?.subfolder).toBe("video");
+    expect(nested[0]?.kind).toBe("video");
+  });
+
+  // #2370 recurrence: a completed VHS render named
+  // LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4, but list_outputs against output/
+  // returned []. VHS_VideoCombine with save_output unchecked writes that file
+  // to temp/ (type:"temp"), which the previous fix only *named* in an empty
+  // caveat. The file must actually be listed, tagged type:"temp".
+  it("#2370: lists a completed VHS -audio.mp4 written to temp/, tagged type:temp", async () => {
+    const now = new Date("2026-08-29T12:00:00Z");
+    await touchTemp("LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4", now);
+    await touchTemp("LTX_NATIVE_CONTEXT_TEST_00001.mp4", now);
+    // PreviewImage stills live in temp/ too and must NOT flood the listing.
+    await touchTemp("ComfyUI_temp_preview.png", now);
+
+    const hits = await listOutputImages({
+      pattern: "LTX_NATIVE_CONTEXT_TEST_00001",
+      limit: 100,
+    });
+    expect(hits.map((r) => r.filename).sort()).toEqual([
+      "LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4",
+      "LTX_NATIVE_CONTEXT_TEST_00001.mp4",
+    ]);
+    expect(hits.every((r) => r.kind === "video")).toBe(true);
+    expect(hits.every((r) => r.type === "temp")).toBe(true);
+    expect(hits.find((r) => r.filename === "ComfyUI_temp_preview.png")).toBeUndefined();
+  });
+
+  it("#2370: a temp VHS video is listed even when output/ already has stills", async () => {
+    const now = new Date("2026-08-29T12:00:00Z");
+    await touch("portrait_00001.png", now);
+    await touchTemp("LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4", now);
+
+    const hits = await listOutputImages({ limit: 100 });
+    expect(hits.map((r) => r.filename).sort()).toEqual([
+      "LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4",
+      "portrait_00001.png",
+    ]);
+    expect(hits.find((r) => r.filename.endsWith(".mp4"))?.type).toBe("temp");
+    expect(hits.find((r) => r.filename.endsWith(".png"))?.type).toBe("output");
   });
 
   it("classifies still images as kind:image and videos/animations as kind:video", async () => {
@@ -162,8 +259,17 @@ describe("listOutputImages", () => {
 
 describe("listOutputImages — remote mode (derived from /history)", () => {
   beforeEach(() => {
-    // No local filesystem → the history-derived branch is used.
+    // ACTUALLY remote (#877). This block called itself "remote mode" while only
+    // clearing `config.comfyuiPath` — which is the very conflation the bug was:
+    // one env var being unset is not "there is no local filesystem", because a
+    // local portable install is located by the SAVED DEFAULT WORKSPACE. Keying
+    // the /history branch off that check sent a local install to a data source
+    // that cannot see its disk, and an emptied history then read as "no outputs".
+    remoteFlag = true;
     config.comfyuiPath = undefined;
+  });
+  afterEach(() => {
+    remoteFlag = false;
   });
 
   it("derives images + videos from history, newest-first, with kind", async () => {
@@ -201,7 +307,7 @@ describe("listOutputImages — remote mode (derived from /history)", () => {
     expect(byName["old.png"].modified).toBe("");
   });
 
-  it("skips temp-type assets and dedupes repeated filenames", async () => {
+  it("skips temp stills (PreviewImage) and dedupes repeated filenames", async () => {
     getHistoryMock.mockResolvedValue({
       a: {
         outputs: {
@@ -221,7 +327,36 @@ describe("listOutputImages — remote mode (derived from /history)", () => {
     });
 
     const results = await listOutputImages({ limit: 100 });
-    expect(results.map((r) => r.filename)).toEqual(["dup.png"]); // temp skipped, dup deduped
+    expect(results.map((r) => r.filename)).toEqual(["dup.png"]); // temp still skipped, dup deduped
+  });
+
+  it("#2370: includes a VHS type:temp video from history, skips temp stills", async () => {
+    getHistoryMock.mockResolvedValue({
+      a: {
+        outputs: {
+          "12": {
+            videos: [
+              {
+                filename: "LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4",
+                subfolder: "",
+                type: "temp",
+              },
+            ],
+            images: [{ filename: "preview.png", subfolder: "", type: "temp" }],
+          },
+        },
+      },
+    });
+
+    const results = await listOutputImages({
+      pattern: "LTX_NATIVE_CONTEXT_TEST_00001",
+      limit: 100,
+    });
+    expect(results.map((r) => r.filename)).toEqual([
+      "LTX_NATIVE_CONTEXT_TEST_00001-audio.mp4",
+    ]);
+    expect(results[0]?.kind).toBe("video");
+    expect(results[0]?.type).toBe("temp");
   });
 
   it("honors limit and pattern", async () => {
@@ -244,9 +379,13 @@ describe("listOutputImages — remote mode (derived from /history)", () => {
     expect((await listOutputImages({ limit: 1 })).length).toBe(1);
   });
 
-  it("returns [] when history is unavailable rather than throwing", async () => {
+  it("does NOT return [] when history is UNAVAILABLE — a failed request is not an empty history", async () => {
+    // This asserted the opposite, and that was the fold (#877): in remote mode
+    // /history is the ONLY source, so returning `[]` when the request failed made
+    // "we never got an answer" indistinguishable from "there are no outputs" —
+    // and `[]` was the whole reply.
     getHistoryMock.mockRejectedValue(new Error("unreachable"));
-    await expect(listOutputImages()).resolves.toEqual([]);
+    await expect(listOutputImages()).rejects.toThrow(/NOT a finding that there are no outputs/i);
   });
 
   it("uses /history even when comfyuiPath IS set, as long as isRemoteMode() is true", async () => {
@@ -274,5 +413,69 @@ describe("listOutputImages — remote mode (derived from /history)", () => {
     // …and ONLY the history-derived entry came back (readdir scan did NOT run).
     expect(results.map((r) => r.filename)).toEqual(["from_history.png"]);
     expect(results.find((r) => r.filename === "local_only.png")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #877 — a LOCAL portable install with COMFYUI_PATH unset. `install_comfyui (action:"environment")`
+// locates it perfectly well from the saved default workspace, but
+// The output listing keyed its remote branch off `!config.comfyuiPath` and so
+// asked /history, which had been emptied by a restart. It returned `[]` over a
+// directory holding exactly the files the caller was asking about — a silent
+// wrong answer, not an error, and the agent concludes the file does not exist.
+
+describe("#877 — a local install whose path comes from the saved workspace, not COMFYUI_PATH", () => {
+  beforeEach(() => {
+    remoteFlag = false; // LOCAL…
+    config.comfyuiPath = undefined; // …but the env var is unset
+    outputDirError = null;
+  });
+  afterEach(() => {
+    outputDirError = null;
+  });
+
+  it("scans the resolved output dir instead of falling back to /history", async () => {
+    // The output dir resolves (as it does from a saved default workspace), and
+    // the files are right there.
+    await writeFile(join(outputDir, "fairy_redhair_00001_.png"), "x");
+    // /history is EMPTY — a restart cleared it. Under the bug this is what the
+    // caller got back, dressed as an answer.
+    getHistoryMock.mockResolvedValue({});
+
+    const images = await listOutputImages({});
+
+    expect(images.map((i) => i.filename)).toContain("fairy_redhair_00001_.png");
+    // And it never consulted the source that cannot see the disk.
+    expect(getHistoryMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT report an empty result when the output dir could not be determined", async () => {
+    // No local root AND nothing in history. Returning `[]` here asserts there are
+    // no outputs, which neither source established: one was never consulted and
+    // the other cannot see files on disk.
+    outputDirError = new Error("no COMFYUI_PATH, no saved workspace");
+    getHistoryMock.mockResolvedValue({});
+
+    await expect(listOutputImages({})).rejects.toThrow(/NOT a finding that there are no outputs/i);
+  });
+
+  it("still ANSWERS from history when the dir is unknown but history has something", async () => {
+    // The inverse: falling back is right, and refusing when the fallback actually
+    // produced an answer would be a false refusal of a real result.
+    outputDirError = new Error("no local root");
+    getHistoryMock.mockResolvedValue({
+      j1: { outputs: { "9": { images: [{ filename: "from-history.png", subfolder: "", type: "output" }] } } },
+    });
+
+    const images = await listOutputImages({});
+    expect(images.map((i) => i.filename)).toEqual(["from-history.png"]);
+  });
+
+  it("does NOT report an empty result when the output dir is known but unreadable", async () => {
+    // We know WHERE the outputs are and could not read them. That is not an empty
+    // directory, and `[]` told the caller their file does not exist.
+    outputDir = join(outputDir, "does-not-exist-at-all");
+
+    await expect(listOutputImages({})).rejects.toThrow(/could not be listed at all/i);
   });
 });

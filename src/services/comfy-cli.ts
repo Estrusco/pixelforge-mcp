@@ -1,7 +1,37 @@
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, dirname, extname, join } from "node:path";
-import { config } from "../config.js";
+import { config, isRemoteMode } from "../config.js";
+import {
+  resolveEffectiveComfyUIBase,
+  resolveEffectiveComfyUICodeBase,
+} from "./workspace-env.js";
+
+/**
+ * The ComfyUI install a comfy-cli invocation TARGETS when the caller passed no explicit
+ * `workspace`. That is a DATA/base-root question: `--workspace` is where comfy-cli
+ * looks for custom_nodes/ and models/. On `--base-directory` runtimes that is the
+ * data root, not the main.py checkout (#1715/#1770). `resolveEffectiveComfyUIBase`
+ * answers it. The CLI *executable* may still live in the code checkout's .venv.
+ *
+ * This used to read `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`, which failed
+ * twice over (#490): the resolver did not yet enforce the mode check this comment
+ * claimed for it, AND the `??` short-circuited past the resolver entirely whenever
+ * COMFYUI_PATH was set — the ordinary local configuration — so fixing the resolver alone
+ * would not have reached here. The two operands answer different questions ("where is
+ * the user's local install" vs "which install does this act on") and the `??` silently
+ * substituted the first for the second.
+ *
+ * It matters most here: this module runs `comfy-cli uninstall` and `comfy-cli disable`.
+ * With a remote `--comfyui-url` session and a stale local COMFYUI_PATH, those commands
+ * ran against the local install while the reply described only the remote server.
+ *
+ * Returning null when nothing is resolvable is the point — callers refuse rather than
+ * guess. Do not reintroduce a fallback here; a `??` at this seam is the bug.
+ */
+function defaultWorkspace(): string | null {
+  return resolveEffectiveComfyUIBase() ?? null;
+}
 
 export interface ComfyCliError {
   code: string;
@@ -25,8 +55,88 @@ export interface ComfyCliRunOptions {
   workspace?: string | null;
   where?: "local" | "cloud";
   timeoutMs?: number;
+  /**
+   * Idle (liveness) timeout in milliseconds. When set, the process is only
+   * killed if it produces NO stdout/stderr output for this long — each chunk
+   * of output (e.g. a downloader progress line) resets the clock. This lets a
+   * long-but-live download run to completion while still terminating a truly
+   * stalled one. Takes precedence over `timeoutMs` when both are provided.
+   */
+  idleTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+}
+
+/** Minimal shape of the child process we consume; keeps this testable. */
+export interface IdleTimeoutChild {
+  stdout: NodeJS.EventEmitter | null;
+  stderr: NodeJS.EventEmitter | null;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  on(event: "close", listener: (code: number | null) => void): unknown;
+  kill(signal?: NodeJS.Signals): unknown;
+}
+
+export interface IdleTimeoutResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut: boolean;
+}
+
+/**
+ * Await a spawned child process, killing it only after `idleTimeoutMs` elapses
+ * with no output on either stream. Any stdout/stderr chunk is treated as
+ * liveness and resets the idle timer. Exported for direct testing.
+ */
+export function awaitProcessWithIdleTimeout(
+  child: IdleTimeoutChild,
+  idleTimeoutMs: number,
+  timers: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout } = { setTimeout, clearTimeout },
+): Promise<IdleTimeoutResult> {
+  return new Promise<IdleTimeoutResult>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearIdle = () => {
+      if (idleTimer) {
+        timers.clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    const armIdle = () => {
+      clearIdle();
+      idleTimer = timers.setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, idleTimeoutMs);
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+      armIdle();
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+      armIdle();
+    });
+    child.on("error", (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearIdle();
+      reject(error);
+    });
+    child.on("close", (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearIdle();
+      resolve({ stdout, stderr, exitCode: timedOut ? 1 : code ?? 0, timedOut });
+    });
+
+    armIdle();
+  });
 }
 
 const MIN_COMFY_CLI_VERSION = [1, 11, 1] as const;
@@ -36,9 +146,17 @@ function executableNames(): string[] {
   return process.platform === "win32" ? ["comfy.exe", "comfy"] : ["comfy"];
 }
 
-function workspaceCandidates(workspace?: string | null): string[] {
-  if (!workspace) return [];
-  const roots = [workspace, dirname(workspace)];
+function workspaceCandidates(...workspaces: Array<string | null | undefined>): string[] {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace) continue;
+    for (const root of [workspace, dirname(workspace)]) {
+      if (seen.has(root)) continue;
+      seen.add(root);
+      roots.push(root);
+    }
+  }
   const dirs = roots.flatMap((root) => [
     join(root, ".venv", process.platform === "win32" ? "Scripts" : "bin"),
     join(root, "venv", process.platform === "win32" ? "Scripts" : "bin"),
@@ -56,8 +174,10 @@ export function resolveComfyCliExecutable(options: { refresh?: boolean; workspac
     return existsSync(explicit) ? explicit : null;
   }
 
-  const workspace = options.workspace ?? config.comfyuiPath;
-  for (const candidate of workspaceCandidates(workspace)) {
+  const workspace = options.workspace ?? defaultWorkspace();
+  // --workspace is the pack/data root; the executable often lives in the
+  // checkout's .venv on a split install. Search both.
+  for (const candidate of workspaceCandidates(workspace, resolveEffectiveComfyUICodeBase())) {
     if (existsSync(candidate)) {
       return candidate;
     }
@@ -77,7 +197,7 @@ export function resolveComfyCliExecutable(options: { refresh?: boolean; workspac
 
 function buildArgs(args: readonly string[], options: ComfyCliRunOptions): string[] {
   const result = ["--json"];
-  const workspace = options.workspace === undefined ? config.comfyuiPath : options.workspace;
+  const workspace = options.workspace === undefined ? defaultWorkspace() : options.workspace;
   if (workspace) result.push("--workspace", workspace);
   if (options.where) result.push("--where", options.where);
   result.push("--skip-prompt", ...args);
@@ -122,6 +242,65 @@ function hasJsonRecord(stdout: string): boolean {
   });
 }
 
+/**
+ * Output lines that are PROGRESS, not diagnosis (#417).
+ *
+ * ENUMERATED ON PURPOSE, and this is the whole safety argument. The failure this guards
+ * against is a non-zero exit whose captured output says nothing about why — the reporter
+ * was handed `Start downloading URL ... into ...` in the place a reason belongs. But a
+ * filter that is too eager does something strictly worse: it discards a REAL error message
+ * and replaces it with "no reason available", un-shipping the fix while looking like it
+ * worked. A keyword test ("downloading", "%") would do exactly that to
+ * `HTTP 403 while downloading ...`.
+ *
+ * So each entry matches one KNOWN emitter, anchored, and anything unrecognised is treated
+ * as a real message and preserved. Being wrong in the direction of showing the user too
+ * much is recoverable; being wrong the other way hides the only evidence they had.
+ */
+const PROGRESS_ONLY_LINE_PATTERNS: readonly RegExp[] = [
+  // comfy-cli's own pre-download announcement — the line from the report. The real
+  // emitter is `print(f"Start downloading URL: {url} into {local_filepath}")`
+  // (comfy_cli/command/models/models.py) — WITH a colon, which my first fixtures omitted.
+  /^start downloading url:?\s.*\binto\b/i,
+  // huggingface_hub's tqdm, which ALWAYS carries a desc:
+  //   "y.safetensors: 45%|████▌     | 1.20G/2.70G [00:30<00:40, 40.0MB/s]"
+  // Every earlier pattern was anchored `^\s*\d`, so a desc-prefixed bar — the only tqdm
+  // this tool actually produces — matched none of them. #417 was therefore still live on
+  // the gated-Hugging-Face path, which is the path the new hint tells the user to suspect.
+  // The desc is bounded and may not contain a `%`, so it cannot swallow a sentence that
+  // merely happens to precede a percentage.
+  /^[^%]{0,120}:\s*\d{1,3}%\|/,
+  // Bare tqdm: " 45%|█████| 1.2G/2.7G [00:30<00:40, 40.0MB/s]". The size quantifiers are
+  // BOUNDED: `[\d.]+\s*\S*\/` is ambiguous, and on a pathological single line it
+  // backtracks quadratically — measured 13.3s at 200 KB, which on a 16 MB capture
+  // (execFile's maxBuffer) would block the event loop for hours.
+  /^\s*\d{1,3}%\|[^|]{0,200}\|\s*[\d.]{1,20}\s*\S{0,10}\/[\d.]{1,20}\s*\S{0,10}/i,
+  // tqdm with no bar drawn (non-tty): " 45%| | 1.2G/2.7G"
+  /^\s*\d{1,3}%\|/,
+  // A bare percentage or a "Downloading: 45%" heartbeat.
+  /^\s*(downloading:?\s*)?\d{1,3}(\.\d+)?%\s*$/i,
+  // A drawn bar with no other text.
+  /^[\s█▉▊▋▌▍▎▏#=>.\-\[\]|]+$/,
+];
+
+/**
+ * Does this captured output contain anything that could explain a failure?
+ *
+ * Returns the surviving text, or null when every line was recognised progress. Null means
+ * "I could not determine the reason" — a distinct third state from "the reason is X", and
+ * it must never be reported as one (#796).
+ */
+export function failureReasonFrom(text: string): string | null {
+  const meaningful = text
+    // A progress bar redraws with \r; without splitting on it the whole bar is ONE line
+    // ending in a real error, or one line of pure progress, depending on the emitter.
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => !PROGRESS_ONLY_LINE_PATTERNS.some((re) => re.test(line)));
+  return meaningful.length ? meaningful.join("\n") : null;
+}
+
 export function normalizeComfyCliResult<T = unknown>(
   args: readonly string[],
   options: ComfyCliRunOptions,
@@ -153,6 +332,22 @@ export function normalizeComfyCliResult<T = unknown>(
     };
   }
   if (result.exitCode !== 0) {
+    // #417 — A PROGRESS LINE IS NOT A FAILURE REASON.
+    //
+    // This used to report `stderr || stdout` verbatim. When comfy-cli dies mid-download
+    // its stderr often holds nothing but the progress it had printed so far, so the
+    // reporter's error message was `Start downloading URL ... into ...` — a sentence that
+    // reads like a diagnosis, names no cause, and sent them looking at their URL and
+    // destination directory (both fine) instead of at the download.
+    //
+    // The three states are: a reason, no reason, and — the one that caused this — no
+    // reason DRESSED AS one. Saying plainly that the command produced no error output is
+    // less satisfying and far more useful, because it redirects the search instead of
+    // misdirecting it. The raw output stays in `details` either way; nothing is dropped.
+    const reason = failureReasonFrom(details.stderr) ?? failureReasonFrom(details.stdout);
+    // Only a DOWNLOAD may be described as having produced download progress. Read from the
+    // argv this call actually ran, not from the tool that happened to call us.
+    const isDownload = args.includes("download") || args.includes("--url");
     return {
       schema: "envelope/1",
       type: "envelope",
@@ -163,7 +358,34 @@ export function normalizeComfyCliResult<T = unknown>(
       data: null,
       error: {
         code: "legacy_command_failed",
-        message: details.stderr || details.stdout || `comfy-cli exited with code ${result.exitCode}`,
+        message:
+          reason ??
+          `comfy-cli exited with code ${result.exitCode} and printed no error, so the cause is ` +
+            `not visible from here${isDownload ? " — the output was download progress only" : ""}.`,
+        ...(reason
+          ? {}
+          : {
+              // THE DIAGNOSIS IS SCOPED TO THE COMMAND THAT EARNED IT. This function
+              // normalizes the ENTIRE comfy-cli surface — stop, launch, run, node
+              // install/update, models list/search/remove, skills_*, env — and the first
+              // version asserted "its output was download progress only" and offered
+              // disk-space-and-gated-HF-auth advice for every one of them. A failing
+              // `comfy node install` would have been handed a fabricated download story.
+              //
+              // Which is this issue's own defect, inverted: #417 is about stating a cause
+              // that was never established. Replacing a progress line with a confident
+              // guess about a different command is the same error with better prose.
+              hint: isDownload
+                ? "Nothing in the command's output says why it stopped. Check, in this order: " +
+                  "free disk space on the destination drive; whether the source needs auth (a " +
+                  "gated Hugging Face repo returns 401/403 and some downloaders exit without " +
+                  "printing it); and whether an antivirus or the OS killed the process. " +
+                  "Re-running with the same arguments will show the same message — the missing " +
+                  "information is on comfy-cli's side, not this tool's."
+                : "Nothing in the command's output says why it stopped, and this tool cannot " +
+                  "infer it. Re-run the same command directly in a terminal, where comfy-cli " +
+                  "may print more than it does when its output is captured.",
+            }),
         details: { ...details, exit_code: result.exitCode },
       },
     };
@@ -181,11 +403,33 @@ export function normalizeComfyCliResult<T = unknown>(
 }
 
 function requireExecutable(options: ComfyCliRunOptions): string {
+  // REFUSE BEFORE RESOLVING, in remote mode (codex gate P0).
+  //
+  // comfy-cli acts on a LOCAL install. With `--comfyui-url` the workspace
+  // resolver now correctly returns nothing — but that is exactly what makes this
+  // dangerous rather than safe: `buildArgs` then omits `--workspace`, the PATH
+  // fallback below still finds a global `comfy`, and the CLI falls back to
+  // WHATEVER workspace it defaults to. `models_remove` therefore deletes models
+  // from some unrelated local install while the session is connected elsewhere.
+  //
+  // "No workspace could be resolved" was being treated as "no workspace will be
+  // used". It is not: it hands the choice to the CLI. This is the one choke-point
+  // both `runComfyCli` and `runComfyCliSync` pass through, which is why the
+  // refusal belongs here — nothing has run at this point.
+  if (isRemoteMode()) {
+    throw new Error(
+      "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+        "LOCAL install — so there is no install here that this session is about. Nothing was " +
+        "run. Run comfy-cli on the machine the install lives on, or point this session at the " +
+        "local install first.",
+    );
+  }
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
   if (!executable) {
     throw new Error(
       "comfy-cli was not found. Install comfy-cli>=1.11.1 and ensure `comfy` is on PATH, " +
-        "set COMFY_CLI_PATH, or install it in the selected ComfyUI workspace's .venv.",
+        "set COMFY_CLI_PATH, or install it in the selected ComfyUI workspace's .venv " +
+        "(the COMFYUI_CODE_PATH checkout on split installs).",
     );
   }
   return executable;
@@ -219,6 +463,41 @@ export async function runComfyCli<T = unknown>(args: readonly string[], options:
     return unsupportedVersionEnvelope<T>(args, options, detectedVersion);
   }
   const version = detectedVersion!;
+  if (options.idleTimeoutMs != null) {
+    try {
+      const child = childProcess.spawn(executable, buildArgs(args, options), {
+        windowsHide: true,
+        env: { ...process.env, PYTHONUTF8: "1", ...options.env },
+        cwd: options.cwd,
+      });
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+      const result = await awaitProcessWithIdleTimeout(child, options.idleTimeoutMs);
+      if (result.timedOut) {
+        return {
+          schema: "envelope/1",
+          type: "envelope",
+          ok: false,
+          command: args.join(" "),
+          version,
+          where: options.where ?? null,
+          data: null,
+          error: {
+            code: "idle_timeout",
+            message:
+              `comfy-cli produced no output for ${Math.round(options.idleTimeoutMs / 1000)}s and was terminated as stalled.`,
+            hint: "The download appears stuck. Check network connectivity and the source URL, then retry.",
+            details: { stdout: result.stdout.trim(), stderr: result.stderr.trim() },
+          },
+        };
+      }
+      return normalizeComfyCliResult<T>(args, options, result, version);
+    } catch (error) {
+      const spawnError = error as Error & { code?: string };
+      if (spawnError.code === "ENOENT") throw error;
+      return normalizeComfyCliResult<T>(args, options, { stdout: "", stderr: spawnError.message, exitCode: 1 }, version);
+    }
+  }
   try {
     const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
       childProcess.execFile(
@@ -299,8 +578,26 @@ function getExecutableVersion(executable: string): string | null {
 }
 
 export function getComfyCliVersion(options: { workspace?: string | null } = {}): string | null {
+  // Read-only, but it still SPAWNS a local `comfy` (codex gate). In remote mode
+  // there is no local install this session is about, so probing one and reporting
+  // its version would describe a CLI that must never be used from here — and
+  // `isComfyCliUsable` below would then advertise it as available. "Not usable"
+  // is the honest answer, and it is the same answer `requireExecutable` gives.
+  if (isRemoteMode()) return null;
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
   return executable ? getExecutableVersion(executable) : null;
+}
+
+/**
+ * Whether a usable comfy-cli (found AND version-supported) is available for the
+ * given workspace. A found-but-unrecognized/too-old CLI is NOT usable — read-only
+ * tools treat that identically to "absent" so they can fall back to the connected
+ * server instead of surfacing `unsupported_version` (#487).
+ */
+export function isComfyCliUsable(options: { workspace?: string | null } = {}): boolean {
+  const executable = resolveComfyCliExecutable({ workspace: options.workspace });
+  if (!executable) return false;
+  return isSupportedComfyCliVersion(getExecutableVersion(executable));
 }
 
 export function isSupportedComfyCliVersion(version: string | null): boolean {

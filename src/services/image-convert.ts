@@ -1,6 +1,6 @@
 import { lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import sharp from "sharp";
+import { requireSharp, type SharpModule } from "./sharp-loader.js";
 import { AssetRegistry } from "./asset-registry.js";
 import { getOutputImage } from "./image-management.js";
 import { resolveOutputDir } from "./output-dir.js";
@@ -135,12 +135,19 @@ async function validateExistingOutputAncestors(
 async function resolveSourcePath(path: string): Promise<{ path: string; size: number }> {
   const lexicalPath = await resolveOutputPath(path, "path");
   const root = await realOutputRoot();
+  // unknown-ok: the caller REFUSES on undefined (the throw immediately below), so a
+  // failed observation and a genuine absence both fail closed. The only cost is that
+  // the message says "not found" for e.g. a permission error — noted, not dangerous,
+  // because nothing proceeds on the unknown.
   const sourcePath = await realpath(lexicalPath).catch(() => undefined);
   if (!sourcePath) {
     throw new ValidationError(`Source image not found: ${lexicalPath}`);
   }
   assertInsideRealOutputDir(root, sourcePath, "path");
 
+  // unknown-ok: undefined fails the isFile() test below and refuses, same as a
+  // genuine non-file. A path realpath just resolved that cannot then be stat-ed is
+  // not usable either way.
   const info = await stat(sourcePath).catch(() => undefined);
   if (!info?.isFile()) {
     throw new ValidationError(`Source image not found: ${sourcePath}`);
@@ -202,7 +209,7 @@ async function resolveSource(opts: ConvertImageOptions): Promise<SourceImage> {
   }
 
   if (!opts.path) {
-    throw new ValidationError("convert_image requires either asset_id or path.");
+    throw new ValidationError("get_image (action:\"convert\") requires either asset_id or path.");
   }
 
   const source = await resolveSourcePath(opts.path);
@@ -212,10 +219,15 @@ async function resolveSource(opts: ConvertImageOptions): Promise<SourceImage> {
   };
 }
 
+// #2411 — the sharp factory arrives as an ARGUMENT rather than a module binding,
+// so this file no longer loads a native library while it evaluates. `convertImage`
+// is the one caller and does the loading, which keeps the refusal message next to
+// the action the user actually asked for.
 function buildEncoder(
+  sharp: SharpModule,
   input: Buffer,
   opts: ConvertImageOptions,
-): ReturnType<typeof sharp> {
+): ReturnType<SharpModule> {
   const image = sharp(input, { limitInputPixels: limitInputPixels() });
   if (opts.format === "png") {
     return image.png({ quality: opts.quality });
@@ -256,8 +268,9 @@ export async function convertImage(
   }
   validateEncodeOptions(opts);
 
+  const sharp = await requireSharp("Image conversion");
   const source = await resolveSource(opts);
-  const converted = await buildEncoder(source.bytes, opts).toBuffer();
+  const converted = await buildEncoder(sharp, source.bytes, opts).toBuffer();
   const mimeType = MIME_BY_FORMAT[opts.format];
   const outPath = opts.out_path
     ? await resolveWritableOutputPath(opts.out_path)

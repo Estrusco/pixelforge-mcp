@@ -28,7 +28,7 @@ pip install -U comfyui_manager
 # then remove/disable the old custom_nodes/ComfyUI-Manager clone and restart
 ```
 
-The [RunPod image](/cloud-deployment) already ships Manager v4.
+The [RunPod image](./cloud-deployment) already ships Manager v4.
 
 **Note on `useCmCli: true`:** the cm-cli fallback runs Manager's CLI as a
 subprocess, so it needs the **local filesystem** — it can't work against a
@@ -81,7 +81,7 @@ from GitHub, or the image seed when offline). It also logs
 reinstall those via Manager. On images `<= 1.5`, delete the panel folder and
 restart: `rm -rf /workspace/custom_nodes/comfyui-mcp-panel`.
 
-## Panel says "No agent is listening on the bridge (ws://127.0.0.1:9180)"
+## Panel says "No agent is listening on the bridge (ws://127.0.0.1:9199)"
 
 You're opening ComfyUI **in a browser on a different machine** than where the
 orchestrator runs. The bridge is loopback-only by design, and `127.0.0.1` in
@@ -111,7 +111,7 @@ COMFYUI_MCP_BRIDGE_TOKEN=<pick-a-long-secret> \
 npx -y comfyui-mcp@latest --panel-orchestrator
 ```
 
-It prints a ready-to-paste `ws://<server-ip>:9180/?token=…` — put that in the
+It prints a ready-to-paste `ws://<server-ip>:9199/?token=…` — put that in the
 panel's **Settings → Advanced → Bridge URL** on any machine and click
 Connect. A non-loopback bind **refuses to start without a token**, and every
 connection is checked on the WebSocket upgrade (constant-time). Treat the URL
@@ -166,9 +166,22 @@ docker run --rm -p 9100:9100 -e COMFYUI_MCP_HTTP_TOKEN=changeme comfyui-mcp \
 
 stdio mode (the default, what MCP clients use) needs none of this.
 
+## The agent never calls a tool — no error, it just talks
+
+It describes your workflow instead of reading it, or offers to write a script.
+There is no error because nothing failed: either the tools never reached your
+client, or your client is stopping the calls, or the capability exists under a
+name that never came up. Those three look identical from the outside and have
+opposite fixes, so guessing is worse than checking.
+
+Two questions to your agent tell them apart —
+see [When it says nothing](./using-tools#when-it-says-nothing). Note that a
+client-side permission block never reaches this server, so nothing in the logs
+below will show it.
+
 ## Local models: tool calls fail or the model "can't see" tools
 
-- **First move: use [our fine-tuned model](/local-llms#our-fine-tuned-local-models-free-recommended)** —
+- **First move: use [our fine-tuned model](./local-llms#our-fine-tuned-local-models-free-recommended)** —
   `ollama pull artokun/gemma4-comfyui-mcp:e4b` (the panel's Ollama default).
   It's Gemma 4 trained on the comfyui-mcp tool suite itself, which eliminates
   most "wrong tool / malformed args" failures out of the box (`:e2b` for
@@ -176,9 +189,10 @@ stdio mode (the default, what MCP clients use) needs none of this.
   arena; `:e4b` remains the sweet spot).
 - **gemma3 has no native tool calling in Ollama** — unsupported; use
   our fine-tune above, stock `gemma4` (e4b+), `qwen3`, or `llama3.1+`.
-- Make sure [compact tool mode](/local-llms) is on for small models
-  (`--compact`) — ~200 full schemas overflow small contexts and the model
-  starts hallucinating tool names.
+- Turn on [compact tool mode](./local-llms) for small models — it is **not**
+  the default, so start the server with `--compact` (or
+  `COMFYUI_MCP_TOOL_MODE=compact`). Without it the full schema surface
+  overflows a small context and the model starts hallucinating tool names.
 - Cold model loads can take 30s+ before the first token — the panel's
   watchdog accounts for this, but a request that dies instantly usually
   means the model tag isn't pulled (`ollama pull <tag>`).
@@ -191,8 +205,8 @@ stdio mode (the default, what MCP clients use) needs none of this.
 ## Where to look for logs
 
 - **Orchestrator**: the terminal running `connect` / `--panel-orchestrator`.
-- **ComfyUI-side**: `get_logs` MCP tool, or the pod's log stream on RunPod.
+- **ComfyUI-side**: `get_system_stats (action:"logs")` MCP tool, or the pod's log stream on RunPod.
 - **Panel JS**: the browser devtools console (the bridge client logs
   connect/reconnect transitions).
-- **Health in one call**: the `health_check` tool aggregates
+- **Health in one call**: the `get_system_stats (action:"health")` tool aggregates
   version/GPU/VRAM/queue/model-dirs/recent-errors.

@@ -4,7 +4,7 @@ description: "The panel agent runs on ANY LLM: Claude, ChatGPT, Gemini, Grok, Ki
 icon: "shuffle"
 ---
 
-The [sidebar panel](/panel) agent is **provider-agnostic**. Pick **Claude**,
+The [sidebar panel](./panel) agent is **provider-agnostic**. Pick **Claude**,
 **ChatGPT**, **Gemini**, or **Ollama (local)** and the matching agent runs in
 the background — subscriptions need no API key, and local models need no
 account at all. The Ollama backend also speaks **any OpenAI-compatible
@@ -12,7 +12,7 @@ endpoint** (OpenRouter, DeepSeek, GLM, MiMo, vLLM, LM Studio), so "bring your
 own model" covers everything from a free 4B on your own GPU to the frontier.
 All providers share the same live-canvas tools, the same model knowledge, the
 same one-shot workflow loads, the same cost guardrail. The
-[LLM Arena](/arena) scores any of them on real ComfyUI tasks.
+[LLM Arena](./arena) scores any of them on real ComfyUI tasks.
 
 ```
 panel (pick a provider) ⇄ loopback bridge ⇄ orchestrator (Claude · ChatGPT · Gemini · any LLM) ⇄ your graph
@@ -62,17 +62,37 @@ placeholder follows the active backend ("Ask Claude…" / "Ask Ollama…").
 - **Grok** — install the Grok CLI (xAI / Grok Build) and run `grok` once to
   sign in; the backend drives it in ACP mode. The panel also offers an
   in-panel OAuth sign-in row when Grok isn't ready.
-- **Kimi** — Kimi Code login (writes `~/.kimi/credentials/kimi-code.json`),
-  or set `KIMI_API_KEY` for pay-per-token/CI use. In-panel OAuth sign-in is
+- **Kimi (recommended)** — install the [Kimi Code CLI](https://moonshotai.github.io/kimi-code/)
+  and run `kimi login` (device-code flow); the backend reuses that login from
+  `~/.kimi-code/credentials/kimi-code.json` (the legacy `~/.kimi` path is still
+  read as a fallback). This uses your **Kimi Code subscription** and is the
+  preferred way to run Kimi — cheaper and higher-limit than the pay-per-token
+  Moonshot key below. Set `KIMI_API_KEY` instead only for CI / no-CLI use, or
+  `KIMI_CODE_HOME` to point at a non-default credentials dir (`KIMI_SHARE_DIR` is
+  still honoured for anyone who set the older name). In-panel OAuth sign-in is
   offered too.
 - **GLM** — set `ZAI_API_KEY` (Z.AI Coding Plan; `GLM_API_KEY` /
   `ZHIPUAI_API_KEY` also accepted). No CLI.
-- **Kimi K3 (Moonshot)** — set `MOONSHOT_API_KEY` from
+- **Kimi K3 (Moonshot)** — the **pay-per-token alternative** when you don't
+  have a Kimi Code subscription (prefer the **Kimi** route above if you do). Set
+  `MOONSHOT_API_KEY` from
   [platform.kimi.ai](https://platform.kimi.ai/console/api-keys). No CLI. This is
   the Moonshot **platform** key (default model `kimi-k3`, base
   `https://api.moonshot.ai/v1`) — distinct from the **Kimi** provider above,
   which is the Kimi Code coding subscription. Override the model with
   `COMFYUI_MCP_MOONSHOT_MODEL` and the base with `COMFYUI_MCP_MOONSHOT_BASE_URL`.
+- **MiniMax** — set `MINIMAX_API_KEY` from
+  [platform.minimax.io](https://platform.minimax.io/console/api-keys). No CLI.
+  The default model is `MiniMax-M3` and the default base is the global endpoint
+  `https://api.minimax.io/v1` (OpenAI-compatible, plain Bearer auth). For the
+  China region, set `COMFYUI_MCP_MINIMAX_BASE_URL=https://api.minimaxi.com/v1`.
+  Override the model with `COMFYUI_MCP_MINIMAX_MODEL`.
+- **Atlas Cloud** — set `ATLASCLOUD_API_KEY` from the
+  [Atlas Cloud console](https://www.atlascloud.ai/console/api-keys). The default
+  model is `qwen/qwen3.5-flash` over the OpenAI-compatible
+  `https://api.atlascloud.ai/v1` endpoint. Override the model with
+  `COMFYUI_MCP_ATLASCLOUD_MODEL` or the base URL with
+  `COMFYUI_MCP_ATLASCLOUD_BASE_URL`.
 - **Copilot (experimental)** — sign in from the panel's experimental provider
   row. Off by default; enable experimental backends in Settings first.
 - **Ollama (local)** — no sign-in. Install Ollama and pull a tool-calling
@@ -84,7 +104,7 @@ placeholder follows the active backend ("Ask Claude…" / "Ask Ollama…").
   `/v1` (vLLM, DeepSeek, Together, Azure, a remote llama-server) in Settings →
   Custom endpoint; add an API key there if the server needs one (masked input,
   stored 0600 by the orchestrator). See
-  [Local LLMs → Custom endpoint](/local-llms#custom-endpoint-any-openai-compatible-server).
+  [Local LLMs → Custom endpoint](./local-llms#custom-endpoint-any-openai-compatible-server).
 
 ### Connect-time readiness & onboarding
 
@@ -116,7 +136,7 @@ The orchestrator depends on a provider-neutral **`AgentBackend`** port
 |---|---|---|---|---|
 | Driver | Claude Agent SDK — persistent streaming session | `codex app-server` JSON-RPC | `gemini --acp` (Agent Client Protocol) | direct HTTP — Ollama `/api/chat` or any OpenAI-compatible `/v1/chat/completions`; the backend owns the whole agentic loop |
 | Auth | claude.ai OAuth | ChatGPT login | Google login | none (local) / bearer key (hosted) |
-| Live-canvas tools | in-process SDK MCP server | loopback streamable-HTTP MCP | loopback streamable-HTTP MCP | the [6-tool router](/local-llms) over the same loopback MCP |
+| Live-canvas tools | in-process SDK MCP server | loopback streamable-HTTP MCP | loopback streamable-HTTP MCP | the [6-tool router](./local-llms) over the same loopback MCP |
 | Headless `comfyui` MCP | in-process | config-declared stdio | config-declared stdio | compact-mode stdio subprocess behind the router |
 
 The `panel_*` tool definitions live in **one shared list**, registered onto
@@ -124,7 +144,7 @@ every path, so the live-canvas surface (including the destructive-confirm
 gating for `panel_clear` / `panel_restart_comfyui`) is identical across
 providers. Parity is automatic — no path reimplements a tool. The Ollama/any-LLM
 backend additionally wraps both tool surfaces behind six router tools so
-small models aren't drowned in schemas — see [Local LLMs & other agents](/local-llms).
+small models aren't drowned in schemas — see [Local LLMs & other agents](./local-llms).
 
 ## Capability matrix
 
@@ -140,7 +160,108 @@ the features a provider can't do:
 | In-process MCP tools | ✅ | ❌ | ❌ | ❌ (router over MCP clients) |
 | Model enumeration | ✅ | ✅ (`config/read`) | static catalog | ✅ (`/api/tags` or `/models`) |
 | Vision (image input) | ✅ | ✅ | ✅ | ❌ (model-dependent; off for now) |
+| Audio input | ❌ | ❌ | ❌ | ✅ Ollama (checked) · ⚠️ others (unverified) |
 | Provider slash commands | ✅ | ❌ | ❌ | ❌ |
+
+### Audio input — which backends, honestly
+
+The agent can drive ComfyUI's audio tools on every backend. **Hearing** an
+audio file is narrower, and the table above is deliberately conservative
+because a silently dropped attachment is worse than a refused one:
+
+- **Ollama (the `ollama` backend, native `/api/chat`) — supported, capability-
+  checked, and verified end to end.** Audio rides the `images[]` array, which
+  is Ollama's own carrier for audio rather than a hack. Confirmed live against
+  a local Ollama with `gemma4:e2b`, which transcribed a real WAV.
+  - **Per-model, not per-provider.** Before sending anything, the backend asks
+    `POST /api/show` whether *this* model reports the `audio` capability. If it
+    doesn't, the attachment is refused by name, the reported capability list is
+    quoted back to you, and you're told which models can hear
+    (`ollama pull gemma4:e2b` / `gemma4:e4b` / `nemotron3:33b`). Note `GET
+    /api/tags` also returns a `capabilities` array and is **not** the same
+    answer — the same model reported no audio there and audio from `/api/show`
+    — so only `/api/show` is consulted.
+  - **The `audio` flag is not a hearing guarantee.** It is inherited from the
+    architecture. A namespaced Gemma 4 fork can list `audio`, accept a WAV in
+    `images[]` with HTTP 200, and return a fluent fabricated transcript
+    (`huihui_ai/gemma-4-abliterated:E4b-qat`, #1972). Native Ollama therefore
+    also requires the model tag to be one of the Ollama-tested set above;
+    anything else — including `artokun/gemma4-comfyui-mcp` — is refused before
+    bytes hit the image slot.
+  - The capability is re-checked on every turn that carries audio, because an
+    Ollama tag is mutable: `ollama pull` can replace the weights under the same
+    name, and a cached verdict could outlive the model it described.
+- **LM Studio / llama.cpp / OpenRouter / GLM / Kimi / Moonshot / MiniMax /
+  Atlas Cloud / Copilot / custom OpenAI-compatible endpoints — attempted, NOT
+  capability-checked.** These all speak `/v1/chat/completions`,
+  which has no capability endpoint to ask, so audio is sent as an `input_audio`
+  content part and you are told, on that turn, that the delivery is
+  **unconfirmed**: *"I cannot confirm the model actually receives them — if the
+  reply does not reflect what is in the file, it did not hear it."* Refusing
+  instead would deny audio to every endpoint that simply has no capability API;
+  a guard that cannot run is not a verdict. The `input_audio` shape itself was
+  verified against Ollama's OpenAI-compatible endpoint; whether any *given*
+  third-party host honours it is not something we can check, and we don't claim
+  to.
+- **Claude, ChatGPT (Codex), Codex CLI, Gemini, Grok, Antigravity, pi** — no
+  audio input in this build. Attaching audio is refused before the turn is
+  built, and both you and the model are told, naming the provider and what
+  would work instead.
+
+  On Gemini/Grok this is a deliberate omission rather than a protocol gap: ACP
+  *does* define an `audio` ContentBlock, but it requires the agent to advertise
+  an `audio` prompt capability first, and neither CLI has been observed doing
+  so. A send path that can never be exercised, whose failure mode is an
+  attachment the user is never told did not arrive, is worse than an honest
+  refusal — so it isn't shipped.
+
+The **Blind** toggle is about *pixels*: it withholds images and does **not**
+withhold audio.
+
+Blind's enforcement reaches the agent's **native tools** too, not just the
+comfyui MCP surface: the built-in Claude backend runs with a PreToolUse gate
+that denies its own `Read`/`WebFetch` on image content (raster files by
+extension *and* magic bytes, PDFs, notebook outputs, and ComfyUI `/view` URLs)
+whenever Blind is on — read live per call, so a mid-session toggle binds the
+very next tool call. The API/local lanes (Ollama family, GLM, Kimi, custom
+endpoints) carry only our tool surface, so the MCP scrub covers them fully. The
+**CLI lanes** (Codex, Gemini, Grok, Antigravity, pi, Copilot) run their own
+agent binaries whose built-in file tools we cannot hook — turning Blind on
+there posts a visible warning saying exactly that, rather than implying a
+guarantee we can't keep.
+
+#### How an audio file gets onto a turn
+
+The orchestrator accepts audio on a panel `message` frame in two ways:
+
+```jsonc
+{ "type": "message", "text": "what key is this in?",
+  "audio":  [{ "filename": "song.mp3", "type": "input" }],   // preferred
+  "images": [{ "filename": "song.mp3", "type": "input" }] }  // also routed to audio
+```
+
+The second form exists because a panel build that only knows about `images`
+would otherwise hand an audio file to a vision content part. Anything with an
+audio extension is moved to the audio path automatically — including formats we
+cannot encode (`.wma`, `.mid`, `.aiff`), so you get "convert it to one of…"
+rather than an image error.
+
+Sending the same file in **both** arrays (as the example above does) is safe: a
+ref is identified by filename + subfolder + type, so it is delivered once and
+counts once against the two-attachments-per-turn limit. It is not mistaken for
+a second file and then refused for not fitting.
+
+<Note>
+A **composer control** for picking an audio file lives in the panel
+(`comfyui-mcp-panel`), which is a separate repository — that part is not in this
+release. Until it lands, the wire contract above is what a client sends, and the
+route is exercised end to end from the orchestrator side.
+</Note>
+
+Only the native-Ollama path above is verified end to end, and it is the only
+one where "this model can hear" is established rather than assumed. The
+OpenAI-compatible path is an honest attempt with an honest caveat; everything
+else in this section describes a refusal, not a capability.
 
 **Conversation-rollback** (forking the chat back to a past turn) is
 Claude-only; the **code/graph** rollback (`/revert`, double-Esc, per-turn
@@ -153,22 +274,24 @@ The effort/model picker is **per-provider**. A chosen effort survives a
 provider switch by mapping to the nearest valid level for the target backend
 (the panel and the orchestrator backends do the same mapping):
 
-- **Claude:** `low` · `medium` · `high` · `max`
-- **ChatGPT (Codex):** `none` · `minimal` · `low` · `medium` · `high` · `xhigh`
+- **Claude:** `low` · `medium` · `high` · `xhigh` · `max`
+- **ChatGPT (Codex):** `none` · `minimal` · `low` · `medium` · `high` · `xhigh` · `max` · `ultra`
+  (`max` / `ultra` on GPT-5.6-class models)
 - **Gemini / Ollama:** no user-facing effort scale — the selector is hidden.
 
 ## Knowledge & cost parity
 
 Because only Claude can load native skills, the bundled expertise is
-published as MCP tools any backend can call — `list_skills`, `read_skill`,
-`list_packs`, `read_pack_workflow`, `list_workflow_templates` — plus the
-local-GPU-vs-paid-API guardrail (`check_workflow_runtime`) and one-shot
-`panel_load_workflow`. See [Skills, Packs & Runtime Cost](/tools/skills-knowledge).
+published as one MCP tool any backend can call — `list_packs`, whose actions
+cover the skills (`skill_list`, `skill_read`), the installer packs (`list`,
+`read_workflow`) and the server's templates (`list_templates`) — plus the
+local-GPU-vs-paid-API guardrail (`action: "check_runtime"`) and one-shot
+`panel_load_workflow`. See [Skills, Packs & Runtime Cost](./tools/skills-knowledge).
 
 ## See also
 
-- [Sidebar Panel](/panel) — the full panel UX
-- [Local LLMs & other agents](/local-llms) — the 6-tool router, model requirements, Hermes/OpenClaw/Copilot setup
-- [LLM Arena](/arena) — score YOUR model on real ComfyUI tasks
-- [Skills, Packs & Runtime Cost](/tools/skills-knowledge) — the parity + cost tools
-- Design doc: [`docs/design/agent-backend-injection.md`](https://github.com/artokun/comfyui-mcp/blob/main/docs/design/agent-backend-injection.md)
+- [Sidebar Panel](./panel) — the full panel UX
+- [Local LLMs & other agents](./local-llms) — the 6-tool router, model requirements, Hermes/OpenClaw/Copilot setup
+- [LLM Arena](./arena) — score YOUR model on real ComfyUI tasks
+- [Skills, Packs & Runtime Cost](./tools/skills-knowledge) — the parity + cost tools
+- Design doc: [`design/agent-backend-injection.md`](https://github.com/artokun/comfyui-mcp/blob/main/design/agent-backend-injection.md)

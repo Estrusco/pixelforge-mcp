@@ -1,0 +1,207 @@
+---
+title: "Kurulum"
+description: "ComfyUI'yi kurun ve MCP sunucusunu bağlayın — yerel, uzak ya da Comfy Cloud."
+icon: "download"
+---
+
+## 1. ComfyUI'yi kurun
+
+<CardGroup cols={2}>
+  <Card title="ComfyUI Desktop" icon="desktop" href="https://www.comfy.org/download">
+    macOS / Windows'ta yönetilen bir kurulum edinmenin en kolay yolu.
+  </Card>
+  <Card title="Kaynaktan" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
+    Klonlayıp elle çalıştırın — ya da [`install_comfyui`](/docs/tools/install-environment) aracını kullanın.
+  </Card>
+</CardGroup>
+
+## 2. MCP sunucusunu ekleyin
+
+ComfyUI MCP, npm'de `comfyui-mcp` olarak yayımlanır ve `npx` ile çalışır — global kuruluma gerek yoktur.
+
+<Tabs>
+  <Tab title="Yerel ComfyUI">
+    Sunucu, yerel kurulumu ve portunu kendiliğinden algılar. `~/.claude/settings.json` dosyasına ekleyin:
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Uzak ComfyUI">
+    `--comfyui-url` ile erişilebilen herhangi bir örneği hedefleyin. HTTP tabanlı araçlar (üretim,
+    kuyruk, iş akışları, model arama vb.) için yerel kurulum gerekmez. Ana makine loopback
+    dışındaysa sunucu **uzak kipe** geçer ve `COMFYUI_PATH` otomatik algılamasını atlar; böylece
+    eski kalmış bir yerel kurulum yüklemeleri sessizce içine çekemez.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp", "--comfyui-url", "https://my-comfy.example.com"]
+        }
+      }
+    }
+    ```
+
+    <Note>
+      Araçların çoğu uzak bir ComfyUI ile sorunsuz çalışır — ComfyUI-Manager HTTP API'si
+      üzerinden özel düğüm kurulumu da buna dahildir. Gerçekten yerel bir kurulum yolu
+      gerektirenler şunlardır: ComfyUI'nin kendisini kurmak, comfy-cli tabanlı işlemler,
+      günlükleri okumak ve model dosyalarını silmek; bunlar uzak kipte açık bir hata döndürür.
+      Bkz. [Nasıl çalışır](/docs/concepts).
+    </Note>
+  </Tab>
+  <Tab title="Comfy Cloud">
+    `COMFYUI_API_KEY` ayarlayarak [Comfy Cloud](https://cloud.comfy.org) hedefleyin. Sunucu
+    **bulut kipine** geçer: HTTP temel işlemleri `X-API-Key` kimlik doğrulamasıyla
+    `cloud.comfy.org` üzerinden yönlendirilir. WebSocket'e bağlı araçlar ile yerel dosya
+    sistemi/süreç araçları açık bir `CLOUD_UNSUPPORTED` hatası fırlatır.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "COMFYUI_API_KEY": "your-comfy-cloud-api-key"
+          }
+        }
+      }
+    }
+    ```
+
+    <Note>
+      Bulut kipi yerel `COMFYUI_PATH` otomatik algılamasını atlar ve bulutun kendi model
+      kitaplığını kullanır. Yerel bir sürece ya da dosya sistemine uzanan araçlar
+      `CLOUD_UNSUPPORTED` fırlatır; diğerleri hata fırlatmak yerine kısıtlı çalışır —
+      `list_local_models` boş bir liste döndürür, `apply_manifest` ise topluca hata vermek
+      yerine öğe başına `skipped`/`failed` bildirir. Tam özellik denklik tablosu için
+      [Yapılandırma](/docs/configuration#deployment-modes) sayfasına bakın.
+    </Note>
+    <Note>
+      **Yalnızca bulut mu?** [Comfy-Org'un Comfy Cloud MCP'si](https://docs.comfy.org/agent-tools) (herkese açık beta) buradaki asıl seçenektir — bkz. [Yerel ile Comfy Cloud karşılaştırması](/docs/local-vs-comfy-cloud). Yerel / uzak / bulut için tek bir MCP istiyorsanız ya da bugün bulut desteğine ihtiyacınız varsa `comfyui-mcp`'nin bulut kipini kullanın.
+    </Note>
+  </Tab>
+  <Tab title="Yönetilen / kurumsal Claude Code">
+    Bir kuruluş tarafından yönetilen Claude Code'da `claude mcp add` çalıştırabileceğiniz
+    `claude` CLI'si yoktur ve yönetici denetimindeki **Yönetilen MCP sunucuları** listesi
+    sunucuyu başarıyla test edip ardından kaydetmeyi reddeder. **Geliştirici ayarları →
+    Yapılandırmayı düzenle**, Code sekmesinin hiç okumadığı bir `claude_desktop_config.json`
+    dosyasını açar. İşe yarayan iki yol var.
+
+    **A seçeneği — HTTP.** Sunucuyu kendiniz çalıştırıp *uzak* bir bağlayıcı olarak ekleyin:
+
+    ```bash
+    npx -y comfyui-mcp@latest --http
+    ```
+
+    Bu, `http://127.0.0.1:9100/mcp` adresinde streamable-HTTP sunar — bağlanacağı adresi
+    `--host` / `--port` ile değiştirebilirsiniz. Bu URL'yi uzak bağlayıcı olarak, taşıma HTTP ve
+    kimlik doğrulama yok biçiminde ekleyin. Araçları kullandığınız sürece sürecin çalışır
+    kalması gerekir; yönetilen bir kuruluş listesi yine de kaydı saklamayı reddedebilir — öyle
+    olursa B seçeneğine geçin.
+
+    **B seçeneği — kullanıcı yapılandırmanızdan stdio.** Sunucuyu Claude'un kendisi başlatır, bu
+    yüzden hiçbir şeyin açık kalması gerekmez. **Claude Code tümüyle kapalıyken** global olarak
+    kurun; yoksa Windows dosyaları açık tutar ve `npm ls -g` çıktısında sürümsüz görünen, yarı
+    silinmiş bir paket bırakır:
+
+    ```bash
+    npm install -g comfyui-mcp
+    npm root -g
+    ```
+
+    Ardından `~/.claude.json` dosyasına — Windows'ta `C:\Users\KULLANICI_ADINIZ\.claude.json` —
+    **en üst düzeyde** bir `mcpServers` bloğu ekleyin ve `node`'u `npm root -g` çıktısındaki
+    yola yönlendirin:
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "node",
+          "args": ["C:/Users/YOUR_NAME/AppData/Roaming/npm/node_modules/comfyui-mcp/dist/index.js"]
+        }
+      }
+    }
+    ```
+
+    Sonra Claude Code'u **sistem tepsisi simgesi dahil olmak üzere tümüyle** yeniden başlatın —
+    aksi hâlde yapılandırma bir daha okunmaz.
+
+    <Note>
+      **Doğrulamak için ajana hangi araçlara sahip olduğunu sorun.** Yönetilen bir yapıda
+      arayüzün hiçbir bölümü çalışan bir MCP sunucusunu güvenilir biçimde yansıtmaz; yalan
+      söylemeyen tek sınama işlevsel olanıdır.
+    </Note>
+    <Note>
+      Yukarıdaki Claude tarafı menü adları ve yolları tek bir yönetilen yapıda gözlemlendi —
+      bunları kesin etiketler değil, neye bakacağınıza dair ipuçları sayın. HTTP uç noktasını
+      loopback üzerinde tutun: loopback dışı bir ana makineye bağlarsanız, `--token` ile bir
+      paylaşılan gizli anahtar tanımlamadıkça sunucu başlamayı reddeder. Bkz.
+      [Uzak bağlayıcı](/docs/remote-connector).
+    </Note>
+  </Tab>
+</Tabs>
+
+Sonra bağlanmak için Claude Code'da `/mcp` çalıştırın.
+
+## 3. Panel orkestratörünü başlatma
+
+Yalnızca **kenar çubuğu paneli** için gereklidir. ComfyUI'yi Claude Code ya da başka bir MCP
+istemcisinden sürüyorsanız bu adımı atlayın — o yol, yukarıda yapılandırdığınız MCP sunucusunu
+kullanır.
+
+Panel, saf ön uç bir ComfyUI eklentisidir: makinenizde bir süreç başlatamaz, bu yüzden
+**orkestratörü siz başlatırsınız** ve panel ona bağlanır.
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+Bu, `--panel-orchestrator` için bir kısayoldur. Tarayıcınızın üzerinde olduğu ComfyUI'yi
+kendiliğinden hedefler, köprüyü `ws://127.0.0.1:9199` üzerinde sunar
+(`COMFYUI_MCP_BRIDGE_PORT` ile değiştirilebilir) ve paneli kullandığınız sürece çalışır durumda
+kalmalıdır. Sonra **Ajan** sekmesini açın, bir sağlayıcı seçin ve **Bağlan**'a tıklayın.
+
+**Uzak** bir ComfyUI mi sürüyorsunuz — bir bulut podu ya da yerel ağınızdaki başka bir makine?
+Aynı komutu uzaktaki makinede değil, **kendi makinenizde** çalıştırın ve adresi verin:
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+Sağlayıcı girişiniz ve ajan yerelde kalır; uzak ana makineye hiçbir şey kurulmaz. Tünel
+ayrıntıları için [Bulut dağıtımı](/docs/cloud-deployment) sayfasına bakın.
+
+## 4. (İsteğe bağlı) Token'lar
+
+Bazı araçlar API token'ları kullanır. Bunları sunucunun `env` bloğunda ayarlayın (bkz. [Yapılandırma](/docs/configuration)):
+
+- `CIVITAI_API_TOKEN` — kısıtlı CivitAI indirmeleri
+- `HUGGINGFACE_TOKEN` — daha yüksek HuggingFace hız sınırları
+- `GITHUB_TOKEN` — skill üretimi / düğüm meta verisi çekme
+- `COMFY_API_KEY` — barındırılan comfy.org API düğümleri
+
+## Yerel geliştirme
+
+Proje `npm link` kullanır; böylece `npx comfyui-mcp` yerel derlemenize çözümlenir:
+
+```bash
+git clone https://github.com/artokun/comfyui-mcp
+cd comfyui-mcp
+npm install
+npm run build
+npm link
+```
+
+Kod değişikliklerinden sonra: `npm run build`, ardından yeniden bağlanmak için `/mcp`.

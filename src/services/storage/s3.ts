@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { createWriteStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import type {
   S3Client,
@@ -61,16 +62,37 @@ export async function downloadS3ToFile(
   url: string,
   targetPath: string,
   auth?: S3Auth,
+  signal?: AbortSignal,
 ): Promise<void> {
   const { bucket, key } = parseS3Url(url);
   const { GetObjectCommand } = await loadAwsS3();
   const client = await makeS3Client(auth);
   try {
-    const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    // Thread the abort signal into BOTH the SDK request and the write pipeline so a
+    // download_model action:"cancel" (#515) aborts the S3 transfer promptly instead of running to
+    // completion. The streamUrlToFile cloud branch also guards before/after as a
+    // backstop, so a cancelled transfer is never finalized even if the SDK ignores it.
+    const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), {
+      abortSignal: signal,
+    });
     if (!response.Body) {
       throw new ModelError("S3 download response has no body", { url: redactUrlForLogs(url) });
     }
-    await pipeline(bodyToReadable(response.Body), createWriteStream(targetPath));
+    await pipeline(bodyToReadable(response.Body), createWriteStream(targetPath), { signal });
+    // #343 edge: the S3 stream can end early (dropped connection) and pipeline()
+    // still resolves, leaving a truncated file. S3 tells us the authoritative
+    // object size in ContentLength — verify the bytes on disk match before this
+    // download can ever be reported as successful.
+    const expected = typeof response.ContentLength === "number" ? response.ContentLength : 0;
+    if (expected > 0) {
+      const actual = (await stat(targetPath)).size;
+      if (actual < expected) {
+        throw new ModelError(
+          `S3 download truncated: wrote ${actual} of ${expected} bytes — the stream ended early. Not complete; retry.`,
+          { url: redactUrlForLogs(url) },
+        );
+      }
+    }
   } catch (err) {
     if (err instanceof ModelError || err instanceof ValidationError) throw err;
     throw new ModelError("S3 download failed", {

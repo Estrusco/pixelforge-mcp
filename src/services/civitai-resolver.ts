@@ -38,6 +38,8 @@ interface CivitaiModelVersion {
   downloadUrl?: string;
   files?: CivitaiFile[];
   images?: CivitaiImage[];
+  /** Version-level maturity rating (newer API responses). */
+  nsfwLevel?: number;
   // Present on GET /model-versions/{id} (not on the nested versions of /models/{id}).
   model?: { name?: string; type?: string };
 }
@@ -105,10 +107,162 @@ export interface CivitaiResolved {
 
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
-  if (config.civitaiApiToken) {
-    headers["Authorization"] = `Bearer ${config.civitaiApiToken}`;
+  // Captured ONCE: the credential getters resolve from the canonical store on
+  // every access, so testing one read and interpolating another can send a
+  // different token — or `Bearer undefined` — if the store is rewritten in
+  // between (codex gate, round 6, finding 3).
+  const civitaiToken = config.civitaiApiToken;
+  if (civitaiToken) {
+    headers["Authorization"] = `Bearer ${civitaiToken}`;
   }
   return headers;
+}
+
+/**
+ * Ceiling on any single CivitAI request. Without it a hung connection wedges
+ * the tool forever — the worst outcome of all (neither a surfaced error nor an
+ * honest empty). Mirrors the 10s guard the provenance hash-lookup already uses;
+ * a touch longer here because search/model reads can be heavier.
+ */
+const CIVITAI_TIMEOUT_MS = 15000;
+
+/**
+ * Translate a raw (non-HTTP) transport failure into a DISTINCT, actionable
+ * ModelError, distinguishing our own timeout/abort from a connection-level
+ * network error. Shared by the initial fetch AND the body read, because an
+ * AbortError/connection reset can fire at EITHER point (after headers arrive
+ * but before the body is drained) and must be labelled the same way — never
+ * misread as a bot-gate/non-JSON page.
+ * Returns null when `err` is not a transport failure (e.g. a JSON SyntaxError),
+ * so the caller can fall through to its own classification.
+ */
+function transportError(err: unknown, url: string): ModelError | null {
+  const name = err instanceof Error ? err.name : "";
+  if (name === "TimeoutError" || name === "AbortError") {
+    return new ModelError(
+      `CivitAI request timed out after ${CIVITAI_TIMEOUT_MS / 1000}s ` +
+        `(civitai.com slow or unreachable) — try again shortly.`,
+      { url, timeout: true },
+    );
+  }
+  if (err instanceof TypeError) {
+    // A malformed Authorization header (e.g. CIVITAI_API_TOKEN pasted with
+    // non-ASCII characters) ALSO rejects as TypeError, but it is a LOCAL
+    // credential-config fault, not a connectivity fault. Labelling it
+    // "unreachable / check connectivity" sends the caller down the wrong
+    // diagnostic path.
+    if (/ByteString|greater than 255|Invalid header|invalid header/i.test(err.message)) {
+      return new ModelError(
+        `CivitAI credential is invalid: the API token contains characters that ` +
+          `cannot be sent in an HTTP header (non-ASCII). Re-enter CIVITAI_API_TOKEN as the raw ASCII ` +
+          `token — no quotes, no "Bearer " prefix, no label or translated text. (raw: ${err.message})`,
+        { url, credential: true },
+      );
+    }
+    return new ModelError(
+      `CivitAI is unreachable (network error: ${err.message}) — ` +
+        `check connectivity and try again.`,
+      { url, network: true },
+    );
+  }
+  return null;
+}
+
+/**
+ * Perform the fetch and translate every non-HTTP failure mode (DNS/connection
+ * down, TLS, or our own timeout abort) into a DISTINCT, actionable ModelError.
+ * A bare `fetch` rejects with an opaque `TypeError: fetch failed` (or a
+ * `TimeoutError`) that, once caught upstream, is indistinguishable from any
+ * other crash — exactly the "silently swallowed" failure WS-6 set out to kill.
+ */
+async function civitaiFetch(
+  url: string,
+  headers: Record<string, string>,
+): Promise<Response> {
+  try {
+    return await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(CIVITAI_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw (
+      transportError(err, url) ??
+      new ModelError(
+        `CivitAI is unreachable (network error: ` +
+          `${err instanceof Error ? err.message : String(err)}) — ` +
+          `check connectivity and try again.`,
+        { url, network: true },
+      )
+    );
+  }
+}
+
+/**
+ * Turn a non-OK HTTP status into a DISTINCT, actionable ModelError so an
+ * auth/rate-limit/upstream failure is never conflated with each other — or,
+ * worse, with a genuine empty result. Callers handle 404 themselves (a 404 is
+ * "resource absent", a definitive answer, not a fault).
+ *
+ * `tokenSent` reflects whether THIS request actually carried a bearer token —
+ * NOT whether one is configured globally. The tRPC leaderboard deliberately
+ * sends none, so a bot-gate 401 there must read as "auth required", never
+ * "your configured token is invalid".
+ */
+async function throwForCivitaiStatus(
+  res: Response,
+  url: string,
+  tokenSent: boolean,
+): Promise<never> {
+  // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+  // HTTP status is reported either way, so an unreadable body costs detail in the
+  // text, never a wrong conclusion. Verified there is no branch on this value.
+  const body = await res.text().catch(() => "");
+  const status = res.status;
+  let message: string;
+  if (status === 401) {
+    message = tokenSent
+      ? `CivitAI rejected the API token (401 Unauthorized) — it is invalid or ` +
+        `expired; refresh CIVITAI_API_TOKEN.`
+      : `CivitAI requires authentication for this request (401 Unauthorized) — ` +
+        `set CIVITAI_API_TOKEN.`;
+  } else if (status === 403) {
+    message =
+      `CivitAI refused the request (403 Forbidden) — the token lacks ` +
+      `permission, or access is region-blocked.`;
+  } else if (status === 429) {
+    message =
+      `CivitAI rate-limited the request (429 Too Many Requests) — ` +
+      `wait a moment and retry.`;
+  } else if (status >= 500) {
+    message =
+      `CivitAI upstream error (${status} ${res.statusText}) — the site is ` +
+      `having trouble; this is transient, retry shortly.`;
+  } else {
+    message = `CivitAI API ${status}: ${res.statusText}`;
+  }
+  throw new ModelError(message, { url, status, body });
+}
+
+/**
+ * Parse a response body as JSON, converting a non-JSON 2xx (e.g. a Cloudflare
+ * challenge or HTML interstitial served with a 200) into a distinct error
+ * rather than an opaque SyntaxError that reads as an empty/garbage result.
+ */
+async function parseCivitaiJson<T>(res: Response, url: string): Promise<T> {
+  try {
+    return (await res.json()) as T;
+  } catch (err) {
+    // An abort/timeout or connection reset can surface HERE (headers arrived,
+    // body drain failed). Classify it as the transport failure it is — only a
+    // genuine parse failure (SyntaxError) is the bot-gate/non-JSON case.
+    const transport = transportError(err, url);
+    if (transport) throw transport;
+    throw new ModelError(
+      `CivitAI returned a non-JSON response (HTTP ${res.status}) — likely a ` +
+        `bot-gate or interstitial page rather than the API; try again shortly.`,
+      { url, status: res.status, nonJson: true },
+    );
+  }
 }
 
 async function civitaiGet<T>(path: string): Promise<T> {
@@ -120,7 +274,8 @@ async function civitaiGet<T>(path: string): Promise<T> {
   const url = `${CIVITAI_API_BASE}${path}`;
   logger.debug("CivitAI API request", { url });
 
-  const res = await fetch(url, { headers: authHeaders() });
+  const headers = authHeaders();
+  const res = await civitaiFetch(url, headers);
   if (res.status === 404) {
     throw new ModelError(`CivitAI resource not found: ${path}`, {
       url,
@@ -128,14 +283,9 @@ async function civitaiGet<T>(path: string): Promise<T> {
     });
   }
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new ModelError(`CivitAI API ${res.status}: ${res.statusText}`, {
-      url,
-      status: res.status,
-      body,
-    });
+    await throwForCivitaiStatus(res, url, "Authorization" in headers);
   }
-  return (await res.json()) as T;
+  return parseCivitaiJson<T>(res, url);
 }
 
 /** Pick the best file from a version's file list: primary first, else the first. */
@@ -335,7 +485,7 @@ export async function resolveCivitaiModel(
 // Keyword search (native — replaces the previously-bundled Civitai MCP for the
 // search→download loop). GET /api/v1/models works UNAUTHENTICATED with query,
 // type, and base-model filters, and each hit carries exactly what
-// download_civitai_model consumes (model id + version id) plus the trigger
+// download_model action:"download_civitai" consumes (model id + version id) plus the trigger
 // words the prompt will need. Field driver: a local-model user asked to "find
 // a good Flux LoRA on Civitai" and there was no tool that could.
 // ---------------------------------------------------------------------------
@@ -348,7 +498,7 @@ export interface CivitaiSearchHit {
   downloads?: number;
   thumbs_up?: number;
   nsfw?: boolean;
-  /** Latest version — the one download_civitai_model fetches by default. */
+  /** Latest version — the one download_model action:"download_civitai" fetches by default. */
   version_id?: number;
   version_name?: string;
   base_model?: string;
@@ -393,10 +543,51 @@ export interface CivitaiSearchResult {
    *  page cap with pages left AND fewer than `limit` matches — matching
    *  models past the cap may exist but were not seen. */
   scanCapped?: boolean;
+  /** Creator+keyword mode only: set when a PAGE AFTER THE FIRST failed
+   *  (upstream/timeout/rate-limit) mid-scan. The returned `hits` are a partial
+   *  result from the pages that did load, NOT a definitive answer — the miss of
+   *  any absent match is unattributable. (A first-page failure throws instead,
+   *  so a broken scan is never mistaken for a genuine empty.) */
+  scanError?: string;
 }
 
-function toSearchHit(m: CivitaiSearchItem): CivitaiSearchHit {
-  const v = m.modelVersions?.[0];
+/**
+ * CivitAI `nsfwLevel` ladder: 1 None · 2 Soft (PG-13) · 4 Mature · 8 Explicit ·
+ * 16 X · 32 Blocked. SFW search surfaces nothing above PG-13.
+ */
+const MAX_SFW_NSFW_LEVEL = 2;
+
+/**
+ * SFW classification of one version — "clean" requires POSITIVE evidence:
+ * a version-level rating at/below PG-13, or at least one preview image all of
+ * which are at/below PG-13. A version with NO rating and NO previews is
+ * UNCLASSIFIED, not clean: treating an empty `images` array as safe let SFW
+ * search vouch an explicit version's trigger words (#664 gate).
+ */
+function versionSfwClass(v: CivitaiModelVersion): "clean" | "explicit" | "unclassified" {
+  if (typeof v.nsfwLevel === "number") {
+    return v.nsfwLevel <= MAX_SFW_NSFW_LEVEL ? "clean" : "explicit";
+  }
+  const imgs = v.images ?? [];
+  if (imgs.length === 0) return "unclassified";
+  return imgs.every((img) => (img.nsfwLevel ?? 1) <= MAX_SFW_NSFW_LEVEL)
+    ? "clean"
+    : "explicit";
+}
+
+function toSearchHit(
+  m: CivitaiSearchItem,
+  opts: { nsfw?: boolean } = {},
+): CivitaiSearchHit {
+  const versions = m.modelVersions ?? [];
+  // The API gates only the MODEL-level nsfw flag — a model flagged SFW can
+  // still front a version with mature/explicit previews and adult trigger
+  // words (#664). In SFW mode prefer the newest version PROVEN clean; an
+  // unclassified version (no rating, no previews) is never vouched, and when
+  // nothing is proven clean the latest version still goes out for the
+  // download handoff but its trigger words are omitted.
+  const clean = opts.nsfw ? undefined : versions.find((v) => versionSfwClass(v) === "clean");
+  const v = clean ?? versions[0];
   const file = v ? pickFile(v) : undefined;
   const sizeKb = (file as { sizeKB?: number } | undefined)?.sizeKB;
   return {
@@ -410,7 +601,8 @@ function toSearchHit(m: CivitaiSearchItem): CivitaiSearchHit {
     version_id: v?.id,
     version_name: v?.name,
     base_model: v?.baseModel,
-    trained_words: v?.trainedWords?.slice(0, 6),
+    trained_words:
+      opts.nsfw || clean ? v?.trainedWords?.slice(0, 6) : undefined,
     ...(sizeKb ? { size_mb: Math.round(sizeKb / 1024) } : {}),
   };
 }
@@ -447,7 +639,7 @@ export async function searchCivitaiModels(
     }
     params.set("limit", String(limit));
     const data = await civitaiGet<CivitaiSearchResponse>(`/models?${params.toString()}`);
-    return { hits: (data.items ?? []).slice(0, limit).map(toSearchHit) };
+    return { hits: (data.items ?? []).slice(0, limit).map((m) => toSearchHit(m, opts)) };
   }
 
   // Creator + keyword: `query` + `username` together return an EMPTY page
@@ -468,9 +660,21 @@ export async function searchCivitaiModels(
   // hit with a next cursor remaining, or the API handed back a degenerate
   // (cycling) cursor we refuse to follow.
   let stoppedEarly = false;
+  // Set when a page AFTER the first fails: we keep the partial matches gathered
+  // so far but flag them as non-definitive. A FIRST-page failure is left to
+  // throw (no partial data exists yet), so a broken scan never looks empty.
+  let scanError: string | undefined;
   for (let page = 0; page < CREATOR_SCAN_MAX_PAGES; page++) {
     if (cursor !== undefined) params.set("cursor", cursor);
-    const data = await civitaiGet<CivitaiSearchResponse>(`/models?${params.toString()}`);
+    let data: CivitaiSearchResponse;
+    try {
+      data = await civitaiGet<CivitaiSearchResponse>(`/models?${params.toString()}`);
+    } catch (err) {
+      if (page === 0) throw err; // nothing gathered yet — surface the failure
+      scanError = err instanceof Error ? err.message : String(err);
+      stoppedEarly = true; // pages remained unscanned → the result is partial
+      break;
+    }
     // Dedupe across pages by model id — a misbehaving cursor that replays a
     // page must not double-count `scanned` or fill `limit` with duplicates.
     const items = (data.items ?? []).filter((m) => !seenIds.has(m.id));
@@ -498,9 +702,10 @@ export async function searchCivitaiModels(
     if (page === CREATOR_SCAN_MAX_PAGES - 1) stoppedEarly = true; // page cap, more remained
   }
   return {
-    hits: matches.slice(0, limit).map(toSearchHit),
+    hits: matches.slice(0, limit).map((m) => toSearchHit(m, opts)),
     scanned,
     scanCapped: stoppedEarly && matches.length < limit,
+    ...(scanError ? { scanError } : {}),
   };
 }
 
@@ -608,19 +813,17 @@ export async function fetchCivitaiTopCreators(
   logger.debug("CivitAI leaderboard request", { url });
 
   // No bearer token here: the leaderboard is public and the API token belongs
-  // to the documented v1 surface, not the site's tRPC endpoints.
-  const res = await fetch(url, { headers: TRPC_BROWSER_HEADERS });
+  // to the documented v1 surface, not the site's tRPC endpoints. Shares the
+  // timeout + distinct network/status/non-JSON error surfacing of civitaiGet.
+  // tokenSent: false — the leaderboard request intentionally carries no bearer
+  // token, so a bot-gate 401 must NOT blame the configured v1 API token.
+  const res = await civitaiFetch(url, TRPC_BROWSER_HEADERS);
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new ModelError(`CivitAI leaderboard ${res.status}: ${res.statusText}`, {
-      url,
-      status: res.status,
-      body,
-    });
+    await throwForCivitaiStatus(res, url, false);
   }
-  const data = (await res.json()) as {
+  const data = await parseCivitaiJson<{
     result?: { data?: { json?: CivitaiLeaderboardEntry[] } };
-  };
+  }>(res, url);
   const entries = data.result?.data?.json ?? [];
   const metric = (e: CivitaiLeaderboardEntry, type: string) =>
     e.metrics?.find((m) => m.type === type)?.value;

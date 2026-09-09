@@ -9,7 +9,7 @@ import {
 
 export interface RemoveBackgroundArgs {
   /** Filename (in ComfyUI's input dir) of the image to cut out. Upload it first
-   *  with upload_image, or stage an output with stage_output_as_input. */
+   *  with upload_image (action:"image"), or stage an output with upload_image (action:"stage"). */
   image: string;
   /** "birefnet" (default, salient-object matting) or "luma_key" (core-node-only
    *  luminance key — no custom node dependency, soft continuous alpha). */
@@ -31,12 +31,18 @@ export interface RemoveBackgroundDeps {
    *  it can't be determined (no running server) — in which case we proceed and
    *  let execution surface any problem. */
   isNodeInstalled?: (classType: string) => Promise<boolean | undefined>;
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface RemoveBackgroundResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   mode: "birefnet" | "luma_key";
   /** BiRefNet model used. Undefined for luma_key (no model involved). */
   model?: string;
@@ -64,7 +70,7 @@ export async function removeBackground(
   if (!args.image || !args.image.trim()) {
     throw new ValidationError(
       "image is required — the filename of an image already in ComfyUI's input dir " +
-        "(upload it first with upload_image, or stage an output with stage_output_as_input).",
+        "(upload it first with upload_image (action:\"image\"), or stage an output with upload_image (action:\"stage\")).",
     );
   }
   assertSafeInputFilename(args.image, "image");
@@ -99,10 +105,9 @@ export async function removeBackground(
     }
   }
 
-  const argsRecord = args as unknown as Record<string, unknown>;
   const seed: Record<string, unknown> = {};
   for (const key of DEFAULTABLE_KEYS) {
-    const v = argsRecord[key];
+    const v = args[key];
     if (v !== undefined) seed[key] = v;
   }
   const resolved = DefaultsManager.apply(seed);
@@ -122,11 +127,11 @@ export async function removeBackground(
     softness: args.softness,
   });
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
 
   if (mode === "luma_key") {
-    return { prompt_id, queue_remaining, mode };
+    return { prompt_id, queue_remaining, rejectedOutputs, mode };
   }
   const model = (workflow["2"]?.inputs.model as string | undefined) ?? "BiRefNet_toonout";
-  return { prompt_id, queue_remaining, mode, model };
+  return { prompt_id, queue_remaining, rejectedOutputs, mode, model };
 }

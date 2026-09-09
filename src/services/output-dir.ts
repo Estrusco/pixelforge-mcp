@@ -1,8 +1,31 @@
-import { isAbsolute, join, resolve } from "node:path";
-import { config } from "../config.js";
-import { getSystemStats } from "../comfyui/client.js";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { config, isRemoteMode } from "../config.js";
+import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
+import {
+  resolveEffectiveComfyUIBase,
+  getLiveServerSnapshot,
+  resolveLiveServerRoot,
+  hasComfyUIEntrypoint,
+} from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  flagValue,
+  hasUnresolvableRelativeBaseDirFlag,
+  parseBaseDirFromArgv,
+  rawFlagValue,
+  resolveServerLaunchPath,
+} from "./launch-argv.js";
+
+// The pure launch-argv helpers live in ./launch-argv.js (a leaf module) so
+// workspace-env.ts can build on them WITHOUT importing this module — output-dir
+// already imports workspace-env, and a cycle here broke vitest's async
+// mock-factory resolution. These re-exports keep the public surface unchanged.
+export {
+  hasUnresolvableRelativeBaseDirFlag,
+  parseBaseDirFromArgv,
+} from "./launch-argv.js";
 
 // ---------------------------------------------------------------------------
 // Resolve ComfyUI's REAL output directory.
@@ -10,7 +33,7 @@ import { logger } from "../utils/logger.js";
 // ComfyUI can be launched with --output-directory (or --base-directory) which
 // redirects generated images away from the default <COMFYUI_PATH>/output (e.g.
 // to a shared drive like ComfyUI-Shared\output). Tools that scan the output
-// directory on the local filesystem (convert_image, list_output_images) must
+// directory on the local filesystem (get_image (action:"convert"), get_image (action:"list_outputs")) must
 // therefore NOT assume <COMFYUI_PATH>/output, or they find nothing after a
 // successful render.
 //
@@ -20,19 +43,101 @@ import { logger } from "../utils/logger.js";
 // override the directory. Same class of fix as the doubled-COMFYUI_PATH bug.
 // ---------------------------------------------------------------------------
 
+/**
+ * A single `/system_stats` snapshot: the live server's launch argv and reported cwd,
+ * captured ONCE so every derivation (models dir, base dirs, authorized extra roots)
+ * reflects the SAME server state — never a mix of two calls that straddled a restart.
+ */
+export interface LiveServerSnapshot {
+  reachable: boolean;
+  argv?: string[];
+  cwd?: string;
+  /** The live server's install root as established by the ONE canonical resolver
+   *  (resolveLiveServerRoot) from THIS snapshot — including the OS-observed anchor
+   *  that argv alone cannot produce. Consumers that need
+   *  `<live root>/extra_model_paths.yaml` must use this rather than re-parsing argv,
+   *  or they miss the relative-`main.py` shape entirely (codex gate, round 12).
+   *  LOCAL mode only. */
+  liveRoot?: string;
+  /** Provenance of liveRoot. An observed-process root is an inference, not a
+   * deletion authority; it is retained for callers that need to explain it. */
+  liveRootSource?: "argv" | "observed-process";
+  /** Normalized OS process start time captured with the live server observation.
+   * Deletion may use launch-named config only when this proof is present. */
+  processStartedAtMs?: number;
+}
+
+/**
+ * Provenance of a resolved models directory (#369).
+ *
+ *  - `argv-flag`     — the server's own `--base-directory`/`--models-directory`.
+ *  - `live-root`     — the server's own argv `main.py` root (absolute / cwd-resolved).
+ *  - `observed-root` — a relative argv `main.py` re-anchored on the interpreter the
+ *                      OS reports for the process on our port.
+ *  - `base-anchored` — the configured base CORROBORATED by the relative `main.py`
+ *                      the live server reported really existing under it.
+ *  - `base-inventory-corroborated` — a non-live-authoritative configured base whose
+ *                                target category inventory fully matches local files.
+ *  - `base-inventory-partial` — the same non-authoritative base under the bounded
+ *                              split-namespace exception; the downstream live check stays on.
+ *  - `configured-base` — plain COMFYUI_PATH / default workspace. This is the only
+ *                      value a REACHABLE server never vouched for, and the one that
+ *                      wrote a 4.88 GB model into a stale install in #369.
+ *
+ * The first three are LIVE-AUTHORITATIVE. `isLiveAuthoritativeModelsDir()` is the
+ * single predicate callers use, so nobody re-derives that classification.
+ */
+export type ModelsDirSource =
+  | "argv-flag"
+  | "live-root"
+  | "observed-root"
+  | "base-anchored"
+  | "base-inventory-corroborated"
+  | "base-inventory-partial"
+  | "configured-base";
+
+/** True when the models dir was established from the RUNNING server rather than
+ *  from local configuration the server never vouched for. */
+export function isLiveAuthoritativeModelsDir(source: ModelsDirSource): boolean {
+  return source === "argv-flag" || source === "live-root" || source === "observed-root";
+}
+
+/**
+ * Did the SERVER ITSELF name this root, rather than us inferring it? (#369)
+ *
+ * Deliberately narrower than `isLiveAuthoritativeModelsDir`, and deliberately a
+ * SEPARATE predicate rather than a change to it — that one has four other callers
+ * answering different questions, and widening or narrowing it in place would move
+ * all of them at once.
+ *
+ * The distinction is what a source is EVIDENCE OF:
+ *
+ *   argv-flag / live-root — the server's own command line, naming its base or its
+ *     script root. A statement about where the server reads.
+ *   observed-root — a relative `main.py` re-anchored on the interpreter the OS
+ *     reports for the process on our port. A statement about where the BINARY
+ *     lives, from which the root is INFERRED.
+ *
+ * Those come apart in an ordinary Windows setup: with a stale portable bundle's
+ * python on PATH, `cd D:\live && python ComfyUI\main.py` anchors
+ * `C:\stale\ComfyUI` — measured, and reachable through both the absolute-argv[0]
+ * tier and the OS-image reading (#1374). A download then lands in an install the
+ * running server never reads, which is #369's original outcome by a new route.
+ *
+ * So only the first two skip the disagreement check. The inferred one runs it, at
+ * the cost of one `/models/<category>` listing call — a check that needs positive
+ * contradicting evidence and fails open on everything else, so it cannot refuse a
+ * fresh or shared tree.
+ */
+export function modelsDirNamedByServer(source: ModelsDirSource): boolean {
+  return source === "argv-flag" || source === "live-root";
+}
+
 /** Resolve a possibly-relative dir against a base (or COMFYUI_PATH, or cwd). */
 function resolveDir(value: string, base?: string): string {
   if (isAbsolute(value)) return resolve(value);
   const root = base ?? config.comfyuiPath ?? process.cwd();
   return resolve(root, value);
-}
-
-/** Read a flag's value supporting both `--flag value` and `--flag=value`. */
-function flagValue(argv: string[], index: number, flag: string): string | undefined {
-  const token = argv[index];
-  if (token === flag) return argv[index + 1];
-  if (token.startsWith(`${flag}=`)) return token.slice(flag.length + 1);
-  return undefined;
 }
 
 /**
@@ -56,14 +161,1169 @@ export function parseOutputDirFromArgv(argv: string[] | undefined): string | und
   return undefined;
 }
 
-/** <COMFYUI_PATH>/output fallback. Throws if COMFYUI_PATH is unset. */
-export function localOutputDirFallback(): string {
-  if (!config.comfyuiPath) {
-    throw new ValidationError(
-      "COMFYUI_PATH is not configured. Set the COMFYUI_PATH environment variable.",
+/**
+ * True when the server's launch argv carries a RELATIVE `--base-directory` or
+ * `--models-directory` that we CANNOT resolve because it did not report an absolute
+ * cwd. Callers must then NOT guess a local destination (they'd write to the wrong
+ * place); route through the server / report live resolution unavailable instead.
+ */
+export function hasUnresolvableRelativeModelDirFlag(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): boolean {
+  if (serverCwd && isAbsolute(serverCwd)) return false; // all relatives resolvable
+  const base = rawFlagValue(argv, "--base-directory");
+  const models = rawFlagValue(argv, "--models-directory");
+  return (
+    (models !== undefined && !isAbsolute(models)) ||
+    (base !== undefined && !isAbsolute(base))
+  );
+}
+
+/**
+ * Parse the models directory the running server actually reads from. ComfyUI's
+ * `--models-directory` overrides `<base>/models` and is resolved INDEPENDENTLY via
+ * os.path.abspath (relative to the SERVER cwd) — NOT relative to `--base-directory`
+ * (folder_paths.py). Otherwise the models root is `<base>/models`. Returns
+ * undefined when neither flag is present, or when a relative flag is unresolvable
+ * without the server cwd.
+ */
+export function parseModelsDirFromArgv(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): string | undefined {
+  const modelsDir = rawFlagValue(argv, "--models-directory");
+  // --models-directory resolves on its OWN against the server cwd, not against base.
+  if (modelsDir !== undefined) return resolveServerLaunchPath(modelsDir, serverCwd);
+  const base = parseBaseDirFromArgv(argv, serverCwd);
+  return base ? join(base, "models") : undefined;
+}
+
+/**
+ * Collect all values that follow `flag` at position `index`, supporting both
+ * `--flag a b` (argparse nargs='+') and `--flag=a`. Consumes consecutive tokens
+ * until the next `--option`. Returns [] when the token at `index` isn't `flag`.
+ */
+function multiFlagValues(argv: string[], index: number, flag: string): string[] {
+  const token = argv[index];
+  if (token.startsWith(`${flag}=`)) return [token.slice(flag.length + 1)];
+  if (token !== flag) return [];
+  const values: string[] = [];
+  for (let j = index + 1; j < argv.length; j++) {
+    if (argv[j].startsWith("--")) break;
+    values.push(argv[j]);
+  }
+  return values;
+}
+
+/**
+ * Parse every `--extra-model-paths-config` value out of the launch argv. ComfyUI
+ * declares this flag as `nargs='+', action='append'`, so it can carry multiple
+ * files per occurrence AND be repeated — both forms are collected here. This is
+ * the config file(s) the running server actually loads extra model search paths
+ * from — on ComfyUI Desktop it is an auto-generated
+ * `…\Comfy Desktop\shared_model_paths.yaml`, NOT the app-data
+ * `ComfyUI\extra_models_config.yaml` the tools historically guessed. Returns []
+ * when the flag is absent.
+ */
+export function parseExtraModelPathsConfigsFromArgv(argv: string[] | undefined): string[] {
+  if (!argv || argv.length === 0) return [];
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    for (const v of multiFlagValues(argv, i, "--extra-model-paths-config")) {
+      out.push(resolveDir(v));
+    }
+  }
+  return out;
+}
+
+/**
+ * Like parseExtraModelPathsConfigsFromArgv but returns the RAW flag values WITHOUT
+ * resolving relatives. Security-critical for AUTHORIZATION (getLiveExtraModelRoots,
+ * #633): a RELATIVE `--extra-model-paths-config` value cannot be safely resolved to
+ * the live server's file from the MCP process — resolveDir() would anchor it to the
+ * local COMFYUI_PATH / MCP cwd, so a stale local same-named config could authorize
+ * an escape the running server never loads (codex P0d). The authorizing caller keeps
+ * only ABSOLUTE values and fails closed on relative ones.
+ */
+export function parseExtraModelPathsConfigsFromArgvRaw(argv: string[] | undefined): string[] {
+  if (!argv || argv.length === 0) return [];
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    for (const v of multiFlagValues(argv, i, "--extra-model-paths-config")) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * Resolve the models directory the CONNECTED server actually reads from AND, from
+ * the SAME `/system_stats` call, the candidate ComfyUI *base install* directories
+ * (used by the download destination guard to locate `custom_nodes` code roots).
+ *
+ * Deriving both from ONE call is a security invariant, not just an optimization:
+ * a SECOND, separate stats call could fail AFTER the models dir was already
+ * resolved from a divergent `--models-directory`, leaving the guard without the
+ * real `--base-directory` code root and letting a relabeled extra-path alias of
+ * `custom_nodes` slip through (fail-open). One call means the models dir and the
+ * base dirs are always consistent — if the call fails, BOTH fall back together to
+ * the configured local base (no partial-information window).
+ *
+ * modelsDir: the running ComfyUI's models root (`--base-directory`/`--models-directory`
+ * → the live server's main.py root → `<COMFYUI_PATH>`/default workspace), issues
+ * #346/#369/#490/#463. baseDirs: the local install roots ComfyUI derives
+ * `custom_nodes` from — the argv `--base-directory`, the live main.py root, and the
+ * configured local base — collected only in LOCAL mode (the guard runs only
+ * locally; a remote server's argv paths are on the remote host).
+ */
+/** Do two absolute paths name the same directory?
+ *
+ *  Case is folded on WINDOWS ONLY. Windows filesystems are case-insensitive
+ *  everywhere, so a server reporting `comfyui\main.py` against a base of
+ *  `...\ComfyUI` genuinely names the same directory. macOS is deliberately NOT
+ *  folded even though HFS+/APFS are case-insensitive by DEFAULT: APFS can be
+ *  formatted case-SENSITIVE, and on such a volume `/x/ComfyUI` and `/x/comfyui`
+ *  are two different installs. This comparison decides whether a download may be
+ *  written to a base, so a wrong "same" is the #369 harm (a model landing in an
+ *  install the running server never reads, reported as a success). Being strict
+ *  costs a case-differing macOS user a refusal they can fix; being lax could cost
+ *  them a silently misplaced multi-gigabyte file. */
+function samePath(a: string, b: string): boolean {
+  const norm = (s: string): string => {
+    const slashed = resolve(s).replace(/\\/g, "/").replace(/\/+$/, "");
+    return process.platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  return norm(a) === norm(b);
+}
+
+/**
+ * Corroborate a configured local `base` against the RELATIVE `main.py` path the
+ * running server reported, and return the install root when — and only when —
+ * they agree. Returns undefined when they do not, so the caller refuses rather
+ * than guesses (#369's doctrine: an honest "I don't know where this would land"
+ * beats a fabricated success).
+ *
+ * TWO base conventions coexist in this codebase and BOTH are legitimate (#813):
+ *
+ *   A. `base` is the OUTER launcher root, the server one level down at
+ *      `<base>/<relDir>/main.py`. This is ComfyUI Desktop, whose `<base>` holds
+ *      the launcher's `standalone-env` python rather than the server.
+ *
+ *   B. `base` IS the ComfyUI directory (it holds `main.py` directly), and the
+ *      server's relative `relDir/main.py` is written from base's PARENT. This is
+ *      the classic Windows portable bundle with `COMFYUI_PATH` set to
+ *      `...\ComfyUI_windows_portable\ComfyUI` — the value `install_comfyui (action:"environment")`,
+ *      `list_local_models` and `resolveEffectiveComfyUIBase` all already treat as
+ *      correct. Only this resolver rejected it, so every download refused (#813).
+ *
+ * Order follows the rule `serverRootsUnder` (workspace-env.ts) already
+ * established for exactly this ambiguity, rather than inventing a second
+ * convention: a base that DIRECTLY holds `main.py` IS the server root and wins;
+ * a nested checkout never outranks it (#401).
+ *
+ * Convention B is accepted ONLY on the same evidence convention A demands —
+ * that the server's reported relative path, anchored one level up, names THIS
+ * directory (so `relDir` must match base's own name) AND that `main.py` is
+ * really there. A base whose name does not match `relDir` is NOT corroborated
+ * and is still refused: the server said its script lives at `<something>/ComfyUI/
+ * main.py`, and a base named `ComfyUI-master` is not that, whatever it contains.
+ */
+function anchorRelativeEntrypointOnBase(base: string, relDir: string): string | undefined {
+  // B — base is itself the directory the server named. The evidence is that
+  // `base` ENDS WITH `relDir`'s segments: climb that many levels up from base and
+  // re-anchor; if we land back on base, then some working directory (the one the
+  // server did not report) makes `relDir/main.py` resolve to exactly this install.
+  // Handles multi-segment relDir ("sub/ComfyUI") as well as the reported single
+  // "ComfyUI"; a base whose tail does NOT match relDir lands elsewhere and is
+  // rejected, which is the whole point of corroborating.
+  const segments = relDir.split(/[\\/]+/).filter((s) => s !== "" && s !== ".");
+  const impliedCwd = resolve(base, ...segments.map(() => ".."));
+  const baseIsTheInstall =
+    samePath(resolve(impliedCwd, relDir), base) && hasComfyUIEntrypoint(base);
+  // A — base is the outer launcher root; the server is nested under it. (This
+  // also covers relDir "." — `resolve(base, ".")` is base — which is how a server
+  // launched as plain `python main.py` from inside the install already resolved.)
+  const nested = resolve(base, relDir);
+  const nestedIsTheInstall = !samePath(nested, base) && hasComfyUIEntrypoint(nested);
+
+  // BOTH readings fit. `<base>/main.py` and `<base>/<relDir>/main.py` both exist,
+  // and the server's relative path is consistent with either — so the evidence
+  // does not say WHICH install is running, and picking one would be a guess about
+  // a destination for multi-gigabyte files. That is exactly the #369 harm (a model
+  // landing in a stale install and being reported a success), so refuse and let
+  // the caller resolve it. Returning undefined routes into the existing refusal,
+  // which names both interpretations.
+  if (baseIsTheInstall && nestedIsTheInstall) return undefined;
+  if (baseIsTheInstall) return resolve(base);
+  if (nestedIsTheInstall) return nested;
+  // relDir "." (or empty): nested IS base, so only the base reading can apply.
+  return hasComfyUIEntrypoint(nested) ? nested : undefined;
+}
+
+/**
+ * Corroborate a configured base by asking the SERVER what models it can SEE (#851).
+ *
+ * `anchorRelativeEntrypointOnBase` corroborates using ComfyUI's CODE layout — it needs a
+ * `main.py` at or under the base. That is an assumption about what an install LOOKS
+ * like, and every deployment shape that does not match produces another false refusal:
+ * #813 was the Windows portable shape, #851 is the Docker/data-dir shape, where
+ * `COMFYUI_PATH` is a bind-mounted host directory holding `models/ input/ output/
+ * custom_nodes/` and the code lives inside the container at a path that does not exist
+ * on the host at all. No amount of layout-matching reaches that, because the evidence it
+ * looks for is genuinely not there — and "I could not determine which install this is"
+ * was being reported as "I determined it is a DIFFERENT install".
+ *
+ * But the question is "where does this server read MODELS from?", and for that there IS
+ * decisive evidence the running server volunteers: `/models/<category>` is ComfyUI
+ * listing the model files it can actually see. If everything it reports for a category
+ * is present under `<base>/models/<category>`, then that directory is (or is mounted as)
+ * the models root the server reads — established by the server, not by us recognising a
+ * layout. That is the same principle #813 used, applied to the evidence that exists in
+ * this deployment rather than the evidence that does not.
+ *
+ * Deliberately conservative, because this decides where multi-gigabyte files land:
+ *  - it runs ONLY where the alternative is today's hard refusal, so it can convert a
+ *    refusal into a corroborated destination but can never redirect a download that
+ *    already resolved;
+ *  - it requires a NON-EMPTY category that the base explains COMPLETELY, except for the
+ *    narrowly bounded split-namespace case below: at least two listed files are present
+ *    and exactly one listed file is absent;
+ *  - a server-answered EMPTY category is usable only as no contradiction for a first
+ *    download, and keeps the destination non-authoritative;
+ *  - anything unreadable or otherwise ambiguous returns a reason and the caller refuses.
+ *
+ * Residual, stated rather than hidden: a stale second install holding an identical copy
+ * of the same model files would also match, and the bounded partial has the same filename-
+ * only limitation. These sources are NOT live-authoritative precisely so downstream keeps
+ * treating the destination as local configuration that was corroborated, not as a path
+ * the server named.
+ */
+/** Is `candidate` strictly inside `root`? The server's listing supplies both the category
+ *  and the file names, and a `..` segment in either (a stray path, a symlinked category)
+ *  would let `join` walk out of `<base>/models` and "find" a file that proves nothing
+ *  about this base. The root itself is not an entry, so equality is not containment. */
+function containedUnder(root: string, candidate: string): boolean {
+  const r = resolve(root);
+  const c = resolve(candidate);
+  if (c === r) return false;
+  const rel = relative(r, c);
+  if (rel === "" || isAbsolute(rel)) return false;
+  // `..` only counts as escaping when it is a whole PATH SEGMENT. A bare
+  // `startsWith("..")` also rejects `..model.safetensors` — a perfectly ordinary
+  // filename that stays inside the directory — and that false refusal would block the
+  // very Docker download this corroboration exists to allow. Over-strict is the same
+  // defect as over-permissive, pointed the other way.
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith("../");
+}
+
+/**
+ * Identity for a server-listed category-relative filename. The bounded partial rescue
+ * counts evidence, so repeated spellings must not manufacture distinct physical files.
+ * Existing entries use the filesystem's own canonical spelling: a case-insensitive volume
+ * resolves `shared.safetensors` and `SHARED.SAFETENSORS` to one identity, while a
+ * case-sensitive volume resolves two physically distinct entries to two identities.
+ * Missing entries conservatively use only normalized lexical identity — collapsing those
+ * without physical evidence could erase genuinely distinct files on a case-sensitive volume.
+ */
+function modelInventoryIdentity(categoryDir: string, name: string): string {
+  const full = join(categoryDir, name);
+  if (containedUnder(categoryDir, full)) {
+    try {
+      return `physical:${realpathSync.native(full)}`;
+    } catch {
+      try {
+        return `physical:${realpathSync(full)}`;
+      } catch {
+        // An absent or unreadable entry has no physical identity to compare.
+      }
+    }
+  }
+  return `lexical:${normalize(name)}`;
+}
+
+/** Preserve the first server spelling while removing aliases before probing/counting. */
+function uniqueModelInventoryFiles(files: string[], categoryDir: string): string[] {
+  const seen = new Set<string>();
+  return files.filter((name) => {
+    const identity = modelInventoryIdentity(categoryDir, name);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+/** What is at this path — keeping "could not look" out of "is not there", and out of
+ *  "is a regular file". A DIRECTORY named like a model would satisfy `existsSync` and
+ *  corroborate a base that holds none of the actual files. */
+function probeEntry(p: string): { kind: "file" | "absent" | "not-a-file" | "indeterminate"; detail?: string } {
+  try {
+    return statSync(p).isFile() ? { kind: "file" } : { kind: "not-a-file" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "absent" };
+    return { kind: "indeterminate", detail: code ?? String(err) };
+  }
+}
+
+/**
+ * Extensions that make a directory entry a MODEL rather than housekeeping (#1371).
+ *
+ * Used only to answer "does this base hold models of its own for this category?" — the
+ * question that separates a stale second install from an extra_model_paths root that is
+ * simply empty here. A `.gitkeep` or a `desktop.ini` answers neither.
+ */
+const BASE_OWN_MODEL_EXTENSIONS = new Set([
+  ".safetensors",
+  ".sft",
+  ".ckpt",
+  ".pt",
+  ".pt2",
+  ".pth",
+  ".bin",
+  ".gguf",
+  ".onnx",
+  // Formats a first pass missed (codex P1). Omitting one is not neutral: a stale base
+  // holding only `.engine` files reads as EMPTY, the contradiction never fires, and the
+  // download goes into the wrong install — the exact write this gate exists to stop.
+  ".pte",
+  ".engine",
+  ".trt",
+  ".plan",
+  ".npz",
+  ".msgpack",
+  ".pkl",
+  ".model",
+]);
+
+/**
+ * Does this directory hold a model file, one level down? (#1371)
+ *
+ * Diffusers-style categories keep their weights in per-model folders, so "no model file at
+ * the top level" is not the same as "this base is empty". One level is deliberate: it
+ * covers the real layout without turning a corroboration check into a recursive walk of a
+ * models tree that can hold tens of thousands of files.
+ */
+function isModelFileEntry(entry: { name: string; isFile(): boolean; isSymbolicLink(): boolean }): boolean {
+  // SYMLINKS COUNT (codex). `Dirent.isFile()` is FALSE for a symbolic link, and sharing one
+  // model tree between installs by symlinking is ordinary practice — this file says so
+  // elsewhere. Requiring isFile() alone made a stale base whose models are links read as
+  // empty, reintroducing the misplaced write for exactly the users most likely to have two
+  // installs.
+  if (!entry.isFile() && !entry.isSymbolicLink()) return false;
+  return BASE_OWN_MODEL_EXTENSIONS.has(extname(entry.name).toLowerCase());
+}
+
+/**
+ * Is this entry a directory, INCLUDING a symlink pointing at one? (#1371)
+ *
+ * `Dirent.isDirectory()` is false for a symlink to a directory — the same trap as
+ * `isFile()` above, and it bit the same users twice. `models/checkpoints/SDXL ->
+ * /mnt/shared/SDXL` is the layout of someone sharing one model tree between installs,
+ * which is precisely the population this gate exists to protect: their base read as empty,
+ * so no contradiction was found, so the misplaced write went ahead.
+ *
+ * Following the link is safe here because the recursion below is depth-bounded and
+ * budget-bounded — a link pointing back up its own tree costs at most a couple of extra
+ * readdirs, not a cycle. A broken link throws and is simply not a directory.
+ */
+function entryIsDirectoryLike(
+  dir: string,
+  entry: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean },
+  budget: ModelScanBudget,
+): boolean {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  // THE STAT IS ITSELF THE WORK (codex P2). A category holding thousands of directory
+  // symlinks reached this line once per entry, because the readdir budget is only consumed
+  // one level down — so bounding readdirs left the symlink-heavy tree exactly as
+  // unbounded as before, in the shape the symlink fix newly made reachable.
+  if (budget.stats <= 0) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.stats -= 1;
+  try {
+    return statSync(join(dir, entry.name)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How many directories one corroboration check may read before it gives up. (#1371, codex P2)
+ *
+ * Depth alone does not bound the work: a category holding 10k subdirectories is 10k
+ * synchronous readdirs at depth 2, on the download path. Exhausting the budget answers
+ * "no model found", which is the SAFE direction — no contradiction means no refusal, only
+ * the pre-existing unconfirmed-visibility warning. A populated base almost always answers
+ * true from a file in the first directory read.
+ */
+const MODEL_SCAN_DIR_BUDGET = 512;
+
+/** Companion cap on link resolutions, for the same reason one level down. */
+const MODEL_SCAN_STAT_BUDGET = 4096;
+
+// A split code/data namespace can make one server-visible entry unavailable to the
+// MCP process. A single shared filename is not enough to distinguish that from a stale
+// clone (#1147/#369), so the bounded rescue requires at least two matches and permits
+// only one unaccounted server entry. Larger or smaller disagreements remain refused.
+const MIN_BOUNDED_NAMESPACE_MATCH_FILES = 2;
+const MAX_BOUNDED_NAMESPACE_ONLY_FILES = 1;
+
+interface ModelScanBudget {
+  dirs: number;
+  stats: number;
+  /**
+   * The scan GAVE UP; it did not finish and find nothing.
+   *
+   * These are not the same answer and folding them together is the defect this repo has a
+   * gate for (#796). "No model here" contradicts the base and refuses the download; "I
+   * stopped looking" establishes nothing, and reporting it as the former would refuse a
+   * working install, while reporting it as a clean negative — which is what the first
+   * version of this bound did — silently returns the misplaced write the whole check
+   * exists to stop. The caller proceeds either way, but says which one happened.
+   */
+  truncated: boolean;
+}
+
+function newModelScanBudget(): ModelScanBudget {
+  return { dirs: MODEL_SCAN_DIR_BUDGET, stats: MODEL_SCAN_STAT_BUDGET, truncated: false };
+}
+
+/**
+ * Does this directory tree hold a model file, within a bounded depth? (#1371)
+ *
+ * TWO LEVELS, not one. A Diffusers/HF repo checkout is `<category>/<repo>/transformer/
+ * model.safetensors` — one level down finds nothing there, and "found nothing" is read as
+ * "this base is empty", which permits the misplaced write this gate exists to stop.
+ *
+ * Bounded on purpose: a models tree can hold tens of thousands of files, and this runs
+ * synchronously inside a corroboration check on the download path. Depth 2 covers the real
+ * layouts without turning that into a full walk. Deeper nesting than that is a false
+ * negative — it proceeds with the existing unconfirmed-visibility warning, which is where
+ * these users were before the gate existed.
+ */
+function directoryHoldsAModel(dir: string, depth = 2, budget = newModelScanBudget()): boolean {
+  if (depth <= 0) return false;
+  if (budget.dirs <= 0) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.dirs -= 1;
+  let entries: { name: string; isFile(): boolean; isSymbolicLink(): boolean; isDirectory(): boolean }[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    // Permission-denied or absent: nothing established either way.
+    return false;
+  }
+  for (const entry of entries) {
+    if (isModelFileEntry(entry)) return true;
+  }
+  for (const entry of entries) {
+    if (budget.dirs <= 0) {
+      budget.truncated = true;
+      return false;
+    }
+    if (
+      entryIsDirectoryLike(dir, entry, budget) &&
+      directoryHoldsAModel(join(dir, entry.name), depth - 1, budget)
+    )
+      return true;
+  }
+  return false;
+}
+
+async function corroborateBaseByModelInventory(
+  base: string,
+  targetCategory: string,
+): Promise<
+  | {
+      ok: true;
+      modelsDir: string;
+      category: string;
+      matched: number;
+      /** How many the server listed, so a PARTIAL match can be reported as one. */
+      listed: number;
+    }
+  | {
+      ok: false;
+      reason: string;
+      /**
+       * The server listed files for this category and NONE of them are under the base
+       * (#1371). That is not "no evidence" — it is evidence AGAINST, and the two must not
+       * be answered the same way. A fresh install with an empty models dir corroborates
+       * nothing either, and refusing that would block the first download on every new
+       * setup; a base the server demonstrably does not read is where a model silently
+       * lands in the wrong install.
+       */
+      contradicted?: boolean;
+      /** The local model scan gave up at its bound, so "not contradicted" is not a finding
+       *  that this base holds nothing of its own. */
+      scanTruncated?: boolean;
+      /**
+       * This is still non-authoritative local configuration. The caller may proceed only
+       * for the two explicitly bounded no-contradiction cases, then keeps the downstream
+       * live-visibility guard in force.
+       */
+      safeFallback?: "bounded-server-superset" | "empty-target";
+    }
+> {
+  // The corroboration must be about the category this download is FOR. A complete match
+  // on some OTHER category proves only that THAT folder is under this base — and a server
+  // can legitimately read `diffusion_models` from here via an extra_model_paths entry
+  // while reading `loras` from somewhere else entirely. Authorising the whole models root
+  // on a sibling's evidence would then write the loras file where the server never looks,
+  // and the downstream live-disagreement guard cannot catch it: an EMPTY local `loras/`
+  // has nothing to contradict, which is exactly the first-download case.
+  if (!targetCategory) {
+    return {
+      ok: false,
+      reason:
+        "this call did not name the model category it is downloading into, and corroboration " +
+        "has to be about that category — a match on a different one would not establish that " +
+        "the server reads THIS folder",
+    };
+  }
+  const modelsDir = resolve(base, "models");
+  let modelsDirIsDir: boolean;
+  try {
+    modelsDirIsDir = statSync(modelsDir).isDirectory();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return {
+      ok: false,
+      reason:
+        code === "ENOENT" || code === "ENOTDIR"
+          ? `it has no "models" directory`
+          : `its "models" directory could not be inspected (${code ?? "unknown error"}), so nothing was established either way`,
+    };
+  }
+  if (!modelsDirIsDir) return { ok: false, reason: `its "models" entry is not a directory` };
+
+  // ONLY the target category — one question, one request. Scoping to it also removed the
+  // /models enumeration and its per-category request budget, which existed solely because
+  // this used to sweep for any category that happened to match.
+  let unreadableCategories = 0;
+  let lastReason: string | undefined;
+  let emptyTargetListing = false;
+  /** Set when the server's own listing shows the base is NOT a root it reads (#1371). */
+  let contradictedBase = false;
+  /** The local scan hit its bound before answering. See the assignment for why it matters. */
+  let scanTruncated = false;
+  for (const category of [targetCategory]) {
+    let files: string[];
+    try {
+      const res = await comfyApiFetch(`/models/${encodeURIComponent(category)}`);
+      if (!res.ok) {
+        unreadableCategories += 1;
+        continue;
+      }
+      const json = (await res.json()) as unknown;
+      if (!Array.isArray(json)) {
+        unreadableCategories += 1;
+        continue;
+      }
+      // A malformed ENTRY makes the whole listing inconclusive. Dropping it and matching
+      // "the rest" would approve a destination while quietly not accounting for
+      // everything the server said it sees — a complete match that is not complete.
+      const malformed = json.filter((n) => typeof n !== "string" || n.trim() === "");
+      if (malformed.length > 0) {
+        unreadableCategories += 1;
+        lastReason =
+          `the server's listing for "${category}" contained ${malformed.length} entr(y/ies) that ` +
+          "are not usable filenames, so what it sees there could not be established — and a " +
+          "match on only the readable remainder would not be the complete match this check requires";
+        continue;
+      }
+      files = json as string[];
+    } catch {
+      unreadableCategories += 1;
+      continue;
+    }
+    if (files.length === 0) {
+      emptyTargetListing = true;
+      continue;
+    }
+    const categoryDir = join(modelsDir, category);
+    // The CATEGORY name comes from the server too, so it gets the same containment
+    // check as the files under it.
+    if (!containedUnder(modelsDir, categoryDir)) {
+      lastReason = `the server's category name "${category}" does not name a directory inside "${modelsDir}", so nothing under it could corroborate this base`;
+      continue;
+    }
+    const missing: string[] = [];
+    const unreadable: string[] = [];
+    const notFiles: string[] = [];
+    const escaping: string[] = [];
+    // Containment has to be PHYSICAL. Sharing model files between installs by symlinking
+    // them is ordinary practice, and a stale base whose `<category>/known.safetensors` is
+    // a link to the file the server really reads would satisfy a lexical check while
+    // proving the opposite: the evidence lives elsewhere, and a NEW download written here
+    // would never appear to the server. `statSync` follows links, so nothing else notices.
+    //
+    // The canonical category must ALSO stay inside the canonical models root. A category
+    // directory that is itself a link out of the tree is a real topology — writes through
+    // it do land in the server's dir — but the download authorizer downstream refuses a
+    // destination whose canonical path escapes the models root, so corroborating it here
+    // would hand the caller an approval the next layer rejects: a contradiction between
+    // two guards, which is worse than either answer. This check is deliberately the
+    // NARROWER of the two so the layers agree; that topology keeps today's refusal.
+    let realModelsDir: string;
+    let realCategoryDir: string;
+    try {
+      realModelsDir = realpathSync(modelsDir);
+      realCategoryDir = realpathSync(categoryDir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      lastReason =
+        code === "ENOENT" || code === "ENOTDIR"
+          ? `"${categoryDir}" does not exist, so this base holds none of what the server lists under "${category}"`
+          : `"${categoryDir}" could not be canonicalized (${code ?? "unknown error"}), so nothing was established either way`;
+      continue;
+    }
+    if (!containedUnder(realModelsDir, realCategoryDir)) {
+      lastReason =
+        `"${categoryDir}" resolves to "${realCategoryDir}", outside "${realModelsDir}" — a ` +
+        "category directory linked out of the models tree. Writes through it would reach the " +
+        "server, but the download authorizer refuses a destination whose canonical path leaves " +
+        "the models root, so corroborating it here would only be overruled a step later. Point " +
+        "COMFYUI_PATH at the directory that physically holds the models instead";
+      continue;
+    }
+    files = uniqueModelInventoryFiles(files, categoryDir);
+    for (const name of files) {
+      const full = join(categoryDir, name);
+      if (!containedUnder(categoryDir, full)) {
+        escaping.push(name);
+        continue;
+      }
+      const found = probeEntry(full);
+      if (found.kind === "absent") {
+        missing.push(name);
+        continue;
+      }
+      if (found.kind === "not-a-file") {
+        notFiles.push(name);
+        continue;
+      }
+      if (found.kind === "indeterminate") {
+        unreadable.push(`${name} (${found.detail ?? "unknown error"})`);
+        continue;
+      }
+      let realEntry: string;
+      try {
+        realEntry = realpathSync(full);
+      } catch (err) {
+        unreadable.push(`${name} (${(err as NodeJS.ErrnoException)?.code ?? "unresolvable link"})`);
+        continue;
+      }
+      if (!containedUnder(realCategoryDir, realEntry)) escaping.push(name);
+    }
+    // A PARTIAL match does NOT ordinarily corroborate — and my first attempt at this had it
+    // backwards (codex gate, twice).
+    //
+    // The original complaint was real: requiring EVERY listed file to be here
+    // assumes one root per category, and `extra_model_paths.yaml` lets ComfyUI
+    // scan this directory AND others for the same one, so a file owned by an extra
+    // root is legitimately absent. I relaxed the rule to accept any overlap.
+    //
+    // That was worse than the bug. The listing is FILENAMES ONLY, so a stale clone
+    // holding `shared.safetensors` is indistinguishable from a genuine second root
+    // holding `shared.safetensors` — and under the relaxed rule a single common
+    // name authorized a multi-gigabyte download into an install the running server
+    // never reads. A false refusal here is recoverable and tells the user exactly
+    // what to set; a wrong destination reported as success is #369, which is the
+    // harm this whole path exists to prevent. Between an unrecoverable wrong answer
+    // and a recoverable refusal, an inconclusive rescue refuses.
+    //
+    // So the verdict remains a full match except for the narrow split-namespace shape
+    // reported in #1147. The server listed one entry that is unavailable in this
+    // process's namespace, while at least two of its other entries are physically
+    // present here. This is not proof of the root, so the caller marks it partial and
+    // keeps the downstream live-visibility check in force.
+    if (missing.length === 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
+      return { ok: true, modelsDir, category, matched: files.length, listed: files.length };
+    }
+    // Each failure mode says what it actually was. "Could not read it" is not "it is not
+    // there", and neither is "something is there but it is not a file" — three different
+    // fixes, and the old single "are not under" phrasing named only one of them.
+    if (unreadable.length > 0) {
+      // ORDERED BEFORE `missing` (codex gate): a mixed result would otherwise be
+      // narrated purely as absence, and an entry we could not inspect is not an
+      // entry we found to be gone. The inconclusive half decides the wording,
+      // because it is the half that is not a finding.
+      lastReason =
+        `the server lists ${files.length} file(s) under "${category}", and ${unreadable.length} of them ` +
+        `could not be inspected under "${categoryDir}" (e.g. "${unreadable[0]}") — that is NOT a finding ` +
+        `that they are missing, so nothing was established either way` +
+        (missing.length > 0
+          ? ` (${missing.length} other(s) were not found there, but with the above unreadable that ` +
+            `does not settle it)`
+          : "");
+    } else if (missing.length > 0) {
+      const present = files.length - missing.length;
+      if (
+        missing.length === MAX_BOUNDED_NAMESPACE_ONLY_FILES &&
+        present >= MIN_BOUNDED_NAMESPACE_MATCH_FILES &&
+        unreadable.length === 0 &&
+        notFiles.length === 0 &&
+        escaping.length === 0
+      ) {
+        return {
+          ok: false,
+          reason:
+            `the server lists ${files.length} file(s) under "${category}" and ${present} are ` +
+            `present under "${categoryDir}", while ${missing.length} listed file is only ` +
+            "visible from the server namespace — a bounded split code/data layout is " +
+            "consistent with this one-entry difference, but the destination remains local " +
+            "configuration rather than live-authoritative",
+          safeFallback: "bounded-server-superset",
+        };
+      }
+      // CONTRADICTION REQUIRES THIS BASE TO HAVE SOMETHING OF ITS OWN.
+      //
+      // present === 0 means none of the server's files for this category are here. That is
+      // a stale base — or an extra_model_paths layout where this IS one of the server's
+      // roots and simply has nothing in this category yet. A filename listing cannot tell
+      // those apart, and refusing the second would block a working install, which is worse
+      // than the wrong-directory write this gate exists to stop.
+      //
+      // An EMPTY (or absent) category dir here is therefore no evidence, not evidence
+      // against. A base holding a different set of files for the same category is the case
+      // that is actually diagnostic, and it is the reporter's: a second full install.
+      if (present === 0) {
+        // …and "has files of its own" must mean MODEL files (codex P0). Counting any
+        // directory entry treats a `.gitkeep`, a `desktop.ini` or a `Thumbs.db` as proof
+        // the base is a populated root — so a legitimate extra_model_paths root holding
+        // nothing but metadata for this category would be refused, which is the working
+        // install this whole refinement exists to protect. Only a real model file is
+        // evidence that this base is a place models live.
+        //
+        // KNOWN AND DELIBERATE GAP: a category whose models live in SUBFOLDERS
+        // (diffusers-style directories, `clip_vision/<dir>/model.bin`) reads as
+        // metadata-only here, so a stale base of that shape is NOT contradicted and the
+        // download proceeds with the existing unconfirmed-visibility note. That is the
+        // safe direction — it returns the behaviour to what it was before this gate rather
+        // than blocking anyone — and the alternative, treating any subdirectory as
+        // evidence, re-opens the metadata hole with an empty folder. A missed contradiction
+        // costs one misplaced file and a warning; a false one costs every download on a
+        // working install.
+        let baseHasOwnModelsHere = false;
+        const budget = newModelScanBudget();
+        // The budget is read BEFORE the link resolution, not after: `.some()` would
+        // otherwise stat every one of thousands of entries and only then let the recursion
+        // decline for want of budget (codex P2).
+        //
+        // Named rather than inlined because the guard must MARK the truncation on its way
+        // out. Written inline as `budget.dirs > 0 && …` it short-circuited silently, so the
+        // scan gave up and reported a clean negative — precisely the fold this budget was
+        // being taught to avoid, committed in the line that avoids it.
+        const subdirHoldsAModel = (entry: {
+          name: string;
+          isDirectory(): boolean;
+          isSymbolicLink(): boolean;
+        }): boolean => {
+          if (budget.dirs <= 0) {
+            budget.truncated = true;
+            return false;
+          }
+          return (
+            entryIsDirectoryLike(categoryDir, entry, budget) &&
+            directoryHoldsAModel(join(categoryDir, entry.name), 2, budget)
+          );
+        };
+        try {
+          // withFileTypes, because a DIRECTORY named `foo.safetensors` is not a model
+          // (codex): counting it would refuse a base on the strength of a folder name.
+          // A nested model directory (diffusers-style) still counts — see below.
+          // ONE budget for the whole scan, not one per subdirectory: the point of the
+          // bound is to cap this entire check, and a fresh budget per entry would let a
+          // category with 10k subdirectories spend 10k of them.
+          baseHasOwnModelsHere = readdirSync(categoryDir, { withFileTypes: true }).some(
+            (entry) =>
+              isModelFileEntry(entry) ||
+              // A SUBDIRECTORY counts too — symlinked ones included — but only when it
+              // actually holds a model file within a bounded depth. An empty folder is not
+              // evidence the base is populated: that is the metadata hole wearing a
+              // directory.
+              subdirHoldsAModel(entry),
+          );
+        } catch {
+          // Absent or unreadable — nothing established either way.
+        }
+        contradictedBase = baseHasOwnModelsHere;
+        // A TRUNCATED SCAN IS NOT A CLEAN NEGATIVE (codex P1, #796 discipline).
+        //
+        // Not finding a model means this base is a place models do not live, which
+        // contradicts nothing and lets the download proceed. Giving up after the bound
+        // means we do not know — and a stale base whose only model sits behind the 512th
+        // directory reads identically to an empty one, which is the silent misplaced write
+        // this whole check exists to stop. The download still proceeds (refusing on an
+        // inconclusive scan would block working installs, which is worse), but the fact
+        // that the check did not finish is stated rather than folded away.
+        scanTruncated = budget.truncated && !baseHasOwnModelsHere;
+      }
+      lastReason =
+        present === 0
+          ? `the server lists ${files.length} file(s) under "${category}" and NONE of them are under ` +
+            `"${categoryDir}" (e.g. "${missing[0]}"), so this base is not a directory the server ` +
+            `reads that category from`
+          : // The multi-root case, named rather than mislabelled as a wrong base.
+            `the server lists ${files.length} file(s) under "${category}" and ${present} of them are ` +
+            `under "${categoryDir}", but ${missing.length} are not (e.g. "${missing[0]}"). That is ` +
+            `consistent with an extra_model_paths layout where this is ONE of several roots for ` +
+            `"${category}" — but it is also what a stale copy sharing some filenames looks like, and ` +
+            `a filename listing cannot tell those apart. Rather than guess a destination, set ` +
+            `COMFYUI_PATH to the root that actually holds "${category}", or launch ComfyUI with an ` +
+            `absolute --base-directory`;
+    } else if (notFiles.length > 0) {
+      lastReason =
+        `the server lists ${files.length} file(s) under "${category}", and ${notFiles.length} of the ` +
+        `matching entries under "${categoryDir}" are not regular files (e.g. "${notFiles[0]}")`;
+    } else {
+      lastReason =
+        `the server lists ${escaping.length} entr(y/ies) under "${category}" whose path escapes ` +
+        `"${categoryDir}" (e.g. "${escaping[0]}"), so they cannot corroborate this base`;
+    }
+  }
+  if (lastReason)
+    return { ok: false, reason: lastReason, contradicted: contradictedBase, scanTruncated };
+  // Nothing was COMPARED. Say which of the two reasons that was: the listing could not be
+  // read, or it was empty. Reporting the first as the second would be the same fold this
+  // whole change is about — and an EMPTY target category genuinely cannot corroborate
+  // anything, which is the honest cost of scoping this to the category being written to.
+  return {
+    ok: false,
+    reason:
+      unreadableCategories > 0
+        ? `the server's "${targetCategory}" listing could not be read, so there was nothing to compare against`
+        : `the server lists no files under "${targetCategory}", so there is nothing there to show that this base is the directory it reads that category from`,
+    ...(emptyTargetListing ? { safeFallback: "empty-target" as const } : {}),
+  };
+}
+
+export async function resolveModelsDirWithBases(opts?: {
+  /** The model category this call is downloading INTO (`loras`, `diffusion_models`, …).
+   *  Required for the #851 inventory corroboration, which must be about the folder
+   *  actually being written to — a match on a sibling category proves nothing about it. */
+  targetCategory?: string;
+}): Promise<{
+  modelsDir: string;
+  baseDirs: string[];
+  /** The SAME /system_stats snapshot the models/base dirs were derived from — so a
+   *  downstream authorizer (getLiveExtraModelRoots, #633) uses ONE consistent
+   *  snapshot and can never mix roots from a server that changed between two calls
+   *  (codex inter-snapshot race). `reachable` is false when the server was down. */
+  snapshot: LiveServerSnapshot;
+  /** WHERE the models dir came from. The three live-* values are anchored on the
+   *  running server; `base-anchored` and `configured-base` are local config, which
+   *  a reachable server may silently disagree with (#369) — callers that WRITE use
+   *  this to decide whether the destination still needs corroborating. */
+  source: ModelsDirSource;
+}> {
+  const baseDirs = new Set<string>();
+  let modelsDir: string | undefined;
+  let source: ModelsDirSource = "configured-base";
+  const snapshot: LiveServerSnapshot = { reachable: false };
+  /** The live server's install root, resolved through the ONE canonical resolver. */
+  let live: ReturnType<typeof resolveLiveServerRoot> | undefined;
+  try {
+    const stats = await getSystemStats();
+    const argv = stats.system?.argv;
+    const cwd = (stats.system as { cwd?: string })?.cwd;
+    snapshot.reachable = true;
+    snapshot.argv = argv;
+    snapshot.cwd = cwd;
+    // THE live install root (#369): argv when it resolves, else the OS-observed
+    // process anchor for the relative-`main.py`-with-no-cwd shape that ComfyUI
+    // Desktop and the Windows portable bundle both report. Computed ONCE here and
+    // used for BOTH the code-root bases and the models dir, so the two can never
+    // be derived from different notions of "live".
+    live = resolveLiveServerRoot(argv, cwd, {
+      remote: isRemoteMode(),
+      includeProcessStart: true,
+    });
+    // Collect base-install dirs (LOCAL only) from the SAME call, regardless of how
+    // the models dir resolves, so the code-root veto always has the real
+    // --base-directory / live-root even when --models-directory diverges.
+    if (!isRemoteMode()) {
+      const baseDir = parseBaseDirFromArgv(argv, cwd);
+      if (baseDir) baseDirs.add(resolve(baseDir));
+      if (live.root) {
+        baseDirs.add(resolve(live.root));
+        // Publish it on the snapshot so downstream consumers (the extra-model-root
+        // authorizer) use the SAME established root instead of re-deriving a weaker
+        // one from argv.
+        snapshot.liveRoot = resolve(live.root);
+        snapshot.liveRootSource = live.source === "argv" ? "argv" : "observed-process";
+      }
+      if (live.observedStartedAtMs !== undefined) {
+        snapshot.processStartedAtMs = live.observedStartedAtMs;
+      }
+    }
+    const fromArgv = parseModelsDirFromArgv(argv, cwd);
+    if (fromArgv) {
+      logger.debug("Resolved ComfyUI models directory from launch argv", {
+        modelsDir: fromArgv,
+      });
+      modelsDir = fromArgv;
+      source = "argv-flag";
+    } else if (!isRemoteMode()) {
+      // No explicit --base-directory/--models-directory flag: derive the models
+      // root from the LIVE connected server's OWN install root. Only adopt it when
+      // it EXISTS locally (a Docker/forwarded server reports a container-side path
+      // that is not the host's) — else fall through to the corroborated/refusing
+      // logic below (#490/#463).
+      if (live.root && existsSync(live.root)) {
+        modelsDir = join(live.root, "models");
+        source = live.source === "argv" ? "live-root" : "observed-root";
+        logger.debug(
+          "Resolved ComfyUI models directory from the live server's install root",
+          { modelsDir, source },
+        );
+      }
+    }
+  } catch (err) {
+    logger.debug(
+      "Could not resolve models dir from /system_stats; using COMFYUI_PATH/models",
+      { error: err instanceof Error ? err.message : String(err) },
     );
   }
-  return resolve(config.comfyuiPath, "output");
+  // The running server specified a RELATIVE --base-directory/--models-directory but
+  // did not report its cwd, so its real models dir is UNKNOWN. Do NOT fall back to a
+  // guessed local path (COMFYUI_PATH/models is the wrong place the server never
+  // reads — #346). Fail loudly (outside the try so it propagates) so the caller
+  // routes through the server / surfaces the problem rather than writing wrong.
+  if (
+    !modelsDir &&
+    snapshot.reachable &&
+    !isRemoteMode() &&
+    hasUnresolvableRelativeModelDirFlag(snapshot.argv, snapshot.cwd)
+  ) {
+    throw new ValidationError(
+      "The connected ComfyUI was launched with a RELATIVE --base-directory/--models-directory " +
+        "and did not report its working directory, so its models directory cannot be resolved " +
+        "locally. A download can't be placed safely here — connect with an absolute --base-directory, " +
+        "or set COMFYUI_PATH to the server's install so the destination is unambiguous.",
+    );
+  }
+  // Effective LOCAL base: COMFYUI_PATH, else the saved default workspace when NOT
+  // remote (#415/#416). Always a code-root base candidate too.
+  const base = resolveEffectiveComfyUIBase();
+  if (base) baseDirs.add(resolve(base));
+  if (!modelsDir) {
+    // The live server NAMED a relative `main.py` we could not pin to an install
+    // (no cwd reported, and the OS process table could not identify the process or
+    // its interpreter is not inside an install tree). COMFYUI_PATH is then NOT
+    // evidence of anything: on the reporter's machine it was a SECOND, stale
+    // install and 4.88 GB landed there while the running server never saw it
+    // (#369). Accept it ONLY when it CORROBORATES what the server reported — the
+    // very same relative `main.py` really exists under it. Otherwise refuse: an
+    // honest "I don't know where this would land" beats a fabricated success.
+    const anchored =
+      base && live?.relDir !== undefined && live.source === "unresolved"
+        ? anchorRelativeEntrypointOnBase(base, live.relDir)
+        : undefined;
+    if (anchored) {
+      modelsDir = join(anchored, "models");
+      source = "base-anchored";
+      baseDirs.add(anchored);
+      logger.debug(
+        "Anchored the live server's relative main.py on the configured base",
+        { modelsDir, relDir: live?.relDir, anchored },
+      );
+    } else if (snapshot.reachable && !isRemoteMode() && live?.source === "unresolved" && live.relDir !== undefined) {
+      // Before refusing: the code-layout corroboration above needed a `main.py` at or
+      // under the base, and a Docker/data-dir deployment genuinely has none — the code
+      // lives inside the container (#851). Ask the SERVER what models it can see and
+      // accept the base only if it explains that completely, or if the response is one of
+      // the two bounded no-contradiction cases below. Runs only here, so it can rescue a
+      // refusal but never redirect a download that already resolved.
+      const inventory = base
+        ? await corroborateBaseByModelInventory(base, (opts?.targetCategory ?? "").trim())
+        : { ok: false as const, reason: "no COMFYUI_PATH or default workspace is configured" };
+      if (inventory.ok) {
+        modelsDir = inventory.modelsDir;
+        source = "base-inventory-corroborated";
+        baseDirs.add(resolve(base as string));
+        // CORROBORATION, NOT PROOF (codex gate P1). The server's listing is
+        // filenames only, so a stale local clone holding files with the same names
+        // satisfies this check without being mounted into the running server at
+        // all. There is no stronger local evidence available — the listing carries
+        // no sizes or hashes to distinguish them — so this stays the last-resort
+        // rescue it was built as, and the log says what it actually established
+        // rather than implying the directory was proven live.
+        //
+        // Refusing on that doubt would be worse: it would reject the ordinary
+        // Docker/data-dir layout this rescue exists to serve. What it must not do
+        // is let a later reader take "corroborated" for "verified".
+        logger.info(
+          "Corroborated the configured base against the running server's model inventory " +
+            "(filename match — evidence that this base is one of the roots the server reads, " +
+            "not proof that it is)",
+          {
+            modelsDir,
+            category: inventory.category,
+            matched: inventory.matched,
+            listed: inventory.listed,
+            partial: inventory.matched < inventory.listed,
+            basis: "filename-inventory",
+          },
+        );
+        return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
+      }
+      if (inventory.safeFallback) {
+        modelsDir = resolve(base as string, "models");
+        source =
+          inventory.safeFallback === "bounded-server-superset"
+            ? "base-inventory-partial"
+            : "configured-base";
+        baseDirs.add(resolve(base as string));
+        // Neither case proves that this local path is the server's primary root. The
+        // bounded partial is the split-namespace recurrence from #1147; the empty
+        // response is the first-download case. Returning a non-authoritative source is
+        // what keeps resolveModelSubfolderWithLiveRoot's live-visibility gate active.
+        logger.warn(
+          inventory.safeFallback === "bounded-server-superset"
+            ? "Using a bounded partial model-inventory match for the configured base; the " +
+              "server-only entry may be in a namespace this process cannot read"
+            : "Using the configured base for a first download into a server-registered " +
+              "category whose live inventory is empty",
+          {
+            modelsDir,
+            category: opts?.targetCategory?.trim(),
+            reason: inventory.reason,
+            basis: "filename-inventory",
+            authoritative: false,
+          },
+        );
+        return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
+      }
+      throw new ValidationError(
+        "The models directory of the CONNECTED ComfyUI could not be determined, so a " +
+          "download has no verified destination. What could not be determined:\n" +
+          `  - the running server reported its launch script as the RELATIVE path "${join(live.relDir, "main.py")}" and did NOT report a working directory, so its install root is unknown;\n` +
+          `  - the OS process table did not identify an interpreter for the ComfyUI listening on ${config.resolvedPort} that sits inside an install tree${live.observedPython ? ` (observed "${live.observedPython}")` : ""};\n` +
+          `  - ${
+            base
+              ? `the configured local base "${base}" corroborates neither reading of that path: it does not contain "${join(live.relDir, "main.py")}" (the ComfyUI Desktop / launcher-root shape), and it is not itself "${live.relDir}" holding "main.py" (the portable shape where COMFYUI_PATH already points at the ComfyUI directory) — so that check did NOT corroborate it, which is not the same as establishing it is a different install (a Docker/data-dir base legitimately has no main.py at all, #851)`
+              : "no COMFYUI_PATH or default workspace is configured"
+          }.\n` +
+          `  - asking the running server what models it can SEE did not corroborate it either: ${inventory.reason} (this is the check that covers a Docker/data-dir COMFYUI_PATH, which holds models/ but no main.py).\n` +
+          "Refusing to write to a guessed directory (that is how a model lands in a stale install and is reported as a success). " +
+          "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the directory whose models/ the server actually reads.",
+      );
+    } else if (base) {
+      // #1371 — DO NOT WRITE INTO A BASE THE SERVER DEMONSTRABLY DOES NOT READ.
+      //
+      // This fallback took COMFYUI_PATH/models with no corroboration at all, and it is
+      // reached whenever the live root could not be derived for any reason OTHER than the
+      // relative-main.py shape the branch above handles. A reporter running two local
+      // ComfyUIs — connected to :8190, COMFYUI_PATH pointing at the other install — had a
+      // model written into the install the server never reads, while the tool told them
+      // "destination came from local configuration rather than the running server;
+      // visibility to the connected ComfyUI is unconfirmed". It knew, and wrote anyway. A
+      // warning beside a write is not a substitute for not writing.
+      //
+      // THE GATE IS EVIDENCE AGAINST, NOT ABSENCE OF EVIDENCE. Refusing whenever the base
+      // cannot be corroborated would break every correct setup whose server reports no
+      // resolvable root — per #1374 that includes the ordinary Windows-portable shape — and
+      // it would block the FIRST download on any fresh install, whose models dir is empty
+      // and therefore corroborates nothing. So this refuses only when the server's own
+      // listing shows the base is not a root it reads: files listed for this category, none
+      // of them here. Silence still writes, with the existing unconfirmed-visibility note.
+      if (snapshot.reachable && !isRemoteMode()) {
+        const verdict = await corroborateBaseByModelInventory(
+          base,
+          (opts?.targetCategory ?? "").trim(),
+        );
+        if (!verdict.ok && verdict.contradicted) {
+          throw new ValidationError(
+            `Refusing to download into "${resolve(base, "models")}": ${verdict.reason}.
+
+` +
+              `The graph you are downloading for is served by a DIFFERENT ComfyUI than this ` +
+              `configured base describes, so the file would land where that server never looks ` +
+              `and be reported as a success (#1371). Fix by pointing COMFYUI_PATH at the install ` +
+              `the connected server actually runs, or by launching that server with an absolute ` +
+              `--base-directory so its models directory can be read from it directly.`,
+          );
+        }
+        if (!verdict.ok && verdict.scanTruncated) {
+          // Proceeding, but not silently (codex P1). The refusal above needs the base to
+          // be PROVEN stale, and a scan that stopped early proves nothing — so the
+          // download goes ahead exactly as it did before this gate existed, with the one
+          // thing the user cannot otherwise know: the check did not finish.
+          logger.warn(
+            `The local check of "${resolve(base, "models")}" did not finish — it stopped at its ` +
+              `directory bound before finding a model of its own. That is NOT a finding that this ` +
+              `base is empty, so the download proceeds; but if this install is stale, the file will ` +
+              `land where the connected server never looks (#1371). ${verdict.reason}.`,
+            { modelsDir: resolve(base, "models"), basis: "filename-inventory", truncated: true },
+          );
+        }
+      }
+      modelsDir = resolve(base, "models");
+      source = "configured-base";
+    } else {
+      throw new ValidationError(
+        "No local ComfyUI models directory could be resolved. Set the COMFYUI_PATH " +
+          "environment variable, save a default workspace with workspace (action:\"set_default\"), " +
+          "or connect to a running ComfyUI so its models directory can be detected.",
+      );
+    }
+  }
+  return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
+}
+
+/**
+ * Resolve the models directory the CONNECTED server actually reads from. Asks
+ * the running ComfyUI (/system_stats argv → `--base-directory`) first; falls
+ * back to `<COMFYUI_PATH>/models`. This is the source of truth for
+ * download_model's destination so files land where the live server sees them
+ * (issues #346/#369) rather than in a stale COMFYUI_PATH install. Delegates to
+ * resolveModelsDirWithBases so the two can never drift.
+ */
+export async function resolveModelsDir(): Promise<string> {
+  return (await resolveModelsDirWithBases()).modelsDir;
+}
+
+/**
+ * Best-effort: the running server's `--extra-model-paths-config` file, or
+ * undefined when unreachable / not launched with the flag. Never throws.
+ */
+export async function resolveServerExtraModelConfig(): Promise<string | undefined> {
+  try {
+    const stats = await getSystemStats();
+    const configs = parseExtraModelPathsConfigsFromArgv(stats.system?.argv);
+    return configs[0];
+  } catch {
+    return undefined;
+  }
+}
+
+/** <COMFYUI_PATH>/output fallback. Throws if COMFYUI_PATH is unset. */
+export function localOutputDirFallback(): string {
+  // THE SAVED DEFAULT WORKSPACE COUNTS (#877). Reading `config.comfyuiPath`
+  // alone asks whether ONE ENVIRONMENT VARIABLE is set, and that is not the
+  // question — a local portable install is located perfectly well by the saved
+  // default workspace, which `install_comfyui (action:"environment")` reports and every other resolver
+  // in this codebase already consults. Keying off the env var made a perfectly
+  // locatable install look pathless, and the caller upstream then fell through
+  // to a data source that cannot see the disk and reported no outputs at all.
+  //
+  // `resolveEffectiveComfyUIBase` is that shared resolver: COMFYUI_PATH, then
+  // the saved default workspace, and nothing in remote mode (where a local path
+  // would name the wrong machine).
+  const base = resolveEffectiveComfyUIBase();
+  if (!base) {
+    throw new ValidationError(
+      "No local ComfyUI install path could be established: COMFYUI_PATH is not set and no " +
+        "default workspace is saved. Set COMFYUI_PATH, or save one with the workspace tool " +
+        "(action 'set_default').",
+    );
+  }
+  return resolve(base, "output");
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +1334,7 @@ export function localOutputDirFallback(): string {
 // that write or check files in the input directory must therefore NOT assume
 // <COMFYUI_PATH>/input, or a server with a custom --input-directory rejects the
 // file ("Invalid image file") while the tool reports success. Prefer the server
-// API (/upload/image, see stage_output_as_input) when possible; use this only
+// API (/upload/image, see upload_image (action:"stage")) when possible; use this only
 // for genuine local filesystem operations.
 // ---------------------------------------------------------------------------
 
@@ -83,7 +1343,10 @@ export function localOutputDirFallback(): string {
  * --input-directory wins; otherwise --base-directory implies <base>/input.
  * Returns undefined when neither flag is present.
  */
-export function parseInputDirFromArgv(argv: string[] | undefined): string | undefined {
+export function parseInputDirFromArgv(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): string | undefined {
   if (!argv || argv.length === 0) return undefined;
 
   let inputDir: string | undefined;
@@ -93,41 +1356,153 @@ export function parseInputDirFromArgv(argv: string[] | undefined): string | unde
     baseDir = flagValue(argv, i, "--base-directory") ?? baseDir;
   }
 
-  const resolvedBase = baseDir ? resolveDir(baseDir) : undefined;
-  if (inputDir) return resolveDir(inputDir, resolvedBase);
+  // ComfyUI resolves these command-line paths with os.path.abspath(), which
+  // anchors relative values at the SERVER process cwd, not COMFYUI_PATH or
+  // the MCP process cwd. Without an absolute server cwd, fail closed rather
+  // than silently selecting a different local install.
+  if (inputDir) return resolveServerLaunchPath(inputDir, serverCwd);
+  const resolvedBase = baseDir ? resolveServerLaunchPath(baseDir, serverCwd) : undefined;
   if (resolvedBase) return join(resolvedBase, "input");
   return undefined;
 }
 
 /** <COMFYUI_PATH>/input fallback. Throws if COMFYUI_PATH is unset. */
 export function localInputDirFallback(): string {
-  if (!config.comfyuiPath) {
+  // The exact mirror of the output fallback above, and the same #877 reasoning:
+  // these two must agree about where the install is, or an upload and the listing
+  // of what was uploaded would disagree.
+  const base = resolveEffectiveComfyUIBase();
+  if (!base) {
     throw new ValidationError(
-      "COMFYUI_PATH is not configured. Set the COMFYUI_PATH environment variable.",
+      "No local ComfyUI install path could be established: COMFYUI_PATH is not set and no " +
+        "default workspace is saved. Set COMFYUI_PATH, or save one with the workspace tool " +
+        "(action 'set_default').",
     );
   }
-  return resolve(config.comfyuiPath, "input");
+  return resolve(base, "input");
+}
+
+// ---------------------------------------------------------------------------
+// Resolve ComfyUI's REAL temp directory — the same argv chain as input/.
+// VHS_VideoCombine writes completed .mp4 files here whenever `save_output` is
+// unchecked (`folder_paths.get_temp_directory()`), and get_image list_outputs
+// must scan that tree or a finished render lists as nothing (#2370).
+// --temp-directory wins; otherwise --base-directory implies <base>/temp.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the configured temp directory out of ComfyUI's launch argv.
+ * --temp-directory wins; otherwise --base-directory implies <base>/temp.
+ * Returns undefined when neither flag is present.
+ */
+export function parseTempDirFromArgv(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): string | undefined {
+  if (!argv || argv.length === 0) return undefined;
+
+  let tempDir: string | undefined;
+  let baseDir: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    tempDir = flagValue(argv, i, "--temp-directory") ?? tempDir;
+    baseDir = flagValue(argv, i, "--base-directory") ?? baseDir;
+  }
+
+  if (tempDir) return resolveServerLaunchPath(tempDir, serverCwd);
+  const resolvedBase = baseDir ? resolveServerLaunchPath(baseDir, serverCwd) : undefined;
+  if (resolvedBase) return join(resolvedBase, "temp");
+  return undefined;
+}
+
+/** <COMFYUI_PATH>/temp fallback. Throws if COMFYUI_PATH is unset. */
+export function localTempDirFallback(): string {
+  const base = resolveEffectiveComfyUIBase();
+  if (!base) {
+    throw new ValidationError(
+      "No local ComfyUI install path could be established: COMFYUI_PATH is not set and no " +
+        "default workspace is saved. Set COMFYUI_PATH, or save one with the workspace tool " +
+        "(action 'set_default').",
+    );
+  }
+  return resolve(base, "temp");
 }
 
 /**
  * Resolve the directory ComfyUI actually reads inputs from. Asks the running
  * ComfyUI (/system_stats argv) first; falls back to <COMFYUI_PATH>/input.
  */
+/**
+ * `<live install root>/<kind>` when the CONNECTED server identifies it, else
+ * undefined (#1052, #2539).
+ *
+ * The argv parse above only answers when ComfyUI was launched with an EXPLICIT
+ * --input-directory / --output-directory. Without one, resolution used to fall
+ * straight through to the configured/auto-detected install — and on a machine
+ * with more than one ComfyUI that is a different tree from the one actually
+ * running.
+ *
+ * A reporter with ComfyUI Desktop installed alongside the git checkout they were
+ * connected to had `train_prepare_dataset` refs resolve against Desktop and fail
+ * "image not found", while the files sat in the connected server's output dir
+ * the whole time. The tool's own description promises refs resolve "against the
+ * connected ComfyUI's output/input dirs", so the contract was right and the
+ * resolution was not.
+ *
+ * Two live rungs, in this order:
+ *
+ *  1. `resolveLiveComfyUIBase` (#2194 / #1052) — argv `main.py` + cwd when that
+ *     is absolute. `get_image` action:get type:input uses this when no
+ *     `--input-directory` is present, so a second install in COMFYUI_PATH is
+ *     not preferred over the connected server.
+ *  2. `resolveLiveServerRoot` (#2539 / #369) — OS-observed process when argv is
+ *     the relative `ComfyUI/main.py` shape Desktop and the Windows portable
+ *     bundle both report (no --output-directory, no cwd). That last shape is
+ *     why `get_image list_outputs` scanned an unrelated COMFYUI_PATH while
+ *     `/view` served the live server's files.
+ *
+ * An explicit --output-directory still wins above, and the configured install
+ * still catches everything below.
+ */
+function liveIoDirFromSnapshot(
+  kind: "input" | "output" | "temp",
+  snapshot: { reachable: boolean; argv?: string[]; cwd?: string },
+): string | undefined {
+  if (!snapshot.reachable) return undefined;
+
+  // #2539 — relative ComfyUI/main.py with no cwd cannot be derived from argv;
+  // resolveLiveServerRoot may use the correlated local process observation for
+  // that shape. The snapshot is passed through unchanged so the explicit-dir
+  // and live-root answers can never describe different server instances.
+  const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+  if (!live.root) return undefined;
+  // A Docker/forwarded server reports a container-side path that is not
+  // host-local. Same gate resolveModelsDir uses for an observed root. An argv
+  // root remains the server's direct claim, preserving the existing not-found
+  // behavior when that claimed path is unavailable locally.
+  if (live.source !== "argv" && !existsSync(live.root)) return undefined;
+  return join(live.root, kind);
+}
+
 export async function resolveInputDir(): Promise<string> {
-  try {
-    const stats = await getSystemStats();
-    const fromArgv = parseInputDirFromArgv(stats.system?.argv);
+  const snapshot = await getLiveServerSnapshot();
+  if (snapshot.reachable) {
+    const fromArgv = parseInputDirFromArgv(snapshot.argv, snapshot.cwd);
     if (fromArgv) {
       logger.debug("Resolved ComfyUI input directory from launch argv", {
         inputDir: fromArgv,
       });
       return fromArgv;
     }
-  } catch (err) {
-    logger.debug(
-      "Could not resolve input dir from /system_stats; using COMFYUI_PATH/input",
-      { error: err instanceof Error ? err.message : String(err) },
-    );
+  }
+  // #1052 — before the CONFIGURED install, try the one that is actually
+  // running. With two ComfyUIs on a machine these differ, and the connected
+  // server is the one whose files the caller means.
+  const live = liveIoDirFromSnapshot("input", snapshot);
+  if (live) {
+    logger.debug("Resolved ComfyUI input directory from the LIVE server's install root", {
+      dir: live,
+    });
+    return live;
   }
   return localInputDirFallback();
 }
@@ -137,20 +1512,50 @@ export async function resolveInputDir(): Promise<string> {
  * ComfyUI (/system_stats argv) first; falls back to <COMFYUI_PATH>/output.
  */
 export async function resolveOutputDir(): Promise<string> {
-  try {
-    const stats = await getSystemStats();
-    const fromArgv = parseOutputDirFromArgv(stats.system?.argv);
+  const snapshot = await getLiveServerSnapshot();
+  if (snapshot.reachable) {
+    const fromArgv = parseOutputDirFromArgv(snapshot.argv);
     if (fromArgv) {
       logger.debug("Resolved ComfyUI output directory from launch argv", {
         outputDir: fromArgv,
       });
       return fromArgv;
     }
-  } catch (err) {
-    logger.debug(
-      "Could not resolve output dir from /system_stats; using COMFYUI_PATH/output",
-      { error: err instanceof Error ? err.message : String(err) },
-    );
+  }
+  // #1052 — before the CONFIGURED install, try the one that is actually
+  // running. With two ComfyUIs on a machine these differ, and the connected
+  // server is the one whose files the caller means.
+  const live = liveIoDirFromSnapshot("output", snapshot);
+  if (live) {
+    logger.debug("Resolved ComfyUI output directory from the LIVE server's install root", {
+      dir: live,
+    });
+    return live;
   }
   return localOutputDirFallback();
+}
+
+/**
+ * Resolve the directory ComfyUI actually writes temp/preview files to. Asks the
+ * running ComfyUI (/system_stats argv) first; falls back to <COMFYUI_PATH>/temp.
+ */
+export async function resolveTempDir(): Promise<string> {
+  const snapshot = await getLiveServerSnapshot();
+  if (snapshot.reachable) {
+    const fromArgv = parseTempDirFromArgv(snapshot.argv, snapshot.cwd);
+    if (fromArgv) {
+      logger.debug("Resolved ComfyUI temp directory from launch argv", {
+        tempDir: fromArgv,
+      });
+      return fromArgv;
+    }
+  }
+  const live = liveIoDirFromSnapshot("temp", snapshot);
+  if (live) {
+    logger.debug("Resolved ComfyUI temp directory from the LIVE server's install root", {
+      dir: live,
+    });
+    return live;
+  }
+  return localTempDirFallback();
 }

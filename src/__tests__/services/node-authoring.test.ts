@@ -10,6 +10,15 @@ vi.mock("../../config.js", () => {
   return { config };
 });
 
+// Control the effective LOCAL base node-authoring resolves through, so #506's
+// saved-default-workspace behavior is exercised without touching real user
+// config. resolveEffectiveComfyUIBase() prefers COMFYUI_PATH then the saved
+// default; the mock mirrors that: config.comfyuiPath first, else wsMock.saved.
+const wsMock = vi.hoisted(() => ({ saved: undefined as string | undefined }));
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? wsMock.saved,
+}));
+
 import { config } from "../../config.js";
 import {
   scaffoldCustomNode,
@@ -72,6 +81,7 @@ const CUSTOM_NODES = join("/fake/comfy", "custom_nodes");
 
 beforeEach(() => {
   config.comfyuiPath = "/fake/comfy";
+  wsMock.saved = undefined;
   delete process.env.REGISTRY_ACCESS_TOKEN;
 });
 
@@ -214,12 +224,29 @@ describe("scaffoldCustomNode", () => {
     expect(writes).toHaveLength(0);
   });
 
-  it("throws a clear error in remote mode (no comfyuiPath)", () => {
+  it("throws a clear error in remote mode (no comfyuiPath, no saved default)", () => {
     config.comfyuiPath = undefined;
+    wsMock.saved = undefined;
     const { deps } = makeDeps();
     expect(() =>
       scaffoldCustomNode({ name: "x", displayName: "X" }, deps),
     ).toThrow(/local ComfyUI install/i);
+  });
+
+  it("resolves against the saved default workspace when COMFYUI_PATH is unset (#506)", () => {
+    // No COMFYUI_PATH, but a saved default workspace is set — a loopback session
+    // must be treated as local, mirroring install_comfyui (action:"environment")/workspace action:"get", instead
+    // of being rejected as remote. Scaffold should write under the saved default.
+    config.comfyuiPath = undefined;
+    wsMock.saved = "/saved/ws";
+    const { deps, mkdirs } = makeDeps();
+    const res = scaffoldCustomNode(
+      { name: "my-nodes", displayName: "My Nodes" },
+      deps,
+    );
+    const packDir = resolve(join("/saved/ws", "custom_nodes"), "my-nodes");
+    expect(res.path).toBe(packDir);
+    expect(mkdirs).toContain(packDir);
   });
 
   it("writes a placeholder PublisherId when none is given", () => {
@@ -228,6 +255,43 @@ describe("scaffoldCustomNode", () => {
     const pyproject = writes.find((w) => w.path.endsWith("pyproject.toml"))!.contents;
     expect(pyproject).toContain('PublisherId = "your-publisher-id"');
     expect(res.message).toMatch(/PublisherId/);
+  });
+
+  it("scaffolds into the threaded live-server base when nothing is configured (#1653)", () => {
+    // The handler resolves the running LOCAL server's own install root
+    // (resolveEffectiveComfyUIBaseLive — the workspace install_comfyui
+    // action:"environment" already reports) and threads it in; scaffold must
+    // land there instead of refusing as "no local install".
+    config.comfyuiPath = undefined;
+    wsMock.saved = undefined;
+    const { deps, mkdirs } = makeDeps();
+    const res = scaffoldCustomNode(
+      { name: "my-nodes", displayName: "My Nodes" },
+      deps,
+      "/live/ComfyUI",
+    );
+    const packDir = resolve(join("/live/ComfyUI", "custom_nodes"), "my-nodes");
+    expect(res.path).toBe(packDir);
+    expect(mkdirs).toContain(packDir);
+  });
+
+  it("the threaded live-aware base is authoritative, even over COMFYUI_PATH (#1715)", () => {
+    // The handler threads the FULLY-resolved base from
+    // resolveEffectiveComfyUIBaseLive, which prefers the running runtime's
+    // --base-directory over configuration — that is where the server actually
+    // scans custom_nodes/ from. Re-preferring configuration here would
+    // resurrect the Desktop split-root bug: scaffold writes under the code
+    // install root, the runtime loads from its base directory, and verify
+    // reports the class missing.
+    const { deps, mkdirs } = makeDeps();
+    const res = scaffoldCustomNode(
+      { name: "my-nodes", displayName: "My Nodes" },
+      deps,
+      "/live/base-dir",
+    );
+    const packDir = resolve(join("/live/base-dir", "custom_nodes"), "my-nodes");
+    expect(res.path).toBe(packDir);
+    expect(mkdirs).toContain(packDir);
   });
 });
 
@@ -460,12 +524,54 @@ describe("publishCustomNode", () => {
     expect(() => publishCustomNode({}, deps)).toThrow(ValidationError);
   });
 
-  it("throws a clear error in remote mode when using name", () => {
+  it("throws a clear error in remote mode when using name (no saved default)", () => {
     config.comfyuiPath = undefined;
+    wsMock.saved = undefined;
     process.env.REGISTRY_ACCESS_TOKEN = "tok";
     const deps = depsWithToml(goodToml);
     expect(() => publishCustomNode({ name: "mypack" }, deps)).toThrow(
       /local ComfyUI install/i,
+    );
+  });
+
+  it("resolves name against the saved default workspace when COMFYUI_PATH is unset (#506)", () => {
+    // COMFYUI_PATH unset but a saved default workspace exists — resolving a pack
+    // by name must use it (not reject as remote), so publish runs in the pack dir
+    // under the saved default's custom_nodes/.
+    config.comfyuiPath = undefined;
+    wsMock.saved = "/saved/ws";
+    process.env.REGISTRY_ACCESS_TOKEN = "tok";
+    const runSpy = vi.fn(() => "ok");
+    const deps = makeDeps({
+      existsSync: vi.fn(() => true),
+      readFile: vi.fn(() => goodToml),
+      run: runSpy,
+    }).deps;
+    const res = publishCustomNode({ name: "mypack" }, deps);
+    expect(res.published).toBe(true);
+    expect(runSpy.mock.calls[0][2].cwd).toBe(
+      resolve(join("/saved/ws", "custom_nodes"), "mypack"),
+    );
+  });
+
+  it("resolves name against the threaded live-server base when nothing is configured (#1653)", () => {
+    // Same session shape as #1653: install_comfyui (action:"environment")
+    // detected the trusted local workspace, nothing is configured, and the
+    // handler threads that running server's root in. Publish by name must run
+    // in THAT install's custom_nodes/, not refuse as unconfigured.
+    config.comfyuiPath = undefined;
+    wsMock.saved = undefined;
+    process.env.REGISTRY_ACCESS_TOKEN = "tok";
+    const runSpy = vi.fn(() => "ok");
+    const deps = makeDeps({
+      existsSync: vi.fn(() => true),
+      readFile: vi.fn(() => goodToml),
+      run: runSpy,
+    }).deps;
+    const res = publishCustomNode({ name: "mypack" }, deps, "/live/ComfyUI");
+    expect(res.published).toBe(true);
+    expect(runSpy.mock.calls[0][2].cwd).toBe(
+      resolve(join("/live/ComfyUI", "custom_nodes"), "mypack"),
     );
   });
 });

@@ -8,7 +8,7 @@
 // PanelAgent keeps all provider-agnostic orchestration (queue, turn-gate, bridge
 // push, self-restart) and drives this backend via
 // `for await (const ev of backend.run({...}))`. See
-// docs/design/agent-backend-injection.md.
+// design/agent-backend-injection.md.
 //
 // PROTOCOL MAPPING (AgentBackend ↔ ACP, per agentclientprotocol.com + the
 // Gemini CLI docs/cli/acp-mode.md):
@@ -63,6 +63,7 @@ import readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { logger } from "../utils/logger.js";
+import { errorText, promptText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -72,6 +73,7 @@ import {
   type ModelChoice,
   type NeutralTurn,
   GROK_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
 import {
@@ -81,9 +83,10 @@ import {
 } from "../services/code-provider-auth.js";
 import { OAUTH_PROVIDERS, assertAllowedTokenHost, grokTokenFile, redactTokens } from "../services/oauth-flow.js";
 import { OllamaBackend } from "./ollama-backend.js";
+import { asRateLimitError, sendWithRateLimitRetry } from "./rate-limit.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /**
@@ -415,13 +418,19 @@ interface AcpInitializeResult {
 // Grok's reasoning control is not exposed as a discrete effort scale here, so we do
 // NOT advertise supportsEffort/supportedEffortLevels: the panel's normalizeModels
 // then hides the effort dropdown (omission is the documented "no effort control"
-// signal). grok-4.5 is the current CLI default.
+// signal). grok-4.6 is the current CLI default: xAI shipped it on 2026-08-12 and
+// Grok Build now defaults to it. Verified against docs.x.ai/developers/grok-4-6 on
+// 2026-08-14 — it is a real id in BOTH namespaces this file spans (the CLI's
+// `--model` flag and the raw xAI `/v1` API), which matters because
+// GROK_DEFAULT_MODEL below also seeds GROK_XAI_DEFAULT_MODEL on the direct-token
+// path. The older ids stay listed so a session pinned to one keeps resolving.
 const GROK_MODELS: ModelChoice[] = [
+  { id: "grok-4.6", label: "Grok 4.6" },
   { id: "grok-4.5", label: "Grok 4.5" },
   { id: "grok-composer-2.5-fast", label: "Grok Composer 2.5 Fast" },
   { id: "grok-build", label: "Grok Build" },
 ];
-const GROK_DEFAULT_MODEL = "grok-4.5";
+const GROK_DEFAULT_MODEL = "grok-4.6";
 
 /** Does this id look like a Grok model (vs. the Claude panel model PanelAgent
  *  unconditionally passes as opts.model)? Used so the configured Grok model
@@ -572,7 +581,7 @@ export class GrokBackend implements AgentBackend {
       return this.resolvedDirect ? this.resolvedDirect.capabilities : GROK_CAPABILITIES;
     }
     const directReachable = !!this.deps.resolveGrokOAuth || existsSync(grokTokenFile);
-    return directReachable ? { ...GROK_CAPABILITIES, vision: false } : GROK_CAPABILITIES;
+    return directReachable ? { ...GROK_CAPABILITIES, vision: false, audio: false } : GROK_CAPABILITIES;
   }
 
   /**
@@ -819,6 +828,7 @@ export class GrokBackend implements AgentBackend {
     };
 
     // Process the neutral channel one turn at a time.
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
       // LIVE MODEL SWITCH (P1): PanelAgent treats setModel as live and does NOT
       // restart run() for a model-only change, so the persistent loop adopts it
@@ -836,7 +846,7 @@ export class GrokBackend implements AgentBackend {
           ...(this.model ? { model: this.model } : {}),
         };
       }
-      yield* this.runTurn(this.client, turn, opts.onActivity);
+      yield* stampTurn(this.runTurn(this.client, turn, opts.onActivity), ++turnSeq);
     }
   }
 
@@ -1028,11 +1038,11 @@ export class GrokBackend implements AgentBackend {
     // FIRST-TURN PERSONA: ACP session/new has no instructions field, so the panel
     // system prompt is prepended to the first turn's prompt as a clearly-marked
     // system/context preamble (later turns send plain text). Mirrors codex.
-    let turnText = turn.text;
+    let turnText = promptText(turn.text);
     if (this.needsSystemPreamble && this.deps.systemAppend) {
       turnText =
         `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${turn.text}`;
+        `The user's first message follows.\n\n${turnText}`;
       this.needsSystemPreamble = false;
     }
 
@@ -1196,14 +1206,15 @@ export class GrokBackend implements AgentBackend {
 //     (redactTokens, from oauth-flow.ts — the single shared redactor) before
 //     it can reach a thrown message or a log line — the access token itself
 //     is never logged anywhere in this path.
-//   - Model slug + exact endpoint sub-path are UNVERIFIED against the live xAI
-//     API (no network access at authoring time, and no Task-1 research
-//     artifact survived for this session to consult). GROK_XAI_DEFAULT_MODEL
-//     reuses the ACP CLI's existing composer alias as a placeholder rather
-//     than inventing a new model string; listModels() prefers a live
-//     `GET /v1/models` probe over any hardcoded catalog. CONFIRM both against
-//     xAI's docs (or override via COMFYUI_MCP_GROK_XAI_MODEL) before relying
-//     on this path in production — see the task-6 report for the flagged risk.
+//   - The exact endpoint SUB-PATH is still UNVERIFIED against the live xAI API
+//     (no network access at authoring time, and no Task-1 research artifact
+//     survived for this session to consult); override it via
+//     COMFYUI_MCP_GROK_XAI_RESPONSES_URL if the real path differs.
+//     The MODEL SLUG is no longer in that bucket: GROK_XAI_DEFAULT_MODEL
+//     inherits GROK_DEFAULT_MODEL, which is `grok-4.6` — documented by
+//     docs.x.ai/developers/grok-4-6 as a real xAI `/v1` API model id (verified
+//     2026-08-14). listModels() still prefers a live `GET /v1/models` probe over
+//     any hardcoded catalog, and COMFYUI_MCP_GROK_XAI_MODEL still overrides.
 // ---------------------------------------------------------------------------
 
 export const GROK_XAI_API_BASE = "https://api.x.ai/v1";
@@ -1222,10 +1233,13 @@ function grokApiHostAllowlist(): string[] {
   return OAUTH_PROVIDERS.grok?.apiHostAllowlist ?? ["x.ai"];
 }
 
-// UNVERIFIED against the live xAI model catalog (see the divergences note
-// above) — reuses the ACP CLI's default composer alias as a safe, non-invented
-// placeholder rather than guessing a raw-API model slug. Override with
-// COMFYUI_MCP_GROK_XAI_MODEL once confirmed, or rely on listModels()'s live
+// Inherits the ACP CLI default (GROK_DEFAULT_MODEL). That used to be an
+// UNVERIFIED placeholder, but as of grok-4.6 the two namespaces coincide:
+// docs.x.ai/developers/grok-4-6 documents `grok-4.6` as a real xAI `/v1` API
+// model id (verified 2026-08-14), so this fallback is now a valid raw-API slug
+// rather than a CLI alias borrowed on faith. The endpoint SUB-PATH is a separate
+// question and remains unverified — see the divergences note above. Override the
+// model with COMFYUI_MCP_GROK_XAI_MODEL, or rely on listModels()'s live
 // /v1/models probe to surface the account's real slugs.
 export const GROK_XAI_DEFAULT_MODEL =
   process.env.COMFYUI_MCP_GROK_XAI_MODEL?.trim() || GROK_DEFAULT_MODEL;
@@ -1316,6 +1330,12 @@ const GROK_DIRECT_CAPABILITIES = {
   slashCommands: false,
   hooks: false,
   vision: false, // the 6-tool router is text-only (mirrors Ollama/ChatGPT); NeutralTurn.images unused here
+  audio: false, // xAI's audio-input contract is unverified, and an over-claim here means a SILENTLY unheard attachment (#790)
+  // This adapter DOES stamp turn markers (see stampTurn in run() below), so it
+  // must say so: #468's run-completion ack trusts the declaration, and a backend
+  // that stamps but declares otherwise would let an unmarked straggler ack a
+  // completion it never carried. Declaration and behavior must not disagree.
+  turnMarkers: true,
 };
 
 /** Direct-token Grok (xAI) backend — see the module-level comment above for the
@@ -1392,27 +1412,42 @@ export class GrokDirectBackend extends OllamaBackend {
     const keepalive = onActivity ? setInterval(onActivity, 5000) : null;
     let res: Response;
     try {
-      res = await fetch(GROK_XAI_RESPONSES_URL, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "text/event-stream",
-          authorization: `Bearer ${this.accessToken}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          instructions,
-          input,
-          tools: grokToolsToResponses(tools),
-          stream: true,
-          store: false,
-        }),
-        signal,
-      });
+      // Capture the model BEFORE the async boundary. The thunk below is re-invoked
+      // after a rate-limit backoff, and re-reading `this.model` there sends the retried
+      // request to whatever the user switched to during the wait — while the notice they
+      // already saw names the old one. One turn, two models, no way to tell from the log.
+      const model = this.model;
+      // 429s are waited out when xAI names a bounded window; every other status
+      // falls through to the error below unchanged (orchestrator/rate-limit.ts).
+      res = yield* sendWithRateLimitRetry(
+        () =>
+          fetch(GROK_XAI_RESPONSES_URL, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "text/event-stream",
+              authorization: `Bearer ${this.accessToken}`,
+            },
+            body: JSON.stringify({
+              model,
+              instructions,
+              input,
+              tools: grokToolsToResponses(tools),
+              stream: true,
+              store: false,
+            }),
+            signal,
+          }),
+        { model, label: "grok-backend", signal, onActivity },
+      );
     } finally {
       if (keepalive) clearInterval(keepalive);
     }
     if (!res.ok || !res.body) {
+      // Never a 429 — sendWithRateLimitRetry owns that status.
+      // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+      // HTTP status is reported either way, so an unreadable body costs detail in the
+      // text, never a wrong conclusion. Verified there is no branch on this value.
       const bodyText = await res.text().catch(() => "");
       throw new Error(`xAI Responses http ${res.status}: ${redactTokens(bodyText).slice(0, 400)}`);
     }
@@ -1519,8 +1554,9 @@ export class GrokDirectBackend extends OllamaBackend {
       .filter(Boolean)
       .join("\n\n");
 
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runGrokTurn(turn, instructions, opts);
+      yield* stampTurn(this.runGrokTurn(turn, instructions, opts), ++turnSeq);
     }
   }
 
@@ -1587,16 +1623,28 @@ export class GrokDirectBackend extends OllamaBackend {
       resultEmitted = true;
     } catch (err) {
       const interrupted = abort.signal.aborted;
+      const rateLimited = asRateLimitError(err);
       if (!interrupted) {
         logger.warn(`[grok-backend] direct-token turn failed: ${msgOf(err)}`);
-        yield { type: "error", message: `grok backend: ${msgOf(err)}` };
-        yield {
-          type: "assistant",
-          text: `⚠️ The model request failed: ${msgOf(err).slice(0, 400)}`,
-        };
+        if (rateLimited) {
+          // Already a finished sentence naming the model, the reason and the
+          // remedy — it travels alone rather than under a "grok backend:" prefix
+          // that would blame this adapter for the provider's limit.
+          yield { type: "error", message: rateLimited.message, rateLimit: true };
+        } else {
+          yield { type: "error", message: `grok backend: ${msgOf(err)}` };
+          yield {
+            type: "assistant",
+            text: `⚠️ The model request failed: ${msgOf(err).slice(0, 400)}`,
+          };
+        }
       }
       if (!resultEmitted) {
-        yield { type: "result", ok: false, subtype: interrupted ? "interrupted" : "error" };
+        yield {
+          type: "result",
+          ok: false,
+          subtype: interrupted ? "interrupted" : rateLimited ? "rate_limit" : "error",
+        };
       }
     } finally {
       if (this.turnAbort === abort) this.turnAbort = null;

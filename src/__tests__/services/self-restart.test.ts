@@ -3,7 +3,15 @@
 // timers, registry, or process spawns).
 
 import { describe, expect, it } from "vitest";
-import { SelfRestarter, type SelfRestartDeps } from "../../services/self-restart.js";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  defaultSpawnReplacement,
+  SelfRestarter,
+  type SelfRestartDeps,
+} from "../../services/self-restart.js";
+import { releaseOwnedPanelLock } from "../../services/panel-pin-guard.js";
 import type { InstallInfo, SelfUpdateResult } from "../../services/self-update.js";
 
 interface Harness {
@@ -21,9 +29,14 @@ function makeHarness(opts: {
   latest?: string;
   updateResult?: SelfUpdateResult;
   env?: NodeJS.ProcessEnv;
+  packageDir?: string;
+  argv?: readonly string[];
   uptimeMs?: number;
   spawnOk?: boolean;
   mtime?: number;
+  releasePanelLock?: () => void;
+  applyAllowed?: () => boolean;
+  panelTick?: SelfRestartDeps["panelTick"];
 }): Harness {
   const calls: string[] = [];
   const spawns: Array<{ npxVersion?: string }> = [];
@@ -33,9 +46,10 @@ function makeHarness(opts: {
   const mode = opts.mode ?? "linked";
   const deps: Partial<SelfRestartDeps> = {
     env: () => opts.env ?? {},
+    argv: () => opts.argv ?? process.argv,
     detectInstall: () => ({
       mode,
-      packageDir: "/pkg",
+      packageDir: opts.packageDir ?? "/pkg",
       currentVersion: opts.currentVersion ?? "1.0.0",
       isDevLink: mode === "linked",
     }),
@@ -48,6 +62,8 @@ function makeHarness(opts: {
     latestVersion: async () => opts.latest,
     entryMtime: () => mtime,
     allIdle: () => idle,
+    applyAllowed: opts.applyAllowed ?? (() => true),
+    panelTick: opts.panelTick,
     announce: (t) => announces.push(t),
     teardown: async () => {
       calls.push("teardown");
@@ -56,6 +72,10 @@ function makeHarness(opts: {
       calls.push("spawn");
       spawns.push(o);
       return opts.spawnOk ?? true;
+    },
+    releasePanelLock: () => {
+      calls.push("releasePanelLock");
+      opts.releasePanelLock?.();
     },
     exit: () => {
       calls.push("exit");
@@ -88,7 +108,7 @@ describe("SelfRestarter — dev rebuild watch", () => {
     expect(h.calls).toEqual([]);
     h.restarter.devTick(); // stable → arm + fire (idle)
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
     expect(h.spawns[0]?.npxVersion).toBeUndefined(); // same argv respawn
   });
 
@@ -116,7 +136,7 @@ describe("SelfRestarter — dev rebuild watch", () => {
     h.setIdle(true);
     h.restarter.tryRestart();
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
   });
 
   it("respects the minimum-uptime guard", () => {
@@ -136,7 +156,7 @@ describe("SelfRestarter — dev rebuild watch", () => {
     h.restarter.devTick();
     h.restarter.devTick();
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn"]); // no teardown, no exit
+    expect(h.calls).toEqual(["spawn"]); // no release, no teardown, no exit
     expect(h.announces.some((a) => a.includes("Restart failed"))).toBe(true);
   });
 });
@@ -150,7 +170,7 @@ describe("SelfRestarter — published installs", () => {
     h.restarter.start();
     await h.restarter.updateTick();
     await Promise.resolve();
-    expect(h.calls).toEqual(["check", "spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["check", "spawn", "releasePanelLock", "teardown", "exit"]);
     expect(h.spawns[0]?.npxVersion).toBeUndefined(); // disk already updated — same argv
   });
 
@@ -162,12 +182,62 @@ describe("SelfRestarter — published installs", () => {
   });
 
   it("npx: respawns pinned to the newer version", async () => {
-    const h = makeHarness({ mode: "npx", currentVersion: "1.0.0", latest: "1.2.0" });
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "1.0.0",
+      latest: "1.2.0",
+      argv: ["npx.cmd", "-y", "comfyui-mcp", "connect"],
+    });
     h.restarter.start();
     await h.restarter.updateTick();
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
     expect(h.spawns[0]?.npxVersion).toBe("1.2.0");
+  });
+
+  it("npx: positional exact pin from the execution cache keeps the healthy runtime", async () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), "cmcp-npx-pin-"));
+    const packageDir = join(cacheRoot, "node_modules", "comfyui-mcp");
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(
+      join(cacheRoot, "package.json"),
+      JSON.stringify({ _npx: { packages: ["comfyui-mcp@0.52.66"] } }),
+    );
+    try {
+      const h = makeHarness({
+        mode: "npx",
+        packageDir,
+        currentVersion: "0.52.66",
+        latest: "0.52.67",
+        env: {},
+        argv: ["C:\\npx.cmd", "-y", "comfyui-mcp", "connect"],
+      });
+      h.restarter.start();
+      await h.restarter.updateTick();
+      await Promise.resolve();
+
+      // npm's positional npx child has no package spec in env or argv. The
+      // cache manifest is the production provenance that distinguishes this
+      // exact pin from the bare command above.
+      expect(h.calls).toEqual([]);
+      expect(h.spawns).toEqual([]);
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("npx: @latest remains unpinned and keeps the spawn-first handoff", async () => {
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "0.52.66",
+      latest: "0.52.67",
+      env: { npm_config_package: "comfyui-mcp@latest" },
+    });
+    h.restarter.start();
+    await h.restarter.updateTick();
+    await Promise.resolve();
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
+    expect(h.spawns[0]?.npxVersion).toBe("0.52.67");
   });
 
   it("npx: same version → no restart", async () => {
@@ -175,6 +245,114 @@ describe("SelfRestarter — published installs", () => {
     h.restarter.start();
     await h.restarter.updateTick();
     expect(h.calls).toEqual([]);
+  });
+
+  it("production npx replacement passes the positional package version", () => {
+    let captured:
+      | { command: string; args: readonly string[]; options: { detached?: boolean; shell?: boolean } }
+      | undefined;
+    const ok = defaultSpawnReplacement({
+      npxVersion: "0.52.67",
+      env: { PATH: "/usr/bin" },
+      spawn: (command, args, options) => {
+        captured = { command, args, options };
+        return { pid: 4321, unref() {} };
+      },
+    });
+
+    expect(ok).toBe(true);
+    expect(captured?.command).toBe(process.platform === "win32" ? "npx.cmd" : "npx");
+    expect(captured?.args.slice(0, 2)).toEqual(["-y", "comfyui-mcp@0.52.67"]);
+    expect(captured?.args.slice(2)).toEqual(process.argv.slice(2));
+    expect(captured?.options.detached).toBe(true);
+  });
+});
+
+describe("SelfRestarter — transport-aware check vs apply (#1963)", () => {
+  it("a quick-tunnel pairing CHECKs but does not APPLY (no disk mutate, no restart)", async () => {
+    const h = makeHarness({
+      mode: "global",
+      currentVersion: "0.52.41",
+      latest: "0.52.42",
+      updateResult: { action: "updated", mode: "global", from: "0.52.41", to: "0.52.42" },
+      applyAllowed: () => false,
+    });
+    h.restarter.start();
+    await h.restarter.updateTick();
+    await Promise.resolve();
+    expect(h.calls).toEqual([]); // latestVersion is a probe, checkAndSelfUpdate is APPLY
+    expect(h.announces.some((a) => a.includes("0.52.41") && a.includes("0.52.42"))).toBe(true);
+    expect(h.announces.some((a) => /mobile tunnel/i.test(a))).toBe(true);
+  });
+
+  it("npx: check-only while the gate is closed — no respawn", async () => {
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "1.0.0",
+      latest: "2.0.0",
+      applyAllowed: () => false,
+    });
+    h.restarter.start();
+    await h.restarter.updateTick();
+    await Promise.resolve();
+    expect(h.calls).toEqual([]);
+    expect(h.announces.some((a) => a.includes("1.0.0") && a.includes("2.0.0"))).toBe(true);
+  });
+
+  it("forceApply bypasses the gate — the Update now path", async () => {
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "1.0.0",
+      latest: "2.0.0",
+      applyAllowed: () => false,
+    });
+    h.restarter.start();
+    await h.restarter.updateTick({ forceApply: true });
+    await Promise.resolve();
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
+    expect(h.spawns[0]?.npxVersion).toBe("2.0.0");
+  });
+
+  it("an armed restart still refuses to fire after a phone pairs", async () => {
+    let allowed = true;
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "1.0.0",
+      latest: "2.0.0",
+      applyAllowed: () => allowed,
+    });
+    h.restarter.start();
+    h.setIdle(false);
+    await h.restarter.updateTick(); // arms, but busy
+    expect(h.calls).toEqual([]);
+    allowed = false; // phone pairs over the tunnel before idle
+    h.setIdle(true);
+    h.restarter.tryRestart();
+    await Promise.resolve();
+    expect(h.calls).toEqual([]); // still held
+    allowed = true;
+    h.restarter.requestApplyPolicyRefresh();
+    await Promise.resolve();
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
+  });
+
+  it("the same tick checks the panel with the same apply bit", async () => {
+    const panel: Array<{ apply: boolean }> = [];
+    const h = makeHarness({
+      mode: "global",
+      currentVersion: "1.0.0",
+      latest: "1.1.0",
+      applyAllowed: () => false,
+      panelTick: async ({ apply }) => {
+        panel.push({ apply });
+        return { action: "deferred", from: "0.15.28", to: "0.15.31" };
+      },
+    });
+    h.restarter.start();
+    await h.restarter.updateTick();
+    expect(panel).toEqual([{ apply: false }]);
+    expect(h.calls).toEqual([]); // orchestrator not applied
+    expect(h.announces.some((a) => /panel/i.test(a) && a.includes("0.15.28"))).toBe(true);
   });
 });
 
@@ -208,5 +386,76 @@ describe("SelfRestarter — opt-outs", () => {
     expect(h.calls).toEqual([]); // never spawned/tore down/exited
     const nags = h.announces.filter((a) => a.includes("auto-restart is off"));
     expect(nags).toHaveLength(1);
+  });
+});
+
+describe("SelfRestarter — releases panel-op.lock this process owns (#1953)", () => {
+  it("a successful restart drops the lock so the successor can acquire it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-self-restart-lock-"));
+    const prev = process.env.COMFYUI_MCP_PANEL_LOCK;
+    const lock = join(dir, "panel-op.lock");
+    process.env.COMFYUI_MCP_PANEL_LOCK = lock;
+    writeFileSync(
+      lock,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "pre-restart",
+      }),
+    );
+    try {
+      const h = makeHarness({
+        mode: "linked",
+        mtime: 1000,
+        releasePanelLock: () => {
+          releaseOwnedPanelLock();
+        },
+      });
+      h.restarter.start();
+      h.setMtime(2000);
+      h.restarter.devTick();
+      h.restarter.devTick();
+      await Promise.resolve();
+      expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
+      expect(existsSync(lock)).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.COMFYUI_MCP_PANEL_LOCK;
+      else process.env.COMFYUI_MCP_PANEL_LOCK = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a failed spawn leaves the lock in place — we are staying alive", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-self-restart-lock-fail-"));
+    const prev = process.env.COMFYUI_MCP_PANEL_LOCK;
+    const lock = join(dir, "panel-op.lock");
+    process.env.COMFYUI_MCP_PANEL_LOCK = lock;
+    const payload = JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      token: "still-held",
+    });
+    writeFileSync(lock, payload);
+    try {
+      const h = makeHarness({
+        mode: "linked",
+        mtime: 1000,
+        spawnOk: false,
+        releasePanelLock: () => {
+          releaseOwnedPanelLock();
+        },
+      });
+      h.restarter.start();
+      h.setMtime(2000);
+      h.restarter.devTick();
+      h.restarter.devTick();
+      await Promise.resolve();
+      expect(h.calls).toEqual(["spawn"]);
+      expect(existsSync(lock)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.COMFYUI_MCP_PANEL_LOCK;
+      else process.env.COMFYUI_MCP_PANEL_LOCK = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -27,7 +27,7 @@ inpainting and ControlNet workflow, how to **train your own anime LoRA** on a
 6 GB card, how it stacks up against the SDXL-lineage giants, and the fastest path
 to running it — a one-command install with
 [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-[sidebar Panel](/panel), instead of hand-downloading a dozen files into five
+[sidebar Panel](../panel), instead of hand-downloading a dozen files into five
 folders.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `anima` pack
@@ -66,7 +66,9 @@ the ControlNet stack exist precisely to address the first two. If you want
 maximum out-of-the-box polish on a big GPU, an Illustrious/NoobAI/Animagine
 fine-tune may still edge it — see [the comparison below](#anima-vs-the-sdxl-anime-giants).
 
-> **License — read this before commercial work.** The **weights** ship under the
+## Licensing
+
+> **Read this before commercial work.** The **weights** ship under the
 > **CircleStone Labs Non-Commercial License** (with NVIDIA Open Model License
 > terms on derivatives) — you can't host them in a paid generation service or
 > embed them in a monetized product without a separate commercial license. But
@@ -96,8 +98,8 @@ text encoder that understands sentences. If your bottleneck is a 6–8 GB card, 
 you want to fine-tune without renting a GPU, ANIMA is the easy call.
 
 For non-anime work, this series covers the other specialists: the open-weight
-text-and-layout champion in [our Ideogram 4 post](/blog/ideogram-4-comfyui), and
-the speed/low-VRAM generalist in [our Z-Image post](/blog/z-image-comfyui).
+text-and-layout champion in [our Ideogram 4 post](./ideogram-4-comfyui), and
+the speed/low-VRAM generalist in [our Z-Image post](./z-image-comfyui).
 
 ## System & VRAM requirements
 
@@ -148,28 +150,28 @@ apply_manifest --path packs/anima/manifest.yaml
 
 Run the generated installer from your **ComfyUI root** (the folder containing
 `custom_nodes/` and `models/`), restart ComfyUI, and load
-`packs/anima/workflow.json`. Because the pack ships with the [plugin](/plugin),
+`packs/anima/workflow.json`. Because the pack ships with the [plugin](../plugin),
 your **own Claude session can drive the live graph through the
-[Panel](/panel)** — add/wire nodes, set widgets, swap LoRAs, and iterate on
+[Panel](../panel)** — add/wire nodes, set widgets, swap LoRAs, and iterate on
 prompts conversationally, with full undo and no API keys. Every model URL in the
 pack is CI-validated for reachability and size, so a link never quietly rots
-([here's why that matters](/blog/installer-packs-that-cant-rot)).
+([here's why that matters](./installer-packs-that-cant-rot)).
 
 ## Anime inpainting (the Anima-LLLite workflow)
 
 ANIMA's inpainting isn't a bolt-on — it's a dedicated **Anima-LLLite ControlNet**.
 LLLite ("LoRA-Lite") patches the **MODEL** directly rather than feeding standard
-ControlNet conditioning, so the pack uses a special `AnimaLLLiteApply` node from
+ControlNet conditioning, so the pack uses a special `AnimaLLLiteApply_sdscripts` node from
 `ComfyUI-Anima-LLLite` (kohya-ss). The inpaint flow is clean:
 
 1. Load an image and paint a mask over the region you want to redraw.
 2. `VAEEncode` the source image, then `SetLatentNoiseMask` with the mask.
 3. Patch the model with `anima-lllite-inpainting-v1.safetensors` via
-   `AnimaLLLiteApply`, fed the same image + mask.
+   `AnimaLLLiteApply_sdscripts`, fed the same image + mask.
 4. Sample. The masked area is regenerated from your prompt while everything
    outside it is preserved.
 
-The same `AnimaLLLiteApply` node powers ANIMA's other control modes — just swap
+The same `AnimaLLLiteApply_sdscripts` node powers ANIMA's other control modes — just swap
 the `lllite_name` and feed a preprocessed control image:
 
 | LLLite | Control source |
@@ -179,8 +181,10 @@ the `lllite_name` and feed a preprocessed control image:
 | `anima-lllite-lineart-1` | Lineart |
 | `anima-lllite-inpainting-v1` | Painted mask |
 
-> **Gotcha:** `AnimaLLLiteApply` is **not** a standard ControlNet node. If it's
-> missing, install `ComfyUI-Anima-LLLite` (the pack does this for you).
+> **Gotcha:** `AnimaLLLiteApply_sdscripts` is **not** a standard ControlNet node, and
+> it is not the core `AnimaLLLiteApply` ID (ComfyUI now owns that name with a
+> different signature). If it's missing, install `ComfyUI-Anima-LLLite` (the pack
+> does this for you).
 
 ## Train your own anime LoRA (under 6 GB)
 
@@ -275,13 +279,13 @@ painterly.
   896x1152, 832x1216, 768x1344, 640x1536).
 - **Turbo output looks washed/flat.** That's turbo at CFG 1. Switch to base mode
   (drop the turbo LoRA, 30–50 steps, CFG 4–5) for max quality.
-- **`AnimaLLLiteApply` missing.** Install `ComfyUI-Anima-LLLite` — it is not a
-  standard ControlNet node.
+- **`AnimaLLLiteApply_sdscripts` missing.** Install `ComfyUI-Anima-LLLite` — it is not a
+  standard ControlNet node, and it is not core `AnimaLLLiteApply`.
 - **CLIP loads but output is garbage.** Confirm the `CLIPLoader` `type` is
   `stable_diffusion` and the file is `qwen_3_06b_base.safetensors` (the Qwen3-0.6B
   *base*, not a chat/edit Qwen).
 - **Inpainting ignores the mask.** Make sure both `SetLatentNoiseMask` *and* the
-  inpainting `AnimaLLLiteApply` receive the painted mask.
+  inpainting `AnimaLLLiteApply_sdscripts` receive the painted mask.
 - **OOM while training.** Drop to `network_dim 8` and/or `resolution 512`, keep
   batch 1, use AdamW8bit.
 
@@ -318,13 +322,13 @@ isn't tuned for photorealistic output.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`anima` pack** — nodes + every model land in the right folders,
    CI-validated, with the Anima-LLLite inpainting node included.
-3. Open the [Panel](/panel) and let the panel's agent wire the graph, swap
+3. Open the [Panel](../panel) and let the panel's agent wire the graph, swap
    LoRAs, and iterate on tag-plus-prose prompts for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **Next in the series:**
-[LTX-2.3](/blog/ltx-2.3-comfyui) — the fast GGUF video model with synchronized
+[LTX-2.3](./ltx-2.3-comfyui) — the fast GGUF video model with synchronized
 audio and the LTX Director timeline.

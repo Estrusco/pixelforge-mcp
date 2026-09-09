@@ -1,5 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OllamaBackend, isOllamaModel, type McpToolClient } from "../../orchestrator/ollama-backend.js";
+import {
+  OllamaBackend,
+  comfyuiSpawnEnv,
+  comfyuiSpawnToolMode,
+  acceptsModelId,
+  isOllamaModel,
+  ollamaSystemPrompt,
+  ollamaZeroToolCause,
+  ollamaZeroToolCauseMessage,
+  ollamaToolSurfaceRecoveredMessage,
+  __resetOllamaToolSurfaceAnnouncementForTests,
+  type McpToolClient,
+} from "../../orchestrator/ollama-backend.js";
+import { logger } from "../../utils/logger.js";
+import { PANEL_TOOL_MCP_TIMEOUT_MS, __panelAskTestHooks } from "../../orchestrator/panel-tools.js";
 import type { AgentEvent, NeutralTurn } from "../../orchestrator/agent-backend.js";
 
 // ---------------------------------------------------------------------------
@@ -177,7 +191,7 @@ describe("OllamaBackend", () => {
     expect(assistant.text).toBe("Hello!");
     expect(assistant.usage).toEqual({ input_tokens: 10, output_tokens: 5 });
     const results = events.filter((e) => e.type === "result");
-    expect(results).toEqual([{ type: "result", ok: true, usage: { input_tokens: 10, output_tokens: 5 } }]);
+    expect(results).toEqual([{ type: "result", ok: true, turn: 1, usage: { input_tokens: 10, output_tokens: 5 } }]);
   });
 
   it("num_ctx is model-aware: 16384 for stock, OMITTED for the fine-tune (baked 65536 governs), env override wins", async () => {
@@ -239,18 +253,70 @@ describe("OllamaBackend", () => {
     chatScript.push(sameCall, sameCall, sameCall, sameCall, sameCall, sameCall);
 
     const events = await collect(backend, turnsOf({ text: "find krea" }));
-    // Dispatched exactly once — repeats got the corrective nudge, not a re-run.
+    // Dispatched exactly once — repeats replay the first payload, not a re-run.
     expect(callTool).toHaveBeenCalledTimes(1);
-    // Repeat calls receive the nudge as their tool result on the wire.
-    const nudges = chatRequests
+    // Repeat calls receive the earlier result on the wire (#2430), not an
+    // error-string-only "use the earlier result" nudge.
+    const toolMsgs = chatRequests
       .flatMap((r) => r.messages)
-      .filter((m) => m.role === "tool" && String(m.content).startsWith("REPEAT CALL BLOCKED"));
-    expect(nudges.length).toBeGreaterThanOrEqual(1);
+      .filter((m) => m.role === "tool")
+      .map((m) => String(m.content));
+    const replays = toolMsgs.filter((c) => c.includes("identical call already made this turn"));
+    expect(replays.length).toBeGreaterThanOrEqual(1);
+    for (const c of replays) {
+      expect(c).toContain("result-of-list_tools");
+      expect(c.startsWith("REPEAT CALL BLOCKED")).toBe(false);
+    }
     // Turn ends with the loop-breaker, not max_tool_rounds (32 rounds later).
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "tool_loop" },
+      { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
     ]);
     expect(chatRequests.length).toBeLessThanOrEqual(5);
+  });
+
+  it("#2430 a blocked repeat replays the earlier payload instead of an error-string-only nudge", async () => {
+    const payload = JSON.stringify({
+      vram_total_gb: 31.84,
+      argv: "--feature-flag show_signin_button=true --enable-manager --listen 127.0.0.1,169.254.41.48 --port 8188 --fast",
+    });
+    const callTool = vi.fn(async () => ({
+      content: [{ type: "text", text: payload }],
+    }));
+    const tools = [
+      ...COMFY_META,
+      { name: "get_system_stats", description: "Stats.", inputSchema: { type: "object", properties: {} } },
+    ];
+    const client: McpToolClient = {
+      listTools: async () => ({ tools }),
+      callTool: callTool as McpToolClient["callTool"],
+      close: async () => {},
+    };
+    const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    const statsCall = [
+      {
+        message: {
+          content: "",
+          tool_calls: [{ function: { name: "get_system_stats", arguments: {} } }],
+        },
+        done: true,
+      },
+    ];
+    chatScript.push(statsCall, statsCall, [{ message: { content: "VRAM is 31.84 GB." }, done: true }]);
+
+    const events = await collect(backend, turnsOf({ text: "Get the ComfyUI system stats." }));
+    expect(callTool).toHaveBeenCalledTimes(1);
+    const toolMsgs = chatRequests
+      .flatMap((r) => r.messages)
+      .filter((m) => m.role === "tool")
+      .map((m) => String(m.content));
+    expect(toolMsgs[0]).toBe(payload);
+    expect(toolMsgs[1]).toContain(payload);
+    expect(toolMsgs[1]).toContain("31.84");
+    expect(toolMsgs[1].startsWith("REPEAT CALL BLOCKED")).toBe(false);
+    expect(toolMsgs[1]).not.toMatch(/Use the earlier result/);
+    const ends = events.filter((e) => e.type === "tool_call" && (e as { phase: string }).phase === "end");
+    expect(ends[1]).toMatchObject({ detail: { isError: false } });
+    expect(events.filter((e) => e.type === "result")).toMatchObject([{ type: "result", ok: true }]);
   });
 
   it("recovers an EMPTY final after tool rounds with one summarize nudge (never loops)", async () => {
@@ -315,8 +381,221 @@ describe("OllamaBackend", () => {
     expect(String(limitNudges[0].content)).toContain("panel_add_node");
     // And the turn ends on the loop-breaker, not by running to max_tool_rounds.
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "tool_loop" },
+      { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
     ]);
+  });
+
+  /**
+   * #2429 — the logged failure was `repeats=2 discovery=9`. Bare identical
+   * `list_tools {}` cannot produce that (the exact-repeat breaker dies at 4
+   * first). `list_tools` also takes `category`, and walking the catalog
+   * headings is the compact-mode protocol: each call has distinct args so
+   * repeats stay at 1–2, while a bare-name counter climbs on one key and
+   * kills the turn. That is the same #839 fold the action-keying already
+   * fixed for download_model / search_custom_nodes.
+   *
+   * Unfixed counting fails this: SEARCH LIMIT from the 4th category, then
+   * tool_loop at 8/9 with no answer. Fixed: every new category dispatches,
+   * the one exact repeat is blocked, the turn completes.
+   */
+  it("#2429 compact-mode category enumeration is not a discovery hunt (repeats=2 discovery=9)", async () => {
+    const { client, callTool } = fakeMcpClient(COMFY_META);
+    const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    const list = (args: Record<string, unknown>, extra?: Record<string, unknown>) => [
+      {
+        message: {
+          content: "",
+          tool_calls: [
+            { function: { name: "list_tools", arguments: args } },
+            ...(extra ? [{ function: { name: "list_tools", arguments: extra } }] : []),
+          ],
+        },
+        done: true,
+      },
+    ];
+    // 7 distinct categories, then a round with one more AND a repeat of the
+    // first — 9 list_tools, max exact-args repeats = 2, one discovery key.
+    chatScript.push(
+      list({ category: "generation" }),
+      list({ category: "models" }),
+      list({ category: "workflows" }),
+      list({ category: "custom-nodes" }),
+      list({ category: "diagnostics" }),
+      list({ category: "server" }),
+      list({ category: "images-assets" }),
+      list({ category: "apps" }, { category: "generation" }),
+      [{ message: { content: "generate_image is in the generation category." }, done: true }],
+    );
+    const events = await collect(backend, turnsOf({ text: "what can you generate?" }));
+    // 8 distinct categories dispatched; the one exact repeat is blocked, not
+    // re-run. None of them is a keyword search, so SEARCH LIMIT must not fire.
+    expect(callTool).toHaveBeenCalledTimes(8);
+    const limitNudges = chatRequests
+      .flatMap((r) => r.messages)
+      .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+    expect(limitNudges).toEqual([]);
+    const repeats = chatRequests
+      .flatMap((r) => r.messages)
+      .filter((m) => m.role === "tool" && String(m.content).includes("identical call already made this turn"));
+    expect(repeats).toHaveLength(1);
+    expect(String(repeats[0].content)).toContain("result-of-list_tools");
+    expect(String(repeats[0].content).startsWith("REPEAT CALL BLOCKED")).toBe(false);
+    expect(events.filter((e) => e.type === "result")).toEqual([
+      { type: "result", ok: true, turn: 1, usage: expect.anything() },
+    ]);
+    const assistant = events.filter((e) => e.type === "assistant") as Array<{ text: string }>;
+    expect(assistant).toHaveLength(1);
+    expect(assistant[0].text).toContain("generate_image");
+  });
+
+  /**
+   * 0.50.0 slice 11 folded the HuggingFace model search into
+   * download_model action:"search", so the discovery counter had to become
+   * action-aware. Keyed on the bare name it would count a download as a catalog
+   * search — and four downloads in one turn would be answered with SEARCH LIMIT
+   * instead of downloading, which is a fold turning legitimate calls into
+   * refusals (#839).
+   */
+  it("the discovery breaker counts download_model's SEARCH action, never its downloads", async () => {
+    const tools = [
+      ...COMFY_META,
+      { name: "download_model", description: "Models.", inputSchema: { type: "object", properties: {} } },
+    ];
+
+    // Six DIFFERENT downloads in one turn: distinct args, so the exact-repeat
+    // breaker cannot fire either. Every one must dispatch.
+    {
+      const { client, callTool } = fakeMcpClient(tools);
+      const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+      const dl = (n: number) => [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "download_model",
+                  arguments: { action: "download", url: `https://h/${n}.safetensors`, target_subfolder: "loras" },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ];
+      chatScript.push(dl(1), dl(2), dl(3), dl(4), dl(5), dl(6), [{ message: { content: "all six queued" }, done: true }]);
+      await collect(backend, turnsOf({ text: "grab these six LoRAs" }));
+      expect(callTool).toHaveBeenCalledTimes(6);
+      const nudges = chatRequests
+        .flatMap((r) => r.messages)
+        .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+      expect(nudges).toEqual([]);
+    }
+
+    // …while the SEARCH action still wedges out at the same threshold.
+    {
+      chatRequests = [];
+      const { client, callTool } = fakeMcpClient(tools);
+      const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+      const search = (q: string) => [
+        {
+          message: {
+            content: "",
+            tool_calls: [{ function: { name: "download_model", arguments: { action: "search", query: q } } }],
+          },
+          done: true,
+        },
+      ];
+      chatScript.push(
+        search("flux"), search("sdxl"), search("wan"), search("qwen"),
+        search("ltx"), search("krea"), search("pony"), search("hunyuan"),
+      );
+      const events = await collect(backend, turnsOf({ text: "find me anything" }));
+      expect(callTool).toHaveBeenCalledTimes(3);
+      const nudges = chatRequests
+        .flatMap((r) => r.messages)
+        .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+      expect(nudges.length).toBeGreaterThanOrEqual(1);
+      // The nudge names the ACTION, so the model is not told to stop calling
+      // download_model altogether.
+      expect(String(nudges[0].content)).toContain('download_model action:"search"');
+      expect(events.filter((e) => e.type === "result")).toEqual([
+        { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
+      ]);
+    }
+  });
+
+  /**
+   * 0.50.0 slice 12 folded the pack-DETAILS lookup into `search_custom_nodes` as
+   * action:"details". The discovery counter keys per DISCOVERY TOOL, and that
+   * retired name was never one — so keying on the NAME after the fold
+   * would start counting a call that never counted before, on the workflow that
+   * is CORRECT: search once, then read details for three or four candidate
+   * packs. The fourth would be answered with "STOP searching — it is very likely
+   * NOT in this catalog" while the model is doing exactly the right thing, and
+   * at eight the turn breaks outright. An invented refusal manufactured by a
+   * pure surface change is the same defect class as a lost one.
+   *
+   * Both directions have to hold: the corrective must still fire on repeated
+   * keyword SEARCHES, and must never fire on detail lookups.
+   */
+  describe("the discovery loop-breaker counts the search ACTION, not the folded tool name", () => {
+    const call = (args: Record<string, unknown>) => [
+      {
+        message: {
+          content: "",
+          tool_calls: [{ function: { name: "search_custom_nodes", arguments: args } }],
+        },
+        done: true,
+      },
+    ];
+    const nudges = () =>
+      chatRequests
+        .flatMap((r) => r.messages)
+        .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+
+    it("does NOT break a loop of distinct DETAIL lookups", async () => {
+      const { client, callTool } = fakeMcpClient(COMFY_META);
+      const backend = new OllamaBackend({
+        model: "gemma4:e4b",
+        connectToolClients: async () => ({ comfyui: client }),
+      });
+      // EIGHT distinct detail lookups — past the discovery threshold that
+      // breaks the turn — with different args each time, so the exact-repeat
+      // breaker cannot see them either. Every one must dispatch, because
+      // get_node_pack_details never counted before the fold.
+      for (const id of ["a", "b", "c", "d", "e", "f", "g", "h"]) {
+        chatScript.push(call({ action: "details", id: `${id}-pack` }));
+      }
+      chatScript.push([{ message: { content: "done" }, done: true }]);
+      await collect(backend, turnsOf({ text: "compare these eight packs for me" }));
+      expect(callTool).toHaveBeenCalledTimes(8);
+      expect(nudges()).toHaveLength(0);
+    });
+
+    it("STILL breaks a loop of distinct registry searches", async () => {
+      const { client, callTool } = fakeMcpClient(COMFY_META);
+      const backend = new OllamaBackend({
+        model: "gemma4:e4b",
+        connectToolClients: async () => ({ comfyui: client }),
+      });
+      for (const query of [
+        "lora", "flux", "civitai", "detailer", "upscale", "sampler", "controlnet", "vae",
+      ]) {
+        chatScript.push(call({ action: "search", query }));
+      }
+      const events = await collect(backend, turnsOf({ text: "find me a pack" }));
+      // First 3 dispatch; the 4th+ get the corrective instead of another search.
+      expect(callTool).toHaveBeenCalledTimes(3);
+      expect(nudges().length).toBeGreaterThanOrEqual(1);
+      // The corrective names the CALL, not just the tool — telling a model to
+      // stop calling `search_custom_nodes` outright would also stop it reading
+      // the details of a pack it has already found.
+      expect(String(nudges()[0].content)).toContain('search_custom_nodes action:"search"');
+      expect(events.filter((e) => e.type === "result")).toEqual([
+        { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
+      ]);
+    });
   });
 
   it("dispatches comfyui meta-tool calls and feeds results back to the next request", async () => {
@@ -340,7 +619,26 @@ describe("OllamaBackend", () => {
     const second = chatRequests[1];
     const toolMsg = second.messages.find((m) => m.role === "tool");
     expect(toolMsg).toMatchObject({ tool_name: "list_tools", content: "result-of-list_tools" });
-    expect(events.filter((e) => e.type === "result")).toEqual([{ type: "result", ok: true, usage: expect.anything() }]);
+    expect(events.filter((e) => e.type === "result")).toEqual([{ type: "result", ok: true, turn: 1, usage: expect.anything() }]);
+  });
+
+  it("a retired comfy tool name gets the ledger's specific error, not the bare Available list (#659)", async () => {
+    // No call_tool meta on the comfy client, so the forgiving direct dispatch
+    // falls through to the backend's own unknown-tool fallback — the path that
+    // used to answer with the full Available list.
+    const { client } = fakeMcpClient([{ name: "get_queue", description: "x" }]);
+    const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    chatScript.push(
+      [{ message: { content: "", tool_calls: [{ function: { name: "apps_list", arguments: {} } }] }, done: true }],
+      [{ message: { content: "done" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "list my apps" }));
+    const toolMsg = chatRequests[1].messages.find((m) => m.role === "tool");
+    const content = String(toolMsg?.content);
+    expect(content).toContain("removed in 0.49.0");
+    expect(content).toContain('apps (action:"list")');
+    expect(content).not.toContain("Available:");
   });
 
   it("synthesizes panel meta-tools over the panel MCP client", async () => {
@@ -375,9 +673,726 @@ describe("OllamaBackend", () => {
     expect(String(listResult?.content)).toContain("panel_focus_node: Focus a node in the canvas.");
     expect(String(listResult?.content)).toContain("panel_clear");
     expect(String(listResult?.content)).not.toContain("Long detail here");
-    // panel_call_tool unwrapped the JSON-string args and dispatched the real tool
-    expect(panelCall).toHaveBeenCalledWith({ name: "panel_focus_node", arguments: { node_id: 3 } });
+    // panel_call_tool unwrapped the JSON-string args and dispatched the real tool —
+    // carrying the #325 request timeout that covers long-blocking card tools.
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
     expect(events.filter((e) => e.type === "result")).toHaveLength(1);
+  });
+
+  it("unwraps a router-self-nested panel_call_tool envelope instead of refusing the real call (#1297)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              // the malformed shape from the issue: the model wrapped the real
+              // call in a second panel_call_tool envelope.
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { name: "panel_focus_node", args: { node_id: 3 } } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "focused." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    // the inner call ran exactly as spelled out — name and args unwrapped once
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+    const toolMsg = chatRequests[1].messages.find((m) => m.role === "tool");
+    const content = String(toolMsg?.content);
+    // the recovery is disclosed, and the correct shape is taught for next time
+    expect(content).toContain("Recovered a nested panel_call_tool envelope");
+    expect(content).toContain('panel_call_tool {"name": "panel_focus_node"');
+    expect(content).toContain("result-of-panel_focus_node");
+    expect(content).not.toContain("Unknown panel tool");
+  });
+
+  it("a router self-call WITHOUT a real nested panel tool is refused with the correct shape (#1297)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              // nested envelope names a tool that does not exist — fail closed.
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { name: "panel_nope" } },
+                },
+              },
+              // bare self-call with no envelope at all
+              { function: { name: "panel_call_tool", arguments: { name: "panel_list_tools" } } },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "sorry" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "do the thing" }));
+    expect(panelCall).not.toHaveBeenCalled();
+    const toolMsgs = chatRequests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+    expect(toolMsgs).toHaveLength(2);
+    for (const content of toolMsgs) {
+      expect(content).toContain("is this router itself, not a panel tool");
+      expect(content).toContain('panel_call_tool {"name": "<panel tool>", "args": {...}}');
+      expect(content).not.toContain("Unknown panel tool");
+    }
+  });
+
+  // #2717 — self-reference often puts the real inner tool on tool_name / tool,
+  // a nested key, or as siblings of name, not nested.name. Unique known names
+  // unwrap once; several names stay refused.
+  it("unwraps a self-call whose inner tool is on sibling tool_name (#2717)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", tool_name: "panel_focus_node", args: { node_id: 3 } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "focused." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+    const content = String(chatRequests[1].messages.find((m) => m.role === "tool")?.content);
+    expect(content).toContain("Recovered a nested panel_call_tool envelope");
+    expect(content).toContain('panel_call_tool {"name": "panel_focus_node"');
+  });
+
+  it("unwraps a nested envelope that names the inner tool as tool_name (#2717)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { tool_name: "panel_focus_node", args: { node_id: 3 } } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "focused." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  it("unwraps args keyed by the inner panel tool name (#2717)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { panel_focus_node: { node_id: 3 } } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "focused." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  it("unwraps a nested name whose payload is sibling fields, not args (#2717)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { name: "panel_focus_node", node_id: 3 } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "focused." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  it("refuses a self-call that names two different inner tools (#2717)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+      { name: "panel_clear", description: "Clear the graph." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: {
+                    name: "panel_call_tool",
+                    tool_name: "panel_focus_node",
+                    args: { name: "panel_clear" },
+                  },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "sorry" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "do the thing" }));
+    expect(panelCall).not.toHaveBeenCalled();
+    const content = String(chatRequests[1].messages.find((m) => m.role === "tool")?.content);
+    expect(content).toContain("is this router itself, not a panel tool");
+    expect(content).toContain("more than one inner tool");
+    expect(content).toContain("panel_focus_node");
+    expect(content).toContain("panel_clear");
+  });
+
+  it("a keyed non-object payload is refused and names the inner tool (#2717)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { panel_focus_node: 3 } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "sorry" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    expect(panelCall).not.toHaveBeenCalled();
+    const content = String(chatRequests[1].messages.find((m) => m.role === "tool")?.content);
+    expect(content).toContain("is this router itself, not a panel tool");
+    expect(content).toContain('panel_call_tool {"name": "panel_focus_node"');
+  });
+
+  it("panel_call_tool schema tells the model never to pass the router as name (#2717)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel } = fakeMcpClient([{ name: "panel_focus_node", description: "x" }]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push([{ message: { content: "hi" }, done: true }]);
+    await collect(backend, turnsOf({ text: "hello" }));
+    const def = (chatRequests[0].tools as Array<{ function: { name: string; parameters: { properties: { name: { description: string } } } } }>).find(
+      (t) => t.function.name === "panel_call_tool",
+    );
+    expect(def?.function.parameters.properties.name.description).toContain("Never panel_call_tool");
+    expect(def?.function.parameters.properties.name.description).toContain("Inner panel tool");
+  });
+
+  // #1937 — ChatGPT's multi_tool_use.parallel names each recipient's payload
+  // `parameters`, and after the first call in a batch the model copies that key
+  // inward instead of `args`. #1824 fixed the headless `call_tool` facade for
+  // exactly this; the panel router was left on `args ?? arguments` alone, so the
+  // real payload was dropped and `panel_set_widget` was invoked with `{}` —
+  // reaching the panel MCP server's strict schema as
+  // "MCP error -32602: Input validation error ... received undefined at node_id;
+  //  expected string, received undefined at widget", with the arguments the model
+  // actually wrote sitting one key away.
+  it("panel_call_tool runs the call when the payload is under `parameters` instead of `args` (#1937)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_set_widget", description: "Set a widget value." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: {
+                    name: "panel_set_widget",
+                    parameters: { node_id: 30, widget: "frame_load_cap", value: 192 },
+                  },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "set." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "set frame_load_cap to 192" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_set_widget", arguments: { node_id: 30, widget: "frame_load_cap", value: 192 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  // The reporter's wire shape, not a convenient one: the ChatGPT backend hands
+  // `dispatch` the Responses API's `function_call.arguments` — a JSON STRING — so
+  // the wrapper key arrives inside text that dispatch parses first. Pinned
+  // separately because a fix that only ever saw a pre-parsed object would look
+  // green while the path that actually reported the bug stayed broken.
+  it("panel_call_tool accepts a `parameters` payload arriving as a JSON string (#1937)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_set_widget", description: "Set a widget value." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments:
+                    '{"name":"panel_set_widget","parameters":{"node_id":30,"widget":"frame_load_cap","value":192}}',
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "set." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "set frame_load_cap to 192" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_set_widget", arguments: { node_id: 30, widget: "frame_load_cap", value: 192 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  it("panel_call_tool prefers `args` over a colliding `parameters` wrapper (#1937)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_set_widget", description: "Set a widget value." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: {
+                    name: "panel_set_widget",
+                    args: { node_id: 30, widget: "from_args", value: 1 },
+                    parameters: { node_id: 99, widget: "from_parameters", value: 2 },
+                  },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "set." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "set it" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_set_widget", arguments: { node_id: 30, widget: "from_args", value: 1 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  it("unwraps a self-nested envelope whose INNER payload is under `parameters` (#1937)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_set_widget", description: "Set a widget value." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: {
+                    name: "panel_call_tool",
+                    args: {
+                      name: "panel_set_widget",
+                      parameters: { node_id: 30, widget: "frame_load_cap", value: 192 },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "set." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "set it" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_set_widget", arguments: { node_id: 30, widget: "frame_load_cap", value: 192 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  // The same wrapper key, one hop away: the FORGIVING DIRECT DISPATCH path below
+  // the router exists because models call a panel tool by its bare name, and
+  // `multi_tool_use.parallel` names THAT payload `parameters` too. Forwarded raw
+  // it hits the panel server's strict schema as an unrecognized key AND two
+  // missing required fields.
+  it("a bare-name panel call unwraps a lone `parameters` wrapper (#1937)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_set_widget", description: "Set a widget value." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_set_widget",
+                  arguments: { parameters: { node_id: 30, widget: "frame_load_cap", value: 192 } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "set." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "set frame_load_cap to 192" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_set_widget", arguments: { node_id: 30, widget: "frame_load_cap", value: 192 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  // The unwrap must never eat a payload the tool actually declares. panel_add_mcp
+  // takes a real `args` array today, and a tool taking `parameters` must reach its
+  // handler with that key intact — otherwise the recovery silently deletes a
+  // legitimate argument.
+  it("does NOT unwrap `parameters` when the panel tool declares it (#1937)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      {
+        name: "panel_takes_parameters",
+        description: "A tool whose own schema has a parameters field.",
+        inputSchema: { type: "object", properties: { parameters: { type: "object" } } },
+      },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_takes_parameters",
+                  arguments: { parameters: { depth: 3 } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "ok." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "run it" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_takes_parameters", arguments: { parameters: { depth: 3 } } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  // The headless surface has the same bare-name hole. #1824 fixed the `call_tool`
+  // FACADE, which is all a compact-mode client can reach — but in full mode every
+  // comfy tool is registered directly, so the wrapper lands on the tool itself and
+  // the facade's alias never runs.
+  it("a bare-name comfy call unwraps a lone `parameters` wrapper (#1937)", async () => {
+    const { client: comfy, callTool: comfyCall } = fakeMcpClient([
+      { name: "download_model", description: "Download a model." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "download_model",
+                  arguments: { parameters: { action: "status", id: "dl-7" } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "checked." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "check the download" }));
+    expect(comfyCall).toHaveBeenCalledWith({
+      name: "download_model",
+      arguments: { action: "status", id: "dl-7" },
+    });
+  });
+
+  // A wrapper key alongside real fields is NOT a wrapper — it is a model that
+  // spelled most of the call correctly. Unwrapping there would throw the sibling
+  // fields away, so the payload must pass through untouched and let the tool's
+  // own schema speak.
+  it("does NOT unwrap `parameters` when it sits alongside other keys (#1937)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_set_widget", description: "Set a widget value." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "panel_set_widget",
+                  arguments: { node_id: 30, parameters: { widget: "frame_load_cap", value: 192 } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "ok." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "set it" }));
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_set_widget", arguments: { node_id: 30, parameters: { widget: "frame_load_cap", value: 192 } } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+  });
+
+  it("panel_call_tool without a name field says what is missing instead of 'Unknown panel tool '''", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [{ function: { name: "panel_call_tool", arguments: { args: { node_id: 3 } } } }],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "sorry" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    expect(panelCall).not.toHaveBeenCalled();
+    const toolMsg = chatRequests[1].messages.find((m) => m.role === "tool");
+    const content = String(toolMsg?.content);
+    expect(content).toContain('panel_call_tool requires a "name" field');
+    expect(content).toContain("panel_list_tools");
   });
 
   it("the model sees exactly six tools", async () => {
@@ -408,7 +1423,7 @@ describe("OllamaBackend", () => {
     const events = await collect(backend, turnsOf({ text: "hi" }));
     expect(events.some((e) => e.type === "error")).toBe(true);
     const results = events.filter((e) => e.type === "result");
-    expect(results).toEqual([{ type: "result", ok: false, subtype: "error" }]);
+    expect(results).toEqual([{ type: "result", ok: false, subtype: "error", turn: 1 }]);
   });
 
   it("interrupt() aborts the in-flight stream and yields one interrupted result", async () => {
@@ -426,7 +1441,7 @@ describe("OllamaBackend", () => {
     })();
     await done;
     const results = events.filter((e) => e.type === "result");
-    expect(results).toEqual([{ type: "result", ok: false, subtype: "interrupted" }]);
+    expect(results).toEqual([{ type: "result", ok: false, subtype: "interrupted", turn: 1 }]);
     expect(events.some((e) => e.type === "error")).toBe(false); // interrupt is not an error
   });
 
@@ -544,7 +1559,10 @@ describe("inline image delivery (per-model vision, graceful degradation)", () =>
     };
     expect(first.images).toHaveLength(1);
     expect(second.images).toBeUndefined();
-    expect(second.content).toContain("rejected image input");
+    // Model-facing note: it must be told it received NOTHING, in the wording
+    // that also covers a mixed image+audio strip (#790).
+    expect(second.content).toContain("did NOT receive them");
+    expect(second.content).toContain("did not see any image");
     // the user was told, and the turn still completed successfully
     const notes = events.filter((e) => e.type === "assistant").map((e) => (e as { text: string }).text);
     expect(notes.some((t) => t.includes("rejected image input"))).toBe(true);
@@ -577,5 +1595,404 @@ describe("inline image delivery (per-model vision, graceful degradation)", () =>
     await collect(backend, turnsOf({ text: "hello" }));
     const user = chatRequests[0].messages.find((m) => m.role === "user") as { images?: string[] };
     expect(user.images).toBeUndefined();
+  });
+});
+
+describe("the system prompt describes the surface that was actually advertised (#788)", () => {
+  it("compact says six tools and routes through call_tool", () => {
+    const p = ollamaSystemPrompt("compact");
+    expect(p).toContain("exactly six tools");
+    expect(p).toContain("list_tools / describe_tool / call_tool");
+  });
+
+  it("FULL does NOT claim there are six tools, nor that comfyui goes through the router", () => {
+    // Auto-selecting full while telling the model the tools do not exist would
+    // make the new selection worse than the old default: the model keeps calling
+    // a router that is no longer the way in.
+    const p = ollamaSystemPrompt("full");
+    expect(p).not.toContain("exactly six tools");
+    expect(p).toContain("advertised to you DIRECTLY");
+    // The panel router IS still a router, and must still be described as one.
+    expect(p).toContain("panel_list_tools");
+    // No tool COUNT is stated for the full surface (#726 rewrites it).
+    expect(p).not.toMatch(/\d+\s*(comfyui )?tools are advertised/i);
+  });
+
+  it("both modes keep the same operating rules", () => {
+    for (const mode of ["compact", "full"] as const) {
+      expect(ollamaSystemPrompt(mode)).toContain("never invent results");
+      expect(ollamaSystemPrompt(mode)).toContain("PAID credits");
+    }
+  });
+});
+
+describe("acceptsModelId — a live switch must not be silently ignored (#788)", () => {
+  it("takes any id the OpenAI-compatible endpoint's own catalog can return", () => {
+    // LM Studio and friends name models whatever they like: `local-model-70b`
+    // has neither a colon nor a slash. Refusing those meant the picker recorded
+    // and displayed the new model while the backend kept running the old one on
+    // the old tool surface — the wrong-model confusion model-keyed selection is
+    // supposed to prevent.
+    expect(acceptsModelId("local-model-70b", "openai")).toBe(true);
+    expect(acceptsModelId("Meta-Llama-3.1-405B-Instruct", "openai")).toBe(true);
+    expect(acceptsModelId("deepseek/deepseek-v4-pro", "openai")).toBe(true);
+  });
+
+  it("keeps the Ollama-tag shape rule on the NATIVE dialect", () => {
+    expect(acceptsModelId("qwen3:4b", "ollama")).toBe(true);
+    expect(acceptsModelId("artokun/gemma4-comfyui-mcp:e4b", "ollama")).toBe(true);
+    expect(acceptsModelId("local-model-70b", "ollama")).toBe(false); // not a tag
+  });
+
+  it("still refuses the hosted frontier ids PanelAgent passes through, on BOTH dialects", () => {
+    // This is the one thing the guard actually exists for.
+    for (const api of ["ollama", "openai"] as const) {
+      expect(acceptsModelId("claude-opus-5", api)).toBe(false);
+      expect(acceptsModelId("gpt-5.6-terra", api)).toBe(false);
+      expect(acceptsModelId("gemini-3-pro", api)).toBe(false);
+      expect(acceptsModelId("", api)).toBe(false);
+      expect(acceptsModelId("   ", api)).toBe(false);
+    }
+  });
+
+  it("gpt-oss is local, on both dialects", () => {
+    expect(acceptsModelId("gpt-oss:120b", "ollama")).toBe(true);
+    expect(acceptsModelId("gpt-oss-120b", "openai")).toBe(true);
+  });
+});
+
+describe("isOllamaModel — gpt-oss is a LOCAL family, not a hosted OpenAI model", () => {
+  it("accepts gpt-oss tags so a live switch to one actually takes effect (#788)", () => {
+    // #788 names gpt-oss:120b as a model that auto-selects the full surface. A
+    // blanket ^gpt exclusion refused the switch, leaving the panel showing one
+    // model while the backend ran another — wrong-model confusion exactly where
+    // model-keyed selection is the promise.
+    expect(isOllamaModel("gpt-oss:120b")).toBe(true);
+    expect(isOllamaModel("gpt-oss:20b")).toBe(true);
+  });
+
+  it("still refuses the hosted OpenAI/Claude/Gemini ids the guard exists for", () => {
+    expect(isOllamaModel("gpt-5.6-terra")).toBe(false);
+    expect(isOllamaModel("claude-opus-5")).toBe(false);
+    expect(isOllamaModel("gemini-3-pro")).toBe(false);
+  });
+});
+
+describe("comfyuiSpawnEnv (#667)", () => {
+  // The ollama path spawns the headless comfyui MCP COMPACT by default (small
+  // local models choke on the full ~200-schema list), but an EXPLICIT user
+  // choice must win over that default — the pre-#667 force overwrote even an
+  // explicit COMFYUI_MCP_TOOL_MODE=full.
+  it("an explicit COMFYUI_MCP_TOOL_MODE=full in the user env survives the ollama path", () => {
+    const env = comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "full", PATH: "/bin" });
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("full");
+    expect(env.PATH).toBe("/bin");
+  });
+
+  it("an explicit COMFYUI_MCP_TOOL_MODE=compact in the user env is honored (not just defaulted)", () => {
+    const env = comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" });
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+  });
+
+  it("the spec's resolved lane mode wins over an unset user env (orchestrator → child channel)", () => {
+    const env = comfyuiSpawnEnv({ COMFYUI_MCP_TOOL_MODE: "full", CIVITAI_API_TOKEN: "tok" }, {});
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("full");
+    expect(env.CIVITAI_API_TOKEN).toBe("tok");
+  });
+
+  it("unset env AND no spec mode gets the documented compact default", () => {
+    const env = comfyuiSpawnEnv(undefined, {});
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+  });
+
+  // #788 — with nobody having chosen, the MODEL decides rather than the provider.
+  it("a LARGE local model gets the full surface when nobody has chosen (#788)", () => {
+    expect(comfyuiSpawnEnv(undefined, {}, "llama3.3:70b").COMFYUI_MCP_TOOL_MODE).toBe("full");
+    const d = comfyuiSpawnToolMode(undefined, {}, "llama3.3:70b");
+    // The REASON matters: the same "full" would also come out of an override.
+    expect(d.source).toBe("model-parameters");
+  });
+
+  it("a SMALL local model keeps compact, attributed to the model (#788)", () => {
+    expect(comfyuiSpawnEnv(undefined, {}, "qwen3:4b").COMFYUI_MCP_TOOL_MODE).toBe("compact");
+    expect(comfyuiSpawnToolMode(undefined, {}, "qwen3:4b").source).toBe("model-parameters");
+  });
+
+  it("an explicit user choice still beats the model rule, in BOTH directions (#788)", () => {
+    expect(
+      comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" }, "llama3.3:70b").COMFYUI_MCP_TOOL_MODE,
+    ).toBe("compact");
+    expect(comfyuiSpawnToolMode(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" }, "llama3.3:70b").source).toBe(
+      "user-explicit",
+    );
+    expect(comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "full" }, "qwen3:4b").COMFYUI_MCP_TOOL_MODE).toBe(
+      "full",
+    );
+    expect(comfyuiSpawnToolMode(undefined, { COMFYUI_MCP_TOOL_MODE: "full" }, "qwen3:4b").source).toBe(
+      "user-explicit",
+    );
+  });
+
+  it("a spec-pinned mode (the HTTP lane's #291 value) still outranks the model rule", () => {
+    const d = comfyuiSpawnToolMode({ COMFYUI_MCP_TOOL_MODE: "compact" }, {}, "llama3.3:70b");
+    expect(d.mode).toBe("compact");
+    expect(d.source).toBe("caller-explicit");
+  });
+});
+
+describe("panel_ask survives a slow human answer (#325)", () => {
+  // ROOT CAUSE of #325: the ollama-family backends reach panel_* tools over the
+  // loopback HTTP MCP with an MCP SDK Client whose DEFAULT request timeout is
+  // 60s. panel_ask is DESIGNED to block on a human up to ~285s (240s card
+  // deadline + 45s late-answer grace, #486), so a user who didn't pick within
+  // 60s got `MCP error -32001: Request timed out` — and their eventual choice,
+  // delivered server-side, never reached the model. The fake panel client below
+  // models the SDK's timeout behavior faithfully: it rejects with the exact
+  // -32001 error when the request's timeout budget is shorter than the (slow)
+  // user's answer time, and delivers the pick otherwise.
+  const ASK_TOOL = [{ name: "panel_ask", description: "Ask the user to choose." }];
+  const ANSWERED_AT_MS = 90_000; // a slow-but-normal human answer (T+90s)
+  const USER_PICK = "Local GPU + Blender";
+
+  function sdkTimeoutPanelClient(calls: Array<{ name: string; timeout?: number }>) {
+    const callTool = vi.fn(
+      async (
+        params: { name: string; arguments: Record<string, unknown> },
+        _resultSchema?: unknown,
+        options?: { timeout?: number },
+      ) => {
+        calls.push({ name: params.name, timeout: options?.timeout });
+        // The MCP SDK's Protocol.request rejects with -32001 after `timeout` ms
+        // (60s when unspecified) — before a slow answer could ever arrive.
+        const budget = options?.timeout ?? 60_000;
+        if (budget < ANSWERED_AT_MS) throw new Error("MCP error -32001: Request timed out");
+        return { content: [{ type: "text", text: USER_PICK }] };
+      },
+    );
+    const client: McpToolClient = {
+      listTools: async () => ({ tools: ASK_TOOL }),
+      callTool: callTool as unknown as McpToolClient["callTool"],
+      close: async () => {},
+    };
+    return { client, callTool };
+  }
+
+  const ASK_ARGS = {
+    question: "Which?",
+    options: [{ label: "Local GPU + Blender" }, { label: "Cloud" }],
+  };
+
+  function scriptPanelAskTurn(direct: boolean) {
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: direct
+                  ? { name: "panel_ask", arguments: ASK_ARGS } // bare name — forgiving dispatch
+                  : { name: "panel_call_tool", arguments: { name: "panel_ask", args: ASK_ARGS } },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "done." }, done: true }],
+    );
+  }
+
+  function lastToolResult(): string {
+    const toolMsg = chatRequests[1].messages.filter((m) => m.role === "tool").at(-1);
+    return String(toolMsg?.content ?? "");
+  }
+
+  it("an answered card resolves the call with the user's choice (panel_call_tool router)", async () => {
+    const calls: Array<{ name: string; timeout?: number }> = [];
+    const { client: panel, callTool } = sdkTimeoutPanelClient(calls);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ panel }),
+    });
+    scriptPanelAskTurn(false);
+
+    await collect(backend, turnsOf({ text: "ask me which" }));
+    // The request carried a timeout that covers a slow human answer — NOT the
+    // SDK's 60s default that produced #325's -32001.
+    expect(calls).toEqual([{ name: "panel_ask", timeout: PANEL_TOOL_MCP_TIMEOUT_MS }]);
+    expect(callTool).toHaveBeenCalledTimes(1);
+    // …so the user's pick (validated at T+90s, past the old 60s kill) was fed
+    // back to the model as the tool result, not a -32001 transport error.
+    expect(lastToolResult()).toContain(USER_PICK);
+    expect(lastToolResult()).not.toContain("-32001");
+  });
+
+  it("an answered card resolves with the user's choice (forgiving direct dispatch)", async () => {
+    const calls: Array<{ name: string; timeout?: number }> = [];
+    const { client: panel } = sdkTimeoutPanelClient(calls);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ panel }),
+    });
+    scriptPanelAskTurn(true);
+
+    await collect(backend, turnsOf({ text: "ask me which" }));
+    expect(calls).toEqual([{ name: "panel_ask", timeout: PANEL_TOOL_MCP_TIMEOUT_MS }]);
+    expect(lastToolResult()).toContain(USER_PICK);
+    expect(lastToolResult()).not.toContain("-32001");
+  });
+
+  it("a genuine request timeout still surfaces truthfully (never swallowed)", async () => {
+    // The transport REALLY timed out (e.g. the user walked away past the whole
+    // card budget): the -32001 must reach the model as an honest tool error —
+    // the fix widens the budget, it does not hide a real timeout.
+    const callTool = vi.fn(async () => {
+      throw new Error("MCP error -32001: Request timed out");
+    });
+    const panel: McpToolClient = {
+      listTools: async () => ({ tools: ASK_TOOL }),
+      callTool: callTool as unknown as McpToolClient["callTool"],
+      close: async () => {},
+    };
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ panel }),
+    });
+    scriptPanelAskTurn(false);
+
+    await collect(backend, turnsOf({ text: "ask me which" }));
+    expect(lastToolResult()).toContain("-32001");
+  });
+
+  it("the client timeout covers the LONGEST blocking panel card with margin", () => {
+    // panel_ask / confirm / consent are hard-capped at ASK_TOTAL_BUDGET_CAP_MS;
+    // panel_request_secret waits up to 300s on its masked input. The client
+    // timeout must exceed BOTH or one can still be killed client-side mid-answer.
+    expect(PANEL_TOOL_MCP_TIMEOUT_MS).toBeGreaterThan(__panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS);
+    expect(PANEL_TOOL_MCP_TIMEOUT_MS).toBeGreaterThan(300_000);
+  });
+});
+
+describe("panel-router retraction rides the mode-varying prompt (main↔#788 merge seam)", () => {
+  it("no panel router → the system prompt retracts the panel tools; router present → no retraction", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    // Without a panel client the three panel_* routers don't exist — the prompt
+    // must say so rather than promise them (#841 lineage, kept through the merge).
+    let backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: comfy }) });
+    chatScript.push([{ message: { content: "hi" }, done: true }]);
+    await collect(backend, turnsOf({ text: "hello" }));
+    let sys = chatRequests.at(-1)!.messages[0] as { role: string; content: string };
+    expect(sys.role).toBe("system");
+    expect(sys.content).toContain("CORRECTION");
+    expect(sys.content).toContain("DO NOT EXIST");
+
+    const { client: panel } = fakeMcpClient([{ name: "panel_run", description: "Run." }]);
+    backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: comfy, panel }) });
+    chatScript.push([{ message: { content: "hi" }, done: true }]);
+    await collect(backend, turnsOf({ text: "hello" }));
+    sys = chatRequests.at(-1)!.messages[0] as { role: string; content: string };
+    expect(sys.content).not.toContain("CORRECTION");
+  });
+});
+
+describe("#2428 — a tool-less ollama ready names its cause", () => {
+  const infos: string[] = [];
+  const warns: string[] = [];
+
+  beforeEach(() => {
+    infos.length = 0;
+    warns.length = 0;
+    __resetOllamaToolSurfaceAnnouncementForTests();
+    vi.spyOn(logger, "info").mockImplementation((msg: string) => {
+      infos.push(msg);
+    });
+    vi.spyOn(logger, "warn").mockImplementation((msg: string) => {
+      warns.push(msg);
+    });
+  });
+
+  afterEach(() => {
+    vi.mocked(logger.info).mockRestore();
+    vi.mocked(logger.warn).mockRestore();
+    __resetOllamaToolSurfaceAnnouncementForTests();
+  });
+
+  it("ollamaZeroToolCause names never-connected vs empty-catalog and is silent only when tools exist", () => {
+    expect(ollamaZeroToolCause(null, 0)).toBe("never-connected");
+    expect(ollamaZeroToolCause(fakeMcpClient([]).client, 0)).toBe("empty-catalog");
+    expect(ollamaZeroToolCause(fakeMcpClient(COMFY_META).client, 3)).toBeNull();
+  });
+
+  it("prepare with no MCP clients is WARN degraded + never-connected, not a silent ready", async () => {
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({}),
+      mcpServers: { panel: { transport: "http", url: "http://127.0.0.1:9198/orchestrator::ollama" } },
+    });
+    await backend.prepare();
+
+    expect(warns).toContain(ollamaZeroToolCauseMessage("never-connected", "comfyui"));
+    expect(warns).toContain(ollamaZeroToolCauseMessage("never-connected", "panel"));
+    expect(
+      warns.some(
+        (line) =>
+          line.includes("degraded") &&
+          line.includes("0 comfyui tools") &&
+          line.includes("0 panel tools") &&
+          line.includes("cause: never-connected"),
+      ),
+    ).toBe(true);
+    expect(
+      infos.some((line) => line.includes("[ollama-backend] ready (") && line.includes("0 comfyui tools")),
+    ).toBe(false);
+  });
+
+  it("prepare with a connected empty catalog names empty-catalog on the degraded line", async () => {
+    const { client } = fakeMcpClient([]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: client }),
+    });
+    await backend.prepare();
+
+    expect(warns).toContain(ollamaZeroToolCauseMessage("empty-catalog", "comfyui"));
+    expect(
+      warns.some(
+        (line) =>
+          line.includes("degraded") && line.includes("0 comfyui tools") && line.includes("cause: empty-catalog"),
+      ),
+    ).toBe(true);
+    expect(
+      infos.some((line) => line.includes("[ollama-backend] ready (") && line.includes("0 comfyui tools")),
+    ).toBe(false);
+  });
+
+  it("a later prepare that gains tools logs tool surface recovered", async () => {
+    const empty = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({}),
+    });
+    await empty.prepare();
+
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel } = fakeMcpClient([{ name: "panel_run", description: "Run." }]);
+    const live = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    await live.prepare();
+
+    expect(infos).toContain(
+      ollamaToolSurfaceRecoveredMessage({ comfy: 0, panel: 0 }, { comfy: COMFY_META.length, panel: 1 }),
+    );
+    expect(
+      infos.some(
+        (line) =>
+          line.includes("[ollama-backend] ready (") &&
+          line.includes(`${COMFY_META.length} comfyui tools`) &&
+          line.includes("1 panel tools"),
+      ),
+    ).toBe(true);
   });
 });

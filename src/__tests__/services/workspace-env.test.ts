@@ -1,7 +1,18 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdtemp, rm, readFile, writeFile, mkdir, symlink } from "node:fs/promises";
+import { tmpdir, platform } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { itWithSymlinks } from "../helpers/platform.js";
+
+const IS_WIN = platform() === "win32";
+/** Create a venv interpreter on disk under `root`, returning its absolute path. */
+async function makeVenvPython(root: string): Promise<string> {
+  const bin = IS_WIN ? join(root, ".venv", "Scripts") : join(root, ".venv", "bin");
+  await mkdir(bin, { recursive: true });
+  const exe = join(bin, IS_WIN ? "python.exe" : "python3");
+  await writeFile(exe, "", "utf-8");
+  return exe;
+}
 
 // ---------------------------------------------------------------------------
 // Mocks for modules with side effects / network at load time
@@ -12,9 +23,23 @@ type ExecResult = { stdout?: string; stderr?: string } | Error;
 // Shared mutable state created via vi.hoisted so the vi.mock factories (which
 // are hoisted to the top of the module) can safely reference it.
 const h = vi.hoisted(() => {
+  // GROUND TRUTH seam (#401): undefined = "we could not observe the interpreter",
+  // which is the default and must always degrade to unknown.
+  const mockLiveInterpreter = vi.fn(() => undefined as unknown);
   return {
-    mockConfig: { comfyuiPath: undefined as string | undefined, resolvedPort: 8188 },
+    mockConfig: {
+      comfyuiPath: undefined as string | undefined,
+      comfyuiCodePath: undefined as string | undefined,
+      resolvedPort: 8188,
+    },
     mockGetSystemStats: vi.fn(),
+    remoteMode: { value: false },
+    mockLiveInterpreter,
+    // The SAME observation, reported without collapsing it to the interpreter
+    // (#1374). Defaults to whatever the interpreter seam says, so every case that
+    // only cares about the interpreter keeps configuring one thing; the cases that
+    // exercise the OS-image fallback override this one directly.
+    mockLiveProcess: vi.fn((...args: unknown[]) => mockLiveInterpreter(...(args as []))),
     execFileResponder: (() => new Error("not configured")) as (
       cmd: string,
       args: string[],
@@ -26,10 +51,17 @@ vi.mock("../../config.js", () => ({
   config: h.mockConfig,
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
   getComfyUIAuthHeaders: () => ({}),
+  // resolveComfyuiPython → resolveEffectiveComfyUIBase + getEnvironment consult this.
+  isRemoteMode: () => h.remoteMode.value,
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: () => h.mockGetSystemStats(),
+}));
+
+vi.mock("../../services/live-interpreter.js", () => ({
+  resolveLiveInterpreter: (...args: unknown[]) => h.mockLiveInterpreter(...(args as [])),
+  observeLiveServerProcess: (...args: unknown[]) => h.mockLiveProcess(...(args as [])),
 }));
 
 // execFile is wrapped by promisify() at module load. The mock invokes the
@@ -61,11 +93,29 @@ function setExecFileResponder(
 
 import {
   configureWorkspace,
+  markLocalComfyUILaunched,
+  resetLocalComfyUILaunchState,
   resetWorkspaceConfig,
   getWorkspace,
   setDefaultWorkspace,
   listWorkspaces,
   getEnvironment,
+  liveRootFromArgv,
+  liveScriptFromArgv,
+  resolveComfyuiPython,
+  resolveEffectiveComfyUIBase,
+  resolveEffectiveComfyUIBaseLive,
+  resolveCustomNodesScanBaseLive,
+  resolveCustomNodesScanBaseLiveStrict,
+  resolveEffectiveComfyUICodeBase,
+  resolveEffectiveComfyUICodeBaseLive,
+  resolveLocalWorkspaceBase,
+  resolveInstallInterpreter,
+  resolveLiveComfyUIBase,
+  getLiveServerSnapshot,
+  resolveLiveServerRoot,
+  resolveRootInterpreter,
+  torchVersionsAgree,
 } from "../../services/workspace-env.js";
 
 async function tmpDir(): Promise<string> {
@@ -74,19 +124,467 @@ async function tmpDir(): Promise<string> {
 
 beforeEach(() => {
   mockConfig.comfyuiPath = undefined;
+  mockConfig.comfyuiCodePath = undefined;
   mockConfig.resolvedPort = 8188;
+  h.remoteMode.value = false;
+  h.mockLiveInterpreter.mockReset();
+  h.mockLiveInterpreter.mockReturnValue(undefined); // no observation by default
+  h.mockLiveProcess.mockReset();
+  // Reinstalled here (mockReset drops the factory default): the process observation
+  // follows the interpreter seam unless a case overrides it.
+  h.mockLiveProcess.mockImplementation((...args: unknown[]) =>
+    h.mockLiveInterpreter(...(args as [])),
+  );
   mockGetSystemStats.mockReset();
   setExecFileResponder(() => new Error("not configured"));
   resetWorkspaceConfig();
   delete process.env.COMFYUI_PATH;
+  delete process.env.COMFYUI_CODE_PATH;
 });
 
 afterEach(() => {
   resetWorkspaceConfig();
+  resetLocalComfyUILaunchState();
+});
+
+describe("resolveInstallInterpreter (#651)", () => {
+  it("refuses a live Desktop-style bundle with two possible environments", async () => {
+    const base = await tmpDir();
+    try {
+      const serverRoot = join(base, "ComfyUI");
+      await mkdir(serverRoot, { recursive: true });
+      await writeFile(join(serverRoot, "main.py"), "", "utf-8");
+      await makeVenvPython(base);
+      await makeVenvPython(serverRoot);
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join("ComfyUI", "main.py")] },
+      });
+
+      const result = await resolveInstallInterpreter(base);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("sys.executable");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when no server is reachable rather than installing into a layout guess", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("Cannot verify the running server's interpreter");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a single discovered venv as the externally launched server", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
+
+      const result = await resolveInstallInterpreter(root);
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses rather than falling back to the requested path when live ComfyUI is another install", async () => {
+    const parent = await tmpDir();
+    try {
+      const requested = join(parent, "requested");
+      const live = join(parent, "live");
+      await mkdir(live, { recursive: true });
+      await writeFile(join(live, "main.py"), "", "utf-8");
+      await makeVenvPython(requested);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(live, "main.py")] } });
+
+      const result = await resolveInstallInterpreter(requested);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+      expect(result.reason).toContain("different install");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT trust an unvalidated launch mark — a stale record must not direct installs (#401)", async () => {
+    // The old workspace-env launch record answered here with no process-identity
+    // proof: our child could be dead, its PID recycled, and another server now on
+    // the port under the SAME install root with a recreated/different venv — yet
+    // pip/update work would have been sent to the OLD interpreter while the result
+    // claimed to be exact. After unification the only launch record is
+    // live-interpreter.ts (PID + creation time), so when the observation channel
+    // cannot validate the process the resolver REFUSES — env-trust (#633) is not
+    // interpreter-identity.
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
+      markLocalComfyUILaunched(); // env-trust mark only — NOT an interpreter record
+      h.mockLiveInterpreter.mockReturnValue(undefined); // identity NOT confirmed
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+    } finally {
+      resetLocalComfyUILaunchState();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  /** Version + torch probes that agree with the running server (trusted). */
+  function mockTrustedInterpreterProbes(opts?: { version?: string; torch?: string }): void {
+    const version = opts?.version ?? "3.12.12";
+    const torch = opts?.torch ?? "2.13.0";
+    setExecFileResponder((_cmd, args) => {
+      if (args.includes("--version") || args.some((a) => a.includes("sys.version"))) {
+        return { stdout: `Python ${version}\n` };
+      }
+      if (args.includes("pip")) return { stdout: `Name: torch\nVersion: ${torch}\n` };
+      return new Error("nope");
+    });
+  }
+
+  it("uses the OS-OBSERVED interpreter when the port owner corroborates the server argv (#401)", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(root, "main.py")],
+          python_version: "3.12.12",
+          pytorch_version: "2.13.0+cu130",
+        },
+      });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "process-table",
+        pid: 777,
+      });
+      mockTrustedInterpreterProbes();
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "observed",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("maps an identity-confirmed launch record from the observation channel to source launched", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts a validated launched-by-us record even when argv names no resolvable main.py", async () => {
+    // We KNOW what we spawned: a PID + creation-time-validated launch record is
+    // authoritative without an argv-derived root to corroborate (#651 semantics,
+    // now carried by the validated channel).
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: ["--port", "8188"] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let a validated launched-by-us record bypass the different-install refusal", async () => {
+    const parent = await tmpDir();
+    try {
+      const requested = join(parent, "requested");
+      const live = join(parent, "live");
+      await mkdir(live, { recursive: true });
+      await writeFile(join(live, "main.py"), "", "utf-8");
+      await makeVenvPython(requested);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(live, "main.py")] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/elsewhere/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      const result = await resolveInstallInterpreter(requested);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+      expect(result.reason).toContain("different install");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses in remote mode even when an observation is available (ladder order)", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      h.remoteMode.value = true;
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("remote");
+    } finally {
+      h.remoteMode.value = false;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an observation bypass the different-install refusal", async () => {
+    const parent = await tmpDir();
+    try {
+      const requested = join(parent, "requested");
+      const live = join(parent, "live");
+      await mkdir(live, { recursive: true });
+      await writeFile(join(live, "main.py"), "", "utf-8");
+      await makeVenvPython(requested);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(live, "main.py")] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/elsewhere/python.exe",
+        source: "process-table",
+        pid: 777,
+      });
+
+      const result = await resolveInstallInterpreter(requested);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+      expect(result.reason).toContain("different install");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an observation bypass the no-resolvable-main.py refusal", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: ["--port", "8188"] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/elsewhere/python.exe",
+        source: "process-table",
+        pid: 777,
+      });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("main.py");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses in remote mode: a local install would not affect the remote server", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      h.remoteMode.value = true;
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("remote");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the running server does not report a resolvable main.py location", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: ["--port", "8188"] } });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("main.py");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicit COMFYUI_PYTHON override even when nothing is reachable", async () => {
+    const root = await tmpDir();
+    try {
+      process.env.COMFYUI_PYTHON = "C:/explicit/python.exe";
+      mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "C:/explicit/python.exe",
+        source: "override",
+      });
+    } finally {
+      delete process.env.COMFYUI_PYTHON;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an observed Stability Matrix BASE interpreter that has no torch while ComfyUI reports pytorch (#2530)", async () => {
+    // The reporter's shape: process-table argv[0] is the uv-managed base CPython
+    // (no torch, PEP 668), while the running ComfyUI imported torch 2.13.0+cu130.
+    // install_comfyui(environment) already sets python_probe_trusted:false; pip
+    // must not target that same interpreter.
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      const basePy =
+        "A:/StabilityMatrix-win-x64/Data/Assets/Python/cpython-3.12.12-windows-x86_64-none/python.exe";
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(root, "main.py")],
+          python_version: "3.12.12",
+          pytorch_version: "2.13.0+cu130",
+        },
+      });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: basePy,
+        source: "process-table",
+        pid: 4242,
+      });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") || args.some((a) => a.includes("sys.version"))) {
+          return { stdout: "Python 3.12.12\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr:
+              "WARNING: Package(s) not found: torch, torchvision, torchaudio, xformers, numpy, transformers, diffusers, comfyui-frontend-package\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toMatch(/none of torch/i);
+      expect(result.reason).toMatch(/2\.13\.0\+cu130/);
+      expect(result.reason).toMatch(/action:"fix"/);
+      expect(result.reason).not.toMatch(/-m pip install/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an observed interpreter whose torch disagrees with the running ComfyUI (#2530)", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(root, "main.py")],
+          python_version: "3.12.12",
+          pytorch_version: "2.13.0+cu130",
+        },
+      });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/wrong-venv/Scripts/python.exe",
+        source: "process-table",
+        pid: 99,
+      });
+      mockTrustedInterpreterProbes({ version: "3.12.12", torch: "2.4.0" });
+
+      const result = await resolveInstallInterpreter(root);
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toMatch(/does not match the running ComfyUI pytorch/i);
+      expect(result.reason).not.toMatch(/-m pip install/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("still hands out an observed interpreter when its torch matches the running ComfyUI (#2530)", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      const venvPy = "D:/ComfyUI/.venv/Scripts/python.exe";
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(root, "main.py")],
+          python_version: "3.12.12",
+          pytorch_version: "2.13.0+cu130",
+        },
+      });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: venvPy,
+        source: "process-table",
+        pid: 777,
+      });
+      mockTrustedInterpreterProbes({ version: "3.12.12", torch: "2.13.0" });
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: venvPy,
+        source: "observed",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
-// set_default_workspace / get_workspace round-trip
+// workspace action:"set_default" / action:"get" round-trip
 // ---------------------------------------------------------------------------
 
 describe("setDefaultWorkspace + getWorkspace round-trip", () => {
@@ -105,7 +603,7 @@ describe("setDefaultWorkspace + getWorkspace round-trip", () => {
       const raw = JSON.parse(await readFile(cfgPath, "utf-8"));
       expect(raw.defaultWorkspace).toBe("/some/ComfyUI");
 
-      // get_workspace reads it back; no comfyuiPath so source is default-config
+      // getWorkspace() reads it back; no comfyuiPath so source is default-config
       const ws = await getWorkspace();
       expect(ws.default_workspace).toBe("/some/ComfyUI");
       expect(ws.workspace_path).toBe("/some/ComfyUI");
@@ -205,7 +703,7 @@ describe("setDefaultWorkspace + getWorkspace round-trip", () => {
 });
 
 // ---------------------------------------------------------------------------
-// list_workspaces
+// workspace action:"list"
 // ---------------------------------------------------------------------------
 
 describe("listWorkspaces", () => {
@@ -241,10 +739,191 @@ describe("listWorkspaces", () => {
 });
 
 // ---------------------------------------------------------------------------
-// get_environment
+// install_comfyui (action:"environment")
 // ---------------------------------------------------------------------------
 
+describe("resolveEffectiveComfyUIBase vs resolveLocalWorkspaceBase (#490)", () => {
+  // Two different questions that shared one answer. "Where is the user's local install?"
+  // was being read as "which install does this operation act on?", and the resolver
+  // returned config.comfyuiPath BEFORE looking at the mode — so a remote session with a
+  // stale local COMFYUI_PATH (the ordinary local configuration) got that unrelated
+  // install as its target. Read-only callers got a wrong answer; comfy-cli uninstall and
+  // named-snapshot save acted on it.
+  it("does NOT return COMFYUI_PATH as the operation target in remote mode", async () => {
+    const dir = await tmpDir();
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dir; // a stale local path, exactly as reported
+      h.remoteMode.value = true;
+
+      expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+      // …while the LOCAL-machine question still answers, because that is a different
+      // question and a legitimate one. Collapsing them is the bug; deleting one is not
+      // the fix.
+      expect(resolveLocalWorkspaceBase()).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still returns COMFYUI_PATH as the target in a local session", async () => {
+    // The over-strict direction would be its own bug: every filesystem-backed tool
+    // depends on this answer.
+    const dir = await tmpDir();
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dir;
+      h.remoteMode.value = false;
+
+      expect(resolveEffectiveComfyUIBase()).toBe(dir);
+      expect(resolveLocalWorkspaceBase()).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls through to the saved default workspace locally, and refuses it remotely", async () => {
+    const dir = await tmpDir();
+    const install = join(dir, "Saved");
+    await mkdir(install, { recursive: true });
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      await setDefaultWorkspace(install);
+      mockConfig.comfyuiPath = undefined;
+
+      h.remoteMode.value = false;
+      expect(resolveEffectiveComfyUIBase()).toBe(install);
+
+      h.remoteMode.value = true;
+      expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+      expect(resolveLocalWorkspaceBase()).toBe(install);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("split code-root resolution", () => {
+  it("preserves the effective COMFYUI_PATH base when no code override is set", () => {
+    mockConfig.comfyuiPath = "/data-and-code";
+    expect(resolveEffectiveComfyUICodeBase()).toBe("/data-and-code");
+  });
+
+  it("uses COMFYUI_CODE_PATH for synchronous code-facing tools", () => {
+    mockConfig.comfyuiPath = "/data";
+    mockConfig.comfyuiCodePath = "/code";
+    expect(resolveEffectiveComfyUICodeBase()).toBe("/code");
+  });
+
+  it("refuses every local code root in remote mode", async () => {
+    mockConfig.comfyuiPath = "/data";
+    mockConfig.comfyuiCodePath = "/code";
+    h.remoteMode.value = true;
+    expect(resolveEffectiveComfyUICodeBase()).toBeUndefined();
+    await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBeUndefined();
+  });
+
+  it("prefers the reachable server's observed main.py root, then falls back to the explicit code root", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      mockConfig.comfyuiPath = "/data";
+      mockConfig.comfyuiCodePath = "/offline-code";
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", join(root, "main.py")] },
+      });
+      await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBe(root);
+
+      mockGetSystemStats.mockRejectedValue(new Error("offline"));
+      await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBe("/offline-code");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("still adopts the live main.py checkout when --base-directory is unresolvable", async () => {
+    // DATA resolver fail-closes here (#1715). CODE operations still want the
+    // checkout: main.py is the right tree for pip/venv/core git even when the
+    // pack root cannot be named.
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      mockConfig.comfyuiCodePath = "/offline-code";
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", join(root, "main.py"), "--base-directory", "data"] },
+      });
+      await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBe(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("getEnvironment", () => {
+  it("reports and probes split data and code roots independently", async () => {
+    const dir = await tmpDir();
+    const dataRoot = join(dir, "data");
+    const codeRoot = join(dir, "code");
+    try {
+      await mkdir(dataRoot, { recursive: true });
+      await mkdir(join(codeRoot, ".git"), { recursive: true });
+      await mkdir(join(dataRoot, "custom_nodes", "ComfyUI-Manager"), { recursive: true });
+      await writeFile(
+        join(dataRoot, "custom_nodes", "ComfyUI-Manager", "pyproject.toml"),
+        'version = "3.41"\n',
+        "utf-8",
+      );
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dataRoot;
+      mockConfig.comfyuiCodePath = codeRoot;
+      mockGetSystemStats.mockRejectedValueOnce(new Error("offline"));
+      setExecFileResponder((cmd, args) => {
+        if (cmd === "git" && args.includes("--short")) return { stdout: "abc123\n" };
+        if (cmd === "git" && args.includes("--abbrev-ref")) return { stdout: "main\n" };
+        return new Error("not configured");
+      });
+
+      const env = await getEnvironment();
+
+      expect(env.local.workspace_path).toBe(dataRoot);
+      expect(env.local.code_path).toBe(codeRoot);
+      expect(env.local.code_path_source).toBe("env");
+      expect(env.local.git).toEqual({ rev: "abc123", branch: "main" });
+      // No trusted interpreter, so no pip Manager version — custom_nodes is fallback (#2538).
+      expect(env.local.comfyui_manager_version).toBe("3.41");
+      expect(env.local.note).toMatch(/Split install/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not label COMFYUI_CODE_PATH as local.workspace_path when no data root is set", async () => {
+    const dir = await tmpDir();
+    const codeRoot = join(dir, "code");
+    try {
+      await mkdir(join(codeRoot, ".git"), { recursive: true });
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = undefined;
+      mockConfig.comfyuiCodePath = codeRoot;
+      mockGetSystemStats.mockRejectedValueOnce(new Error("offline"));
+      setExecFileResponder((cmd, args) => {
+        if (cmd === "git" && args.includes("--short")) return { stdout: "def456\n" };
+        if (cmd === "git" && args.includes("--abbrev-ref")) return { stdout: "main\n" };
+        return new Error("not configured");
+      });
+
+      const env = await getEnvironment();
+
+      expect(env.local.workspace_path).toBeUndefined();
+      expect(env.local.code_path).toBe(codeRoot);
+      expect(env.local.code_path_source).toBe("env");
+      expect(env.local.git).toEqual({ rev: "def456", branch: "main" });
+      expect(env.local.note).toMatch(/no data\/base workspace/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reports running instance from system_stats and degrades local probes when no path", async () => {
     const dir = await tmpDir();
     try {
@@ -315,10 +994,14 @@ describe("getEnvironment", () => {
     }
   });
 
-  it("captures the unreachable error and still returns local probes when path set", async () => {
+  it("captures the unreachable error and still returns local probes for a real workspace venv", async () => {
     const dir = await tmpDir();
     const install = join(dir, "ComfyUI");
     await mkdir(install, { recursive: true });
+    // A real workspace venv on disk → resolved.verified, so an unreachable server's
+    // packages are still reported (#401 round 3: only a VERIFIED interpreter is
+    // trusted when unreachable, never a bare PATH fallback).
+    await makeVenvPython(install);
     try {
       configureWorkspace({ configPath: join(dir, "workspace.json") });
       mockConfig.comfyuiPath = install;
@@ -346,8 +1029,11 @@ describe("getEnvironment", () => {
 
       expect(env.local.workspace_path).toBe(install);
       expect(env.local.python?.version).toBe("3.11.5");
-      expect(env.local.packages?.torch).toBe("2.3.1");
-      expect(env.local.packages?.numpy).toBe("1.26.4");
+      // The server is DOWN, so no process exists to observe: the interpreter shown is
+      // a layout guess and its package list is withheld (#401 terminating rule).
+      expect(env.local.python_probe_source).toBe("layout-guess");
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
       // No .git directory created → git omitted
       expect(env.local.git).toBeUndefined();
     } finally {
@@ -405,10 +1091,1720 @@ describe("getEnvironment", () => {
       });
 
       const env = await getEnvironment();
+      // Offline / untrusted probe: no pip package list, so the custom_nodes
+      // checkout is the fallback — not a claim that this is the live Manager (#2538).
       expect(env.local.comfyui_manager_version).toBe("3.10.1");
       expect(env.local.git).toEqual({ rev: "abc1234", branch: "master" });
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // #401 — the TERMINATING RULE. An interpreter is authoritative only when we
+  // OBSERVED it (we launched the process, or the OS told us what it is running).
+  // Layout inference selects what to PROBE and nothing more.
+  // -------------------------------------------------------------------------
+
+  /** Stage a workspace whose layout GUESS resolves to a venv on disk. */
+  async function stageWorkspace(dir: string): Promise<string> {
+    const install = join(dir, "ComfyUI");
+    await mkdir(install, { recursive: true });
+    const exe = await makeVenvPython(install);
+    configureWorkspace({ configPath: join(dir, "workspace.json") });
+    mockConfig.comfyuiPath = install;
+    return exe;
+  }
+
+  function statsReachable(python = "3.12.11"): void {
+    mockGetSystemStats.mockResolvedValueOnce({
+      system: {
+        os: "nt",
+        python_version: python,
+        comfyui_version: "0.27.1",
+        embedded_python: false,
+        argv: [],
+      },
+      devices: [],
+    });
+  }
+
+  async function writeLegacyManager(install: string, version: string): Promise<void> {
+    await mkdir(join(install, "custom_nodes", "ComfyUI-Manager"), { recursive: true });
+    await writeFile(
+      join(install, "custom_nodes", "ComfyUI-Manager", "pyproject.toml"),
+      `[project]\nname = "comfyui-manager"\nversion = "${version}"\n`,
+      "utf-8",
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // #2538 — a leftover custom_nodes/ComfyUI-Manager checkout is not the live
+  // Manager when ComfyUI --enable-manager serves the pip package instead.
+  // -------------------------------------------------------------------------
+
+  it("prefers a trusted pip comfyui-manager over a leftover custom_nodes checkout (#2538)", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    const install = join(dir, "ComfyUI");
+    await writeLegacyManager(install, "3.41");
+    try {
+      statsReachable("3.12.11");
+      h.mockLiveInterpreter.mockReturnValue({
+        python: exe,
+        source: "launched-by-us",
+        pid: 4242,
+      });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.11\n" };
+        if (args.includes("pip")) {
+          const records = ["Name: torch\nVersion: 2.5.0"];
+          // Only emit the pip Manager if the probe actually asked for it — otherwise
+          // this would pass on a KEY_PACKAGES list that still ignores comfyui-manager.
+          if (args.includes("comfyui-manager") || args.includes("comfyui_manager")) {
+            records.push("Name: comfyui-manager\nVersion: 4.2.2");
+          }
+          return { stdout: `${records.join("\n---\n")}\n` };
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.["comfyui-manager"]).toBe("4.2.2");
+      expect(env.local.comfyui_manager_version).toBe("4.2.2");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to custom_nodes when a trusted probe has no pip comfyui-manager (#2538)", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    const install = join(dir, "ComfyUI");
+    await writeLegacyManager(install, "3.41");
+    try {
+      statsReachable("3.12.11");
+      h.mockLiveInterpreter.mockReturnValue({
+        python: exe,
+        source: "launched-by-us",
+        pid: 4242,
+      });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.11\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.5.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.["comfyui-manager"]).toBeUndefined();
+      expect(env.local.comfyui_manager_version).toBe("3.41");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not invent a pip Manager version after a trusted probe is withdrawn (#2538)", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    const install = join(dir, "ComfyUI");
+    await writeLegacyManager(install, "3.41");
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "nt",
+          python_version: "3.12.11",
+          comfyui_version: "0.27.1",
+          pytorch_version: "2.9.0",
+          embedded_python: false,
+          argv: [],
+        },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: exe,
+        source: "process-table",
+        pid: 99,
+      });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.11\n" };
+        if (args.includes("pip")) {
+          const records = ["Name: torch\nVersion: 1.0.0"];
+          if (args.includes("comfyui-manager") || args.includes("comfyui_manager")) {
+            records.push("Name: comfyui-manager\nVersion: 4.2.2");
+          }
+          return { stdout: `${records.join("\n---\n")}\n` };
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      // Fail-closed: a withdrawn probe's pip 4.2.2 must not be reported as live.
+      expect(env.local.comfyui_manager_version).toBe("3.41");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports UNKNOWN (never a package list) when the interpreter was not observed", async () => {
+    const dir = await tmpDir();
+    await stageWorkspace(dir);
+    try {
+      statsReachable();
+      h.mockLiveInterpreter.mockReturnValue(undefined); // could not observe the process
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.11\n" };
+        // Even a PERFECTLY matching python must not unlock this list.
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.5.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_source).toBe("layout-guess");
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/BEST GUESS/);
+      expect(env.local.note).toMatch(/#401/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts the interpreter WE launched ComfyUI with", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.12.11");
+      h.mockLiveInterpreter.mockReturnValue({
+        python: exe,
+        source: "launched-by-us",
+        pid: 4242,
+      });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.11\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.5.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python?.executable).toBe(exe);
+      expect(env.local.python_probe_source).toBe("launched-by-us");
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.torch).toBe("2.5.0");
+      expect(env.local.python_probe_reason).toMatch(/launched ComfyUI/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts the interpreter the OS reports for the process on our port", async () => {
+    const dir = await tmpDir();
+    await stageWorkspace(dir);
+    // The OS names an interpreter the layout guess would NEVER have found — which is
+    // the whole point: observation beats inference.
+    const elsewhere = join(dir, "somewhere-else", "python.exe");
+    await mkdir(join(dir, "somewhere-else"), { recursive: true });
+    await writeFile(elsewhere, "", "utf-8");
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({
+        python: elsewhere,
+        source: "process-table",
+        pid: 777,
+      });
+      setExecFileResponder((cmd, args) => {
+        if (args.includes("--version"))
+          return { stdout: cmd === elsewhere ? "Python 3.13.12\n" : "Python 3.10.0\n" };
+        if (args.includes("pip"))
+          return {
+            stdout:
+              cmd === elsewhere ? "Name: torch\nVersion: 9.1.0\n" : "Name: torch\nVersion: 0.0.1\n",
+          };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python?.executable).toBe(elsewhere);
+      expect(env.local.python_probe_source).toBe("process-table");
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.torch).toBe("9.1.0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades to UNKNOWN when an OBSERVED interpreter contradicts the running python", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12"); // server says 3.13.12 …
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 99 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.11.9\n" }; // … probe says 3.11.9
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/does not match the running ComfyUI python/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says the comparison could NOT BE MADE, not that it failed, when the server reports no python", async () => {
+    // `pythonVersionsAgree` returns false when EITHER side is missing, so an unreported
+    // server python fell into the mismatch branch and the reason read "does not match the
+    // running ComfyUI python (unreported)" — asserting a disagreement nobody observed.
+    // One verdict, two causes, and the message named the wrong one; a user reading it
+    // would go hunting for a version conflict that does not exist.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", comfyui_version: "0.27.1", embedded_python: false, argv: [] },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 77 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      // Still fail-closed — an unverified match is not a verified one.
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      // …but the REASON must describe what actually happened. Asserting only the state
+      // would pass on the old, wrong message too.
+      expect(env.local.python_probe_reason).toMatch(/could\s+NOT be compared/);
+      expect(env.local.python_probe_reason).toMatch(/unverified match, not a mismatch/);
+      expect(env.local.python_probe_reason).not.toMatch(/does not match the running/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts a launched-by-us interpreter even when no cross-check was possible", async () => {
+    // The other direction. We CHOSE this interpreter and spawned the process; a
+    // corroboration we never needed being unavailable is not a reason to withhold a
+    // package list we genuinely know.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", comfyui_version: "0.27.1", embedded_python: false, argv: [] },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "launched-by-us", pid: 78 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.9.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.torch).toBe("2.9.0");
+      expect(env.local.python_probe_reason).toMatch(/no\s+cross-check was possible/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes 'pip answered, nothing installed' from 'pip never answered'", async () => {
+    // An empty package map has two causes and the note used to assert one of them. On a
+    // uv-created venv — which frequently has NO pip at all — the "pip did not answer"
+    // case is the common one, and calling it "none of these are installed" would be a
+    // false capability report of exactly the kind #401 is about.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 12 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        // pip's OWN full-miss output, from the SAME invocation. It EXITS 1 and warns on
+        // stderr, so the rejection carries the evidence — a separate later
+        // `pip --version` would prove only that pip can start now, never that this
+        // query ran.
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr: "WARNING: Package(s) not found: torch, numpy\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip answered and none of/);
+      expect(env.local.note).not.toMatch(/did not answer at all/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says the query FAILED when pip itself does not answer (uv venvs often have no pip)", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 13 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) return new Error("No module named pip");
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).toMatch(/NOT evidence that these packages are missing/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the packages pip DID find when other requested ones are missing", async () => {
+    // `pip show a b c` exits 1 whenever ANY name is missing, and KEY_PACKAGES contains
+    // xformers and diffusers — absent on most real machines. The shared `probe()` helper
+    // discards everything on a non-zero exit, so the records pip HAD produced (torch
+    // among them) were thrown away and install_comfyui (action:"environment") reported no packages at all on
+    // installs that plainly had them.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 15 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "Name: torch\nVersion: 2.9.0\n---\nName: numpy\nVersion: 2.1.0\n",
+            stderr: "WARNING: Package(s) not found: xformers, diffusers\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages?.torch).toBe("2.9.0");
+      expect(env.local.packages?.numpy).toBe("2.1.0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not accept a stray mention of the phrase as pip's not-found warning", async () => {
+    // The evidence has to be pip's STRUCTURED line. A traceback or wrapper that merely
+    // quotes "Package(s) not found" would otherwise license the "none of these are
+    // installed" claim off a `pip show` that never ran.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 16 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr:
+              "Traceback (most recent call last):\n" +
+              '  File "<frozen importlib>", line 1, in <module>\n' +
+              "RuntimeError: broken plugin said Package(s) not found somewhere\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a KILLED pip show as a completed no-match", async () => {
+    // The shortcut this replaced: `pip show` dies on the 8s timeout, a follow-up
+    // `pip --version` answers instantly, and the silence of the FIRST query gets
+    // vouched for by the SECOND — reporting "none of these are installed" about a
+    // question that was never answered. Only evidence inside the failed invocation
+    // itself can settle it, and there is none here.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 14 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        // `pip show` killed by the timeout: no output at all, no warning.
+        if (args.includes("show")) return new Error("Command failed: timed out, SIGTERM");
+        // A LATER `pip --version` would succeed — and must not be consulted.
+        if (args.includes("pip")) return { stdout: "pip 24.0 from …\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("compares the FULL python version, not just major.minor", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      // Same 3.13 major.minor, different patch → a contradiction we now catch.
+      statsReachable("3.13.12 (main, Feb 12 2026, 00:38:53) [MSC v.1944 64 bit (AMD64)]");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 5 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.4\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 1.0.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still SELECTS the server venv for a Desktop-style relative argv (selection survives)", async () => {
+    // Selection is still layout-driven and still lands on the right interpreter —
+    // that is what makes a POSITIVE capability finding possible. It just cannot
+    // authorize a package list without an observation.
+    const dir = await tmpDir();
+    const base = join(dir, "Desktop");
+    const server = join(base, "ComfyUI");
+    await mkdir(server, { recursive: true });
+    await writeFile(join(server, "main.py"), "", "utf-8");
+    const wrongExe = await makeVenvPython(base);
+    const rightExe = await makeVenvPython(server);
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = base;
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "nt",
+          python_version: "3.13.12",
+          comfyui_version: "0.27.1",
+          embedded_python: false,
+          argv: [IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py"],
+        },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue(undefined);
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.9.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python?.executable).toBe(rightExe);
+      expect(env.local.python?.executable).not.toBe(wrongExe);
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("untrusts a process-table hit that has no torch while /system_stats reports pytorch (#401)", async () => {
+    // 0.52.1 recurrence: macOS Homebrew base marked trusted (versions agree with
+    // the venv by construction), pip answers, none of torch/vision/audio are
+    // there, while the reachable server's /system_stats reports PyTorch 2.12.1.
+    // Reporting that as "not installed" is the same false capability as Triton.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "darwin",
+          python_version: "3.12.13",
+          comfyui_version: "0.27.0",
+          pytorch_version: "2.12.1",
+          embedded_python: false,
+          argv: [],
+        },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 88 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.12.13\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr: "WARNING: Package(s) not found: torch, torchvision, torchaudio, xformers, numpy, transformers, diffusers, comfyui-frontend-package\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.running_instance.pytorch_version).toBe("2.12.1");
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/none of torch/i);
+      expect(env.local.python_probe_reason).toMatch(/2\.12\.1/);
+      expect(env.local.note).toMatch(/#401/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("untrusts a process-table hit whose torch disagrees with /system_stats", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "darwin",
+          python_version: "3.12.13",
+          comfyui_version: "0.27.0",
+          pytorch_version: "2.12.1",
+          embedded_python: false,
+          argv: [],
+        },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 89 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.12.13\n" };
+        }
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.4.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/does not match the running ComfyUI pytorch/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still reports packages when the probed torch matches /system_stats", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "darwin",
+          python_version: "3.12.13",
+          comfyui_version: "0.27.0",
+          pytorch_version: "2.12.1+cpu",
+          embedded_python: false,
+          argv: [],
+        },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 90 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.12.13\n" };
+        }
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.12.1\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.torch).toBe("2.12.1");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a failed pip query as a torch contradiction", async () => {
+    // uv venvs often have no pip. Silence is "we could not tell", not "torch is absent".
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "darwin",
+          python_version: "3.12.13",
+          pytorch_version: "2.12.1",
+          embedded_python: false,
+          argv: [],
+        },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 91 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.12.13\n" };
+        }
+        if (args.includes("pip")) return new Error("No module named pip");
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.python_probe_reason).not.toMatch(/none of torch/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never trusts anything for a REMOTE server (#401 / #433 round 3)", async () => {
+    const dir = await tmpDir();
+    const rootB = join(dir, "B");
+    await mkdir(rootB, { recursive: true });
+    await makeVenvPython(rootB);
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      h.remoteMode.value = true;
+      mockConfig.comfyuiPath = undefined;
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "nt",
+          python_version: "3.12.11",
+          comfyui_version: "0.27.1",
+          argv: [join(rootB, "main.py")],
+        },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue(undefined); // remote → never observable
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.11\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/REMOTE/i);
+      expect(env.local.note).toMatch(/#401/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe("torchVersionsAgree (#401)", () => {
+  it("treats local suffixes as the same build", () => {
+    expect(torchVersionsAgree("2.12.1", "2.12.1+cpu")).toBe(true);
+    expect(torchVersionsAgree("2.12.1+cu130", "2.12.1")).toBe(true);
+  });
+
+  it("rejects a different version, and never agrees on a missing side", () => {
+    expect(torchVersionsAgree("2.11.0", "2.12.1")).toBe(false);
+    expect(torchVersionsAgree("2.12.1", undefined)).toBe(false);
+    expect(torchVersionsAgree(undefined, "2.12.1")).toBe(false);
+  });
+});
+
+describe("liveRootFromArgv (#401 / #433 — robust argv parsing)", () => {
+  it("returns the absolute dir of an absolute main.py", () => {
+    const root = IS_WIN ? "C:\\Comfy\\ComfyUI" : "/opt/ComfyUI";
+    const argv = [join(root, "main.py"), "--port", "8188"];
+    expect(liveRootFromArgv(argv)).toBe(root);
+  });
+
+  it("strips surrounding quotes on the main.py path", () => {
+    const root = IS_WIN ? "C:\\Comfy\\ComfyUI" : "/opt/ComfyUI";
+    const argv = [`"${join(root, "main.py")}"`];
+    expect(liveRootFromArgv(argv)).toBe(root);
+  });
+
+  it("resolves a RELATIVE main.py against the server cwd when available, else UNRESOLVED", () => {
+    const cwd = IS_WIN ? "C:\\portable" : "/portable";
+    const rel = IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py";
+    expect(liveRootFromArgv([rel], cwd)).toBe(join(cwd, "ComfyUI"));
+    // No cwd → cannot resolve to an absolute dir → UNRESOLVED (not a bogus rel root).
+    expect(liveRootFromArgv([rel])).toBeUndefined();
+  });
+
+  it("treats a bare 'main.py' as cwd (when absolute) or UNRESOLVED", () => {
+    const cwd = IS_WIN ? "C:\\here" : "/here";
+    expect(liveRootFromArgv(["main.py"], cwd)).toBe(cwd);
+    expect(liveRootFromArgv(["main.py"])).toBeUndefined();
+  });
+
+  it("ignores non-main.py args and returns undefined when there is no main.py", () => {
+    expect(liveRootFromArgv(["python", "--port", "8188"])).toBeUndefined();
+    // A boundary check: 'notmain.py' must NOT be treated as main.py.
+    expect(liveRootFromArgv([IS_WIN ? "C:\\x\\notmain.py" : "/x/notmain.py"])).toBeUndefined();
+  });
+
+  it("a main.py-shaped FLAG VALUE is never the launch script (#648 review)", () => {
+    const root = IS_WIN ? "C:\\Comfy\\ComfyUI" : "/opt/ComfyUI";
+    // A main-less `python -m comfyui …` launch whose --extra-model-paths-config value
+    // happens to END in main.py: accepting that value as the script would let the config
+    // path self-prove the server's locality and then be read/written as a host file.
+    expect(
+      liveRootFromArgv(["python", "-m", "comfyui", "--extra-model-paths-config", join(root, "main.py")]),
+    ).toBeUndefined();
+    // The --flag=value spelling is an option token too.
+    expect(
+      liveRootFromArgv(["python", "-m", "comfyui", `--extra-model-paths-config=${join(root, "main.py")}`]),
+    ).toBeUndefined();
+    // A main.py-shaped token AFTER any flag is an argument, not the positional script.
+    expect(liveRootFromArgv(["--port", "8188", join(root, "main.py")])).toBeUndefined();
+    // …but the interpreter name before the script stays tolerated (positional scan).
+    expect(liveRootFromArgv(["python", join(root, "main.py"), "--port", "8188"])).toBe(root);
+  });
+
+  it("returns undefined for missing/empty argv", () => {
+    expect(liveRootFromArgv(undefined)).toBeUndefined();
+    expect(liveRootFromArgv([])).toBeUndefined();
+  });
+});
+
+/**
+ * liveScriptFromArgv is the same parse returning the main.py FILE (needed to follow a
+ * symlink — ComfyUI reads the config next to os.path.realpath(__file__)). Both functions
+ * share the script-TOKEN extraction (scriptTokenFromArgv: a positional token before the
+ * first option, never a flag's value); liveRootFromArgv keeps its OWN return shaping for
+ * the #633 download-authorization path, so this cross-check is what stops the two return
+ * shapes from drifting apart.
+ */
+describe("liveScriptFromArgv agrees with liveRootFromArgv on every argv shape", () => {
+  const winCwd = "C:\\here";
+  const nixCwd = "/here";
+  const cwd = IS_WIN ? winCwd : nixCwd;
+  const root = IS_WIN ? "C:\\Comfy\\ComfyUI" : "/opt/ComfyUI";
+  const rel = IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py";
+  const unnormalizedCwd = IS_WIN ? "C:\\x\\." : "/x/.";
+
+  const shapes: Array<[name: string, argv: string[] | undefined, cwd?: string]> = [
+    ["absolute main.py", [join(root, "main.py"), "--port", "8188"]],
+    ["quoted absolute main.py", [`"${join(root, "main.py")}"`]],
+    ["single-quoted main.py", [`'${join(root, "main.py")}'`]],
+    ["absolute main.pyw", [join(root, "main.pyw")]],
+    ["relative main.py with cwd", [rel], cwd],
+    ["relative main.py without cwd", [rel]],
+    ["bare main.py with cwd", ["main.py"], cwd],
+    ["bare main.py with UNNORMALIZED cwd", ["main.py"], unnormalizedCwd],
+    ["bare main.py without cwd", ["main.py"]],
+    ["unnormalized absolute", [IS_WIN ? "C:\\x\\.\\main.py" : "/x/./main.py"]],
+    ["several candidates (first wins)", [join(root, "main.py"), join(cwd, "main.py")]],
+    ["non-string entries", [42 as unknown as string, join(root, "main.py")]],
+    ["no main.py", ["python", "--port", "8188"]],
+    ["notmain.py boundary", [IS_WIN ? "C:\\x\\notmain.py" : "/x/notmain.py"]],
+    // #648 review: a main.py-shaped token after an option is a flag VALUE / argument,
+    // never the launch script — on both functions.
+    [
+      "main.py only as a --extra-model-paths-config VALUE",
+      ["python", "-m", "comfyui", "--extra-model-paths-config", join(root, "main.py")],
+    ],
+    [
+      "main.py only as a --flag=value",
+      ["python", "-m", "comfyui", `--extra-model-paths-config=${join(root, "main.py")}`],
+    ],
+    ["main.py only AFTER the flags", ["--port", "8188", join(root, "main.py")]],
+    ["empty argv", []],
+    ["missing argv", undefined],
+  ];
+
+  for (const [name, argv, argCwd] of shapes) {
+    it(name, () => {
+      const root_ = liveRootFromArgv(argv, argCwd);
+      const script = liveScriptFromArgv(argv, argCwd);
+      if (root_ === undefined) {
+        expect(script).toBeUndefined();
+        return;
+      }
+      expect(script).toBeDefined();
+      // The script must be main.py[w] inside that root — equal after normalization, which
+      // is all any caller relies on (every one of them resolve()s the value).
+      expect(basename(script as string)).toMatch(/^main\.pyw?$/i);
+      expect(resolve(dirname(script as string))).toBe(resolve(root_));
+    });
+  }
+});
+
+itWithSymlinks("realpath-resolves a symlinked absolute launch script for live authorization", async () => {
+  const dir = await tmpDir();
+  try {
+    const realRoot = join(dir, "real-install");
+    const launcherRoot = join(dir, "launcher");
+    const realScript = join(realRoot, "main.py");
+    const launchScript = join(launcherRoot, "main.py");
+    await mkdir(realRoot, { recursive: true });
+    await mkdir(launcherRoot, { recursive: true });
+    await writeFile(realScript, "# real ComfyUI\n", "utf-8");
+    await symlink(realScript, launchScript, "file");
+
+    expect(liveScriptFromArgv([launchScript])).toBe(realScript);
+    const resolved = resolveLiveServerRoot([launchScript]);
+    expect(resolved.source).toBe("argv");
+    expect(resolved.root).toBe(realRoot);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+describe("resolveRootInterpreter (portable + venv layouts)", () => {
+  it("finds the install's own .venv interpreter on disk", async () => {
+    const root = await tmpDir();
+    try {
+      const py = await makeVenvPython(root);
+      expect(resolveRootInterpreter(root)).toBe(py);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers a portable python_embeded layout on Windows", async () => {
+    if (!IS_WIN) return; // python_embeded candidates are Windows-only
+    const root = await tmpDir();
+    try {
+      const embDir = join(root, "python_embeded");
+      await mkdir(embDir, { recursive: true });
+      const emb = join(embDir, "python.exe");
+      await writeFile(emb, "", "utf-8");
+      expect(resolveRootInterpreter(root)).toBe(emb);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT follow a nested ComfyUI/ venv — installs keep targeting the root's own python", async () => {
+    // resolveComfyuiPython follows <base>/ComfyUI (verified against the live server),
+    // but this resolver picks the interpreter pip INSTALLS run under and has nothing
+    // live to check against. Preferring a nested venv here would be an unverifiable
+    // guess in a mutating path, so the root's own interpreter must still win.
+    const root = await tmpDir();
+    try {
+      const nested = join(root, "ComfyUI");
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(nested, "main.py"), "", "utf-8");
+      await makeVenvPython(nested);
+      const own = await makeVenvPython(root);
+      expect(resolveRootInterpreter(root)).toBe(own);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to a bare platform python when nothing is on disk / root is undefined", async () => {
+    const root = await tmpDir();
+    try {
+      expect(resolveRootInterpreter(root)).toBe(IS_WIN ? "python.exe" : "python3");
+      expect(resolveRootInterpreter(undefined)).toBe(IS_WIN ? "python.exe" : "python3");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveLiveComfyUIBase (#490 / #463 — live connected install root)", () => {
+  it("derives the live root from the running server's main.py argv", async () => {
+    const root = IS_WIN ? "C:\\live\\ComfyUI" : "/live/ComfyUI";
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [join(root, "main.py"), "--listen"] },
+    });
+    expect(await resolveLiveComfyUIBase()).toBe(root);
+  });
+
+  it("returns undefined in remote mode (the live root is on the remote host)", async () => {
+    h.remoteMode.value = true;
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [IS_WIN ? "C:\\remote\\main.py" : "/remote/main.py"] },
+    });
+    expect(await resolveLiveComfyUIBase()).toBeUndefined();
+    // Never even probes /system_stats when remote.
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+  });
+
+  it("returns undefined (never throws) when the server is unreachable", async () => {
+    mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    await expect(resolveLiveComfyUIBase()).resolves.toBeUndefined();
+  });
+
+  it("sanitizes malformed argv and cwd from the production JSON response", async () => {
+    mockGetSystemStats.mockResolvedValue({ system: { argv: [1], cwd: 42 } });
+    await expect(getLiveServerSnapshot()).resolves.toEqual({
+      reachable: true,
+      argv: undefined,
+      cwd: undefined,
+    });
+  });
+});
+
+describe("resolveEffectiveComfyUIBaseLive (#1653 — configuration first, live server fills the gap)", () => {
+  it("returns the configured base when the live server reports no --base-directory", async () => {
+    mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [IS_WIN ? "C:\\live\\main.py" : "/live/main.py", "--listen"] },
+    });
+    expect(await resolveEffectiveComfyUIBaseLive()).toBe(mockConfig.comfyuiPath);
+  });
+
+  it("adopts the live server's own root when nothing is configured and it looks like an install", async () => {
+    const root = await tmpDir();
+    try {
+      await mkdir(join(root, "custom_nodes"), { recursive: true });
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join(root, "main.py"), "--listen"] },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a live root that does not look like a ComfyUI install on disk", async () => {
+    // The argv root is the server's CLAIM; the models/ or custom_nodes/ check
+    // is what keeps a stale or relocated report from becoming a write target.
+    const root = await tmpDir();
+    try {
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join(root, "main.py")] },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined in remote mode without probing /system_stats", async () => {
+    h.remoteMode.value = true;
+    expect(await resolveEffectiveComfyUIBaseLive()).toBeUndefined();
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+  });
+
+  it("returns undefined (never throws) when the server is unreachable", async () => {
+    mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    await expect(resolveEffectiveComfyUIBaseLive()).resolves.toBeUndefined();
+  });
+
+  it("#1715: the live server's --base-directory wins, even over a configured install root", async () => {
+    // The ComfyUI Desktop shape: main.py runs from the code install tree while
+    // --base-directory points at the user-data dir the runtime ACTUALLY scans
+    // custom_nodes/ from. A pack written under the install root (the
+    // configured base here) is invisible to that runtime — the exact split-root
+    // failure of #1715. Same precedence the download path applies (#346).
+    const baseDir = await tmpDir();
+    try {
+      mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [
+            IS_WIN ? "C:\\install\\ComfyUI\\main.py" : "/install/ComfyUI/main.py",
+            "--base-directory",
+            baseDir,
+          ],
+        },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(baseDir);
+    } finally {
+      await rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it("#1715: a --base-directory that does not exist on disk is not adopted", async () => {
+    // The flag is the server's claim; the disk check keeps a stale or relocated
+    // report from becoming a write target — configuration fills in instead.
+    mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          IS_WIN ? "C:\\install\\main.py" : "/install/main.py",
+          "--base-directory",
+          IS_WIN ? "C:\\gone\\base" : "/gone/base",
+        ],
+      },
+    });
+    expect(await resolveEffectiveComfyUIBaseLive()).toBe(mockConfig.comfyuiPath);
+  });
+
+  it("#1715: a relative --base-directory resolves against the server-reported cwd", async () => {
+    const cwd = await tmpDir();
+    try {
+      await mkdir(join(cwd, "data"), { recursive: true });
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: ["python", "main.py", "--base-directory", "data"],
+          cwd,
+        },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(join(cwd, "data"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("#1715: an UNRESOLVABLE relative --base-directory fails closed — the main.py root is not adopted", async () => {
+    // Every root derivable here names a DIFFERENT tree than the one being
+    // served, so adopting the install root would be a confidently WRONG answer
+    // (hasUnresolvableRelativeBaseDirFlag's contract), not a harmless fallback.
+    const root = await tmpDir();
+    try {
+      await mkdir(join(root, "custom_nodes"), { recursive: true });
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", "main.py", "--base-directory", "data"] },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveCustomNodesScanBaseLive (#2031 — scan path, not data workspace)", () => {
+  it("uses the live main.py checkout when COMFYUI_PATH is a different data root and there is no --base-directory", async () => {
+    // The portable split the reporter hit: workspace_path ~/ComfyUI (models via
+    // extra_model_paths), code_path ~/ComfyUI/ComfyUI (main.py + custom_nodes).
+    // folder_paths.base_path is the checkout; writing under the data workspace
+    // lands in a directory the runtime never scans.
+    const dir = await tmpDir();
+    try {
+      const workspace = join(dir, "ComfyUI");
+      const code = join(workspace, "ComfyUI");
+      await mkdir(join(workspace, "custom_nodes"), { recursive: true });
+      await mkdir(join(code, "custom_nodes"), { recursive: true });
+      await writeFile(join(code, "main.py"), "", "utf-8");
+      mockConfig.comfyuiPath = workspace;
+      mockConfig.comfyuiCodePath = code;
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join(code, "main.py"), "--listen"] },
+      });
+
+      expect(await resolveCustomNodesScanBaseLive()).toBe(code);
+      // The data resolver still answers the workspace — models/output belong
+      // there. Only custom_nodes scan must not follow it.
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(workspace);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still prefers --base-directory over the checkout (#1770 Desktop)", async () => {
+    const dir = await tmpDir();
+    try {
+      const workspace = join(dir, "user-data");
+      const code = join(dir, "install", "ComfyUI");
+      await mkdir(workspace, { recursive: true });
+      await mkdir(code, { recursive: true });
+      await writeFile(join(code, "main.py"), "", "utf-8");
+      mockConfig.comfyuiPath = workspace;
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(code, "main.py"), "--base-directory", workspace],
+        },
+      });
+
+      expect(await resolveCustomNodesScanBaseLive()).toBe(workspace);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on an unresolvable relative --base-directory", async () => {
+    const root = await tmpDir();
+    try {
+      await mkdir(join(root, "custom_nodes"), { recursive: true });
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", "main.py", "--base-directory", "data"] },
+      });
+      expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when an absolute --base-directory is currently unavailable", async () => {
+    const root = await tmpDir();
+    try {
+      const code = join(root, "code");
+      await mkdir(join(code, "custom_nodes"), { recursive: true });
+      await writeFile(join(code, "main.py"), "", "utf-8");
+      const unavailable = join(root, "data-not-mounted");
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(code, "main.py"), "--base-directory", unavailable],
+        },
+      });
+
+      expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
+      await expect(resolveCustomNodesScanBaseLiveStrict()).rejects.toThrow(
+        /currently unavailable.*custom_nodes would be written where this runtime does not scan/i,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined in remote mode without probing /system_stats", async () => {
+    h.remoteMode.value = true;
+    expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the configured data base when the server is unreachable", async () => {
+    mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+    mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await resolveCustomNodesScanBaseLive()).toBe(mockConfig.comfyuiPath);
+  });
+});
+
+describe("resolveComfyuiPython live-first (#401 / #433)", () => {
+  it("prefers the live argv root over the pinned COMFYUI_PATH, both with venvs", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "comfyui-resolve-"));
+    try {
+      const rootA = join(dir, "A");
+      const rootB = join(dir, "B");
+      await mkdir(rootA, { recursive: true });
+      await mkdir(rootB, { recursive: true });
+      await makeVenvPython(rootA);
+      const exeB = await makeVenvPython(rootB);
+
+      const res = resolveComfyuiPython(rootA, [join(rootB, "main.py")]);
+      expect(res.python).toBe(exeB);
+      expect(res.liveRoot).toBe(rootB);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("in REMOTE mode, a coincident local live path is NOT marked live and is not probed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "comfyui-resolve-"));
+    try {
+      const rootB = join(dir, "B");
+      await mkdir(rootB, { recursive: true });
+      const exeB = await makeVenvPython(rootB);
+
+      const res = resolveComfyuiPython(undefined, [join(rootB, "main.py")], { remote: true });
+      // Live root is still reported for provenance, but the coincident local install
+      // is NOT probed — it is not the remote server's.
+      expect(res.python).not.toBe(exeB);
+      expect(res.python).toBe(IS_WIN ? "python.exe" : "python3");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveLiveServerRoot (#369) — the ONE notion of "the live server's install
+// root". The bug it exists to end: ComfyUI Desktop and the Windows portable
+// bundle both report a RELATIVE `main.py` with no cwd, argv resolution returns
+// nothing, and the download destination silently fell through to COMFYUI_PATH —
+// a DIFFERENT install the running server never reads from.
+// ---------------------------------------------------------------------------
+describe("resolveLiveServerRoot (#369)", () => {
+  // Build the relative argv with join(), NEVER a hardcoded "ComfyUI\\main.py".
+  // node's path.dirname only treats "\" as a separator on Windows, so a backslash
+  // literal parses as the single filename "ComfyUI\main.py" on POSIX — relDir comes
+  // back "." and the entire shape under test evaporates. These passed locally on
+  // Windows and failed on the macOS CI leg for exactly that reason. join() produces
+  // the form each platform's ComfyUI actually reports.
+  /** Portable Windows bundle: <root>/python_embeded/python.exe + <root>/ComfyUI/main.py */
+  async function makePortableBundle(
+    base: string,
+  ): Promise<{ python: string; serverRoot: string }> {
+    const embedded = join(base, "python_embeded");
+    await mkdir(embedded, { recursive: true });
+    const python = join(embedded, IS_WIN ? "python.exe" : "python3");
+    await writeFile(python, "", "utf-8");
+    const serverRoot = join(base, "ComfyUI");
+    await mkdir(serverRoot, { recursive: true });
+    await writeFile(join(serverRoot, "main.py"), "", "utf-8");
+    return { python, serverRoot };
+  }
+
+  it("resolves from argv when the script path is absolute", async () => {
+    const dir = await tmpDir();
+    try {
+      const res = resolveLiveServerRoot([join(dir, "main.py"), "--listen"]);
+      expect(res.source).toBe("argv");
+      expect(res.root).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors a RELATIVE main.py on the interpreter the OS observes — live wins over a stale COMFYUI_PATH", async () => {
+    const dir = await tmpDir();
+    try {
+      // Two installs, exactly as in the reopened report: the portable bundle is
+      // LIVE, and COMFYUI_PATH points at an unrelated second checkout.
+      const live = join(dir, "ComfyUI_windows_portable2");
+      const stale = join(dir, "Documents", "ComfyUI");
+      await mkdir(stale, { recursive: true });
+      await writeFile(join(stale, "main.py"), "", "utf-8");
+      const { python, serverRoot } = await makePortableBundle(live);
+      mockConfig.comfyuiPath = stale;
+
+      const res = resolveLiveServerRoot(
+        [join("ComfyUI", "main.py"), "--windows-standalone-build"],
+        undefined,
+        { observedPython: python },
+      );
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(serverRoot);
+      expect(res.root).not.toBe(stale);
+      expect(res.relDir).toBe("ComfyUI");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors a Desktop-style nested venv interpreter on its own server root", async () => {
+    const dir = await tmpDir();
+    try {
+      const serverRoot = join(dir, "ComfyUI");
+      await mkdir(serverRoot, { recursive: true });
+      await writeFile(join(serverRoot, "main.py"), "", "utf-8");
+      const python = await makeVenvPython(serverRoot);
+
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
+        observedPython: python,
+      });
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(serverRoot);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a BARE main.py against the observed interpreter's own root", async () => {
+    const dir = await tmpDir();
+    try {
+      await writeFile(join(dir, "main.py"), "", "utf-8");
+      const python = await makeVenvPython(dir);
+      const res = resolveLiveServerRoot(["main.py"], undefined, { observedPython: python });
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(dir);
+      expect(res.relDir).toBe(".");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors the Windows embedded layout: <root>\\python\\python.exe + <root>\\main.py", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "ComfyUI");
+      const python = join(root, "python", "python.exe");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(python, "", "utf-8");
+      await writeFile(join(root, "main.py"), "", "utf-8");
+
+      const res = resolveLiveServerRoot(["main.py", "--listen"], undefined, {
+        observedPython: python,
+        observedPid: 2252,
+      });
+
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(root);
+      expect(res.anchorDir).toBe(root);
+      expect(res.observedPython).toBe(python);
+      expect(res.observedPid).toBe(2252);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays UNRESOLVED when nothing observes the process — never a layout guess", () => {
+    h.mockLiveInterpreter.mockReturnValue(undefined);
+    const res = resolveLiveServerRoot([join("ComfyUI", "main.py")]);
+    expect(res.source).toBe("unresolved");
+    expect(res.root).toBeUndefined();
+    expect(res.relDir).toBe("ComfyUI");
+  });
+
+  it("never adopts an unrelated install above a SYSTEM interpreter (codex gate r3)", async () => {
+    const dir = await tmpDir();
+    try {
+      // `C:\Python311\python.exe` runs `ComfyUI\main.py` from a cwd it never reports,
+      // and an UNRELATED `<dir>/ComfyUI/main.py` happens to sit beside the python.
+      // Walking up must NOT adopt it: nothing ties that install to the interpreter.
+      const stale = join(dir, "ComfyUI");
+      await mkdir(stale, { recursive: true });
+      await writeFile(join(stale, "main.py"), "", "utf-8");
+      const sysDir = join(dir, "Python311");
+      await mkdir(sysDir, { recursive: true });
+      const python = join(sysDir, IS_WIN ? "python.exe" : "python3");
+      await writeFile(python, "", "utf-8");
+
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
+        observedPython: python,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never adopts a stale sibling install from a GENERIC venv beside it (codex gate r13)", async () => {
+    const dir = await tmpDir();
+    try {
+      // The live server runs D:\Live\ComfyUI\main.py from an EXTERNAL venv at
+      // <dir>/venv, and an unrelated <dir>/ComfyUI/main.py sits beside that venv.
+      // A generic venv says nothing about which install it serves.
+      const stale = join(dir, "ComfyUI");
+      await mkdir(stale, { recursive: true });
+      await writeFile(join(stale, "main.py"), "", "utf-8");
+      const python = await makeVenvPython(join(dir, "external"));
+      // Move it so the venv is a SIBLING of the stale install, not inside it.
+      const sibling = IS_WIN ? join(dir, "venv", "Scripts") : join(dir, "venv", "bin");
+      await mkdir(sibling, { recursive: true });
+      const siblingPython = join(sibling, basename(python));
+      await writeFile(siblingPython, "", "utf-8");
+
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
+        observedPython: siblingPython,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays UNRESOLVED when the observed interpreter is not inside an install tree", async () => {
+    const dir = await tmpDir();
+    try {
+      // A system python with no ComfyUI anywhere above it.
+      const python = join(dir, IS_WIN ? "python.exe" : "python3");
+      await writeFile(python, "", "utf-8");
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
+        observedPython: python,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.observedPython).toBe(python);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never probes the process table in REMOTE mode (its paths are on another host)", async () => {
+    const dir = await tmpDir();
+    try {
+      const { python } = await makePortableBundle(dir);
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
+        observedPython: python,
+        remote: true,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // #1374 — the tier above is built for the portable bundle, and on the stock
+  // portable bundle it did not run. `run_nvidia_gpu.bat` launches
+  // `.\python_embeded\python.exe -s ComfyUI\main.py`, so the command line the OS
+  // records has a RELATIVE argv[0] and the interpreter answer fails closed (#401,
+  // correctly — a relative argv[0] names no file). The install root then stayed
+  // unresolved, download_model routed to ComfyUI-Manager, and on an install where
+  // Manager is not serving its routes that is a hard failure for a capability that
+  // needs no Manager at all.
+  //
+  // These pin the fallback and its LIMIT: the OS image resolves the root, and a
+  // reading that cannot be placed inside the install still resolves nothing.
+  it("anchors on the OS IMAGE when the launcher spelled the interpreter relatively", async () => {
+    const dir = await tmpDir();
+    try {
+      const { python, serverRoot } = await makePortableBundle(dir);
+      // What the process table reports for the stock portable launch: no usable
+      // argv[0], but the OS's own record of the same binary.
+      h.mockLiveProcess.mockReturnValue({ pid: 4242, image: python });
+
+      const res = resolveLiveServerRoot(
+        [join("ComfyUI", "main.py"), "--windows-standalone-build"],
+        undefined,
+        {},
+      );
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(serverRoot);
+      expect(res.observedPid).toBe(4242);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  itWithSymlinks("realpath-resolves an observed symlinked launch script before authorizing its root", async () => {
+    const dir = await tmpDir();
+    try {
+      const realRoot = join(dir, "real-install");
+      const launcherRoot = join(dir, "launcher");
+      const realScript = join(realRoot, "main.py");
+      const launchScript = join(launcherRoot, "main.py");
+      await mkdir(realRoot, { recursive: true });
+      await mkdir(launcherRoot, { recursive: true });
+      await writeFile(realScript, "# real ComfyUI\n", "utf-8");
+      await symlink(realScript, launchScript, "file");
+      h.mockLiveProcess.mockReturnValue({ pid: 4243, launchScript });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("observed-process");
+      expect(resolved.root).toBe(realRoot);
+      expect(resolved.observedLaunchScript).toBe(realScript);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an observed DIRECTORY named main.py before authorizing its parent", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "directory-main");
+      const script = join(root, "main.py");
+      await mkdir(script, { recursive: true });
+      h.mockLiveProcess.mockReturnValue({ pid: 4244, launchScript: script });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+
+      const argvResolved = resolveLiveServerRoot([script]);
+      expect(argvResolved.source).toBe("unresolved");
+      expect(argvResolved.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not fall back to an interpreter after an invalid observed launch script", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "interpreter-fallback");
+      const python = join(root, "python_embeded", IS_WIN ? "python.exe" : "python3");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(join(root, "main.py"), "# fallback tree\n", "utf-8");
+      await writeFile(python, "", "utf-8");
+
+      h.mockLiveProcess.mockReturnValue({
+        pid: 4245,
+        python,
+        launchScriptInvalid: true,
+      });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+      expect(resolved.observedPython).toBe(python);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on an indeterminate observed launch-script path", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "interpreter-fallback");
+      const python = join(root, "python_embeded", IS_WIN ? "python.exe" : "python3");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(join(root, "main.py"), "# fallback tree\n", "utf-8");
+      await writeFile(python, "", "utf-8");
+
+      // NUL makes realpathSync throw a non-ENOENT/ENOTDIR argument error. It
+      // must not be converted into a lexical path and then an interpreter root.
+      const indeterminateScript = `${join(dir, "blocked")}\0main.py`;
+      const resolved = resolveLiveServerRoot(
+        ["main.py"],
+        undefined,
+        { observedPython: python, observedLaunchScript: indeterminateScript },
+      );
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors a BARE main.py on the OS image when that image is inside the install", async () => {
+    const dir = await tmpDir();
+    try {
+      // The shape the reopened report describes: argv[0] is `main.py` with no cwd,
+      // so the server's install root IS its working directory.
+      await writeFile(join(dir, "main.py"), "", "utf-8");
+      const python = await makeVenvPython(dir);
+      h.mockLiveProcess.mockReturnValue({ pid: 7, image: python });
+
+      const res = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(dir);
+      expect(res.relDir).toBe(".");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still REFUSES an image that sits outside the install — the containment test is what gates it", async () => {
+    const dir = await tmpDir();
+    try {
+      // A system python with an unrelated ComfyUI somewhere above it: exactly the
+      // reading `interpreterBelongsToInstall` exists to reject, and the OS image is
+      // no more privileged than argv[0] was. Windows reports a venv's BASE
+      // interpreter here, so this is the ordinary case, not an exotic one.
+      await mkdir(join(dir, "ComfyUI"), { recursive: true });
+      await writeFile(join(dir, "ComfyUI", "main.py"), "", "utf-8");
+      const systemPython = join(dir, "Python313", IS_WIN ? "python.exe" : "python3");
+      await mkdir(dirname(systemPython), { recursive: true });
+      await writeFile(systemPython, "", "utf-8");
+      h.mockLiveProcess.mockReturnValue({ pid: 9, image: systemPython });
+
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {});
+      expect(res.source).toBe("unresolved");
+      expect(res.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ── The gap this does NOT close, measured rather than assumed ─────────────
+  //
+  // Worth being exact, because the two shapes look alike in a report and behave
+  // differently, and the difference decides whether #1374's recurring reporter is
+  // helped:
+  //
+  //   argv[0] = "ComfyUI\main.py"  → relDir "ComfyUI". Walking up from
+  //     <bundle>/python_embeded reaches <bundle>, and <bundle>/ComfyUI/main.py
+  //     exists — RESOLVED. This is what run_nvidia_gpu.bat produces, so the stock
+  //     portable bundle IS served by this tier.
+  //
+  //   argv[0] = "main.py"          → relDir ".". Walking up asks whether
+  //     <bundle>/python_embeded or <bundle> is itself the install root; neither
+  //     holds main.py, so it stays UNRESOLVED. This is the shape the recurrence
+  //     comment reports, and it is only helped when the interpreter lives INSIDE
+  //     the install (a venv at <install>/.venv), which the test above pins.
+  //
+  // Anchoring "." on a sibling would mean guessing which of <bundle>'s children is
+  // the install — the layout-guess tier this file deliberately does not have, and
+  // the one that wrote 4.88 GB into the wrong install in #369. So the gap stays,
+  // and stays recorded.
+  it("does NOT resolve a BARE main.py when the interpreter is a SIBLING of the install", async () => {
+    const dir = await tmpDir();
+    try {
+      const { python, serverRoot } = await makePortableBundle(dir);
+      h.mockLiveProcess.mockReturnValue({ pid: 4242, image: python });
+
+      // Same bundle, same image — only argv[0] differs from the resolving case.
+      const bare = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(bare.source).toBe("unresolved");
+      expect(bare.root).toBeUndefined();
+      // …and the contrast, so this cannot pass by the whole tier being broken.
+      const withDir = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {});
+      expect(withDir.source).toBe("observed-process");
+      expect(withDir.root).toBe(serverRoot);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers the INTERPRETER over the image when both were observed", async () => {
+    const dir = await tmpDir();
+    try {
+      const { python, serverRoot } = await makePortableBundle(dir);
+      const venvPython = await makeVenvPython(serverRoot);
+      // Windows reports the bundle's base interpreter as the image while argv[0] is
+      // the venv python. Both anchor to the same root here — what is pinned is that
+      // the weaker reading never displaces the stronger one.
+      h.mockLiveProcess.mockReturnValue({
+        pid: 11,
+        python: venvPython,
+        source: "process-table",
+        image: python,
+      });
+
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {});
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(serverRoot);
+      expect(res.observedPython).toBe(venvPython);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #490 (reopened). `resolveEffectiveComfyUIBase` returns `config.comfyuiPath`
+// BEFORE it consults remote mode, against its own docstring — so with
+// --comfyui-url and a stale local COMFYUI_PATH it hands back an install that has
+// nothing to do with the connected server. That resolver has twelve callers and
+// is not being changed here; `resolveLocalMutationTarget` is what destructive
+// paths use instead, and it must refuse rather than hand back the wrong tree.
+//
+// The consumer suites mock this function, which proves they HONOUR a refusal but
+// not that the production resolver ever ISSUES one (codex gate). This exercises
+// the real thing.
+
+describe("resolveLocalMutationTarget — refuses what it cannot identify", () => {
+  beforeEach(() => {
+    h.remoteMode.value = false;
+    h.mockConfig.comfyuiPath = undefined;
+  });
+
+  it("REFUSES in remote mode even when COMFYUI_PATH is set — the dangerous case", async () => {
+    const { resolveLocalMutationTarget, resolveEffectiveComfyUIBase } = await import(
+      "../../services/workspace-env.js"
+    );
+    h.remoteMode.value = true;
+    h.mockConfig.comfyuiPath = "/stale/local/ComfyUI";
+
+    // #490 IS NOW FIXED (by #835): the shared resolver checks remote mode before
+    // it returns `config.comfyuiPath`, so it no longer hands back a local install
+    // that has nothing to do with the connected server. This assertion used to
+    // pin the bug — it was written to start failing on the day the resolver was
+    // repaired, and it did exactly that on the rebase.
+    expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+    // The mutation target still refuses, and still names why. Now defence in
+    // depth rather than the only defence: a destructive path must be able to say
+    // WHY it will not act, which an `undefined` cannot.
+    const target = resolveLocalMutationTarget();
+    expect(target.base).toBeUndefined();
+    expect(target.refusal).toMatch(/REMOTE ComfyUI/i);
+    expect(target.refusal).toMatch(/stale\/local\/ComfyUI/);
+    expect(target.refusal).toMatch(/DIFFERENT install/i);
+  });
+
+  // The third case — no path establishable at all — is deliberately NOT tested
+  // here: with COMFYUI_PATH unset this resolver falls through to the machine's
+  // SAVED DEFAULT WORKSPACE, so on any developer rig that has one the assertion
+  // depends on the host rather than the code. The consumer suites cover it with
+  // that lookup mocked.
+  it("returns the base in LOCAL mode — the refusal must not swallow the normal case", async () => {
+    const { resolveLocalMutationTarget } = await import("../../services/workspace-env.js");
+    h.mockConfig.comfyuiPath = "/local/ComfyUI";
+    const target = resolveLocalMutationTarget();
+    expect(target.base).toBe("/local/ComfyUI");
+    expect(target.refusal).toBeUndefined();
+  });
+
 });

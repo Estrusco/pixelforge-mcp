@@ -14,10 +14,13 @@ import {
 } from "../config.js";
 import { attachExecutionListeners } from "../comfyui/events.js";
 import { logger } from "../utils/logger.js";
-import { AssetRegistry } from "./asset-registry.js";
+import { AssetRegistry, normalizeAssetType } from "./asset-registry.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import {
   analyzeHistoryEntry,
+  hasAffirmativeSuccessStatus,
+  historyCompletionTimeMs,
+  historyTerminalTimeMs,
   normalizeHistoryMessages,
   type ExecutionStats,
   type ExecutionErrorDetails,
@@ -129,6 +132,59 @@ function buildImageUrl(
   return `${getComfyUIBaseUrl()}/view?${params.toString()}`;
 }
 
+/** A media ref from history is only real when it carries a non-empty string
+ *  filename. Anything else — null, missing, empty, or non-string filename — is
+ *  malformed /history data and must be dropped here, never emitted as an
+ *  output or registered as an asset with filename=undefined (#753 gate). */
+interface HistoryMediaRef {
+  filename: string;
+  subfolder?: string;
+  type?: string;
+}
+
+const KNOWN_IMAGE_KEYS = new Set(["images"]);
+const KNOWN_VIDEO_KEYS = new Set(["videos", "video", "gifs"]);
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".bmp"]);
+const VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi", ".gif", ".webp"]);
+
+function isHistoryMediaRef(value: unknown): value is HistoryMediaRef {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const rec = value as { filename?: unknown; subfolder?: unknown; type?: unknown };
+  if (typeof rec.filename !== "string" || rec.filename.length === 0) return false;
+  if (rec.subfolder != null && typeof rec.subfolder !== "string") return false;
+  if (rec.type != null && typeof rec.type !== "string") return false;
+  return true;
+}
+
+/** One-level bags only: a media ref, or an array of them. Nested objects are not walked. */
+function historyMediaRefs(value: unknown): HistoryMediaRef[] {
+  if (Array.isArray(value)) return value.filter(isHistoryMediaRef);
+  return isHistoryMediaRef(value) ? [value] : [];
+}
+
+function filenameExt(filename: string): string {
+  const base = filename.slice(Math.max(filename.lastIndexOf("/"), filename.lastIndexOf("\\")) + 1);
+  const dot = base.lastIndexOf(".");
+  return dot >= 0 ? base.slice(dot).toLowerCase() : "";
+}
+
+function unknownKeyMediaKind(filename: string): "image" | "video" | null {
+  const ext = filenameExt(filename);
+  if (VIDEO_EXTS.has(ext)) return "video";
+  if (IMAGE_EXTS.has(ext)) return "image";
+  return null;
+}
+
+function toMediaOutput(ref: HistoryMediaRef): MediaOutput {
+  const type = normalizeAssetType(ref.type);
+  return {
+    filename: ref.filename,
+    subfolder: ref.subfolder ?? "",
+    type,
+    url: buildImageUrl(ref.filename, ref.subfolder ?? "", type),
+  };
+}
+
 export function buildCompletionNotification(
   promptId: string,
   entry: HistoryEntry,
@@ -137,18 +193,14 @@ export function buildCompletionNotification(
   const messages = normalizeHistoryMessages(entry);
   const analysis = analyzeHistoryEntry(entry);
 
-  // Timing
-  const startMsg = messages.find((m) => m[0] === "execution_start");
-  const endMsg = messages.find(
-    (m) => m[0] === "execution_success" || m[0] === "execution_error",
-  );
-  const startTs = (startMsg?.[1] as { timestamp?: number })?.timestamp;
-  const endTs = (endMsg?.[1] as { timestamp?: number })?.timestamp;
+  // Timing — interrupt is a terminal end event, same as success/error (#2512).
+  // Duration and finished-at come from ComfyUI's execution record, never from
+  // the moment this notification is later delivered.
+  const observedAt = Date.now();
+  const terminalAt = historyTerminalTimeMs(entry, observedAt);
   const durationMs =
     analysis.execution_stats?.total_duration_ms ??
-    (startTs && endTs
-      ? (endTs - startTs) * 1000 // ComfyUI timestamps are seconds
-      : Date.now() - startTime);
+    (terminalAt !== undefined ? Math.max(0, terminalAt - startTime) : observedAt - startTime);
 
   // Status
   const errorMsg = messages.find((m) => m[0] === "execution_error");
@@ -177,26 +229,13 @@ export function buildCompletionNotification(
     if (!nodeOutput || typeof nodeOutput !== "object") continue;
     const out = nodeOutput as Record<string, unknown>;
 
-    // Extract image outputs (SaveImage, PreviewImage)
+    // Extract image outputs (SaveImage, PreviewImage) — malformed refs are
+    // filtered BEFORE any use, so a bad /history entry can neither crash the
+    // parse nor surface as an output with filename=undefined.
+    const images: MediaOutput[] = [];
     if (Array.isArray(out.images)) {
-      const images = (
-        out.images as Array<{
-          filename: string;
-          subfolder?: string;
-          type?: string;
-        }>
-      ).map((img) => ({
-        filename: img.filename,
-        subfolder: img.subfolder ?? "",
-        type: img.type ?? "output",
-        url: buildImageUrl(
-          img.filename,
-          img.subfolder ?? "",
-          img.type ?? "output",
-        ),
-      }));
-      if (images.length > 0) {
-        outputs.push({ node_id: nodeId, images });
+      for (const img of out.images.filter(isHistoryMediaRef)) {
+        images.push(toMediaOutput(img));
       }
     }
 
@@ -205,25 +244,28 @@ export function buildCompletionNotification(
     // keys into a single entry per node, mirroring how images group once.
     // Adapted from jcd315's fork (jcd315/comfyui-mcp-muse, commit e13342ec).
     const videos: MediaOutput[] = [];
-    for (const videoKey of ["videos", "video", "gifs"] as const) {
+    for (const videoKey of KNOWN_VIDEO_KEYS) {
       const videoData = out[videoKey];
       if (!Array.isArray(videoData)) continue;
-      for (const vid of videoData as Array<{
-        filename: string;
-        subfolder?: string;
-        type?: string;
-      }>) {
-        videos.push({
-          filename: vid.filename,
-          subfolder: vid.subfolder ?? "",
-          type: vid.type ?? "output",
-          url: buildImageUrl(
-            vid.filename,
-            vid.subfolder ?? "",
-            vid.type ?? "output",
-          ),
-        });
+      for (const vid of videoData.filter(isHistoryMediaRef)) {
+        videos.push(toMediaOutput(vid));
       }
+    }
+
+    // #2845 — SaveVideoDexter (`dexter_video`) and NKDVideoViewer (`nkd_video`)
+    // emit a `{filename, subfolder?, type?}` ref under a custom key, as a single
+    // object or a one-item array. Harvest that one level; nested bags stay closed.
+    for (const [key, raw] of Object.entries(out)) {
+      if (KNOWN_IMAGE_KEYS.has(key) || KNOWN_VIDEO_KEYS.has(key)) continue;
+      for (const ref of historyMediaRefs(raw)) {
+        const kind = unknownKeyMediaKind(ref.filename);
+        if (kind === "video") videos.push(toMediaOutput(ref));
+        else if (kind === "image") images.push(toMediaOutput(ref));
+      }
+    }
+
+    if (images.length > 0) {
+      outputs.push({ node_id: nodeId, images });
     }
     if (videos.length > 0) {
       video_outputs.push({ node_id: nodeId, videos });
@@ -234,7 +276,7 @@ export function buildCompletionNotification(
     prompt_id: promptId,
     status,
     duration_ms: Math.round(durationMs),
-    timestamp: new Date().toISOString(),
+    timestamp: new Date(terminalAt ?? observedAt).toISOString(),
     error,
     outputs,
     video_outputs,
@@ -252,6 +294,14 @@ async function handleCompletion(
   // Race guard: only first detector proceeds
   if (state.completed) return;
   state.completed = true;
+
+  // The watch's OWN observed finish time: the moment this watcher detected
+  // the completion (WS event or poll tick). For a live-watched job this is a
+  // real, truthful observation — within one poll interval / WS latency of the
+  // actual finish — and serves as the createdAt fallback when the history
+  // entry carries no usable execution_success timestamp (never the registry's
+  // silent default-now; provenance is recorded on the record, #751 r4 gate).
+  const observedFinishAt = Date.now();
 
   logger.info(`Completion detected via ${detectedBy}`, { prompt_id: promptId });
 
@@ -292,11 +342,24 @@ async function handleCompletion(
     const notification = buildCompletionNotification(promptId, entry, state.startTime);
 
     // Register outputs with the AssetRegistry so they can be referenced by
-    // asset_id for view_image / regenerate. Only register on successful
-    // completion with a stored workflow snapshot.
-    if (notification.status === "success" && state.workflow) {
+    // asset_id for get_image (action:"view") and for
+    // generate_image (action:"regenerate"). Registration requires AFFIRMATIVE
+    // success evidence — the shared predicate (job-history) both registration
+    // paths use. The live watch only detects "finished" (WS and poll both
+    // route success AND error to this handler), and notification.status is a
+    // derivation that defaults to success when messages are absent/malformed;
+    // the history entry's own status_str + messages are therefore the
+    // AUTHORITATIVE status source for registration on this path too. (The
+    // derived status still drives the completion FILE, where presenting a
+    // best-effort outcome is a display matter, not an asset guarantee.)
+    if (hasAffirmativeSuccessStatus(entry) && state.workflow) {
       try {
-        const records = AssetRegistry.register({
+        // createdAt is a REAL time, never the registry's silent default-now:
+        // prefer the entry's recorded execution_success timestamp; fall back
+        // to this watcher's own observed finish time — distinguishable via
+        // createdAtSource ("history" vs "observed").
+        const recordedAt = historyCompletionTimeMs(entry, observedFinishAt);
+        AssetRegistry.register({
           promptId,
           workflow: state.workflow,
           outputs: notification.outputs.map((o) => ({
@@ -308,15 +371,13 @@ async function handleCompletion(
               url: img.url,
             })),
           })),
+          createdAt: recordedAt ?? observedFinishAt,
+          createdAtSource: recordedAt !== undefined ? "history" : "observed",
         });
-        const idByKey = new Map(
-          records.map((r) => [`${r.nodeId}|${r.filename}|${r.subfolder}|${r.type}`, r.assetId]),
-        );
         for (const output of notification.outputs) {
           for (const img of output.images) {
-            const key = `${output.node_id}|${img.filename}|${img.subfolder}|${img.type}`;
-            const id = idByKey.get(key);
-            if (id) img.asset_id = id;
+            const record = AssetRegistry.find(promptId, img);
+            if (record) img.asset_id = record.assetId;
           }
         }
       } catch (regErr) {
@@ -376,7 +437,8 @@ export const JobWatcher = {
   /**
    * Start monitoring a prompt_id for completion via WS + polling dual-track.
    * Optionally pass the submitted workflow so completed outputs can be
-   * registered with the AssetRegistry for view_image / regenerate.
+   * registered with the AssetRegistry for get_image (action:"view") and for
+   * generate_image (action:"regenerate").
    */
   watch(promptId: string, workflow?: WorkflowJSON): void {
     // Don't double-watch

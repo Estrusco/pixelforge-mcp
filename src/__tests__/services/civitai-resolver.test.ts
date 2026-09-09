@@ -129,6 +129,171 @@ describe("resolveCivitaiModelVersion", () => {
   });
 });
 
+describe("civitai request error surfacing (distinct failure modes)", () => {
+  // Each failure mode must surface as a DISTINCT, actionable message — never a
+  // swallowed empty and never conflated with a neighbouring status (WS-6 #204).
+  it("401 without a token → 'requires authentication' (set the token)", async () => {
+    config.civitaiApiToken = undefined;
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /requires authentication.*set CIVITAI_API_TOKEN/i,
+    );
+  });
+
+  it("401 WITH a token → 'token invalid or expired' (refresh it)", async () => {
+    config.civitaiApiToken = "stale-token";
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /invalid or expired.*refresh CIVITAI_API_TOKEN/i,
+    );
+  });
+
+  it("403 → 'forbidden' (permission or region), distinct from 401", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 403));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /403 Forbidden.*permission.*region/i,
+    );
+  });
+
+  it("429 → 'rate-limited' (back off and retry), distinct from an upstream 5xx", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 429));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /rate-limited.*429.*retry/i,
+    );
+  });
+
+  it("5xx → 'upstream error' flagged transient", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 503));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /upstream error.*503.*transient/i,
+    );
+  });
+
+  it("our own timeout abort → distinct 'timed out' message (not a hang, not empty)", async () => {
+    const timeoutErr = Object.assign(new Error("The operation timed out."), {
+      name: "TimeoutError",
+    });
+    fetchMock.mockRejectedValueOnce(timeoutErr);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /timed out.*unreachable/i,
+    );
+    await expect(
+      (async () => {
+        fetchMock.mockRejectedValueOnce(timeoutErr);
+        return resolveCivitaiModelVersion(1);
+      })(),
+    ).rejects.toBeInstanceOf(ModelError);
+  });
+
+  it("network failure (fetch rejects TypeError) → distinct 'unreachable' message", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /unreachable.*network error/i,
+    );
+  });
+
+  it("a non-ASCII CIVITAI_API_TOKEN is a credential fault, not a network outage (#1702)", async () => {
+    // Node's fetch rejects a non-ASCII Authorization header with TypeError
+    // *before* any socket opens. The suite-wide fetch stub would hide that
+    // throw, so this case drives the real platform fetch — the same path
+    // download_model action:"download_civitai" hits.
+    vi.unstubAllGlobals();
+    const nonAsciiToken = "token日本語";
+    try {
+      const probe = await fetch("https://example.invalid", {
+        headers: { Authorization: `Bearer ${nonAsciiToken}` },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(probe).toBeInstanceOf(TypeError);
+      expect((probe as TypeError).message).toMatch(/ByteString|greater than 255/i);
+
+      config.civitaiApiToken = nonAsciiToken;
+      let err: unknown;
+      try {
+        await resolveCivitaiModelVersion(3223074);
+      } catch (e) {
+        err = e;
+      }
+
+      expect(err).toBeInstanceOf(ModelError);
+      const me = err as ModelError;
+      expect(me.message).not.toMatch(/unreachable|check connectivity/i);
+      expect(me.message).toMatch(/credential|CIVITAI_API_TOKEN/i);
+      expect((me.details as { network?: boolean } | undefined)?.network).not.toBe(true);
+      expect((me.details as { credential?: boolean } | undefined)?.credential).toBe(true);
+    } finally {
+      vi.stubGlobal("fetch", fetchMock);
+    }
+  });
+
+  it("2xx that is NOT JSON (bot-gate/interstitial) → distinct non-JSON error, not a garbage empty", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw new SyntaxError("Unexpected token < in JSON");
+      },
+      text: async () => "<html>Just a moment…</html>",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /non-JSON response.*bot-gate|interstitial/i,
+    );
+  });
+
+  it("an abort DURING the body read is classified as a timeout, NOT a non-JSON bot-gate", async () => {
+    // Headers arrived (2xx), then the connection aborts while draining the body.
+    const abortErr = Object.assign(new Error("The operation was aborted."), {
+      name: "AbortError",
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw abortErr;
+      },
+      text: async () => "",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(/timed out/i);
+    // Distinctly NOT the non-JSON category.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw abortErr;
+      },
+      text: async () => "",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.not.toThrow(/non-JSON/i);
+  });
+
+  it("a network failure DURING the body read is classified as unreachable, NOT non-JSON", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw new TypeError("terminated");
+      },
+      text: async () => "",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /unreachable.*network error/i,
+    );
+  });
+
+  it("applies a request timeout signal to every civitai fetch", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ id: 1, files: [] }));
+    await resolveCivitaiModelVersion(1);
+    const opts = fetchMock.mock.calls[0][1] as { signal?: AbortSignal };
+    expect(opts.signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
 describe("resolveCivitaiModel", () => {
   it("picks the first (latest) version by default", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -198,6 +363,9 @@ describe("searchCivitaiModels", () => {
             baseModel: "Flux.1 D",
             trainedWords: ["Jeddtlv3"],
             files: [{ name: "flux-detailer.safetensors", primary: true, sizeKB: 300000 }],
+            // SFW mode vouches trained_words only for a PROVEN-clean version
+            // (#664 gate) — give the fixture explicit clean previews.
+            images: [{ url: "p1", nsfwLevel: 1 }],
           },
         ],
       },
@@ -232,6 +400,167 @@ describe("searchCivitaiModels", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ items: [] }));
     await searchCivitaiModels("x", { nsfw: true });
     expect(String(fetchMock.mock.calls[0][0])).toContain("nsfw=true");
+  });
+
+  it("nsfw:false selects the newest PG-13 version, not the latest mixed-NSFW one (#664)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        items: [
+          {
+            id: 1403959,
+            name: "Camera Motion",
+            type: "LORA",
+            nsfw: false, // model-level flag is clean — the API lets it through
+            creator: { username: "someone" },
+            modelVersions: [
+              {
+                id: 1666048, // latest version fronts explicit previews + adult words
+                name: "v3",
+                baseModel: "Wan Video",
+                trainedWords: ["explicit adult phrase", "camera motion"],
+                images: [
+                  { url: "a", nsfwLevel: 1 },
+                  { url: "b", nsfwLevel: 2 },
+                  { url: "c", nsfwLevel: 8 },
+                ],
+              },
+              {
+                id: 1599906, // older version stays at/below PG-13 (levels 1-2)
+                name: "v2",
+                baseModel: "Wan Video",
+                trainedWords: ["subtle camera motion"],
+                images: [
+                  { url: "d", nsfwLevel: 1 },
+                  { url: "e", nsfwLevel: 2 },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { hits } = await searchCivitaiModels("subtle camera motion cinematic", { nsfw: false });
+    expect(hits[0].version_id).toBe(1599906);
+    expect(hits[0].version_name).toBe("v2");
+    expect(hits[0].trained_words).toEqual(["subtle camera motion"]);
+  });
+
+  it("nsfw:false treats an image-less version as UNCLASSIFIED, never vouched (#664 gate)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        items: [
+          {
+            id: 2,
+            name: "No Previews",
+            nsfw: false,
+            modelVersions: [
+              {
+                id: 200,
+                name: "v1",
+                trainedWords: ["unverified phrase"],
+                images: [], // no previews → unclassified, not "clean"
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { hits } = await searchCivitaiModels("no previews", { nsfw: false });
+    // Download handoff preserved…
+    expect(hits[0].version_id).toBe(200);
+    // …but an unverified version's words are never serialized in SFW mode.
+    expect(hits[0].trained_words).toBeUndefined();
+  });
+
+  it("nsfw:false uses the version-level nsfwLevel when present, previews or not (#664 gate)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        items: [
+          {
+            id: 3,
+            name: "Rated Versions",
+            nsfw: false,
+            modelVersions: [
+              {
+                id: 301,
+                name: "v2 (latest, explicit rating)",
+                nsfwLevel: 8,
+                trainedWords: ["adult phrase"],
+                images: [],
+              },
+              {
+                id: 300,
+                name: "v1 (clean rating, no previews)",
+                nsfwLevel: 1,
+                trainedWords: ["safe phrase"],
+                images: [],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { hits } = await searchCivitaiModels("rated", { nsfw: false });
+    expect(hits[0].version_id).toBe(300);
+    expect(hits[0].trained_words).toEqual(["safe phrase"]);
+  });
+
+  it("nsfw:false never serializes trained words when NO version is clean (#664)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        items: [
+          {
+            id: 1,
+            name: "Mixed Pack",
+            nsfw: false,
+            modelVersions: [
+              {
+                id: 1666048,
+                name: "v1",
+                trainedWords: ["explicit adult phrase"],
+                images: [{ url: "a", nsfwLevel: 8 }],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { hits } = await searchCivitaiModels("mixed", { nsfw: false });
+    // The download handoff is preserved (the model itself is flagged SFW)…
+    expect(hits[0].version_id).toBe(1666048);
+    // …but trigger words from an adult-preview version are never vouched for.
+    expect(hits[0].trained_words).toBeUndefined();
+  });
+
+  it("nsfw:true keeps the latest version and its words regardless of preview levels", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        items: [
+          {
+            id: 1403959,
+            name: "Camera Motion",
+            nsfw: true,
+            modelVersions: [
+              {
+                id: 1666048,
+                name: "v3",
+                trainedWords: ["camera motion"],
+                images: [{ url: "a", nsfwLevel: 8 }],
+              },
+              {
+                id: 1599906,
+                name: "v2",
+                trainedWords: ["subtle camera motion"],
+                images: [{ url: "b", nsfwLevel: 1 }],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { hits } = await searchCivitaiModels("camera motion", { nsfw: true });
+    expect(hits[0].version_id).toBe(1666048);
+    expect(hits[0].trained_words).toEqual(["camera motion"]);
   });
 
   it("fails FAST with the config message when CIVITAI_ENABLED=0 (kill-switch, #127)", async () => {
@@ -433,6 +762,42 @@ describe("searchCivitaiModels", () => {
     await expect(searchCivitaiModels("  ")).rejects.toBeInstanceOf(ValidationError);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("creator + keyword: a FIRST-page failure THROWS (a broken scan must never read as empty)", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 503));
+    await expect(
+      searchCivitaiModels("detail", { creator: "jed" }),
+    ).rejects.toThrow(/upstream error.*503/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("creator + keyword: a LATER-page failure surfaces partial hits + scanError (not a silent truncation)", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          items: [{ id: 1, name: "Detail A", modelVersions: [] }],
+          metadata: { nextCursor: "p2" },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}, 429)); // page 2 rate-limited
+    const { hits, scanned, scanCapped, scanError } = await searchCivitaiModels(
+      "detail",
+      { creator: "prolific" },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(hits.map((h) => h.model_id)).toEqual([1]); // page-1 match retained
+    expect(scanned).toBe(1);
+    expect(scanCapped).toBe(true); // pages remained → result is not definitive
+    expect(scanError).toMatch(/rate-limited.*429/i); // the miss is attributable
+  });
+
+  it("creator + keyword: no scanError field on a clean full scan", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ items: [{ id: 1, name: "Detail A", modelVersions: [] }] }),
+    );
+    const result = await searchCivitaiModels("detail", { creator: "jed" });
+    expect(result.scanError).toBeUndefined();
+  });
 });
 
 describe("searchCivitaiCreators", () => {
@@ -543,9 +908,14 @@ describe("fetchCivitaiTopCreators", () => {
     expect(hits[1].thumbs_up).toBeUndefined();
   });
 
-  it("throws ModelError on a bot-gate 401", async () => {
+  it("bot-gate 401 reads as 'auth required', NOT 'your token is invalid' — the leaderboard sends no token even when one is configured", async () => {
+    config.civitaiApiToken = "a-valid-v1-token"; // configured, but NOT sent here
     fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
-    await expect(fetchCivitaiTopCreators()).rejects.toBeInstanceOf(ModelError);
+    const err = await fetchCivitaiTopCreators().catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    // Must NOT blame the configured token, since this request never sent it.
+    expect(err.message).toMatch(/requires authentication.*set CIVITAI_API_TOKEN/i);
+    expect(err.message).not.toMatch(/invalid or expired/i);
   });
 
   it("fails FAST when CIVITAI_ENABLED=0 (kill-switch, #127)", async () => {

@@ -4,6 +4,13 @@ import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { NodeBisectError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  detectManagerApi,
+  enqueueManagerTaskForExternal,
+  managerApiPrefixFor,
+  startManagerQueueForExternal,
+  type ManagerApi,
+} from "./node-management.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -154,11 +161,12 @@ async function managerFetch(
   path: string,
   init?: RequestInit,
   timeoutMs = 15000,
+  base = managerBase(),
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await comfyuiFetch(`${managerBase()}${path}`, {
+    const res = await comfyuiFetch(`${base}${path}`, {
       ...init,
       signal: controller.signal,
       headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
@@ -180,10 +188,13 @@ async function managerFetch(
  */
 export async function isManagerAvailable(): Promise<boolean> {
   try {
+    const base = managerBase();
+    const api = await detectManagerApi(base);
     const res = await managerFetch(
-      "/customnode/installed?mode=default",
+      `${managerApiPrefixFor(api)}/customnode/installed?mode=default`,
       { method: "GET" },
       4000,
+      base,
     );
     return res.ok;
   } catch {
@@ -220,9 +231,11 @@ const managerDescriptors = new Map<string, ManagerNodeDescriptor>();
  */
 export const managerController: NodeController = {
   async listNodes(): Promise<InstalledNodeInfo[]> {
-    const res = await managerFetch("/customnode/installed?mode=default", {
+    const base = managerBase();
+    const api = await detectManagerApi(base);
+    const res = await managerFetch(`${managerApiPrefixFor(api)}/customnode/installed?mode=default`, {
       method: "GET",
-    });
+    }, 15000, base);
     if (!res.ok) {
       throw new NodeBisectError(
         `ComfyUI-Manager /customnode/installed returned HTTP ${res.status}`,
@@ -262,49 +275,31 @@ export const managerController: NodeController = {
       };
     };
 
+    const base = managerBase();
     let queued = 0;
+    let used: ManagerApi | undefined;
     for (const id of disabled) {
-      const res = await managerFetch("/manager/queue/disable", {
-        method: "POST",
-        body: JSON.stringify(payloadFor(id)),
-      });
-      if (!res.ok) {
-        throw new NodeBisectError(
-          `Failed to queue disable for "${id}": HTTP ${res.status}`,
-        );
-      }
+      const p = payloadFor(id);
+      used = await enqueueManagerTaskForExternal("disable", (api) =>
+        api === "v2"
+          ? { node_name: id, is_unknown: false }
+          : { node_name: id, node_ver: p.version },
+      base);
       queued++;
     }
     for (const id of enabled) {
       const p = payloadFor(id);
-      const res = await managerFetch("/manager/queue/install", {
-        method: "POST",
-        // skip_post_install routes Manager to the synchronous unified_enable
-        // path: it moves the pack out of .disabled/ without reinstalling.
-        body: JSON.stringify({
-          ...p,
-          selected_version: p.version,
-          skip_post_install: true,
-        }),
-      });
-      if (!res.ok) {
-        throw new NodeBisectError(
-          `Failed to queue enable for "${id}": HTTP ${res.status}`,
-        );
-      }
+      used = await enqueueManagerTaskForExternal("enable", (api) =>
+        api === "v2"
+          ? { cnr_id: managerDescriptors.get(id)?.cnrId ?? id }
+          : {
+              node_name: id,
+              node_ver: p.version,
+            },
+      base);
       queued++;
     }
-    if (queued > 0) {
-      const res = await managerFetch("/manager/queue/start", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      if (!res.ok) {
-        throw new NodeBisectError(
-          `Failed to start ComfyUI-Manager task queue: HTTP ${res.status}`,
-        );
-      }
-    }
+    if (queued > 0 && used) await startManagerQueueForExternal(used, base);
   },
 };
 
@@ -426,12 +421,12 @@ function describe(state: BisectState): string {
       : "Resolved: no candidate nodes remain (problem not attributable to a single node).";
   }
   if (state.status === "idle") {
-    return "No bisect session is active. Run bisect_start to begin.";
+    return 'No bisect session is active. Run bisect (action:"start") to begin.';
   }
   return (
     `Round in progress: ${state.range.length} candidate node(s) remain. ` +
     `${state.active.length} enabled this round, ${state.all.length - state.active.length} disabled. ` +
-    `Reproduce your problem now, then call bisect_good (problem gone) or bisect_bad (problem persists).`
+    `Reproduce your problem now, then call bisect (action:"good") if the problem is gone or bisect (action:"bad") if it persists.`
   );
 }
 
@@ -492,7 +487,7 @@ export async function bisectStart(deps?: BisectDeps): Promise<ApplyResult> {
 function requireRunning(): BisectState {
   if (!session || session.status !== "running") {
     throw new NodeBisectError(
-      "No bisect session is in progress. Run bisect_start first.",
+      'No bisect session is in progress. Run bisect (action:"start") first.',
     );
   }
   return session;

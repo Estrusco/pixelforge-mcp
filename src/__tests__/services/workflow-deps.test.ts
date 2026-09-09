@@ -1,12 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   collectClassTypes,
   extractWorkflowDependencies,
   installWorkflowDependencies,
   type WorkflowDepsDeps,
   type ManagerNodePack,
+  defaultWorkflowDepsDeps,
+  installWorkflowDependenciesForAnalysis,
 } from "../../services/workflow-deps.js";
+import { resetManagerApiCacheForTests } from "../../services/node-management.js";
+import { setPanelVersionPin } from "../../services/panel-settings.js";
 import type { WorkflowJSON, ObjectInfo, ComfyUINodeDef } from "../../comfyui/types.js";
+
+afterEach(() => vi.unstubAllGlobals());
 
 /** Build a minimal ObjectInfo node def with a given python_module. */
 function def(name: string, pythonModule: string): ComfyUINodeDef {
@@ -85,6 +94,18 @@ function makeDeps(overrides: Partial<WorkflowDepsDeps> = {}): WorkflowDepsDeps {
   };
 }
 
+describe("default WorkflowDeps Manager dialect routing", () => {
+  it("uses the v4-prefixed customnode mapping route", async () => {
+    resetManagerApiCacheForTests("v2");
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await defaultWorkflowDepsDeps().fetchManagerMappings();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8188/v2/customnode/getmappings?mode=nickname",
+    );
+  });
+});
+
 describe("collectClassTypes", () => {
   it("returns distinct, sorted class_types", () => {
     expect(collectClassTypes(sampleWorkflow)).toEqual([
@@ -114,6 +135,41 @@ describe("collectClassTypes", () => {
       links: [],
     };
     expect(collectClassTypes(ui)).toEqual(["CLIPTextEncode", "KSampler"]);
+  });
+
+  // #2648 — a UI subgraph INSTANCE is structural (type === definition UUID).
+  // Reading only workflow.nodes treated that UUID as a class_type and never
+  // walked definitions.subgraphs[].nodes, so extract_deps mapped the UUID
+  // through an unrelated Manager pattern and omitted inner packs.
+  it("walks UI subgraph inner nodes and does not treat the instance UUID as a class_type (#2648)", () => {
+    const instanceId = "2d4f2d38-ff62-4ae8-853d-2a359520164b";
+    const ui = {
+      nodes: [
+        { id: 1, type: "LoadImage" },
+        { id: 2, type: instanceId },
+      ],
+      links: [],
+      definitions: {
+        subgraphs: [
+          {
+            id: instanceId,
+            name: "WanSampler",
+            nodes: [
+              { id: 10, type: "WanVideoSampler" },
+              { id: 11, type: "WanVideoWrapper" },
+              { id: 12, type: "SetNode" },
+            ],
+          },
+        ],
+      },
+    };
+    expect(collectClassTypes(ui)).toEqual([
+      "LoadImage",
+      "SetNode",
+      "WanVideoSampler",
+      "WanVideoWrapper",
+    ]);
+    expect(collectClassTypes(ui)).not.toContain(instanceId);
   });
 });
 
@@ -206,9 +262,95 @@ describe("extractWorkflowDependencies", () => {
       source: "manager_mappings",
     });
   });
+
+  it("does not map a UI subgraph UUID through an unrelated Manager pattern (#2648)", async () => {
+    const instanceId = "2d4f2d38-ff62-4ae8-853d-2a359520164b";
+    const deps = makeDeps({
+      fetchObjectInfo: vi.fn(async () => ({}) as ObjectInfo),
+      fetchManagerMappings: vi.fn(
+        async () =>
+          ({
+            "https://github.com/DemonGatanjieu/Anomalous_Model_Browser": [
+              [],
+              {
+                title: "Anomalous_Model_Browser",
+                nodename_pattern: "^[0-9a-f]{8}-",
+              },
+            ],
+            "https://github.com/kijai/ComfyUI-WanVideoWrapper": [
+              ["WanVideoSampler", "WanVideoWrapper"],
+              { title: "WanVideoWrapper" },
+            ],
+            "https://github.com/kijai/ComfyUI-KJNodes": [
+              ["SetNode"],
+              { title: "KJNodes" },
+            ],
+          }) as never,
+      ),
+    });
+    const ui = {
+      nodes: [
+        { id: 1, type: "LoadImage" },
+        { id: 2, type: instanceId },
+      ],
+      definitions: {
+        subgraphs: [
+          {
+            id: instanceId,
+            nodes: [
+              { id: 10, type: "WanVideoSampler" },
+              { id: 11, type: "WanVideoWrapper" },
+              { id: 12, type: "SetNode" },
+            ],
+          },
+        ],
+      },
+    };
+    const result = await extractWorkflowDependencies(ui as never, deps);
+
+    expect(result.classTypes).toEqual([
+      "LoadImage",
+      "SetNode",
+      "WanVideoSampler",
+      "WanVideoWrapper",
+    ]);
+    expect(result.classTypes).not.toContain(instanceId);
+    expect(result.requiredPacks).toEqual(["KJNodes", "WanVideoWrapper"]);
+    expect(result.requiredPacks).not.toContain("Anomalous_Model_Browser");
+    expect(result.missingPacks).not.toContain("Anomalous_Model_Browser");
+    expect(result.dependencies.map((d) => d.class_type)).not.toContain(instanceId);
+  });
 });
 
 describe("installWorkflowDependencies", () => {
+  it("refuses before queuing when a workflow dependency selects the pinned panel", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-workflow-deps-pin-"));
+    process.env.COMFYUI_MCP_PANEL_SETTINGS = join(dir, "panel-settings.json");
+    process.env.COMFYUI_MCP_PANEL_LOCK = join(dir, "panel-op.lock");
+    try {
+      setPanelVersionPin("0.11.3");
+      const deps = makeDeps({
+        fetchObjectInfo: vi.fn(async () => ({})),
+        fetchManagerMappings: vi.fn(async () => ({
+          "comfyui-agent-panel": [["PanelOnlyNode"], {}],
+        } as never)),
+      });
+      const panelWorkflow: WorkflowJSON = {
+        "1": { class_type: "PanelOnlyNode", inputs: {} },
+      };
+
+      await expect(installWorkflowDependencies(panelWorkflow, deps)).rejects.toThrow(/pinned/i);
+      // The guard wraps the transaction, so no Manager mutation starts.
+      expect(deps.fetchManagerList).not.toHaveBeenCalled();
+      expect(deps.resetQueue).not.toHaveBeenCalled();
+      expect(deps.queueInstall).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.COMFYUI_MCP_PANEL_SETTINGS;
+      delete process.env.COMFYUI_MCP_PANEL_LOCK;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("installs via ComfyUI-Manager regardless of any local path (server-side install)", async () => {
     // Installs run through the Manager HTTP queue on the connected instance, so
     // the absence of a local path must NOT block them.
@@ -216,6 +358,28 @@ describe("installWorkflowDependencies", () => {
     const result = await installWorkflowDependencies(sampleWorkflow, deps);
     expect(result.installed).toEqual(["Remote-Only-Pack"]);
     expect(deps.queueInstall).toHaveBeenCalledTimes(1);
+  });
+
+  it("never queues the panel through the generic direct-install/remote fallback", async () => {
+    const deps = makeDeps({
+      fetchObjectInfo: vi.fn(async () => ({})),
+      fetchManagerMappings: vi.fn(async () => ({
+        "comfyui-agent-panel": [["PanelOnlyNode"], {}],
+      } as never)),
+      fetchManagerList: vi.fn(async () => ({ directInstall: true, packs: [] })),
+    });
+    const panelWorkflow: WorkflowJSON = {
+      "1": { class_type: "PanelOnlyNode", inputs: {} },
+    };
+
+    const result = await installWorkflowDependencies(panelWorkflow, deps);
+
+    expect(result.installed).toEqual([]);
+    expect(result.unresolved).toEqual(["comfyui-agent-panel"]);
+    expect(result.panel_notes?.join(" ")).toMatch(/does not queue or mutate.*install_comfyui\(action:'panel'/i);
+    expect(deps.resetQueue).not.toHaveBeenCalled();
+    expect(deps.queueInstall).not.toHaveBeenCalled();
+    expect(deps.startQueue).not.toHaveBeenCalled();
   });
 
   it("resets the queue, queues missing packs (with channel), then starts the worker", async () => {
@@ -270,5 +434,160 @@ describe("installWorkflowDependencies", () => {
     expect(result.alreadyInstalled).not.toContain("Remote-Only-Pack");
     expect(result.alreadyInstalled).toEqual(["ComfyUI-Impact-Pack"]);
     expect(deps.queueInstall).not.toHaveBeenCalled();
+  });
+});
+
+// #1136 — an EMPTY Manager catalogue must not read as "these packs do not exist".
+//
+// This is the reported user's actual path. They were told to search ComfyUI
+// Manager, the registry was unreachable FROM THE COMFYUI HOST, and Manager
+// returned a healthy 200 with an empty cache. Every pack then fell to
+// `unresolved` and rendered as "neither installed nor known to ComfyUI-Manager".
+// We cannot see their DNS failure -- it happened in another process -- but an
+// empty legacy catalogue is a strong local signal, because a healthy one
+// carries thousands of entries.
+describe("empty Manager catalogue is flagged, not read as absence (#1136)", () => {
+  const base = {
+    analysis: {
+      requiredPacks: [],
+      missingPacks: ["some-pack"],
+      unresolved: ["SomeNodeType"],
+      dependencies: [],
+    },
+  };
+
+  it("sets catalogue_unavailable when a non-local channel returns zero packs", async () => {
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({ channel: "default", packs: [] }),
+      queueInstall: async () => "legacy",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeTruthy();
+    expect(res.catalogue_unavailable).toMatch(/NOT evidence that these\s+packs do not exist|NOT evidence/i);
+    expect(res.unresolved).toContain("SomeNodeType");
+  });
+
+  it("does NOT flag a local channel — an empty local list is a real answer", async () => {
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({ channel: "local", packs: [] }),
+      queueInstall: async () => "legacy",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+
+  it("does NOT flag a Manager v4 host — directInstall is the ONLY production over-fire", async () => {
+    // S1 from the re-review. fetchManagerList returns {packs: [], directInstall:
+    // true} for EVERY v4 host (workflow-deps.ts:188), so `!directInstall` is the
+    // only clause standing between v4 users and this note on every install. My
+    // two original negatives (a `local` channel, a populated catalogue) covered
+    // neither -- dropping `!directInstall` killed zero tests, while the commit
+    // claimed they "keep an over-firing version honest".
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({ channel: "default", packs: [], directInstall: true }),
+      queueInstall: async () => "v4",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+
+  it("does not set catalogue_unavailable when nothing is unresolved", async () => {
+    // Round 3: a comment claimed this gate existed; it did not.
+    const res = await installWorkflowDependenciesForAnalysis(
+      { requiredPacks: [], missingPacks: [], unresolved: [], dependencies: [] } as never,
+      {
+        fetchManagerList: async () => ({ channel: "default", packs: [] }),
+        queueInstall: async () => "legacy",
+        resetQueue: async () => undefined,
+        startQueue: async () => undefined,
+        queueStatus: async () => undefined,
+      } as never,
+    );
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+
+  it("does NOT flag a catalogue that actually returned entries", async () => {
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({
+        channel: "default",
+        packs: [{ id: "other-pack", title: "Other" }],
+      }),
+      queueInstall: async () => "legacy",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+});
+
+// P0-1 from the re-review: extract_deps is the READ action the tool description
+// tells callers to use FIRST, and its `unresolved` comes from the MAPPINGS
+// endpoint — whose failure was caught, logged at warn, and discarded, after
+// which we asserted "not known to ComfyUI-Manager". Stronger evidence thrown
+// away than the getlist case: there we infer from an empty list; here we were
+// holding the exception.
+describe("extract_deps flags an unanswered mappings lookup (#1136)", () => {
+  const wf = { nodes: [{ type: "SomeMissingNodeType" }] };
+  const objectInfo = {};
+
+  const mk = (fetchManagerMappings: () => Promise<unknown>) =>
+    ({
+      fetchObjectInfo: async () => objectInfo,
+      fetchManagerMappings,
+      fetchInstalledPacks: async () => [],
+    }) as never;
+
+  it("sets mappings_unavailable when the lookup THROWS", async () => {
+    const err = new TypeError("fetch failed");
+    (err as unknown as { cause: unknown }).cause = Object.assign(new Error("ENOTFOUND"), {
+      code: "ENOTFOUND",
+    });
+    const res = await extractWorkflowDependencies(wf as never, mk(async () => {
+      throw err;
+    }));
+    expect(res.unresolved.length).toBeGreaterThan(0);
+    expect(res.mappings_unavailable).toBeTruthy();
+    expect(res.mappings_unavailable).toMatch(/NOT evidence/i);
+  });
+
+  it("sets it for an EMPTY mappings response too — a 200 carrying nothing", async () => {
+    const res = await extractWorkflowDependencies(wf as never, mk(async () => ({})));
+    expect(res.mappings_unavailable).toBeTruthy();
+  });
+
+  it("says 'no usable entries', NOT 'came back EMPTY', for an unparseable shape", async () => {
+    // buildMappingIndex skips non-Array values, so a v4 shape difference yields
+    // an empty index from a NON-empty body. Claiming the response was empty
+    // asserts something we never checked -- the defect class this issue is
+    // about, one endpoint over.
+    const res = await extractWorkflowDependencies(
+      wf as never,
+      mk(async () => ({ "some-pack": { nodes: ["SomeMissingNodeType"] } })),
+    );
+    expect(res.mappings_unavailable).toBeTruthy();
+    expect(res.mappings_unavailable).not.toMatch(/came back EMPTY/);
+    expect(res.mappings_unavailable).toMatch(/no usable entries/i);
+  });
+
+  it("does not set the note when there is nothing unresolved to mislead about", async () => {
+    // H3 — the producer gate I described in review and had not pinned.
+    const res = await extractWorkflowDependencies({ nodes: [] } as never, mk(async () => ({})));
+    expect(res.unresolved).toEqual([]);
+    expect(res.mappings_unavailable).toBeUndefined();
+  });
+
+  it("stays quiet when the mappings lookup actually answered", async () => {
+    const res = await extractWorkflowDependencies(
+      wf as never,
+      mk(async () => ({ "some-pack": [["SomeMissingNodeType"], { title_aux: "Some Pack" }] })),
+    );
+    expect(res.mappings_unavailable).toBeUndefined();
   });
 });

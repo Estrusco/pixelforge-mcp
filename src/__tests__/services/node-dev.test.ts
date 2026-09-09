@@ -3,6 +3,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -17,8 +19,21 @@ vi.mock("../../config.js", () => {
   const config: { comfyuiPath: string | undefined; githubToken?: string } = {
     comfyuiPath: undefined,
   };
-  return { config, getComfyUIBaseUrl: () => "http://127.0.0.1:8188" };
+  return {
+    config,
+    getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+    isRemoteMode: () => false,
+  };
 });
+
+// Control the effective LOCAL base node-dev resolves through, so #506's
+// saved-default-workspace behavior is exercised without touching real user
+// config. resolveEffectiveComfyUIBase() prefers COMFYUI_PATH then the saved
+// default; the mock mirrors that: config.comfyuiPath first, else wsMock.saved.
+const wsMock = vi.hoisted(() => ({ saved: undefined as string | undefined }));
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? wsMock.saved,
+}));
 
 import { config } from "../../config.js";
 import {
@@ -37,6 +52,12 @@ import {
   NodeDevError,
   LONG_LINE_CHUNK,
   READ_MAX_CHARS,
+  // #809
+  MIN_OUTPUT_CHARS,
+  SEARCH_LINE_MAX,
+  SEARCH_MAX_COLUMNS,
+  SEARCH_MAX_RESULTS,
+  LIST_MAX_ENTRIES,
   defaultDeps,
   type NodeDevDeps,
   type RunResult,
@@ -80,6 +101,7 @@ beforeEach(() => {
   customNodes = join(workspace, "custom_nodes");
   mkdirSync(customNodes, { recursive: true });
   config.comfyuiPath = workspace;
+  wsMock.saved = undefined;
   delete process.env.COMFYUI_MCP_ALLOW_GIT_WRITES;
 });
 
@@ -150,9 +172,21 @@ describe("resolveInJail", () => {
     expect(() => resolveInJail("junction/loot.txt")).toThrow(NodeDevError);
   });
 
-  it("refuses when comfyuiPath is unset (remote mode)", () => {
+  it("refuses when no local install is configured (remote mode, no saved default)", () => {
     config.comfyuiPath = undefined;
+    wsMock.saved = undefined;
     expect(() => resolveInJail("MyPack")).toThrow(/local ComfyUI install/);
+  });
+
+  it("resolves against the saved default workspace when COMFYUI_PATH is unset (#506)", () => {
+    // No COMFYUI_PATH, but a saved default workspace is set — a loopback session
+    // must be treated as local, mirroring install_comfyui (action:"environment")/workspace action:"get", instead
+    // of being rejected as remote.
+    config.comfyuiPath = undefined;
+    wsMock.saved = workspace;
+    mkdirSync(join(customNodes, "MyPack"), { recursive: true });
+    const { rel } = resolveInJail("MyPack");
+    expect(rel).toBe("MyPack");
   });
 });
 
@@ -170,12 +204,39 @@ describe("bounding helpers", () => {
   });
 
   it("boundText clips and flags truncation", () => {
-    const r = boundText("abcdef", 3);
+    // #809: the notice is REQUIRED — boundText is shared by tools with different levers,
+    // so a default naming `max_chars` would ship a dead remedy to callers without one.
+    const notice = (dropped: number) => `[cut ${dropped}]`;
+    // The notice is reserved OUT of the budget (#809), so the budget must leave room for
+    // both: 20 chars fits "abcdef"'s head plus the ~8-char marker.
+    const r = boundText("abcdef".repeat(10), 20, notice);
     expect(r.truncated).toBe(true);
-    expect(r.text.startsWith("abc")).toBe(true);
-    const ok = boundText("abc", 10);
+    expect(r.text.startsWith("a")).toBe(true);
+    expect(r.text.length).toBeLessThanOrEqual(20);
+    const ok = boundText("abc", 10, notice);
     expect(ok.truncated).toBe(false);
     expect(ok.text).toBe("abc");
+  });
+
+  // #809 (codex gate): the marker is spent from the very budget it describes, so a longer
+  // marker must not be able to push the result past maxChars — the bound is the promise
+  // the parameter makes, and breaking it to explain the break would be absurd.
+  it("boundText keeps the RESULT within maxChars even with a long notice", () => {
+    const notice = (dropped: number) =>
+      `\n\n[... ${dropped} more char(s) cut by \`max_chars\`; raise \`max_chars\` up to ${READ_MAX_CHARS} ...]`;
+    const noticeLen = notice(50_000).length;
+    for (const budget of [200, 1000, 5000, 12_000]) {
+      const r = boundText("z".repeat(50_000), budget, notice);
+      expect(r.truncated).toBe(true);
+      expect(r.text.length, `budget ${budget} breached`).toBeLessThanOrEqual(budget);
+      // And the marker itself survives — reserving space must not clip the instruction.
+      expect(r.text).toContain("raise `max_chars`");
+    }
+    // A budget smaller than the marker cannot honour both; the MARKER wins, because an
+    // empty unexplained field reads as "the file is empty".
+    const tiny = boundText("z".repeat(50_000), 5, notice);
+    expect(tiny.text).toContain("raise `max_chars`");
+    expect(tiny.text.length).toBeLessThanOrEqual(noticeLen);
   });
 
   it("readNodeFile reports total_lines on a CRLF file and clips char budget", () => {
@@ -224,7 +285,9 @@ describe("searchNodePacks", () => {
     mkdirSync(pack, { recursive: true });
     writeFileSync(join(pack, "nodes.py"), "class FooNode:\n    pass\n");
     writeFileSync(join(pack, "bin.dat"), Buffer.from([0, 1, 2, 0, 70, 111, 111]));
-    const res = searchNodePacks({ query: "FooNode" });
+    // Force the builtin path regardless of whether rg exists on this host (#655).
+    const { deps } = makeDeps();
+    const res = searchNodePacks({ query: "FooNode" }, deps);
     expect(res.engine).toBe("builtin");
     expect(res.matches.length).toBe(1);
     // Default path "." searches the whole jail root, so file is root-relative.
@@ -250,6 +313,194 @@ describe("searchNodePacks", () => {
     expect(rgCallsSpy[0].args).toContain("hit");
     // no option-injection: query passed after --regexp, not as a bare arg
     expect(rgCallsSpy[0].args[rgCallsSpy[0].args.indexOf("--regexp") + 1]).toBe("hit");
+  });
+
+  // #809 (codex gate) — BOTH directions of the truncation lie, run for real rather than
+  // asserted against the source text.
+  //
+  // `--max-count` is PER FILE, so asking rg for exactly `cap` meant a file holding more
+  // had its extras dropped by rg before we saw a line (silent loss), while a search with
+  // exactly `cap` real matches was labelled truncated (false alarm — the agent is told to
+  // retry wider for nothing, which is how it learns to distrust the tool). Asking for
+  // `cap + 1` closes both: the extra line is the proof, its absence the proof of
+  // completeness.
+  it("asks ripgrep for ONE past the cap so truncation can be PROVEN either way", () => {
+    const seen: string[][] = [];
+    const { deps } = makeDeps({
+      hasRipgrep: () => true,
+      runRipgrep: (args) => {
+        seen.push(args);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    searchNodePacks({ query: "x", maxResults: 5 }, deps);
+    expect(seen[0][seen[0].indexOf("--max-count") + 1]).toBe("6");
+  });
+
+  // #2418 — `--max-count` is per FILE, so ONE minified one-line workflow JSON can put
+  // its whole self on stdout. Measured against real ripgrep 15.0.0: a 42 MB single-line
+  // file produced 33 MB of output, past spawnSync's 32 MB maxBuffer, and the search died
+  // ENOBUFS before returning a single match. SEARCH_LINE_MAX cannot help — clipMatchLine
+  // runs after spawnSync has already returned, so the bound has to be asked of ripgrep.
+  it("bounds each printed line AT THE SOURCE so one minified file cannot ENOBUFS it", () => {
+    const seen: string[][] = [];
+    const { deps } = makeDeps({
+      hasRipgrep: () => true,
+      runRipgrep: (args) => {
+        seen.push(args);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    searchNodePacks({ query: "x" }, deps);
+    expect(seen[0]).toContain("--max-columns");
+    expect(seen[0][seen[0].indexOf("--max-columns") + 1]).toBe(String(SEARCH_MAX_COLUMNS));
+    // PREVIEW, not bare --max-columns: bare yields "[Omitted long matching line]" (28
+    // chars), which is UNDER SEARCH_LINE_MAX, so clipMatchLine would skip its marker and
+    // the caller would get neither the content nor any disclosure that it was cut.
+    expect(seen[0]).toContain("--max-columns-preview");
+  });
+
+  it("does NOT claim truncation when the match count is exactly max_results", () => {
+    const lines = Array.from({ length: 3 }, (_, i) => `a.py:${i + 1}:hit`).join("\n");
+    const { deps } = makeDeps({
+      hasRipgrep: () => true,
+      runRipgrep: () => ({ status: 0, stdout: `${lines}\n`, stderr: "" }),
+    });
+    const res = searchNodePacks({ query: "hit", maxResults: 3 }, deps);
+    expect(res.matches).toHaveLength(3);
+    expect(res.truncated).toBe(false);
+    expect(res.truncation_hint).toBeUndefined();
+  });
+
+  it("DOES claim truncation — with the lever and ceiling — on the (cap+1)-th match", () => {
+    const lines = Array.from({ length: 4 }, (_, i) => `a.py:${i + 1}:hit`).join("\n");
+    const { deps } = makeDeps({
+      hasRipgrep: () => true,
+      runRipgrep: () => ({ status: 0, stdout: `${lines}\n`, stderr: "" }),
+    });
+    const res = searchNodePacks({ query: "hit", maxResults: 3 }, deps);
+    expect(res.matches).toHaveLength(3);
+    expect(res.truncated).toBe(true);
+    expect(res.truncated_by).toBe("max_results");
+    expect(res.truncation_hint).toContain("`max_results`");
+    expect(res.truncation_hint).toContain(`up to ${SEARCH_MAX_RESULTS}`);
+  });
+
+  // codex gate: the FIRST cut is the one the caller must act on. If a later write could
+  // flip an actionable "raise `max_results`" into "no parameter raises it", the remedy
+  // would name the wrong lever — the defect this whole issue is about.
+  it("keeps the FIRST truncation cause, so the remedy names the lever that applies", () => {
+    const files = Array.from({ length: 50 }, (_, i) => ({ name: `f${i}.py`, isDir: false }));
+    const { deps } = makeDeps({
+      hasRipgrep: () => false,
+      isDirectory: () => true,
+      listDir: () => files,
+      fileSize: () => 10,
+      readFileBuffer: () => Buffer.from("hit\nhit\nhit\n"),
+    });
+    const res = searchNodePacks({ query: "hit", maxResults: 2 }, deps);
+    expect(res.truncated).toBe(true);
+    expect(res.truncated_by).toBe("max_results");
+    expect(res.truncation_hint).toContain("`max_results`");
+    expect(res.truncation_hint).not.toContain("no parameter raises it");
+  });
+
+  it("marks the 600-char per-line clip and stays inside it", () => {
+    const { deps } = makeDeps({
+      hasRipgrep: () => true,
+      runRipgrep: () => ({ status: 0, stdout: `a.py:1:${"z".repeat(5000)}\n`, stderr: "" }),
+    });
+    const res = searchNodePacks({ query: "z" }, deps);
+    expect(res.matches[0].text.length).toBeLessThanOrEqual(SEARCH_LINE_MAX);
+    expect(res.matches[0].text).toContain("fixed 600-char per-line cap");
+  });
+});
+
+// #809 (codex gate): the file walk had the same exact-cap false alarm, and reported a
+// bare boolean with no total and no lever.
+describe("listNodePackFiles truncation honesty (#809)", () => {
+  const seed = (n: number) => {
+    const pack = join(customNodes, "Pack");
+    mkdirSync(pack, { recursive: true });
+    for (let i = 0; i < n; i++) writeFileSync(join(pack, `f${i}.py`), "x");
+  };
+
+  it("does NOT claim truncation when the entry count is exactly max_entries", () => {
+    seed(3);
+    const res = listNodePackFiles({ pack: "Pack", maxEntries: 3 });
+    expect(res.entries).toHaveLength(3);
+    expect(res.truncated).toBe(false);
+    expect(res.truncation_hint).toBeUndefined();
+  });
+
+  it("names max_entries, its ceiling, and glob when the walk really stopped early", () => {
+    seed(5);
+    const res = listNodePackFiles({ pack: "Pack", maxEntries: 3 });
+    expect(res.entries).toHaveLength(3);
+    expect(res.truncated).toBe(true);
+    expect(res.truncation_hint).toContain("`max_entries`");
+    expect(res.truncation_hint).toContain(`up to ${LIST_MAX_ENTRIES}`);
+    expect(res.truncation_hint).toContain("`glob`");
+  });
+});
+
+// #809 (codex gate): the clamps must be exercised, not asserted about. A remedy that
+// quotes a ceiling the runtime does not enforce is the same defect as a wrong param.
+describe("max_chars clamps are real (#809)", () => {
+  it('node_pack action:"read" honours the ceiling AND the floor it advertises', () => {
+    const pack = join(customNodes, "Pack");
+    mkdirSync(pack, { recursive: true });
+    // MANY lines, so paging by start_line/line_count is a live remedy here.
+    writeFileSync(join(pack, "big.py"), Array.from({ length: 5000 }, (_, i) => `line ${i} ${"z".repeat(60)}`).join("\n"));
+
+    // line_count high enough that the CHAR budget is what cuts, not the line window.
+    const over = readNodeFile({ path: "Pack/big.py", maxChars: 1_000_000, lineCount: 800 });
+    expect(over.content.length).toBeLessThanOrEqual(READ_MAX_CHARS);
+    expect(over.truncated).toBe(true);
+    // Clamped to the ceiling, so the remedy must NOT say "raise max_chars to 24000" —
+    // the caller is already there, and that retry would change nothing (#809 codex gate).
+    expect(over.content).toContain(`already at its ceiling of ${READ_MAX_CHARS}`);
+    expect(over.content).not.toContain("raise `max_chars` (up to");
+    // What IS left must still be named.
+    expect(over.content).toContain("`start_line`");
+
+    // A budget of 1 used to yield either an unexplained empty field or a marker that
+    // breached its own bound. The FLOOR (not the ceiling) fixes that.
+    const under = readNodeFile({ path: "Pack/big.py", maxChars: 1 });
+    expect(under.content.length).toBeLessThanOrEqual(MIN_OUTPUT_CHARS);
+    expect(under.content).toContain("raise `max_chars`");
+  });
+
+  // codex gate: `start_line`/`line_count` index SOURCE lines. On a slice that is ONE
+  // physical line there is nothing to page to, so offering it names a real lever that
+  // cannot move — the same wasted round trip as naming a nonexistent one.
+  it("does NOT offer line paging when the slice is a single overlong line", () => {
+    const pack = join(customNodes, "Pack");
+    mkdirSync(pack, { recursive: true });
+    writeFileSync(join(pack, "min.js"), "z".repeat(200_000));
+
+    const r = readNodeFile({ path: "Pack/min.js", maxChars: 1_000_000 });
+    expect(r.truncated).toBe(true);
+    expect(r.content).toMatch(/SINGLE physical line/);
+    expect(r.content).toMatch(/`start_line`\/`line_count` cannot reach the rest/);
+    // At the ceiling it must not pretend another parameter would help either.
+    expect(r.content).toContain(`at the ${READ_MAX_CHARS} ceiling this tool cannot return more of it`);
+    expect(r.content).toContain('node_pack (action:"search")');
+  });
+
+  it('node_pack action:"git" honours the same ceiling and floor', () => {
+    mkdirSync(join(customNodes, "Pack"), { recursive: true });
+    const { deps } = makeDeps({
+      runGit: () => ({ status: 0, stdout: "d".repeat(200_000), stderr: "" }),
+    });
+    const over = nodePackGit({ pack: "Pack", action: "diff", maxChars: 1_000_000 }, deps);
+    expect(over.stdout.length).toBeLessThanOrEqual(READ_MAX_CHARS);
+    expect(over.stdout).toContain(`already at its ceiling of ${READ_MAX_CHARS}`);
+    expect(over.stdout).toContain("`paths`");
+
+    const under = nodePackGit({ pack: "Pack", action: "diff", maxChars: 1 }, deps);
+    expect(under.stdout.length).toBeLessThanOrEqual(MIN_OUTPUT_CHARS);
+    expect(under.stdout).toContain("raise `max_chars`");
   });
 });
 
@@ -289,6 +540,39 @@ describe("parsePatchPaths", () => {
       "+new",
     ].join("\n");
     expect(parsePatchPaths(patch)).toEqual(["Pack/nodes.py"]);
+  });
+
+  it("extracts apply-patch *** Update File paths (#2496)", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: Pack/nodes.py",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+    expect(parsePatchPaths(patch)).toEqual(["Pack/nodes.py"]);
+  });
+
+  it("extracts Add File, Delete File, and Move to paths (#2496)", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Add File: Pack/new.py",
+      "+hello",
+      "*** Delete File: Pack/gone.py",
+      "*** Update File: Pack/old.py",
+      "*** Move to: Pack/renamed.py",
+      "@@",
+      "-a",
+      "+b",
+      "*** End Patch",
+    ].join("\n");
+    expect(parsePatchPaths(patch)).toEqual([
+      "Pack/new.py",
+      "Pack/gone.py",
+      "Pack/old.py",
+      "Pack/renamed.py",
+    ]);
   });
 });
 
@@ -349,6 +633,61 @@ describe("applyNodePatch", () => {
     ].join("\n");
     expect(() => applyNodePatch(patch, deps)).toThrow(NodeDevError);
     expect(gitCalls.length).toBe(0);
+  });
+
+  it("applies *** Begin Patch / *** Update File (real git) (#2496)", () => {
+    initRepoPack();
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: Pack/nodes.py",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+    const res = applyNodePatch(patch);
+    expect(res.success).toBe(true);
+    expect(res.stage).toBe("apply");
+    expect(res.touched).toEqual(["Pack/nodes.py"]);
+    expect(readFileSync(join(customNodes, "Pack", "nodes.py"), "utf8").replace(/\r\n/g, "\n")).toBe(
+      "new\n",
+    );
+  });
+
+  it("applies *** Add File (real git) (#2496)", () => {
+    initRepoPack();
+    const patch = [
+      "*** Begin Patch",
+      "*** Add File: Pack/extra.py",
+      "+hello",
+      "*** End Patch",
+    ].join("\n");
+    const res = applyNodePatch(patch);
+    expect(res.success).toBe(true);
+    expect(res.touched).toEqual(["Pack/extra.py"]);
+    expect(readFileSync(join(customNodes, "Pack", "extra.py"), "utf8").replace(/\r\n/g, "\n")).toBe(
+      "hello\n",
+    );
+  });
+
+  it("jail-checks apply-patch paths BEFORE any git call (#2496)", () => {
+    const { deps, gitCalls } = makeDeps();
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: ../escape.py",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+    expect(() => applyNodePatch(patch, deps)).toThrow(NodeDevError);
+    expect(gitCalls.length).toBe(0);
+  });
+
+  it("still names both header styles when none are present (#2496)", () => {
+    expect(() => applyNodePatch("not a patch")).toThrow(
+      /---\/\+\+\+ or \*\*\* Update\/Add\/Delete File/,
+    );
   });
 });
 
@@ -426,5 +765,451 @@ describe("nodePackGit", () => {
     expect(() => nodePackGit({ pack: "Pack", action: "commit" }, deps)).toThrow(
       /message/,
     );
+  });
+
+  it("refuses a missing pack before resolving paths or invoking git", () => {
+    const { deps, gitCalls } = makeDeps();
+    expect(() =>
+      nodePackGit({ pack: "Missing", action: "diff", paths: ["nodes.py"] }, deps),
+    ).toThrow(/does not exist under custom_nodes/);
+    expect(gitCalls.length).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // #2716 — `paths` is documented as PACK-relative, and every documented spelling
+  // was refused: relative entries were resolved against the custom_nodes/ ROOT, so
+  // "preset_core.py" landed beside the pack and failed the pack-containment check.
+  // These pin the anchor, and pin that moving it did not widen the jail.
+  // -------------------------------------------------------------------------
+  describe("paths are relative to the pack root (#2716)", () => {
+    function mkPackFiles(): void {
+      mkdirSync(join(customNodes, "Pack", "tests"), { recursive: true });
+      writeFileSync(join(customNodes, "Pack", "preset_core.py"), "x\n");
+      writeFileSync(join(customNodes, "Pack", "tests", "test_preset_core.py"), "x\n");
+    }
+
+    it("scopes a diff with the reporter's exact call", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      const res = nodePackGit(
+        {
+          pack: "Pack",
+          action: "diff",
+          paths: ["preset_core.py", "tests/test_preset_core.py"],
+        },
+        deps,
+      );
+      expect(res.success).toBe(true);
+      expect(gitCalls[0].args).toEqual([
+        "diff",
+        "--",
+        "preset_core.py",
+        "tests/test_preset_core.py",
+      ]);
+      // The pathspecs are handed to git with the PACK as cwd, so a pack-relative
+      // spelling is what git itself resolves them against.
+      expect(gitCalls[0].cwd).toBe(realpathSync(join(customNodes, "Pack")));
+    });
+
+    it("stages pack-relative paths on commit", () => {
+      mkPackFiles();
+      process.env.COMFYUI_MCP_ALLOW_GIT_WRITES = "1";
+      const { deps, gitCalls } = makeDeps();
+      const res = nodePackGit(
+        { pack: "Pack", action: "commit", message: "fix: x", paths: ["preset_core.py"] },
+        deps,
+      );
+      expect(res.success).toBe(true);
+      expect(gitCalls[0].args).toEqual([
+        "add",
+        "--end-of-options",
+        "--",
+        "preset_core.py",
+      ]);
+    });
+
+    it("accepts an absolute path that lands inside the pack", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      nodePackGit(
+        {
+          pack: "Pack",
+          action: "status",
+          paths: [join(customNodes, "Pack", "tests", "test_preset_core.py")],
+        },
+        deps,
+      );
+      expect(gitCalls[0].args).toEqual([
+        "status",
+        "--short",
+        "--branch",
+        "--",
+        "tests/test_preset_core.py",
+      ]);
+    });
+
+    it("still refuses a SIBLING pack's file by absolute path, before any git call", () => {
+      // The one shape that reaches the pack-containment check: inside custom_nodes/,
+      // outside the selected pack. Anchoring `paths` at the pack must not make a
+      // neighbouring pack reachable through the pack-scoped git surface.
+      mkPackFiles();
+      mkdirSync(join(customNodes, "Other"), { recursive: true });
+      writeFileSync(join(customNodes, "Other", "loot.py"), "secret\n");
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit(
+          {
+            pack: "Pack",
+            action: "diff",
+            paths: [join(customNodes, "Other", "loot.py")],
+          },
+          deps,
+        ),
+      ).toThrow(/outside the target pack/);
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("still refuses a path that climbs out of the pack, before any git call", () => {
+      mkPackFiles();
+      mkdirSync(join(customNodes, "Other"), { recursive: true });
+      writeFileSync(join(customNodes, "Other", "loot.py"), "secret\n");
+      const { deps, gitCalls } = makeDeps();
+      // A ".." segment is refused by the Windows-hazard scan before containment is
+      // even reached — which is why this asserts the refusal, not its wording.
+      expect(() =>
+        nodePackGit({ pack: "Pack", action: "diff", paths: ["../Other/loot.py"] }, deps),
+      ).toThrow(NodeDevError);
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("still refuses an absolute path outside custom_nodes, before any git call", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit(
+          { pack: "Pack", action: "diff", paths: [join(workspace, "outside.py")] },
+          deps,
+        ),
+      ).toThrow(NodeDevError);
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("still refuses a symlink inside the pack that escapes custom_nodes", () => {
+      mkPackFiles();
+      const outside = join(tmpdir(), `node-dev-outside-${Date.now()}`);
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, "loot.py"), "secret\n");
+      try {
+        symlinkSync(outside, join(customNodes, "Pack", "link"), "junction");
+      } catch {
+        return; // environment can't create junctions — skip
+      }
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit({ pack: "Pack", action: "diff", paths: ["link/loot.py"] }, deps),
+      ).toThrow(/escapes custom_nodes/);
+      expect(gitCalls.length).toBe(0);
+      rmSync(outside, { recursive: true, force: true });
+    });
+
+    it("names the correction for the pack-name-prefixed spelling this bug forced", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit(
+          { pack: "Pack", action: "diff", paths: ["Pack/preset_core.py"] },
+          deps,
+        ),
+      ).toThrow(
+        /names custom_nodes\/Pack\/Pack\/preset_core\.py .+ custom_nodes\/Pack\/Pack is not in the working tree.+drop the "Pack\/" prefix and pass "preset_core\.py"/s,
+      );
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("keeps the literal reading when the pack really has a same-named subdir", () => {
+      mkPackFiles();
+      mkdirSync(join(customNodes, "Pack", "Pack"), { recursive: true });
+      writeFileSync(join(customNodes, "Pack", "Pack", "preset_core.py"), "x\n");
+      const { deps, gitCalls } = makeDeps();
+      nodePackGit(
+        { pack: "Pack", action: "diff", paths: ["Pack/preset_core.py"] },
+        deps,
+      );
+      expect(gitCalls[0].args).toEqual(["diff", "--", "Pack/preset_core.py"]);
+    });
+
+    it("names the correction for a BARE pack name, which used to mean the pack root", () => {
+      // The same mistake with nothing after the prefix: under the old anchor "Pack"
+      // resolved to the pack itself and scoped everything; anchored it matches nothing,
+      // and git reports that as an empty result rather than an error.
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit({ pack: "Pack", action: "diff", paths: ["Pack"] }, deps),
+      ).toThrow(/omit `paths` to scope the whole pack/);
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("names the correction when the pack is reached through an ALIAS directory", () => {
+      // custom_nodes/Alias -> RealPack. `packDir` is the REALPATH, so its basename is
+      // "RealPack" while the caller said "Alias"; matching only the basename would let the
+      // aliased prefix through and answer with an empty diff.
+      mkdirSync(join(customNodes, "RealPack"), { recursive: true });
+      writeFileSync(join(customNodes, "RealPack", "preset_core.py"), "x\n");
+      try {
+        symlinkSync(join(customNodes, "RealPack"), join(customNodes, "Alias"), "junction");
+      } catch {
+        return; // environment can't create junctions — skip
+      }
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit(
+          { pack: "Alias", action: "diff", paths: ["Alias/preset_core.py"] },
+          deps,
+        ),
+      ).toThrow(/drop the "Alias\/" prefix and pass "preset_core\.py"/);
+      expect(gitCalls.length).toBe(0);
+      // …and the documented spelling works through the alias.
+      nodePackGit({ pack: "Alias", action: "diff", paths: ["preset_core.py"] }, deps);
+      expect(gitCalls[0].args).toEqual(["diff", "--", "preset_core.py"]);
+    });
+
+    it("passes an unprefixed wildcard pathspec straight through", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      nodePackGit({ pack: "Pack", action: "diff", paths: ["*.py", "tests/**"] }, deps);
+      expect(gitCalls[0].args).toEqual(["diff", "--", "*.py", "tests/**"]);
+    });
+
+    it("names the correction for a prefixed WILDCARD too", () => {
+      // The refusal rests on one fact — the pack has no child named "Pack" — which decides
+      // a wildcard exactly as well as a literal path: it can match nothing either way.
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit({ pack: "Pack", action: "diff", paths: ["Pack/*.py"] }, deps),
+      ).toThrow(/drop the "Pack\/" prefix and pass "\*\.py"/);
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("honours a prefixed wildcard when the pack really has a same-named subdir", () => {
+      mkPackFiles();
+      mkdirSync(join(customNodes, "Pack", "Pack"), { recursive: true });
+      const { deps, gitCalls } = makeDeps();
+      nodePackGit({ pack: "Pack", action: "diff", paths: ["Pack/*.py"] }, deps);
+      expect(gitCalls[0].args).toEqual(["diff", "--", "Pack/*.py"]);
+    });
+
+    it("still corrects a deep prefixed path when the same-named child is a FILE", () => {
+      // A file cannot have children, so "Pack/preset_core.py" matches nothing even though
+      // something named "Pack" exists inside the pack — but the bare name DOES name that
+      // file, so the two arms of the check are not interchangeable.
+      mkPackFiles();
+      writeFileSync(join(customNodes, "Pack", "Pack"), "not a directory\n");
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit({ pack: "Pack", action: "diff", paths: ["Pack/preset_core.py"] }, deps),
+      ).toThrow(/drop the "Pack\/" prefix/);
+      expect(gitCalls.length).toBe(0);
+      const second = makeDeps();
+      nodePackGit({ pack: "Pack", action: "diff", paths: ["Pack"] }, second.deps);
+      expect(second.gitCalls[0].args).toEqual(["diff", "--", "Pack"]);
+    });
+
+    it("honours the ABSOLUTE spelling of a prefixed path — the guard's escape hatch", () => {
+      // The disk cannot settle one case: a same-named child that is TRACKED but deleted
+      // from the working tree, where git still matches "Pack/gone.py". An absolute entry
+      // spells the whole path out, so it cannot be the prefix mistake and is taken as
+      // written — which is what the refusal message tells the caller to do.
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      const abs = join(realpathSync(join(customNodes, "Pack")), "Pack", "gone.py");
+      nodePackGit({ pack: "Pack", action: "diff", paths: [abs] }, deps);
+      expect(gitCalls[0].args).toEqual(["diff", "--", "Pack/gone.py"]);
+      // …while the relative spelling of the same path is still corrected.
+      const second = makeDeps();
+      expect(() =>
+        nodePackGit({ pack: "Pack", action: "diff", paths: ["Pack/gone.py"] }, second.deps),
+      ).toThrow(/pass it as an absolute path/);
+    });
+
+    it("leaves a WILDCARD head alone even when it matches the pack's own name", () => {
+      // assertSafeRepoName allows "*" in a folder name, so a POSIX pack really can be
+      // called "Pack*" — and then "Pack*/foo.py" is a glob git resolves, not the prefix
+      // mistake. Simulated through the fs seam, since Windows cannot create that name.
+      const packDir = join(customNodes, "Pack*");
+      const seen = new Set([customNodes, packDir]);
+      const { deps, gitCalls } = makeDeps({
+        existsSync: (q: string) => seen.has(q),
+        realpath: (q: string) => q,
+        isDirectory: (q: string) => q === packDir || q === customNodes,
+      });
+      nodePackGit({ pack: "Pack*", action: "diff", paths: ["Pack*/foo.py"] }, deps);
+      expect(gitCalls[0].args).toEqual(["diff", "--", "Pack*/foo.py"]);
+    });
+
+    it("scopes a path that no longer exists — a deletion is a legitimate pathspec", () => {
+      // `git diff`/`git add` are how a DELETED file is inspected and staged, so the guard
+      // must not probe the de-prefixed path for existence. Here the pack HAS a same-named
+      // subdir and the file inside it is gone; the literal reading must survive.
+      mkPackFiles();
+      mkdirSync(join(customNodes, "Pack", "Pack"), { recursive: true });
+      const { deps, gitCalls } = makeDeps();
+      nodePackGit({ pack: "Pack", action: "diff", paths: ["Pack/gone.py"] }, deps);
+      expect(gitCalls[0].args).toEqual(["diff", "--", "Pack/gone.py"]);
+      // …and an unprefixed deleted file is untouched by any of this.
+      const second = makeDeps();
+      nodePackGit({ pack: "Pack", action: "diff", paths: ["gone.py"] }, second.deps);
+      expect(second.gitCalls[0].args).toEqual(["diff", "--", "gone.py"]);
+    });
+
+    it("normalises an interior climb that stays inside the pack", () => {
+      // join() collapses ".." before the resolver sees it, so "tests/../preset_core.py"
+      // names the file it means. The escaping case is covered above.
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      nodePackGit(
+        { pack: "Pack", action: "diff", paths: ["tests/../preset_core.py"] },
+        deps,
+      );
+      expect(gitCalls[0].args).toEqual(["diff", "--", "preset_core.py"]);
+    });
+
+    it("refuses an empty path entry", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit({ pack: "Pack", action: "diff", paths: ["  "] }, deps),
+      ).toThrow(/empty string/);
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("still refuses an NTFS alternate-data-stream path", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      expect(() =>
+        nodePackGit(
+          { pack: "Pack", action: "diff", paths: ["preset_core.py:hidden"] },
+          deps,
+        ),
+      ).toThrow(NodeDevError);
+      expect(gitCalls.length).toBe(0);
+    });
+
+    it("rejects UNC spellings before the pack anchor can erase the marker", () => {
+      mkPackFiles();
+      const { deps, gitCalls } = makeDeps();
+      for (const unc of [String.raw`\\server\share\loot.py`, "//server/share/loot.py"]) {
+        expect(() =>
+          nodePackGit({ pack: "Pack", action: "diff", paths: [unc] }, deps),
+        ).toThrow(/UNC path/);
+      }
+      expect(gitCalls.length).toBe(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2422 — node_pack action:"patch" returned {success:true, stage:"apply"} for two
+// one-line hunks while an immediate readback still showed the original lines.
+//
+// `success` was `apply.status === 0` and nothing else: git's exit code, taken as
+// proof the content moved. These pin that a 0 exit alone can no longer report success.
+// ---------------------------------------------------------------------------
+
+describe("patch verifies the file actually moved (#2422)", () => {
+  const PATCH = [
+    "--- a/Pack/h3.py",
+    "+++ b/Pack/h3.py",
+    "@@ -1,1 +1,1 @@",
+    "-frame_count=5",
+    "+frame_count=9",
+    "",
+  ].join("\n");
+
+  function seed(contents: string) {
+    const pack = join(customNodes, "Pack");
+    mkdirSync(pack, { recursive: true });
+    writeFileSync(join(pack, "h3.py"), contents);
+  }
+
+  it("REFUSES when git exits 0 but every touched file is byte-identical", () => {
+    seed("frame_count=5\n");
+    // git says it worked; the disk says otherwise. This is the reported shape.
+    const { deps } = makeDeps({
+      runGit: () => ({ status: 0, stdout: "", stderr: "" }),
+    });
+    const res = applyNodePatch(PATCH, deps);
+    expect(res.success).toBe(false);
+    expect(res.stage).toBe("apply");
+    expect(res.stderr).toContain("byte-identical");
+    expect(res.stderr).toContain("NOTHING was applied");
+  });
+
+  it("REPORTS SUCCESS when the file really changed", () => {
+    seed("frame_count=5\n");
+    const { deps } = makeDeps({
+      runGit: (args) => {
+        // Only the real apply mutates; --check must not.
+        if (args[0] === "apply" && !args.includes("--check")) {
+          writeFileSync(join(customNodes, "Pack", "h3.py"), "frame_count=9\n");
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    const res = applyNodePatch(PATCH, deps);
+    expect(res.success).toBe(true);
+    expect(res.stderr).not.toContain("byte-identical");
+  });
+
+  it("counts a CREATED file as changed — absent before, present after", () => {
+    mkdirSync(join(customNodes, "Pack"), { recursive: true });
+    const { deps } = makeDeps({
+      runGit: (args) => {
+        if (args[0] === "apply" && !args.includes("--check")) {
+          writeFileSync(join(customNodes, "Pack", "h3.py"), "frame_count=9\n");
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    const res = applyNodePatch(PATCH, deps);
+    expect(res.success).toBe(true);
+  });
+
+  it("an UNREADABLE file is never counted as evidence that nothing happened", () => {
+    seed("frame_count=5\n");
+    const { deps } = makeDeps({
+      runGit: () => ({ status: 0, stdout: "", stderr: "" }),
+      readFileBuffer: () => {
+        throw new Error("EACCES");
+      },
+    });
+    // Unverifiable is not refutable: the check only refuses what it positively saw.
+    expect(applyNodePatch(PATCH, deps).success).toBe(true);
+  });
+
+  it("a non-zero apply still fails at stage apply, unchanged by this check", () => {
+    seed("frame_count=5\n");
+    const { deps } = makeDeps({
+      runGit: (args) =>
+        args.includes("--check")
+          ? { status: 0, stdout: "", stderr: "" }
+          : { status: 1, stdout: "", stderr: "patch does not apply" },
+    });
+    const res = applyNodePatch(PATCH, deps);
+    expect(res.success).toBe(false);
+    expect(res.stage).toBe("apply");
+    expect(res.stderr).toContain("patch does not apply");
+    expect(res.stderr).not.toContain("byte-identical");
+  });
+
+  it("a failing --check is still reported at stage check, never reaching the verify", () => {
+    seed("frame_count=5\n");
+    const { deps } = makeDeps({
+      runGit: () => ({ status: 1, stdout: "", stderr: "does not apply" }),
+    });
+    const res = applyNodePatch(PATCH, deps);
+    expect(res.success).toBe(false);
+    expect(res.stage).toBe("check");
   });
 });

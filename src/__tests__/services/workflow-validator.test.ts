@@ -99,6 +99,57 @@ describe("validateWorkflow — combo value_not_in_list parity with the ComfyUI f
   });
 });
 
+describe("validateWorkflow — COMFY_AUTOGROW_V3 required inputs", () => {
+  const autogrowObjectInfo = {
+    PrimitiveInt: {
+      input: { required: { value: ["INT", { default: 0 }] } },
+      output: ["INT"],
+    },
+    ComfyMathExpression: {
+      input: {
+        required: {
+          expression: ["STRING", { default: "a + b" }],
+          values: ["COMFY_AUTOGROW_V3", { min: 1 }],
+        },
+      },
+      output: ["FLOAT", "INT", "BOOLEAN"],
+    },
+  } as const;
+
+  it("accepts dotted child entries without a separate parent value", async () => {
+    getObjectInfoMock.mockResolvedValue(autogrowObjectInfo);
+    const r = await validateWorkflow(
+      wf({
+        "1": { class_type: "PrimitiveInt", inputs: { value: 8 } },
+        "2": {
+          class_type: "ComfyMathExpression",
+          inputs: { expression: "a / 2", "values.a": ["1", 0] },
+        },
+      }),
+      { health: false },
+    );
+    expect(r.issues.filter((issue) => issue.severity === "error")).toHaveLength(0);
+    expect(r.valid).toBe(true);
+  });
+
+  it("still reports a missing required AUTOGROW input when it has no children", async () => {
+    getObjectInfoMock.mockResolvedValue(autogrowObjectInfo);
+    const r = await validateWorkflow(
+      wf({
+        "2": { class_type: "ComfyMathExpression", inputs: { expression: "a / 2" } },
+      }),
+      { health: false },
+    );
+    expect(r.issues).toContainEqual(
+      expect.objectContaining({
+        node_id: "2",
+        message: 'Missing required input "values"',
+      }),
+    );
+    expect(r.valid).toBe(false);
+  });
+});
+
 describe("validateWorkflow — graph-health merge", () => {
   it("merges health findings (warning/info) without flipping `valid` and returns a health section", async () => {
     // Combo-clean graph, but structurally an isolated CLIPLoader (nothing reads it).
@@ -129,5 +180,213 @@ describe("validateWorkflow — graph-health merge", () => {
     );
     expect(r.health).toBeUndefined();
     expect(r.issues.some((i) => i.kind)).toBe(false);
+  });
+});
+
+// #1869 — create_workflow (action:"validate") on a saved UI graph used to report
+// false type/enum errors because action-button tokens serialized into
+// widgets_values were paired against /object_info from slot 0.
+describe("validateWorkflow — UI graph with serialized action buttons (#1869)", () => {
+  const AM_OBJECT_INFO = {
+    AMVideoRead: {
+      input: {
+        required: {
+          file_path: ["STRING", { default: "" }],
+          frame_mode: [["single", "range", "all"], { default: "all" }],
+          first_frame: ["INT", { default: 1 }],
+          last_frame: ["INT", { default: -1 }],
+        },
+      },
+      output: ["IMAGE"],
+      output_node: true,
+    },
+  } as const;
+
+  const FILE_PATH = "D:/shots/plate.mov";
+  const uiWorkflow = {
+    nodes: [
+      {
+        id: 1,
+        type: "AMVideoRead",
+        mode: 0,
+        inputs: [],
+        outputs: [{ name: "IMAGE", type: "IMAGE", links: null }],
+        widgets_values: [
+          "browse",
+          "open_in_explorer",
+          "copy_path",
+          FILE_PATH,
+          "range",
+          "detect_range",
+          12,
+          48,
+        ],
+      },
+    ],
+    links: [],
+  } as unknown as WorkflowJSON;
+
+  it("does not report action-button tokens as combo/enum errors", async () => {
+    getObjectInfoMock.mockResolvedValue(AM_OBJECT_INFO);
+    const r = await validateWorkflow(uiWorkflow, { health: false });
+    // The bug was false ERRORS naming button tokens as widget values. Scope
+    // the assertion to errors: those tokens now appear in WARNINGS on
+    // purpose, because a skip must never be silent (asserted below).
+    const text = r.issues
+      .filter((i) => i.severity === "error")
+      .map((i) => i.message)
+      .join("\n");
+    expect(text).not.toMatch(/open_in_explorer/);
+    expect(text).not.toMatch(/copy_path/);
+    expect(text).not.toMatch(/detect_range/);
+    expect(r.issues.filter((i) => i.kind === "value_not_in_list")).toHaveLength(0);
+    expect(r.issues.filter((i) => i.severity === "error")).toHaveLength(0);
+    expect(r.valid).toBe(true);
+  });
+
+  // Which entry in a run is the button is not always decidable, so a skip
+  // that happens silently is unrecoverable for the user. Name every one.
+  it("reports each skipped action-button token as a warning", async () => {
+    getObjectInfoMock.mockResolvedValue(AM_OBJECT_INFO);
+    const r = await validateWorkflow(uiWorkflow, { health: false });
+    const warningText = r.issues
+      .filter((i) => i.severity === "warning")
+      .map((i) => i.message)
+      .join("\n");
+    for (const t of ["browse", "open_in_explorer", "copy_path", "detect_range"]) {
+      expect(warningText).toContain(t);
+    }
+  });
+
+  // The converter DROPS a node whose type object_info doesn't know, so the
+  // per-node check never sees it. Reporting only a conversion warning made the
+  // SAME uninstalled custom node an error in API format and a `valid: true`
+  // workflow in UI format — a false green on the one thing validation is for.
+  it("still reports an uninstalled custom node as an ERROR, not a warning", async () => {
+    getObjectInfoMock.mockResolvedValue({
+      SaveImage: { input: { required: { images: ["IMAGE"] } }, output: [] },
+    });
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "TotallyNotInstalled",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: [],
+        },
+      ],
+      links: [],
+    } as unknown as WorkflowJSON;
+
+    const r = await validateWorkflow(ui, { health: false });
+    const missing = r.issues.filter((i) => i.kind === "missing_node_type");
+    expect(missing).toHaveLength(1);
+    expect(missing[0].severity).toBe("error");
+    expect(missing[0].node_id).toBe("1");
+    expect(missing[0].node_type).toBe("TotallyNotInstalled");
+    expect(r.valid).toBe(false);
+    // ...and reported ONCE. The converter also warns about the node it
+    // dropped; surfacing both made the UI path report the same node twice
+    // where the API path reports it once.
+    expect(
+      r.issues.filter((i) => i.message.includes("TotallyNotInstalled")),
+    ).toHaveLength(1);
+  });
+});
+
+// A graph-health finding is only worth anything if the PRODUCTION entry point
+// surfaces it. create_workflow (action:"validate") calls validateWorkflow, which
+// merges analyzeGraphHealth findings when `health` is on (default true) -- these
+// assert that path end to end rather than the helper in isolation (#2678).
+describe("validateWorkflow -- partial denoise over an empty latent reaches the caller", () => {
+  const SAMPLER_INFO = {
+    CheckpointLoaderSimple: {
+      input: { required: { ckpt_name: [["sd_xl_base.safetensors"], {}] } },
+      output: ["MODEL", "CLIP", "VAE"],
+    },
+    EmptyLatentImage: {
+      input: { required: { width: ["INT"], height: ["INT"], batch_size: ["INT"] } },
+      output: ["LATENT"],
+    },
+    VAEEncode: {
+      input: { required: { pixels: ["IMAGE"], vae: ["VAE"] } },
+      output: ["LATENT"],
+    },
+    LoadImage: { input: { required: { image: [["ref.png"], {}] } }, output: ["IMAGE", "MASK"] },
+    KSampler: {
+      input: {
+        required: {
+          model: ["MODEL"],
+          positive: ["CONDITIONING"],
+          negative: ["CONDITIONING"],
+          latent_image: ["LATENT"],
+          seed: ["INT"],
+          steps: ["INT"],
+          cfg: ["FLOAT"],
+          sampler_name: [["euler"], {}],
+          scheduler: [["simple"], {}],
+          denoise: ["FLOAT"],
+        },
+      },
+      output: ["LATENT"],
+    },
+    VAEDecode: { input: { required: { samples: ["LATENT"], vae: ["VAE"] } }, output: ["IMAGE"] },
+    SaveImage: { input: { required: { images: ["IMAGE"] } }, output: [], output_node: true },
+  } as const;
+
+  // The #2678 graph: EmptyLatentImage into a KSampler at denoise 0.65.
+  const badGraph = (latentSource: Record<string, { class_type: string; inputs: Record<string, unknown> }>) =>
+    wf({
+      "4": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sd_xl_base.safetensors" } },
+      "5": { class_type: "LoadImage", inputs: { image: "ref.png" } },
+      ...latentSource,
+      "9": {
+        class_type: "KSampler",
+        inputs: {
+          model: ["4", 0], positive: ["4", 1], negative: ["4", 1], latent_image: ["8", 0],
+          seed: 42, steps: 50, cfg: 4, sampler_name: "euler", scheduler: "simple", denoise: 0.65,
+        },
+      },
+      "10": { class_type: "VAEDecode", inputs: { samples: ["9", 0], vae: ["4", 2] } },
+      "11": { class_type: "SaveImage", inputs: { images: ["10", 0] } },
+    });
+
+  const EMPTY_LATENT = {
+    "8": { class_type: "EmptyLatentImage", inputs: { width: 1024, height: 1024, batch_size: 1 } },
+  };
+  const VAE_ENCODE = {
+    "8": { class_type: "VAEEncode", inputs: { pixels: ["5", 0], vae: ["4", 2] } },
+  };
+
+  beforeEach(() => {
+    getObjectInfoMock.mockResolvedValue(SAMPLER_INFO);
+  });
+
+  it("surfaces the finding as a warning issue carrying the kind, without flipping `valid`", async () => {
+    const r = await validateWorkflow(badGraph(EMPTY_LATENT));
+    const issue = r.issues.find((i) => i.kind === "partial_denoise_empty_latent");
+    expect(issue).toBeDefined();
+    expect(issue?.severity).toBe("warning");
+    expect(issue?.health).toBe(true);
+    expect(issue?.node_id).toBe("9");
+    expect(issue?.node_type).toBe("KSampler");
+    expect(issue?.message).toMatch(/VAEEncode/);
+    // Health findings never make a runnable graph invalid -- ComfyUI WILL execute this.
+    expect(r.valid).toBe(true);
+    expect(r.health?.findings.some((f) => f.kind === "partial_denoise_empty_latent")).toBe(true);
+  });
+
+  it("stays silent on the corrected graph -- same sampler, latent from VAEEncode", async () => {
+    const r = await validateWorkflow(badGraph(VAE_ENCODE));
+    expect(r.issues.some((i) => i.kind === "partial_denoise_empty_latent")).toBe(false);
+    expect(r.valid).toBe(true);
+  });
+
+  it("is suppressed with health:false, like every other health finding", async () => {
+    const r = await validateWorkflow(badGraph(EMPTY_LATENT), { health: false });
+    expect(r.issues.some((i) => i.kind === "partial_denoise_empty_latent")).toBe(false);
+    expect(r.health).toBeUndefined();
   });
 });

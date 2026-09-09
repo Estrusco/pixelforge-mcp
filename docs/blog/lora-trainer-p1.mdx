@@ -56,6 +56,19 @@ underfitting. The config generator (`src/services/training-config.ts`) owns the
 mapping from "character LoRA on flux1-dev with these params" to the YAML schema
 `run.py` consumes, mirrored from ai-toolkit's own example configs.
 
+<Note>
+  Since this post was published, 0.50.0 consolidated the eighteen `train_*` tools into
+  three action-parameterized ones, so the names below are the tools **as they shipped
+  at the time**. The work is unchanged; the calls moved. Preflight and setup are now
+  `train_doctor` with `action: "doctor"` / `"build_image"` / `"bootstrap"`. Job
+  lifecycle and discovery are `train_start` with `action: "start"` / `"status"` /
+  `"cancel"` / `"delete"` / `"list_flows"` / `"job_config"` / `"preview_config"`.
+  Datasets are `train_prepare_dataset` with `action: "prepare"` / `"list"` /
+  `"detail"` / `"update"` / `"delete"` / `"file"` / `"caption_image"` /
+  `"caption_dataset"`. Same services, same behaviour — the rest of the post still
+  applies.
+</Note>
+
 ## The flow, as a conversation
 
 Under the hood it's seven tools, but from the chat it reads like this:
@@ -173,7 +186,7 @@ underneath it are already the real, E2E-proven thing.
 
 And if 24 GB isn't your reality *today*: LoRA training on genuinely small cards
 already exists in the pack shelf — [ANIMA trains character and style LoRAs on
-~6 GB](/blog/anima-comfyui), via its own trainer skill. Different base model,
+~6 GB](./anima-comfyui), via its own trainer skill. Different base model,
 same idea: your character, your GPU.
 
 ---
@@ -181,8 +194,7 @@ same idea: your character, your GPU.
 ## Train one tonight
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-   [Panel](/panel) — the panel auto-starts a background agent on your Claude
-   subscription (no API keys; sign in with `claude` once).
+   [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Have Docker + the NVIDIA Container Toolkit installed, and an `HF_TOKEN` with
    FLUX.1-dev access in the MCP server env.
 3. Ask: *"train a character LoRA from these photos."* The agent runs

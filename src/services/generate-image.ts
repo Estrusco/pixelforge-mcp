@@ -21,12 +21,18 @@ export interface GenerateImageDeps {
   /** Resolve a checkpoint filename when none is given or defaulted. */
   resolveCheckpoint: () => Promise<string | undefined>;
   /** Submit the constructed workflow; returns the prompt id. */
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface GenerateImageResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   checkpoint: string;
 }
 
@@ -54,10 +60,9 @@ export async function generateImage(
   deps: GenerateImageDeps,
 ): Promise<GenerateImageResult> {
   // Backfill only the defaultable knobs; prompt is always caller-supplied.
-  const argsRecord = args as unknown as Record<string, unknown>;
   const seed: Record<string, unknown> = {};
   for (const key of DEFAULTABLE_KEYS) {
-    const v = argsRecord[key];
+    const v = args[key];
     if (v !== undefined) seed[key] = v;
   }
   const resolved = DefaultsManager.apply(seed);
@@ -69,7 +74,7 @@ export async function generateImage(
   if (!checkpoint) {
     throw new ValidationError(
       "No checkpoint specified, defaulted, or found locally. " +
-        "Pass `checkpoint`, set a default via set_defaults, or download one with download_model.",
+        "Pass `checkpoint`, set a default via get_defaults (action:\"set\"), or download one with download_model.",
     );
   }
 
@@ -95,6 +100,6 @@ export async function generateImage(
     }
   }
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-  return { prompt_id, queue_remaining, checkpoint };
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+  return { prompt_id, queue_remaining, rejectedOutputs, checkpoint };
 }

@@ -8,6 +8,7 @@ import {
   matchQuality,
   rankCandidates,
   resolveCandidates,
+  resolveCandidatesDetailed,
   type ObjectInfoLike,
 } from "../../services/missing-models.js";
 
@@ -98,6 +99,63 @@ describe("findMissingModels", () => {
     const out = findMissingModels(wf, oi);
     expect(out).toHaveLength(1);
     expect(out[0]!.directory).toBeUndefined(); // unknown, but NOT dropped
+  });
+
+  // #2068 — ComfyUI 0.33 serialises custom-node combos as ["COMBO", {options}]
+  // (add_to_dict_v1). The V1-only parser treated that as "not a combo" and
+  // resolve_missing returned "No missing models" while panel_get_errors
+  // correctly listed DonutLoRAStack lora_name_N files as unavailable.
+  it("reports unavailable custom-node LoRA combo values against a V3 COMBO option list", () => {
+    const wanted = [
+      "krea2/general-purpose/realism_engine_krea2_v1.safetensors",
+      "krea2/Krea2-realism-V2.safetensors",
+      "krea2/general-purpose/Krea2_HMNSFW_AIO.safetensors",
+      "krea2/Krea2_NSFW_Aesthetics_V1.safetensors",
+    ];
+    const installed = ["None", "already-have.safetensors"];
+    const v3 = (options: string[]) => ["COMBO", { options }];
+    const oi: ObjectInfoLike = {
+      DonutLoRAStack: {
+        input: {
+          required: {
+            model_type: v3(["Auto", "KREA2"]),
+            switch_1: v3(["Off", "On"]),
+            lora_name_1: v3(installed),
+            lora_name_2: v3(installed),
+            lora_name_3: v3(installed),
+          },
+        },
+      },
+    };
+    const wf = {
+      "10": {
+        class_type: "DonutLoRAStack",
+        inputs: {
+          model_type: "KREA2",
+          switch_1: "On",
+          lora_name_1: wanted[0],
+          lora_name_2: wanted[1],
+          lora_name_3: "None",
+        },
+      },
+      "11": {
+        class_type: "DonutLoRAStack",
+        inputs: {
+          switch_1: "On",
+          lora_name_1: wanted[2],
+          lora_name_2: wanted[3],
+          lora_name_3: installed[1],
+        },
+      },
+    };
+    const out = findMissingModels(wf, oi);
+    const names = out.map((m) => m.name);
+    for (const file of wanted) expect(names).toContain(file);
+    expect(names).not.toContain("None");
+    expect(names).not.toContain(installed[1]);
+    expect(out.every((m) => m.node_type === "DonutLoRAStack")).toBe(true);
+    expect(out.every((m) => m.directory === "loras")).toBe(true);
+    expect(out).toHaveLength(wanted.length);
   });
 });
 
@@ -264,6 +322,36 @@ describe("resolveCandidates", () => {
     }));
     // a checkpoint hunt must not return LoRAs
     expect(seenTypes).toEqual(["Checkpoint"]);
+  });
+
+  it("a FAILED lookup is reported as failed, never folded into an empty list (#796)", async () => {
+    const out = await resolveCandidatesDetailed(
+      MISSING,
+      deps({
+        searchCivitai: async () => { throw new Error("civitai 503"); },
+        searchHf: async () => { throw new Error("hf timeout"); },
+      }),
+    );
+    expect(out.candidates).toEqual([]);
+    expect(out.failedProviders).toEqual(["CivitAI", "HuggingFace"]);
+  });
+
+  it("a one-provider failure degrades AND is disclosed", async () => {
+    const out = await resolveCandidatesDetailed(
+      MISSING,
+      deps({ searchCivitai: async () => { throw new Error("civitai 503"); } }),
+    );
+    expect(out.candidates.length).toBeGreaterThan(0);
+    expect(out.failedProviders).toEqual(["CivitAI"]);
+  });
+
+  it("a genuinely empty answer carries NO failures — 'nothing found' is then honest", async () => {
+    const out = await resolveCandidatesDetailed(
+      MISSING,
+      deps({ searchCivitai: async () => [], searchHf: async () => [] }),
+    );
+    expect(out.candidates).toEqual([]);
+    expect(out.failedProviders).toEqual([]);
   });
 });
 

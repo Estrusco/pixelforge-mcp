@@ -242,7 +242,7 @@ RUN if [ -n "${WHEEL_SAGE}${WHEEL_XFORMERS}" ]; then \
 # Bump PANEL_CACHEBUST (e.g. to the target panel commit SHA) to force a fresh
 # panel clone WITHOUT busting the expensive torch/sage layers above. `git clone
 # --branch` only accepts a ref name (not a raw SHA), so pinning is done here.
-ARG PANEL_CACHEBUST=923330b
+ARG PANEL_CACHEBUST=7b477d55
 RUN echo "panel cachebust: ${PANEL_CACHEBUST}" \
  && git clone --depth 1 ${PANEL_REF:+--branch "${PANEL_REF}"} \
       "${PANEL_REPO}" "${COMFY_HOME}/custom_nodes/comfyui-mcp-panel" \
@@ -317,7 +317,7 @@ RUN chmod +x /post_start.sh
 
 # Dead-man switch (#269) — heartbeat server + self-stop watchdog, launched by
 # post_start.sh only when the pod env carries RUNPOD_API_KEY + DEADMAN_TOKEN
-# (i.e. pods created via runpod_pod_create). See deadman_watch.sh's header.
+# (i.e. pods created via the runpod tool's create action). See deadman_watch.sh's header.
 COPY deadman_server.py deadman_watch.sh /opt/comfyui-mcp-deadman/
 RUN chmod +x /opt/comfyui-mcp-deadman/deadman_watch.sh
 

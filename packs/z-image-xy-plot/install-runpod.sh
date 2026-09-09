@@ -25,7 +25,6 @@ grab() { # relpath url
 }
 
 echo "-------- custom nodes --------"
-clone "ComfyUI-Manager" "https://github.com/ltdrdata/ComfyUI-Manager.git"
 clone "ComfyUI-GGUF" "https://github.com/city96/ComfyUI-GGUF"
 clone "rgthree-comfy" "https://github.com/rgthree/rgthree-comfy"
 clone "ComfyUI-Easy-Use" "https://github.com/yolain/ComfyUI-Easy-Use"
@@ -39,6 +38,6 @@ clone "RES4LYF" "https://github.com/ClownsharkBatwing/RES4LYF"
 echo "-------- models --------"
 grab "models/text_encoders/Qwen3-4B-UD-Q6_K_XL.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Qwen3-4B-UD-Q6_K_XL.gguf"
 grab "models/vae/z-image-ae.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/ae.safetensors"
-grab "models/unet/z_image_turbo-Q5_K_S.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/z_image_turbo-Q5_K_S.gguf"
+grab "models/unet/z_image_turbo-Q8_0.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/z_image_turbo-Q8_0.gguf"
 
 echo "DONE. Restart ComfyUI, then load workflow.json."

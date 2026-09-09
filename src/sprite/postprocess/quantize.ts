@@ -1,4 +1,4 @@
-import sharp from "sharp";
+import { requireSharp } from "../../services/sharp-loader.js";
 import { applyPalette, buildPalette, utils } from "image-q";
 import type { PaletteSource, QuantizeOptions, QuantizeResult, RawImage } from "../types.js";
 import { cleanupIsolatedPixels } from "./cleanup-isolated-pixels.js";
@@ -92,6 +92,7 @@ export async function quantizeImage(bytes: Buffer, options: QuantizeOptions): Pr
   const cleaned =
     options.cleanupIsolatedPixels === false ? alphaPreserved : cleanupIsolatedPixels(alphaPreserved);
 
+  const sharp = await requireSharp("pixelate_image");
   let pipeline = sharp(cleaned.data, {
     raw: { width: cleaned.width, height: cleaned.height, channels: 4 },
   });
