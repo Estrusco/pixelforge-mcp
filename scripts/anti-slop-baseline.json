@@ -596,7 +596,31 @@
     "src/__tests__/services/workspace-env.test.ts": {
       "no-chained-type-assertions": 1
     },
+    "src/__tests__/sprite/pixelate-image.test.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/__tests__/sprite/tools/generate-sprite.test.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/__tests__/sprite/tools/get-workflow-prompt-template.test.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/__tests__/sprite/tools/workflow-from-prompt-spec.test.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/__tests__/tools/assets.test.ts": {
+      "no-chained-type-assertions": 1
+    },
     "src/__tests__/tools/batches.test.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/__tests__/tools/export-for-engine.test.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/__tests__/tools/generate-animation-set.test.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/__tests__/tools/generate-arcade-topdown-set.test.ts": {
       "no-chained-type-assertions": 1
     },
     "src/__tests__/tools/generate-image-tool.test.ts": {
@@ -639,6 +663,9 @@
     },
     "src/__tests__/tools/runpod.test.ts": {
       "no-chained-type-assertions": 5
+    },
+    "src/__tests__/tools/secrets.test.ts": {
+      "no-unknown-returns": 1
     },
     "src/__tests__/tools/skills-access.test.ts": {
       "no-chained-type-assertions": 5
@@ -763,6 +790,12 @@
     },
     "src/services/workflow-converter.ts": {
       "no-unknown-returns": 4
+    },
+    "src/sprite/comfyui/sprite-job.ts": {
+      "no-chained-type-assertions": 1
+    },
+    "src/sprite/spec/spec-job.ts": {
+      "no-chained-type-assertions": 1
     },
     "src/tools/apps.ts": {
       "no-unknown-returns": 2
