@@ -25,7 +25,19 @@ function listTools(entry) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [entry], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, COMFYUI_URL: "http://127.0.0.1:59999" },
+      // COMFYUI_MCP_AUTOUPDATE=0 is load-bearing on a FORK, not tidiness.
+      // src/services/self-update.ts checks the npm registry on server START and
+      // REWRITES the on-disk package when a newer version is published. This fork
+      // ships under upstream's name (`comfyui-mcp`) on a version line that tracks
+      // theirs, so "newer version" means UPSTREAM'S package: booting the install
+      // replaces it with one that has no src/sprite/ and none of the fork's tools,
+      // and the surface measured below is upstream's, not the tarball we packed.
+      // Measured on 2026-09-10: install put 0.52.202 (ours) on disk, the boot left
+      // 0.52.203 (upstream) there, and this step reported 38 core tools instead of
+      // 52 — the 14 missing being exactly the fork's. See tasks/2026-09-10-post-sync
+      // -bonifica-e-upstreaming.md Step 1b: pinning it here makes the CHECK honest,
+      // it does NOT protect a real user's install, which has the same problem.
+      env: { ...process.env, COMFYUI_URL: "http://127.0.0.1:59999", COMFYUI_MCP_AUTOUPDATE: "0" },
     });
     const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
     let buf = "";
@@ -97,6 +109,10 @@ const boot = spawnSync(process.execPath, [join(pkg, "dist/index.js")], {
   input: "",
   timeout: 8000,
   encoding: "utf8",
+  // Same reason as in listTools(): a start is what triggers the self-update, and
+  // this start comes FIRST, so leaving it unpinned lets the package be swapped out
+  // from under every later step.
+  env: { ...process.env, COMFYUI_MCP_AUTOUPDATE: "0" },
 });
 // Pass if it stayed up until the timeout (SIGTERM) or exited cleanly on stdin EOF.
 if (boot.signal === "SIGTERM" || boot.status === 0) {

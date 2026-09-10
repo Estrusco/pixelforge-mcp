@@ -39,3 +39,11 @@ locales/**/*.json text eol=lf
 # fine either way — it strips shebangs itself. CI is Linux, so the hole
 # is invisible there. Force LF the same way we do for the ratchet files.
 *.mjs text eol=lf
+
+# Fork maintenance: ci.yml is byte-identical to upstream apart from line endings. An
+# accidental normalisation (core.autocrlf on the Windows dev box) turned it into a
+# whole-file conflict on every `git merge upstream/main` for zero content. `-text`
+# disables EOL conversion in BOTH directions, so the committed blob stays identical
+# to upstream's and the file stops appearing in merges at all. Note this governs the
+# COMMITTED bytes: `text eol=lf` would only affect checkout and would not help here.
+.github/workflows/*.yml -text
