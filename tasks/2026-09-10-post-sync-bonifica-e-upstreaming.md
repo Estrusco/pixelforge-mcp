@@ -13,7 +13,8 @@
 | step | stato |
 |---|---|
 | 1 — `ci.yml` / `.gitattributes` | ✅ **fatto** in sessione, commit `aadf5e4` |
-| 0, 1b, 1c, 2, 3, 4, 5, 6, 7 | ⬜ da fare sulla macchina di esecuzione |
+| 1b — `Pack & install smoke` | ✅ **check verde** (`4001544`); la causa di fondo resta aperta, serve una decisione |
+| 0, 1c, 2, 3, 4, 5, 6, 7 | ⬜ da fare sulla macchina di esecuzione |
 
 **I bead NON sono stati creati.** `bd` non è disponibile in questo ambiente (stessa limitazione
 annotata in `PixelForgeDocumentations/backlog-proposals.md`: l'installer è bloccato dalla policy
@@ -67,10 +68,11 @@ già girati dentro `npm test`.
 | **`check:vocabulary`** | ❌ **ROSSO — 438 riferimenti** |
 | **`asset-counts`** | ❌ **ROSSO — 13 claim** |
 | **`check:docs-locale`** | ❌ **ROSSO — 22 problemi strutturali** |
-| **`Pack & install smoke`** | ❌ **ROSSO — vedi Step 1b** |
+| `Pack & install smoke` | ✅ **risolto in sessione** (`4001544`) — la causa di fondo resta, vedi Step 1b |
 
-Tutti e quattro i rossi sono **debito del fork, pre-esistente su `main`**: nessuno è causato da
-codice upstream e nessuno è un flake.
+Tutti e quattro i rossi erano **debito del fork, pre-esistente su `main`**: nessuno causato da
+codice upstream, nessuno un flake. Il quarto è stato chiuso in sessione (Step 1b); restano i tre
+gate di `Build`.
 
 Branch di lavoro: `claude/overlap-original-features-a8uh4v` (già esistente su origin).
 
@@ -191,48 +193,61 @@ Commit: `fix(fork): stop ci.yml from conflicting on every upstream sync`
 
 ---
 
-## Step 1b — `Pack & install smoke`: il fork condivide l'identità npm di upstream (decisione richiesta)
+## Step 1b — Il pacchetto installato si auto-aggiorna in quello di upstream (decisione richiesta)
+
+> **Diagnosi corretta il 2026-09-10.** La prima stesura di questa sezione attribuiva il guasto alla
+> risoluzione del range semver da parte di `npm install`. **Era sbagliata**: ci ero arrivato
+> ispezionando la directory temporanea *dopo* la run, quando era già stata sovrascritta, e avevo
+> letto le macerie come causa. Il meccanismo reale è peggiore e più ampio.
 
 **Sintomo.** `scripts/smoke-install.mjs` → `installed surface has 38 core tools, ledger declares 52`.
 52 − 38 = esattamente i 14 nomi del fork.
 
-**Causa, riprodotta in locale.** Lo smoke impacchetta il tarball e lo installa in un progetto
-temporaneo pulito. `npm install <tarball>` registra la dipendenza come **range semver** (`^0.52.202`)
-e poi lo risolve. Il fork mantiene l'identità di upstream — `name: "comfyui-mcp"` e una linea di
-versione che insegue la loro — quindi il range matcha il pacchetto pubblicato e npm installa
-**quello**, non il nostro tarball:
+**Causa reale, strumentata.** `src/services/self-update.ts` interroga il registry npm **all'avvio del
+server MCP** e, se risulta pubblicata una versione più alta, **riscrive il pacchetto su disco**. Il
+fork gira sotto il nome di upstream (`comfyui-mcp`) con una linea di versione che insegue la loro,
+quindi "versione più alta" significa **il pacchetto di upstream**. Lo smoke installa correttamente il
+nostro tarball, poi lo avvia — e quell'avvio lo sostituisce prima che la superficie venga misurata:
 
-| | tarball nostro | ciò che npm installa |
-|---|---|---|
-| versione | 0.52.202 | **0.52.203** |
-| `dist/tools/index.js` | 17928 B, importa `../sprite/tools/index.js` | 15235 B, nessun import del fork |
-| `dist/sprite/` | 88 file | assente |
-| `image-q` nelle dependencies | sì | no |
+```
+[DEBUG] subito dopo npm install : 0.52.202  (nostro, con image-q, con dist/sprite/)
+[DEBUG] dopo lo step di boot    : 0.52.203  (upstream, senza sprite, senza image-q)
+```
 
-**Perché è comparso ora.** Date di pubblicazione sul registry: `0.52.202` il 2026-09-07 23:58 UTC,
-`0.52.203` il **2026-09-10 02:44 UTC**. Finché la versione più alta pubblicata coincideva con la
-nostra, npm si teneva il tarball locale e il check passava. Non è cambiato il branch: è cambiato il
-registry. **`main` fallirà allo stesso modo al prossimo run.**
+**Perché è comparso ora.** `0.52.202` pubblicata il 2026-09-07 23:58 UTC, **`0.52.203` il 2026-09-10
+alle 02:44 UTC**. Finché non esisteva una versione più alta, l'auto-update non aveva nulla da
+applicare. Non è cambiato il branch: è cambiato il registry. **`main` fallirà allo stesso modo al
+prossimo run.**
 
-**Non è solo un problema di CI.** Qualunque consumatore che risolva `comfyui-mcp` per nome può
-ottenere il pacchetto di upstream al posto di PixelForge — incluso il cold path del plugin
-documentato in `CLAUDE.md` (`npx -y comfyui-mcp` in `plugin/scripts/launch-server.mjs`).
+**La CI è già sistemata** (`4001544`): `COMFYUI_MCP_AUTOUPDATE=0` sui due spawn dell'entrypoint
+installato, così il check misura il tarball che ha impacchettato. Verificato: 52 core tools + 3
+compact-mode, e a fine run il pacchetto su disco è ancora il nostro.
 
-**Tre strade, tutte praticabili, la scelta è dell'owner:**
+**Ciò che resta aperto è molto più serio di un check.** L'installazione di un utente reale ha la
+stessa esposizione: si auto-aggiorna nel pacchetto di upstream e perde silenziosamente tutti e 14 i
+tool del fork, `dist/sprite/` e le dipendenze del fork. Da notare che `self-update.ts` si rifiuta
+esplicitamente di toccare un dev install da `npm link` — **ed è esattamente per questo che il
+problema non si è mai visto sulla macchina dello sviluppatore**. Chiunque installi PixelForge in
+modo normale, invece, lo subisce.
 
-1. **Rinominare il pacchetto** (`pixelforge-mcp`). Risolve alla radice, ma tocca `plugin/.mcp.json`,
+**Tre strade, la scelta è dell'owner:**
+
+1. **Rinominare il pacchetto** (`pixelforge-mcp`). Risolve alla radice: l'auto-update non troverebbe
+   più upstream come "sé stesso più recente". Tocca però `plugin/.mcp.json`,
    `plugin/scripts/launch-server.mjs` (warm path `npm root -g`, cold path `npx -y`), il workflow
-   `npm link` e le istruzioni d'installazione. È un cambio di identità pubblica del progetto.
-2. **Sganciare la linea di versione** dal numero di upstream (es. `1.x` del fork). Il range smette di
-   matchare le loro release. Meno invasivo, ma il nome resta condiviso e la collisione può tornare.
-3. **Blindare solo lo smoke**: installare con `--no-save` e una spec `file:` esatta, in modo che npm
-   non registri un range risolvibile. Fix di una riga, ma cura il sintomo in CI e lascia in piedi il
-   problema per gli utenti reali.
+   `npm link` documentato in `CLAUDE.md` e le istruzioni d'installazione. È un cambio di identità
+   pubblica del progetto.
+2. **Sganciare la linea di versione** (es. serie `1.x` del fork). L'auto-update non vedrebbe più le
+   release di upstream come più recenti. Meno invasivo del rename, ma il nome resta condiviso: resta
+   il caso di chi installa `comfyui-mcp` per nome e ottiene upstream.
+3. **Disattivare l'auto-update per default nel fork.** Non risolve l'identità condivisa, ma toglie il
+   meccanismo che oggi distrugge un'installazione. Va valutato contro il motivo per cui upstream lo
+   ha introdotto.
 
-La 3 rende la CI verde subito e non preclude la 1 o la 2. Le prime due sono decisioni
-architetturali: vanno prese, non fatte di passaggio.
+Le tre non si escludono: la 1 è la sola che chiude il problema per intero, la 3 è la più rapida da
+applicare come mitigazione.
 
-Bead: `bd create "Identità npm del fork collide con comfyui-mcp upstream"`
+Bead: `bd create "L'installazione si auto-aggiorna nel pacchetto comfyui-mcp di upstream"`
 
 ---
 
@@ -556,7 +571,7 @@ Il SUMMARY deve arrivare a:
 I due gate che `npm test` **non** copre vanno lanciati a parte:
 
 ```bash
-node scripts/smoke-install.mjs                      # ← rosso finché lo Step 1b non è deciso
+node scripts/smoke-install.mjs                      # ← verde da 4001544
 npm run docs:gen && git diff --exit-code -- docs/   # deve essere un no-op
 ```
 
@@ -586,7 +601,7 @@ là e riavviare; per i soli tool MCP basta `npm run build` + `/mcp`.
 |---|---|---|---|
 | 0 | Setup + bead | 5 min | — |
 | ~~1~~ | ~~`ci.yml` / `.gitattributes`~~ **✅ fatto (`aadf5e4`)** | — | — |
-| **1b** | **Identità npm (`Pack & install smoke`)** | **decisione + 10 min–1 g** | **bloccato: serve una scelta dell'owner** |
+| ~~1b~~ | ~~`Pack & install smoke`~~ **✅ check verde (`4001544`)** — la causa di fondo resta una decisione aperta | — | — |
 | **1c** | **`asset-counts` + `check:docs-locale`** | **1-2 h** | — |
 | 2 | **Rot nel codice** | 2-3 h | — |
 | 3 | Rot nei prompt subagent | 30 min | — |
@@ -595,9 +610,10 @@ là e riavviare; per i soli tool MCP basta `npm run build` + `/mcp`.
 | 6 | PR upstream `luma_key` | ½ giorno + attesa | indipendente, può partire in parallelo |
 | 7 | Design doc consolidamento | ½ giorno | indipendente |
 
-Step 1, 1c, 2, 3 e 4 chiudono tre dei quattro rossi in circa una giornata. Lo Step 5 porta
-`check:vocabulary` a zero. Lo **Step 1b resta l'unico bloccante che non dipende da lavoro ma da una
-decisione**: finché non è presa, `Pack & install smoke` resta rosso su ogni PR e su `main`.
+Step 1c, 2, 3 e 4 chiudono i tre gate rimasti in circa una giornata; lo Step 5 porta
+`check:vocabulary` a zero. Lo Step 1b non blocca più la CI, ma **la decisione che porta con sé è la
+più urgente del piano**: finché non è presa, ogni installazione reale di PixelForge continua ad
+auto-aggiornarsi nel pacchetto di upstream, perdendo tutti i tool del fork.
 
 ---
 
