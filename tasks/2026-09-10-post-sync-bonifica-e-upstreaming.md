@@ -37,19 +37,30 @@ superficie sprite.
 
 ---
 
-## Stato di partenza (verificato in questa sessione, 2026-09-10)
+## Stato di partenza (verificato su CI run 34451044623 + riproduzione locale, 2026-09-10)
+
+**`npm test` non è vitest.** È `node scripts/run-checks.mjs`: un runner ombrello che esegue la
+suite vitest **più** una dozzina di gate, e stampa un SUMMARY finale. Quindi "npm test rosso" non
+significa "test rotti", e i gate che compaiono come step separati in `ci.yml` sono in gran parte
+già girati dentro `npm test`.
 
 | gate | stato |
 |---|---|
+| `vitest` (dentro `npm test`) | ✅ verde |
 | `npm run lint` (tsc --noEmit + anti-slop) | ✅ verde |
-| `npm test` (subset surface + sprite: 19 file, 253 test) | ✅ verde |
-| `npm run check:unknown-collapse` | ✅ verde (0 siti) |
-| `npm run check:anti-slop` | ✅ verde (796 finding a baseline, nessuno nuovo) |
-| `npm run vocab:export -- --check` | ✅ verde (52 core, 96 panel, 159 dead) |
-| **`npm run check:vocabulary`** | ❌ **ROSSO — 438 riferimenti** |
+| `check:unknown-collapse` | ✅ verde (0 siti) |
+| `check:anti-slop` | ✅ verde (796 finding a baseline, nessuno nuovo) |
+| `vocab:export --check` | ✅ verde (52 core, 96 panel, 159 dead) |
+| `i18n:check`, `check:docs-links`, `check:docs-mdx`, `check:blog*`, `check:changelog` | ✅ verdi |
+| **`check:vocabulary`** | ❌ **ROSSO — 438 riferimenti** |
+| **`asset-counts`** | ❌ **ROSSO — 13 claim** |
+| **`check:docs-locale`** | ❌ **ROSSO — 22 problemi strutturali** |
+| **`Pack & install smoke`** | ❌ **ROSSO — vedi Step 1b** |
+
+Tutti e quattro i rossi sono **debito del fork, pre-esistente su `main`**: nessuno è causato da
+codice upstream e nessuno è un flake.
 
 Branch di lavoro: `claude/overlap-original-features-a8uh4v` (già esistente su origin).
-Working tree pulito al momento della stesura.
 
 ### Distribuzione dei 438 riferimenti
 
@@ -160,6 +171,98 @@ committato*, e serve impedirne la ri-normalizzazione al commit.
 **Verifica:** `git diff d996e12 HEAD --name-only` non deve più elencare `.github/workflows/ci.yml`.
 
 Commit: `fix(fork): stop ci.yml from conflicting on every upstream sync`
+
+---
+
+## Step 1b — `Pack & install smoke`: il fork condivide l'identità npm di upstream (decisione richiesta)
+
+**Sintomo.** `scripts/smoke-install.mjs` → `installed surface has 38 core tools, ledger declares 52`.
+52 − 38 = esattamente i 14 nomi del fork.
+
+**Causa, riprodotta in locale.** Lo smoke impacchetta il tarball e lo installa in un progetto
+temporaneo pulito. `npm install <tarball>` registra la dipendenza come **range semver** (`^0.52.202`)
+e poi lo risolve. Il fork mantiene l'identità di upstream — `name: "comfyui-mcp"` e una linea di
+versione che insegue la loro — quindi il range matcha il pacchetto pubblicato e npm installa
+**quello**, non il nostro tarball:
+
+| | tarball nostro | ciò che npm installa |
+|---|---|---|
+| versione | 0.52.202 | **0.52.203** |
+| `dist/tools/index.js` | 17928 B, importa `../sprite/tools/index.js` | 15235 B, nessun import del fork |
+| `dist/sprite/` | 88 file | assente |
+| `image-q` nelle dependencies | sì | no |
+
+**Perché è comparso ora.** Date di pubblicazione sul registry: `0.52.202` il 2026-09-07 23:58 UTC,
+`0.52.203` il **2026-09-10 02:44 UTC**. Finché la versione più alta pubblicata coincideva con la
+nostra, npm si teneva il tarball locale e il check passava. Non è cambiato il branch: è cambiato il
+registry. **`main` fallirà allo stesso modo al prossimo run.**
+
+**Non è solo un problema di CI.** Qualunque consumatore che risolva `comfyui-mcp` per nome può
+ottenere il pacchetto di upstream al posto di PixelForge — incluso il cold path del plugin
+documentato in `CLAUDE.md` (`npx -y comfyui-mcp` in `plugin/scripts/launch-server.mjs`).
+
+**Tre strade, tutte praticabili, la scelta è dell'owner:**
+
+1. **Rinominare il pacchetto** (`pixelforge-mcp`). Risolve alla radice, ma tocca `plugin/.mcp.json`,
+   `plugin/scripts/launch-server.mjs` (warm path `npm root -g`, cold path `npx -y`), il workflow
+   `npm link` e le istruzioni d'installazione. È un cambio di identità pubblica del progetto.
+2. **Sganciare la linea di versione** dal numero di upstream (es. `1.x` del fork). Il range smette di
+   matchare le loro release. Meno invasivo, ma il nome resta condiviso e la collisione può tornare.
+3. **Blindare solo lo smoke**: installare con `--no-save` e una spec `file:` esatta, in modo che npm
+   non registri un range risolvibile. Fix di una riga, ma cura il sintomo in CI e lascia in piedi il
+   problema per gli utenti reali.
+
+La 3 rende la CI verde subito e non preclude la 1 o la 2. Le prime due sono decisioni
+architetturali: vanno prese, non fatte di passaggio.
+
+Bead: `bd create "Identità npm del fork collide con comfyui-mcp upstream"`
+
+---
+
+## Step 1c — `asset-counts` e `check:docs-locale` (1-2 h)
+
+Due gate rossi **causati dal fork**, che non erano nella prima stesura di questo piano perché non li
+avevo eseguiti in locale (`asset-counts` richiede una `dist/` fresca, `check:docs-locale` non lo
+avevo lanciato affatto). Entrambi pre-esistenti su `main`.
+
+### `asset-counts` — 13 claim non allineate
+
+`node scripts/asset-counts.mjs --check` confronta i numeri annunciati nella prosa con il registry
+reale. Il fork ha portato la superficie da 38 a 52 tool senza rigenerare i testi:
+
+- `docs/plugin.mdx`, `docs/local-vs-comfy-cloud.mdx`, `docs/local-llms.mdx`, `docs/index.mdx`,
+  `docs/blog/local-llms-comfyui.mdx` → *"claims 38 for mcp_tools, actual is 52"*. Sono il numero di
+  upstream, rimasto lì dopo il sync.
+- `README.md` → **7 claim introvabili** (`could not find a claim matching /\*\*(\d+) MCP tools\*\*/`
+  e simili). Il fork ha riscritto il README (è un file `merge=ours`) e nel farlo ha eliminato le
+  formule che lo script sa verificare. Qui non basta rigenerare: vanno **reintrodotte le frasi**
+  nella forma che i regex in `scripts/asset-counts.mjs` riconoscono, oppure va aggiornato lo script.
+
+Procedura: `node scripts/asset-counts.mjs` (senza `--check`) aggiorna ciò che sa aggiornare; le 7
+claim del README vanno scritte a mano. Poi ri-verificare con `--check`.
+
+### `check:docs-locale` — 22 problemi strutturali
+
+Tutti su `<locale>/quickstart.mdx`, 11 locale × 2 problemi:
+
+```
+✗ <loc>/quickstart: code block #1 was modified — a reader runs this verbatim
+✗ <loc>/quickstart: MDX components differ — English [...,Note,...] vs [...senza Note...]
+```
+
+Causa: il fork ha modificato `docs/quickstart.mdx` (+10/−4) aggiungendo un `<Note>` e cambiando il
+primo code block, **senza propagare alle traduzioni** (`git diff --name-only d996e12 HEAD --
+'docs/*/quickstart.mdx'` è vuoto).
+
+Il contenuto non è cosmetico: il `<Note>` avverte che dichiarare `"CIVITAI_API_TOKEN": ""` in
+`.mcp.json` **blocca silenziosamente** il caricamento del token da `~/.comfyui-mcp/.env`. Undici
+localizzazioni continuano a mostrare la configurazione sbagliata. Vanno aggiornate: stesso `<Note>`
+tradotto e stesso code block, in `docs/{ar,es,fa,fr,ja,ko,pt-BR,ru,tr,zh,zh-TW}/quickstart.mdx`.
+
+Verifica: `npm run check:docs-locale` a zero problemi.
+
+Commit suggeriti (separati): `docs: realign advertised asset counts with the 52-tool surface` e
+`docs(i18n): propagate the quickstart CIVITAI_API_TOKEN note to every locale`
 
 ---
 
@@ -419,18 +522,29 @@ Al termine di ogni step, e obbligatoriamente prima del push finale:
 
 ```bash
 npm ci
-npm run lint                       # tsc --noEmit + anti-slop
-npm run build
-npm test                           # suite completa, non solo il subset
-npm run check:vocabulary           # ← deve essere VERDE (0 riferimenti) dopo Step 5
-npm run check:unknown-collapse
-npm run check:anti-slop
-npm run vocab:export -- --check
-node scripts/asset-counts.mjs --check   # richiede dist/ fresco
+npm run lint     # tsc --noEmit + anti-slop
+npm run build    # necessario prima di npm test: asset-counts legge dist/
+npm test         # ombrello: vitest + ~12 gate, con SUMMARY finale
+```
+
+**Leggere il SUMMARY, non solo l'exit code.** `npm test` è `node scripts/run-checks.mjs`: esegue
+vitest *e* la maggior parte dei gate, e stampa alla fine l'elenco di quelli falliti. Un exit code 1
+può voler dire "un gate è rosso" con tutti i test verdi — nel run 34451044623 era esattamente così.
+Il SUMMARY deve arrivare a:
+
+```
+✅ vitest ... ✅ check:vocabulary ✅ asset-counts ✅ check:docs-locale
+```
+
+I due gate che `npm test` **non** copre vanno lanciati a parte:
+
+```bash
+node scripts/smoke-install.mjs                      # ← rosso finché lo Step 1b non è deciso
 npm run docs:gen && git diff --exit-code -- docs/   # deve essere un no-op
 ```
 
-Sono esattamente i gate di `.github/workflows/ci.yml:30-96`, nello stesso ordine.
+Per isolare un singolo gate durante il lavoro: `npm run check:vocabulary`,
+`npm run check:docs-locale`, `node scripts/asset-counts.mjs --check`.
 
 **Verifica funzionale del comportamento (non solo dei gate).** Il punto dello Step 2 è che il modello
 smetta di chiamare tool morti. Dopo il build, in Claude Code:
@@ -455,6 +569,8 @@ là e riavviare; per i soli tool MCP basta `npm run build` + `/mcp`.
 |---|---|---|---|
 | 0 | Setup + bead | 5 min | — |
 | 1 | `ci.yml` / `.gitattributes` | 10 min | — |
+| **1b** | **Identità npm (`Pack & install smoke`)** | **decisione + 10 min–1 g** | **bloccato: serve una scelta dell'owner** |
+| **1c** | **`asset-counts` + `check:docs-locale`** | **1-2 h** | — |
 | 2 | **Rot nel codice** | 2-3 h | — |
 | 3 | Rot nei prompt subagent | 30 min | — |
 | 4 | Esenzioni HISTORICAL | 20 min | — |
@@ -462,7 +578,9 @@ là e riavviare; per i soli tool MCP basta `npm run build` + `/mcp`.
 | 6 | PR upstream `luma_key` | ½ giorno + attesa | indipendente, può partire in parallelo |
 | 7 | Design doc consolidamento | ½ giorno | indipendente |
 
-Gli step 1-4 chiudono l'80% del gate in circa mezza giornata. Lo step 5 è quello che lo porta a zero.
+Step 1, 1c, 2, 3 e 4 chiudono tre dei quattro rossi in circa una giornata. Lo Step 5 porta
+`check:vocabulary` a zero. Lo **Step 1b resta l'unico bloccante che non dipende da lavoro ma da una
+decisione**: finché non è presa, `Pack & install smoke` resta rosso su ogni PR e su `main`.
 
 ---
 
