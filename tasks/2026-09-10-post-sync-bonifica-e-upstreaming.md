@@ -17,9 +17,10 @@ gate CI che verifica che nessun testo del repo dica a un modello di chiamare un 
 
 Conseguenza misurata: **`npm run check:vocabulary` è ROSSO — 438 riferimenti a nomi ritirati**,
 quasi tutti fork-side. Tra questi ~44 stanno nelle *descrizioni dei nostri tool*, cioè in stringhe
-che il modello legge e su cui agisce: `generate_sprite` gli dice di chiamare `search_civitai_models`,
-`get_sprite_result` gli dice `view_image`, `remove_background` gli dice `stage_output_as_input`.
-Tutti e tre oggi rispondono con un redirect "removed in 0.50.0". È un bug di comportamento, non un
+che il modello legge e su cui agisce: `generate_sprite` gli dice di cercare i modelli con un tool
+CivitAI che non esiste più, `get_sprite_result` di guardare l'immagine con un viewer ritirato,
+`remove_background` di fare lo staging con un tool ritirato. Tutti e tre oggi rispondono con un
+redirect "removed in 0.50.0" che il modello non sa diagnosticare. È un bug di comportamento, non un
 neo cosmetico.
 
 In parallelo l'analisi di sovrapposizione ha prodotto due esiti da chiudere:
@@ -77,27 +78,29 @@ Working tree pulito al momento della stesura.
 - Profilo git: **conservativo**. Commit sì (il branch è designato), push sul branch designato sì.
   Nessuna PR su `Estrusco/pixelforge-mcp` senza richiesta esplicita.
 
-### Tabella di sostituzione (dal ledger, autoritativa)
+### La lista di lavoro è l'output del gate, non questo file
 
-| nome morto | sostituto |
-|---|---|
-| `get_job_status` | `queue (action:"status")` |
-| `view_image` | `get_image (action:"view")` |
-| `list_assets` | `get_image (action:"list_assets")` |
-| `get_asset_metadata` | `get_image (action:"asset_metadata")` |
-| `regenerate` | `generate_image (action:"regenerate")` |
-| `search_models` | `download_model (action:"search")` |
-| `search_civitai_models` | `download_model (action:"search_civitai")` |
-| `download_civitai_model` | `download_model (action:"download_civitai")` |
-| `resolve_missing_models` | `download_model (action:"resolve_missing")` |
-| `run_template` | `enqueue_workflow (action:"run_template")` |
-| `stage_output_as_input` | `upload_image (action:"stage")` |
-| `validate_workflow` | `create_workflow (action:"validate")` |
-| `analyze_color` | `get_image (action:"analyze_color")` |
-| `health_check` / `get_workspace` | vedi output del gate |
+`npm run check:vocabulary` stampa, per **ogni** riferimento: il file, la riga, il testo che lo
+contiene e il sostituto esatto letto dal ledger (`DEAD_NAMES` in `src/tools/vocabulary.ts`).
 
-Il gate stampa il sostituto corretto accanto a ogni riferimento: **usa il suo output come lista di
-lavoro**, non questa tabella a memoria.
+```bash
+npm run check:vocabulary 2>&1 | tee /tmp/vocab-worklist.txt
+```
+
+Quello è l'elenco autoritativo. **Questo piano non ricopia la tabella dei nomi ritirati, e non
+deve farlo**: il gate scandisce ogni file tracciato del repo, quindi un documento che elenca nomi
+morti diventa *esso stesso* un riferimento da bonificare — questo file è stato riscritto una volta
+proprio per quel motivo. Vale per qualunque nota tu prenda dentro il repo mentre lavori: tienila
+fuori (`/tmp`) o scrivi solo i nomi vivi.
+
+**Forma accettata.** Il gate distingue *rot* (prosa che dice a un modello di chiamare un nome che
+oggi risponde 404) da *migrazione* (`rotMentions`, `src/tools/vocabulary.ts:624`). Nominare il
+tool vivo con la sua azione è sempre accettato:
+
+- ❌ il nome ritirato da solo, anche dentro backtick o in una cella di tabella
+- ✅ `get_image (action:"view")`, `queue (action:"status")`, `download_model (action:"search_civitai")` …
+
+Quindi la riscrittura non è "cancella la menzione": è "di' al modello cosa chiamare **oggi**".
 
 ---
 
@@ -162,61 +165,55 @@ Commit: `fix(fork): stop ci.yml from conflicting on every upstream sync`
 
 ## Step 2 — Bonifica rot nel codice (2-3 h) — **priorità massima**
 
-Sono le stringhe che il modello legge e su cui agisce. Lista esatta dei siti (dall'output del gate):
+Sono le stringhe che il modello legge e su cui agisce: le descrizioni e le note dei nostri tool.
+Prendi i siti da `/tmp/vocab-worklist.txt` filtrando i path sotto `src/` e
+`PixelForgeDocumentations/fork-customization/`. Al momento della stesura erano **~30 siti** così
+distribuiti (solo i path, per stimare lo scope — i nomi e i sostituti li dà il gate):
 
-**Descrizioni/note di tool — riscrivere il nome:**
-
-| file:riga | nome morto |
+| file | siti |
 |---|---|
-| `src/sprite/tools/generate-sprite.ts:145` | `search_models`, `search_civitai_models` |
-| `src/sprite/tools/generate-sprite.ts:241` | `search_civitai_models` |
-| `src/sprite/tools/generate-sprite.ts:244` | `view_image` |
-| `src/sprite/tools/get-sprite-result.ts:7,24` | `get_job_status` |
-| `src/sprite/tools/get-sprite-result.ts:27,41` | `view_image` |
-| `src/sprite/tools/pixelate-image.ts:284` | `regenerate` |
-| `src/sprite/comfyui/sprite-job.ts:70` | `download_civitai_model` |
-| `src/sprite/comfyui/sprite-status.ts:15` | `list_assets`, `view_image` |
-| `src/sprite/comfyui/sprite-status.ts:68,70` | `run_template` |
-| `src/sprite/types.ts:107` | `get_job_status` |
-| `src/sprite/types.ts:265` | `view_image` |
-| `src/tools/remove-background.ts:72` | `stage_output_as_input` |
-| `src/tools/remove-background.ts:161` | `view_image` |
-| `src/tools/contact-sheet.ts:10,13` | `view_image` |
-| `src/services/contact-sheet.ts:12,98` | `view_image` |
-| `src/services/view-image.ts:17` | `view_image` |
-| `src/services/asset-registry.ts:219` | `regenerate` |
-| `src/services/missing-models.ts:454` | `resolve_missing_models` |
-| `src/__tests__/tools/assets.test.ts:8,30,50,67,109` | `regenerate`, `get_asset_metadata` |
-| `PixelForgeDocumentations/fork-customization/tool-surface.md:13` (+3 altri) | `get_job_status`, `get_asset_metadata`, `regenerate` |
-| `PixelForgeDocumentations/fork-customization/repo-layout.md:7` | `get_job_status` |
+| `src/sprite/tools/generate-sprite.ts` | 4 (righe 145, 241, 244) |
+| `src/sprite/tools/get-sprite-result.ts` | 4 (righe 7, 24, 27, 41) |
+| `src/sprite/tools/pixelate-image.ts` | 1 (riga 284) |
+| `src/sprite/comfyui/sprite-status.ts` | 4 (righe 15, 68, 70) |
+| `src/sprite/comfyui/sprite-job.ts` | 1 (riga 70) |
+| `src/sprite/types.ts` | 2 (righe 107, 265) |
+| `src/tools/remove-background.ts` | 2 (righe 72, 161) |
+| `src/tools/contact-sheet.ts` | 2 (righe 10, 13) |
+| `src/services/contact-sheet.ts` | 2 (righe 12, 98) |
+| `src/services/view-image.ts` | 1 (riga 17) |
+| `src/services/asset-registry.ts` | 1 (riga 219) |
+| `src/services/missing-models.ts` | 1 (riga 454) |
+| `src/__tests__/tools/assets.test.ts` | 5 (righe 8, 30, 50, 67, 109) |
+| `PixelForgeDocumentations/fork-customization/tool-surface.md` | 4 |
+| `PixelForgeDocumentations/fork-customization/repo-layout.md` | 1 (riga 7) |
 
-**Come riscrivere.** Il gate riconosce la forma `tool (action:"x")` come *migrazione*, non come rot
-(`rotMentions`, `src/tools/vocabulary.ts:624`). Quindi:
+**Come riscrivere.** Vedi "Forma accettata" sopra: sostituisci il nome nudo con il tool vivo più la
+sua azione, mantenendo la frase leggibile. Esempio della trasformazione, sul lato buono:
 
-- ❌ `"pass the returned asset_id straight to view_image"`
 - ✅ `"pass the returned asset_id straight to get_image (action:\"view\")"`
 
 **Casi che richiedono giudizio, non sostituzione meccanica:**
 
-- `get-sprite-result.ts:7` — commento *"a thin wrapper over the INHERITED get_job_status"*. Descrive
-  la genealogia del codice. Riscrivere comunque nominando il tool attuale: ciò che è ereditato è il
-  **servizio**, non il nome del tool. Formulazione suggerita: *"a thin wrapper over the inherited job
-  status path (surfaced upstream as `queue (action:\"status\")`)"*.
-- `sprite-status.ts:68,70` — `run_template`: verificare che il riferimento sia al *tool* e non alla
-  funzione interna `runTemplate`. Se è codice (identificatore), non è rot: il gate distingue per
-  contesto, ma se lo segnala va comunque disambiguato (rinominare la variabile o riformulare il
-  commento).
-- `src/__tests__/tools/assets.test.ts` — sono **fixture di test**. Se asseriscono su un nome morto
-  come stringa di dato, il trattamento corretto è `allowedIn` in `vocabulary.ts` con `path`/`context`/
-  `why` (vedi il precedente `upscale_image` a `vocabulary.ts:2250-2262`), **non** riscrivere
-  l'asserzione. Leggere il test prima di decidere.
-- `src/services/view-image.ts:17`, `src/services/contact-sheet.ts`, `asset-registry.ts`,
+- `get-sprite-result.ts:7` — è un commento che descrive il tool come *"a thin wrapper over the
+  INHERITED …"*, cioè racconta la genealogia del codice. Riscrivere comunque nominando il tool
+  attuale: ciò che è ereditato è il **servizio**, non il nome del tool. Formulazione suggerita:
+  *"a thin wrapper over the inherited job status path (surfaced upstream as `queue (action:\"status\")`)"*.
+- `sprite-status.ts:68,70` — verificare se il riferimento è al *tool* o alla funzione interna
+  omonima. Se è un identificatore di codice non è rot; ma se il gate lo segnala va comunque
+  disambiguato (rinominare la variabile, o riformulare il commento perché non si legga come un
+  invito a chiamare un tool).
+- `src/__tests__/tools/assets.test.ts` — sono **fixture di test**. Se asseriscono su un nome ritirato
+  *come stringa di dato*, il trattamento corretto è `allowedIn` in `vocabulary.ts` con
+  `path`/`context`/`why`, **non** riscrivere l'asserzione. Il precedente da copiare come forma sta a
+  `src/tools/vocabulary.ts:2249-2263`. Leggere il test prima di decidere.
+- `src/services/view-image.ts`, `src/services/contact-sheet.ts`, `asset-registry.ts`,
   `missing-models.ts` — sono file *upstream* che il fork ha modificato. Verificare con
-  `git diff d996e12 HEAD -- <file>` se la riga rot è nostra o loro. **Se è nostra: correggila.**
+  `git diff d996e12 HEAD -- <file>` se la riga segnalata è nostra o loro. **Se è nostra: correggila.**
   Se è di upstream, è un bug loro → annotarlo per lo Step 6 (candidato a micro-PR separata).
 
-**Verifica:** `npm run check:vocabulary` deve scendere da 438 a ~394 (restano solo expert docs +
-storici). `npm run lint && npm test`.
+**Verifica:** il conteggio del gate deve calare di ~30 (restano expert docs + storici).
+`npm run lint && npm test`.
 
 Commit: `fix(sprite): tool descriptions name the post-0.50.0 surface, not retired names`
 
@@ -224,7 +221,8 @@ Commit: `fix(sprite): tool descriptions name the post-0.50.0 surface, not retire
 
 ## Step 3 — Bonifica rot nei prompt dei subagent (30 min)
 
-14 siti, tutti `get_job_status` tranne due `get_asset_metadata`:
+14 siti, quasi tutti sullo stesso nome (il job-status ritirato in 0.49.0), più due su un lettore
+di metadati asset ritirato in 0.50.0. Il gate li nomina; qui bastano i path:
 
 | file | righe |
 |---|---|
@@ -315,11 +313,12 @@ che il gate esiste per prevenire.
      agli 8 MVP si aggiungono `workflow_from_prompt_spec` e `get_workflow_prompt_template`.
    - **Parte 2 (superficie ComfyUI)** — riscrittura vera. La vecchia parte elencava ~120 tool
      singoli; oggi sono ~42 tool action-parameterized. Organizzare **per tool, con le sue azioni**
-     (`get_image`: get/view/list_outputs/convert/analyze_color/list_assets/asset_metadata;
-     `generate_image`: image/audio/video/3d/controlnet/ip_adapter/regenerate/upscale/remove_background;
-     `queue`, `download_model`, `install_comfyui`, `get_system_stats`, ecc.).
-   - Aggiornare la sezione "Before doing real work": `health_check` → `get_system_stats (action:"health")`,
-     `get_environment`/`get_workspace` → `install_comfyui (action:"environment")` / `workspace`.
+     invece che un tool per riga: `get_image`, `generate_image`, `queue`, `download_model`,
+     `install_comfyui`, `get_system_stats`, `enqueue_workflow`, `create_workflow`… L'elenco esatto
+     delle azioni di ciascuno **non va scritto a memoria**: leggilo da `/tmp/surface-current.json`.
+   - Aggiornare la sezione "Before doing real work": i tre probe d'ambiente che cita sono tutti
+     ritirati. Sostituirli con `get_system_stats (action:"health")` e
+     `install_comfyui (action:"environment")` / `workspace`.
    - **Aggiungere una sezione nuova** su ciò che il sync ha reso disponibile e che l'agente deve
      conoscere: `kitchen` (probe GPU/triton), `batch` (sweep multi-job), `train_*` +
      skill `train-character-lora`, `contact_sheet` per la QA visiva.
@@ -438,10 +437,11 @@ smetta di chiamare tool morti. Dopo il build, in Claude Code:
 
 1. `/mcp` per riconnettere il server.
 2. Chiedere: *"genera uno sprite di un serpente pixel art, poi mostrami il risultato"*.
-3. Confermare che l'agente, dopo `generate_sprite`, chiami **`get_image (action:"view")`** e non
-   `view_image`. Se chiama ancora il nome morto, una descrizione è rimasta indietro.
-4. Idem per `remove_background` → deve indirizzare a `upload_image (action:"stage")`, non a
-   `stage_output_as_input`.
+3. Confermare che l'agente, dopo `generate_sprite`, chiami **`get_image (action:"view")`** e non il
+   viewer ritirato che il gate segnalava per quel file. Se chiama ancora il nome morto, una
+   descrizione è rimasta indietro.
+4. Idem per `remove_background`: deve indirizzare a **`upload_image (action:"stage")`**, non al tool
+   di staging ritirato.
 
 Ricordare il **Plugin File Sync** (CLAUDE.md): il plugin gira da
 `~/.claude/plugins/cache/pixelforge-mcp/pixelforge/<version>/`. Dopo modifiche in `plugin/` copiare
