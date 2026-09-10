@@ -8,6 +8,18 @@
 > per confermare che i gate siano ancora nella condizione descritta — upstream rilascia ~8 volte al
 > giorno, quindi un sync intercorso può aver spostato i numeri.
 
+## Stato di avanzamento
+
+| step | stato |
+|---|---|
+| 1 — `ci.yml` / `.gitattributes` | ✅ **fatto** in sessione, commit `aadf5e4` |
+| 0, 1b, 1c, 2, 3, 4, 5, 6, 7 | ⬜ da fare sulla macchina di esecuzione |
+
+**I bead NON sono stati creati.** `bd` non è disponibile in questo ambiente (stessa limitazione
+annotata in `PixelForgeDocumentations/backlog-proposals.md`: l'installer è bloccato dalla policy
+dell'ambiente nelle sessioni Claude Code on the web). Lo Step 0 va eseguito per intero sulla
+macchina di destinazione, dove `bd` è configurato.
+
 ## Context
 
 Il 2026-09-09 il fork ha assorbito ~5 settimane di upstream (`artokun/comfyui-mcp`) nel merge
@@ -139,7 +151,12 @@ bd create "ci.yml: eliminare il conflitto CRLF ricorrente"     # Step 1
 
 ---
 
-## Step 1 — `ci.yml`: eliminare un conflitto di merge gratuito (10 min)
+## Step 1 — `ci.yml`: eliminare un conflitto di merge gratuito ✅ FATTO (`aadf5e4`)
+
+> Eseguito il 2026-09-10 in sessione. `.github/workflows/ci.yml` è ora byte-identico a upstream
+> (`git diff d996e12 -- .github/workflows/ci.yml` vuoto, CRLF preservati) e `.gitattributes` porta
+> la regola `-text` che impedisce la ri-normalizzazione. Il resto della sezione è conservato come
+> referto di cosa è stato fatto e perché.
 
 **Problema.** `.github/workflows/ci.yml` differisce da upstream **solo per i line-ending** (228 righe,
 upstream CRLF / fork LF, verificato con `git diff --ignore-cr-at-eol`, che azzera il diff). È l'unico
@@ -568,7 +585,7 @@ là e riavviare; per i soli tool MCP basta `npm run build` + `/mcp`.
 | # | step | stima | dipendenze |
 |---|---|---|---|
 | 0 | Setup + bead | 5 min | — |
-| 1 | `ci.yml` / `.gitattributes` | 10 min | — |
+| ~~1~~ | ~~`ci.yml` / `.gitattributes`~~ **✅ fatto (`aadf5e4`)** | — | — |
 | **1b** | **Identità npm (`Pack & install smoke`)** | **decisione + 10 min–1 g** | **bloccato: serve una scelta dell'owner** |
 | **1c** | **`asset-counts` + `check:docs-locale`** | **1-2 h** | — |
 | 2 | **Rot nel codice** | 2-3 h | — |
