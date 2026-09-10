@@ -1,0 +1,486 @@
+# Piano post-sync upstream — bonifica, upstreaming, decisione superficie
+
+> **Redatto:** 2026-09-10 · **Branch:** `claude/overlap-original-features-a8uh4v` · **Baseline:** `4b6bdd1` (v0.52.202)
+>
+> Piano destinato a essere **eseguito su un'altra macchina**. È autoportante: ogni step ha i comandi,
+> i path esatti e i criteri di verifica. Prima di iniziare, allineare il checkout alla baseline sopra
+> (`git log --oneline -1` deve mostrare `4b6bdd1`, o un discendente) e rileggere lo "Stato di partenza"
+> per confermare che i gate siano ancora nella condizione descritta — upstream rilascia ~8 volte al
+> giorno, quindi un sync intercorso può aver spostato i numeri.
+
+## Context
+
+Il 2026-09-09 il fork ha assorbito ~5 settimane di upstream (`artokun/comfyui-mcp`) nel merge
+`02bc1ef`, arrivando a 0.52.202. Quel sync ha portato dentro la **consolidation 0.49.0/0.50.0**:
+121 nomi di tool ritirati, tool action-parameterized, e un *ledger* (`src/tools/vocabulary.ts`) con
+gate CI che verifica che nessun testo del repo dica a un modello di chiamare un nome morto.
+
+Conseguenza misurata: **`npm run check:vocabulary` è ROSSO — 438 riferimenti a nomi ritirati**,
+quasi tutti fork-side. Tra questi ~44 stanno nelle *descrizioni dei nostri tool*, cioè in stringhe
+che il modello legge e su cui agisce: `generate_sprite` gli dice di chiamare `search_civitai_models`,
+`get_sprite_result` gli dice `view_image`, `remove_background` gli dice `stage_output_as_input`.
+Tutti e tre oggi rispondono con un redirect "removed in 0.50.0". È un bug di comportamento, non un
+neo cosmetico.
+
+In parallelo l'analisi di sovrapposizione ha prodotto due esiti da chiudere:
+1. alcune modifiche che il fork ha fatto ai **servizi upstream** sono generiche e senza accoppiamento
+   pixel-art — candidate a PR upstream (upstream accetta contributi esterni: 3 PR mergiate su 254,
+   tutte piccole e platform-shaped);
+2. upstream ha un ratchet dichiarato `MAX_TOOLS = 52` / `TOOL_BUDGET_TARGET = 30` mentre il fork
+   contribuisce **14 nomi**: prima o poi i nostri nomi saranno l'unica ragione per cui il ratchet non
+   chiude. Va deciso a freddo, non sotto un merge.
+
+**Esito atteso del piano:** CI verde, descrizioni dei tool che nominano tool esistenti, un conflitto
+di merge ricorrente eliminato, una PR upstream aperta come sonda, e una decisione scritta sulla
+superficie sprite.
+
+---
+
+## Stato di partenza (verificato in questa sessione, 2026-09-10)
+
+| gate | stato |
+|---|---|
+| `npm run lint` (tsc --noEmit + anti-slop) | ✅ verde |
+| `npm test` (subset surface + sprite: 19 file, 253 test) | ✅ verde |
+| `npm run check:unknown-collapse` | ✅ verde (0 siti) |
+| `npm run check:anti-slop` | ✅ verde (796 finding a baseline, nessuno nuovo) |
+| `npm run vocab:export -- --check` | ✅ verde (52 core, 96 panel, 159 dead) |
+| **`npm run check:vocabulary`** | ❌ **ROSSO — 438 riferimenti** |
+
+Branch di lavoro: `claude/overlap-original-features-a8uh4v` (già esistente su origin).
+Working tree pulito al momento della stesura.
+
+### Distribuzione dei 438 riferimenti
+
+| file | occorrenze | trattamento |
+|---|---|---|
+| `PixelForgeDocumentations/agents/pixelforge-expert-{opus,sonnet}.md` | 183 + 183 | **riscrittura** (Step 5) |
+| `PixelForge_Gap_Report{,_Plan}_2026-08-02.md` | 6 + 10 | **esenzione HISTORICAL** (Step 4) |
+| `.beads/interactions.jsonl` | 7 | **esenzione HISTORICAL** (Step 4) |
+| `src/**` (codice runtime + 1 test) | ~30 | **riscrittura** (Step 2) |
+| `.claude/agents/*` + `.clinerules/workflows/*` | 14 | **riscrittura** (Step 3) |
+| `fork-customization/tool-surface.md`, `repo-layout.md` | 5 | **riscrittura** (Step 2) |
+
+---
+
+## Regole d'ingaggio (valgono per tutti gli step)
+
+- **Un branch per step**, un commit coerente per step. Non impastare Step 2 e Step 5.
+- Prima di ogni commit: `npm run lint && npm test && npm run check:vocabulary`.
+- **Mai allargare la lista `HISTORICAL` per far passare il gate** se il file è guida viva. Il gate lo
+  dice esplicitamente in `scripts/check-tool-vocabulary.mts:63-78`. Le due esenzioni dello Step 4 sono
+  legittime perché sono *dati*, non istruzioni — stesso argomento del già-esente
+  `packs/*/workflow.json`.
+- **Non toccare** `src/tools/vocabulary.ts` `TOOL_NAMES`, `MAX_TOOLS`, `BASELINE_SHA256`. Nessuno step
+  qui aggiunge o rimuove tool. Se un gate lamenta il baseline, hai sbagliato qualcosa.
+- Il task tracking è **beads (`bd`)**, non TodoWrite né liste markdown (CLAUDE.md).
+- Profilo git: **conservativo**. Commit sì (il branch è designato), push sul branch designato sì.
+  Nessuna PR su `Estrusco/pixelforge-mcp` senza richiesta esplicita.
+
+### Tabella di sostituzione (dal ledger, autoritativa)
+
+| nome morto | sostituto |
+|---|---|
+| `get_job_status` | `queue (action:"status")` |
+| `view_image` | `get_image (action:"view")` |
+| `list_assets` | `get_image (action:"list_assets")` |
+| `get_asset_metadata` | `get_image (action:"asset_metadata")` |
+| `regenerate` | `generate_image (action:"regenerate")` |
+| `search_models` | `download_model (action:"search")` |
+| `search_civitai_models` | `download_model (action:"search_civitai")` |
+| `download_civitai_model` | `download_model (action:"download_civitai")` |
+| `resolve_missing_models` | `download_model (action:"resolve_missing")` |
+| `run_template` | `enqueue_workflow (action:"run_template")` |
+| `stage_output_as_input` | `upload_image (action:"stage")` |
+| `validate_workflow` | `create_workflow (action:"validate")` |
+| `analyze_color` | `get_image (action:"analyze_color")` |
+| `health_check` / `get_workspace` | vedi output del gate |
+
+Il gate stampa il sostituto corretto accanto a ogni riferimento: **usa il suo output come lista di
+lavoro**, non questa tabella a memoria.
+
+---
+
+## Step 0 — Setup (5 min)
+
+```bash
+git checkout claude/overlap-original-features-a8uh4v
+git pull origin claude/overlap-original-features-a8uh4v
+git config merge.ours.driver true      # richiesto da .gitattributes, per-clone
+npm ci
+npm run check:vocabulary 2>&1 | tee /tmp/vocab-before.txt
+```
+
+Aprire i bead (prefisso di progetto: vedi `.beads/config.yaml`):
+
+```bash
+bd create "Bonifica nomi tool ritirati nel codice sprite"      # Step 2
+bd create "Bonifica nomi tool ritirati nei prompt subagent"    # Step 3
+bd create "Esenzioni HISTORICAL per Gap Report e beads log"    # Step 4
+bd create "Riscrittura pixelforge-expert-{opus,sonnet}"        # Step 5
+bd create "PR upstream: luma_key su remove_background"         # Step 6
+bd create "Design doc: consolidamento sprite tool surface"     # Step 7
+bd create "ci.yml: eliminare il conflitto CRLF ricorrente"     # Step 1
+```
+
+---
+
+## Step 1 — `ci.yml`: eliminare un conflitto di merge gratuito (10 min)
+
+**Problema.** `.github/workflows/ci.yml` differisce da upstream **solo per i line-ending** (228 righe,
+upstream CRLF / fork LF, verificato con `git diff --ignore-cr-at-eol`, che azzera il diff). È l'unico
+file del repo in questa condizione. Nessuna modifica semantica del fork: è normalizzazione accidentale
+(probabilmente `core.autocrlf`). Risultato: conflitto pieno a ogni sync futuro, per contenuto zero.
+
+**Azione.**
+
+```bash
+# 1. ripristina i byte esatti di upstream (d996e12 = tip upstream del sync)
+git checkout d996e12 -- .github/workflows/ci.yml
+git diff --stat d996e12 HEAD -- .github/workflows/ci.yml   # deve essere VUOTO
+```
+
+2. Aggiungere in `.gitattributes`, in coda, per impedire che si ri-normalizzi:
+
+```gitattributes
+# Fork maintenance: ci.yml è identico a upstream a meno dei line-ending. Una
+# normalizzazione accidentale (core.autocrlf sul dev box Windows) lo ha reso un
+# conflitto pieno a ogni `git merge upstream/main` per contenuto zero. `-text`
+# disattiva ogni conversione EOL in entrambe le direzioni, così il blob committato
+# resta byte-identico a quello di upstream e il file smette di comparire nei merge.
+.github/workflows/*.yml -text
+```
+
+**Nota:** `-text` (non `text eol=lf`). `eol=` agisce solo sul checkout; qui il problema è il *blob
+committato*, e serve impedirne la ri-normalizzazione al commit.
+
+**Verifica:** `git diff d996e12 HEAD --name-only` non deve più elencare `.github/workflows/ci.yml`.
+
+Commit: `fix(fork): stop ci.yml from conflicting on every upstream sync`
+
+---
+
+## Step 2 — Bonifica rot nel codice (2-3 h) — **priorità massima**
+
+Sono le stringhe che il modello legge e su cui agisce. Lista esatta dei siti (dall'output del gate):
+
+**Descrizioni/note di tool — riscrivere il nome:**
+
+| file:riga | nome morto |
+|---|---|
+| `src/sprite/tools/generate-sprite.ts:145` | `search_models`, `search_civitai_models` |
+| `src/sprite/tools/generate-sprite.ts:241` | `search_civitai_models` |
+| `src/sprite/tools/generate-sprite.ts:244` | `view_image` |
+| `src/sprite/tools/get-sprite-result.ts:7,24` | `get_job_status` |
+| `src/sprite/tools/get-sprite-result.ts:27,41` | `view_image` |
+| `src/sprite/tools/pixelate-image.ts:284` | `regenerate` |
+| `src/sprite/comfyui/sprite-job.ts:70` | `download_civitai_model` |
+| `src/sprite/comfyui/sprite-status.ts:15` | `list_assets`, `view_image` |
+| `src/sprite/comfyui/sprite-status.ts:68,70` | `run_template` |
+| `src/sprite/types.ts:107` | `get_job_status` |
+| `src/sprite/types.ts:265` | `view_image` |
+| `src/tools/remove-background.ts:72` | `stage_output_as_input` |
+| `src/tools/remove-background.ts:161` | `view_image` |
+| `src/tools/contact-sheet.ts:10,13` | `view_image` |
+| `src/services/contact-sheet.ts:12,98` | `view_image` |
+| `src/services/view-image.ts:17` | `view_image` |
+| `src/services/asset-registry.ts:219` | `regenerate` |
+| `src/services/missing-models.ts:454` | `resolve_missing_models` |
+| `src/__tests__/tools/assets.test.ts:8,30,50,67,109` | `regenerate`, `get_asset_metadata` |
+| `PixelForgeDocumentations/fork-customization/tool-surface.md:13` (+3 altri) | `get_job_status`, `get_asset_metadata`, `regenerate` |
+| `PixelForgeDocumentations/fork-customization/repo-layout.md:7` | `get_job_status` |
+
+**Come riscrivere.** Il gate riconosce la forma `tool (action:"x")` come *migrazione*, non come rot
+(`rotMentions`, `src/tools/vocabulary.ts:624`). Quindi:
+
+- ❌ `"pass the returned asset_id straight to view_image"`
+- ✅ `"pass the returned asset_id straight to get_image (action:\"view\")"`
+
+**Casi che richiedono giudizio, non sostituzione meccanica:**
+
+- `get-sprite-result.ts:7` — commento *"a thin wrapper over the INHERITED get_job_status"*. Descrive
+  la genealogia del codice. Riscrivere comunque nominando il tool attuale: ciò che è ereditato è il
+  **servizio**, non il nome del tool. Formulazione suggerita: *"a thin wrapper over the inherited job
+  status path (surfaced upstream as `queue (action:\"status\")`)"*.
+- `sprite-status.ts:68,70` — `run_template`: verificare che il riferimento sia al *tool* e non alla
+  funzione interna `runTemplate`. Se è codice (identificatore), non è rot: il gate distingue per
+  contesto, ma se lo segnala va comunque disambiguato (rinominare la variabile o riformulare il
+  commento).
+- `src/__tests__/tools/assets.test.ts` — sono **fixture di test**. Se asseriscono su un nome morto
+  come stringa di dato, il trattamento corretto è `allowedIn` in `vocabulary.ts` con `path`/`context`/
+  `why` (vedi il precedente `upscale_image` a `vocabulary.ts:2250-2262`), **non** riscrivere
+  l'asserzione. Leggere il test prima di decidere.
+- `src/services/view-image.ts:17`, `src/services/contact-sheet.ts`, `asset-registry.ts`,
+  `missing-models.ts` — sono file *upstream* che il fork ha modificato. Verificare con
+  `git diff d996e12 HEAD -- <file>` se la riga rot è nostra o loro. **Se è nostra: correggila.**
+  Se è di upstream, è un bug loro → annotarlo per lo Step 6 (candidato a micro-PR separata).
+
+**Verifica:** `npm run check:vocabulary` deve scendere da 438 a ~394 (restano solo expert docs +
+storici). `npm run lint && npm test`.
+
+Commit: `fix(sprite): tool descriptions name the post-0.50.0 surface, not retired names`
+
+---
+
+## Step 3 — Bonifica rot nei prompt dei subagent (30 min)
+
+14 siti, tutti `get_job_status` tranne due `get_asset_metadata`:
+
+| file | righe |
+|---|---|
+| `.claude/agents/comfyui-integration-specialist-{opus,sonnet}.md` | 11, 40 |
+| `.claude/agents/mcp-protocol-architect-{opus,sonnet}.md` | 15, 26 |
+| `.claude/agents/typescript-architecture-specialist-{opus,sonnet}.md` | 42 |
+| `.clinerules/workflows/comfyui-integration-specialist.md` | 16 |
+| `.clinerules/workflows/mcp-protocol-architect.md` | 20, 31 |
+| `.clinerules/workflows/typescript-architecture-specialist.md` | 47 |
+
+**Attenzione all'accoppiamento:** i file `.claude/agents/*-opus.md` e `*-sonnet.md` sono coppie che
+devono restare allineate (CLAUDE.md: *"never dispatch to a bare (non-tiered) domain name"*), e
+`.clinerules/workflows/*.md` ne sono i mirror senza tier. **Ogni modifica va replicata su tutti e tre
+i file della stessa famiglia.** Verifica finale:
+
+```bash
+diff <(sed 's/-opus//;s/model: opus//' .claude/agents/mcp-protocol-architect-opus.md) \
+     <(sed 's/-sonnet//;s/model: sonnet//' .claude/agents/mcp-protocol-architect-sonnet.md)
+```
+
+I prompt dei subagent sono in **inglese** (convenzione non negoziabile, CLAUDE.md).
+
+Commit: `docs(agents): retire dead tool names from specialist prompts`
+
+---
+
+## Step 4 — Esenzioni HISTORICAL motivate (20 min)
+
+23 riferimenti in file che sono **dati storici**: riscriverli falsificherebbe il record.
+
+In `scripts/check-tool-vocabulary.mts`, nell'array `HISTORICAL` (righe ~65-73), aggiungere **due
+regex letterali e strette**, ciascuna con la propria motivazione nel commento — nello stile
+dell'esenzione già presente per `packs/*/workflow.json`:
+
+```ts
+  // Il log append-only delle interazioni beads è DATO, non guida: registra quali
+  // tool furono effettivamente chiamati in una sessione passata. Riscriverlo
+  // falsificherebbe il record e corromperebbe l'export che `bd` rilegge — stesso
+  // argomento dei workflow salvati sopra. Regex sul file esatto, mai su `.beads/`.
+  /^\.beads\/interactions\.jsonl$/,
+  // Gap report DATATI: snapshot dell'ambiente ComfyUI al 2026-08-02, che
+  // documentano quali tool furono eseguiti quel giorno e con che esito. Sono
+  // referti, non istruzioni: nessuno li legge per sapere cosa chiamare oggi, e
+  // riscriverli cambierebbe cosa risulta essere stato misurato. Il nome del file
+  // porta la data, quindi la regex non può catturare documentazione viva.
+  /^PixelForgeDocumentations\/PixelForge_Gap_Report_[0-9-]+.*\.md$/,
+```
+
+**Vincoli da rispettare:**
+- Non aggiungere `PixelForgeDocumentations/` come glob: quella directory contiene guida viva
+  (`fork-customization/`, `backlog-proposals.md`), che deve restare sotto gate.
+- Per prudenza, aggiungere in testa a entrambi i Gap Report un banner di una riga:
+  `> Snapshot datato 2026-08-02. I nomi di tool citati sono quelli in vigore allora; molti sono stati ritirati nella consolidation 0.50.0.`
+
+**Verifica:** il gate non deve più elencare `.beads/interactions.jsonl` né i Gap Report.
+
+Commit: `chore(vocabulary): exempt dated snapshots and the beads interaction log`
+
+---
+
+## Step 5 — Riscrittura `pixelforge-expert-{opus,sonnet}.md` (~1 giornata)
+
+**Cosa sono.** 539 righe, `PixelForgeDocumentations/agents/`. Agente power-user **autoportante**,
+progettato per essere copiato in `.claude/agents/` di qualunque progetto senza accesso al repo
+PixelForge. Struttura: Parte 1 = pipeline sprite (8 tool), Parte 2 = superficie ComfyUI completa.
+I due file sono **byte-identici tranne `name:` e `model:`** (verificato).
+
+**Perché è guida viva e non può essere esentata.** 183 riferimenti a nomi morti ciascuno significano
+366 istruzioni che, se l'agente le esegue, ottengono un redirect 404. È esattamente il failure mode
+che il gate esiste per prevenire.
+
+**Procedura.**
+
+1. Generare la superficie reale corrente:
+   ```bash
+   npm run build        # tools:dump richiede dist/
+   npm run tools:dump > /tmp/surface-current.json
+   ```
+   `scripts/tools-dump.mts` fa introspezione **attraverso il vero McpServer** (`src/tools/introspect.ts`),
+   quindi restituisce nome + descrizione + inputSchema *come li vede un client* — non una lista
+   dedotta. È la sola fonte di verità accettabile qui.
+   Riferimenti secondari: `docs/design/tool-surface.txt` (i 52 nomi in ordine di registrazione) e
+   `docs/tools/*.mdx` (generati dagli schemi).
+
+2. **Riscrivere `pixelforge-expert-opus.md`:**
+   - **Parte 1 (pipeline sprite)** — sostanzialmente valida, va solo bonificata dai nomi morti e
+     allineata a `fork-customization/tool-surface.md`. Ricordare che i tool sono **10**, non 8:
+     agli 8 MVP si aggiungono `workflow_from_prompt_spec` e `get_workflow_prompt_template`.
+   - **Parte 2 (superficie ComfyUI)** — riscrittura vera. La vecchia parte elencava ~120 tool
+     singoli; oggi sono ~42 tool action-parameterized. Organizzare **per tool, con le sue azioni**
+     (`get_image`: get/view/list_outputs/convert/analyze_color/list_assets/asset_metadata;
+     `generate_image`: image/audio/video/3d/controlnet/ip_adapter/regenerate/upscale/remove_background;
+     `queue`, `download_model`, `install_comfyui`, `get_system_stats`, ecc.).
+   - Aggiornare la sezione "Before doing real work": `health_check` → `get_system_stats (action:"health")`,
+     `get_environment`/`get_workspace` → `install_comfyui (action:"environment")` / `workspace`.
+   - **Aggiungere una sezione nuova** su ciò che il sync ha reso disponibile e che l'agente deve
+     conoscere: `kitchen` (probe GPU/triton), `batch` (sweep multi-job), `train_*` +
+     skill `train-character-lora`, `contact_sheet` per la QA visiva.
+   - Il file è in **inglese**.
+
+3. **Derivare il sonnet:** copiare l'opus e cambiare solo `name:` e `model:`. Verificare con il `diff`
+   dello Step 3.
+
+4. Se durante la riscrittura emergono nomi che non esistono più *e non hanno sostituto*, non
+   inventarli: interrogare `/tmp/surface-current.json`.
+
+**Verifica:** `npm run check:vocabulary` deve arrivare a **0 riferimenti** (gate verde) — questo è lo
+step che chiude il ciclo.
+
+Commit: `docs(agents): rewrite pixelforge-expert against the post-consolidation surface`
+
+---
+
+## Step 6 — PR upstream: `luma_key` come sonda (mezza giornata + attesa)
+
+**Perché questa e non altre.** È l'unico candidato che **aggiunge zero nomi di tool** (è un nuovo
+`mode` su un'action esistente), quindi non collide con `MAX_TOOLS`/`TOOL_BUDGET_TARGET = 30`. Ha
+esattamente la forma delle 3 PR esterne che upstream ha mergiato negli ultimi 37 giorni. E porta
+valore generico: risolve i due failure mode reali di BiRefNet (riempie i centri cavi di nero opaco,
+mangia l'alone emissivo) usando **soli nodi core ComfyUI**, senza dipendenza da custom node.
+
+**Preliminare obbligatorio.** `CONTRIBUTING.md`: *"Open a GitHub issue first for large or potentially
+breaking changes"*. Con un manutentore a ~46 commit/giorno, **aprire prima l'issue** descrivendo il
+problema (BiRefNet su arte neon-su-nero) e la soluzione proposta, e attendere un cenno. Non aprire la
+PR a freddo.
+
+**Contenuto della PR** (da estrarre dal fork, non da riscrivere):
+
+| file | cosa |
+|---|---|
+| `src/services/workflow-composer.ts` | 2 hunk: campi `mode`/`threshold`/`softness` su `RemoveBackgroundParams`, e la funzione `buildRemoveBackgroundLumaKey` (~89 righe, già commentata incluso il TRAP su `JoinImageWithAlpha` che calcola `alpha = 1.0 - mask`) |
+| `src/services/remove-background.ts` | 4 hunk, +53/−14: dispatch birefnet/luma_key |
+| `src/tools/generate-image.ts` | **da scrivere ex novo**: esporre `mode`/`threshold`/`softness` sull'action `remove_background` esistente. Il fork li espone solo sul proprio tool standalone, che upstream non ha. |
+| `src/__tests__/services/remove-background.test.ts` | i test del fork, già scritti |
+| `docs/` | `npm run docs:gen` e committare il rigenerato (gate CI di upstream) |
+
+**Cosa NON includere:** il tool standalone `remove_background`, la risoluzione `asset_id`/`path`
+(dipende da `resolveReferenceImage` in `src/sprite/`), qualunque riferimento a PixelForge o sprite.
+La PR deve leggersi come un miglioramento di comfyui-mcp, perché lo è.
+
+**Meccanica:** fork pulito di `artokun/comfyui-mcp` (non questo repo), branch `feat/remove-bg-luma-key`,
+Conventional Commit, `npm run build && npm test` verdi prima di aprire.
+
+**Candidati successivi**, solo se questa PR viene accolta — una alla volta, mai in blocco:
+1. statistiche alpha in `src/services/color-analysis.ts` (+50) — upstream **le cita già** nella
+   descrizione di `get_image (action:"analyze_color")`;
+2. `saveWorkflowToLibrary` estratto in `src/services/workflow-converter.ts` (+83) — de-duplica la loro
+   save path;
+3. `ResolveDeps` live in `src/services/missing-models.ts` (+60) — espansione HF `/tree/main` con
+   size/precision/fit verdict, inclusa la nota verificata sul perché `?blobs=true` dà 400;
+4. `contact_sheet` — **da proporre come `get_image (action:"contact_sheet")`**, mai come tool nuovo.
+
+---
+
+## Step 7 — Design doc: consolidamento della sprite surface (mezza giornata, solo carta)
+
+**Nessun codice.** `locked-decisions.md` impone conferma esplicita prima di rovesciare la "MVP surface
+locked": questo step produce il documento su cui decidere, non la decisione.
+
+Creare `PixelForgeDocumentations/fork-customization/tool-surface-consolidation.md` con:
+
+1. **Il vincolo, con le prove.** `MAX_TOOLS = 52` asserito *uguale* a `TOOL_NAMES.length`
+   (`vocabulary.ts:219`), `TOOL_BUDGET_TARGET = 30` (`:222`), e la motivazione scritta da upstream
+   ("Glama scores Tool Count 1/5 at 148+ tools"). Il fork contribuisce 14 dei 52 nomi.
+2. **La mappa di consolidamento proposta**, 14 → ~7:
+   - `generate_sprite` + `generate_animation_set` + `generate_arcade_topdown_set` +
+     `get_sprite_result` → `sprite (action: "generate"|"animation_set"|"arcade_topdown"|"result")`
+   - `workflow_from_prompt_spec` + `get_workflow_prompt_template` → `prompt_spec (action: "compile"|"template")`
+   - `get_secrets` + `set_secret` + `clear_secret` → `secrets (action: "get"|"set"|"clear")`
+   - `contact_sheet` → azione su `get_image` (allineato allo Step 6, candidato 4)
+   - restano standalone: `pixelate_image`, `pack_spritesheet`, `export_for_engine`, `remove_background`
+3. **Costo di migrazione:** `TOOL_NAMES` + `MAX_TOOLS` + `DEAD_NAMES` (i vecchi nomi fork diventano
+   redirect), `tool-surface-filter.ts` (le tre liste), `docs:gen`, `vocab:export`, i test di superficie,
+   e ogni descrizione che nomina un tool sprite. Stimare in file toccati.
+4. **Il rischio del non fare nulla:** al prossimo giro di consolidation upstream, i nostri nomi sono
+   l'unica ragione per cui il ratchet non chiude, e la decisione arriva sotto merge conflittuale.
+5. **Il vincolo di forma da rispettare:** lo shape deve essere un **oggetto piatto con enum `action`**,
+   mai `z.discriminatedUnion` — l'SDK MCP renderizza quest'ultimo con zero parametri visibili,
+   nascondendo ogni input al modello (`src/tools/system-stats.ts:23-26`).
+6. **Effetto collaterale positivo:** 14 → 7 è anche la forma che renderebbe una eventuale PR upstream
+   della superficie sprite *discutibile* invece che automaticamente fuori policy.
+
+Aggiornare `fork-customization/INDEX.md` con il link. **Non** modificare `locked-decisions.md` finché
+la decisione non è presa.
+
+Commit: `docs(fork): record the sprite tool-surface consolidation decision`
+
+---
+
+## Verifica end-to-end
+
+Al termine di ogni step, e obbligatoriamente prima del push finale:
+
+```bash
+npm ci
+npm run lint                       # tsc --noEmit + anti-slop
+npm run build
+npm test                           # suite completa, non solo il subset
+npm run check:vocabulary           # ← deve essere VERDE (0 riferimenti) dopo Step 5
+npm run check:unknown-collapse
+npm run check:anti-slop
+npm run vocab:export -- --check
+node scripts/asset-counts.mjs --check   # richiede dist/ fresco
+npm run docs:gen && git diff --exit-code -- docs/   # deve essere un no-op
+```
+
+Sono esattamente i gate di `.github/workflows/ci.yml:30-96`, nello stesso ordine.
+
+**Verifica funzionale del comportamento (non solo dei gate).** Il punto dello Step 2 è che il modello
+smetta di chiamare tool morti. Dopo il build, in Claude Code:
+
+1. `/mcp` per riconnettere il server.
+2. Chiedere: *"genera uno sprite di un serpente pixel art, poi mostrami il risultato"*.
+3. Confermare che l'agente, dopo `generate_sprite`, chiami **`get_image (action:"view")`** e non
+   `view_image`. Se chiama ancora il nome morto, una descrizione è rimasta indietro.
+4. Idem per `remove_background` → deve indirizzare a `upload_image (action:"stage")`, non a
+   `stage_output_as_input`.
+
+Ricordare il **Plugin File Sync** (CLAUDE.md): il plugin gira da
+`~/.claude/plugins/cache/pixelforge-mcp/pixelforge/<version>/`. Dopo modifiche in `plugin/` copiare
+là e riavviare; per i soli tool MCP basta `npm run build` + `/mcp`.
+
+---
+
+## Ordine di esecuzione e stima
+
+| # | step | stima | dipendenze |
+|---|---|---|---|
+| 0 | Setup + bead | 5 min | — |
+| 1 | `ci.yml` / `.gitattributes` | 10 min | — |
+| 2 | **Rot nel codice** | 2-3 h | — |
+| 3 | Rot nei prompt subagent | 30 min | — |
+| 4 | Esenzioni HISTORICAL | 20 min | — |
+| 5 | Riscrittura expert docs | ~1 giorno | Step 2 (per coerenza di formulazione) |
+| 6 | PR upstream `luma_key` | ½ giorno + attesa | indipendente, può partire in parallelo |
+| 7 | Design doc consolidamento | ½ giorno | indipendente |
+
+Gli step 1-4 chiudono l'80% del gate in circa mezza giornata. Lo step 5 è quello che lo porta a zero.
+
+---
+
+## Cosa NON fare
+
+- **Non** allargare `HISTORICAL` oltre le due regex dello Step 4. Se il gate resta rosso su un file di
+  guida viva, il file va corretto, non esentato.
+- **Non** toccare `TOOL_NAMES`, `MAX_TOOLS`, `BASELINE_SHA256`, `PANEL_BASELINE_SHA256`: nessuno step
+  qui cambia la superficie. Un baseline rosso significa che qualcosa è andato storto.
+- **Non** implementare `consistency_mode: "controlnet_pose"` in questo piano, anche se il sync ha reso
+  disponibili entrambi i prerequisiti (`generate_image (action:"controlnet"/"ip_adapter")` e i tool
+  `train_*` + skill `train-character-lora`). Resta una decisione bloccata da `locked-decisions.md`.
+- **Non** aggiornare `backlog-proposals.md` sullo scene-splitting in questo piano. Va fatto, ma è
+  lavoro separato: la premessa del documento è obsoleta (SAM3 è ora core in `comfy_extras` —
+  `SAM3_VideoTrack`/`SAM3_TrackToMask` — quindi il blocco su `triton`/ComfyUI-RMBG non esiste più, e
+  il checkpoint `sam3.1_multiplex_fp16` è provisionabile via `apply_manifest` su `packs/artokun-flow`).
+  Aprire un bead a parte.
+- **Non** modificare `plugin/.mcp.json` per puntare a un path locale (CLAUDE.md lo vieta
+  esplicitamente).
+- **Non** aprire PR su `Estrusco/pixelforge-mcp` senza richiesta esplicita. Lo Step 6 riguarda una PR
+  su `artokun/comfyui-mcp`, che è un repo diverso e richiede un fork separato.
